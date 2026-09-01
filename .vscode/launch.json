@@ -1,0 +1,85 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "render",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "/nix/store/3mbcahbl8lznlk7bm1sfv52m8lpnw4i2-just-1.58.0/bin/just",
+      "args": [
+        "render"
+      ],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "setupCommands": [
+        {
+          "description": "Enable pretty-printing for gdb",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Set Disassembly Flavor to Intel",
+          "text": "-gdb-set disassembly-flavor intel",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Make sure GDB does not spawn a new shell",
+          "text": "-gdb-set startup-with-shell off",
+          "ignoreFailures": false
+        },
+        {
+          "description": "Make sure GDB switch to child on fork",
+          "text": "-gdb-set follow-fork-mode child",
+          "ignoreFailures": false
+        },
+        {
+          "description": "Make sure GDB does not detach on fork",
+          "text": "-gdb-set detach-on-fork off",
+          "ignoreFailures": false
+        }
+      ]
+    },
+    {
+      "name": "view",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "/nix/store/3mbcahbl8lznlk7bm1sfv52m8lpnw4i2-just-1.58.0/bin/just",
+      "args": [
+        "view"
+      ],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "setupCommands": [
+        {
+          "description": "Enable pretty-printing for gdb",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Set Disassembly Flavor to Intel",
+          "text": "-gdb-set disassembly-flavor intel",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Make sure GDB does not spawn a new shell",
+          "text": "-gdb-set startup-with-shell off",
+          "ignoreFailures": false
+        },
+        {
+          "description": "Make sure GDB switch to child on fork",
+          "text": "-gdb-set follow-fork-mode child",
+          "ignoreFailures": false
+        },
+        {
+          "description": "Make sure GDB does not detach on fork",
+          "text": "-gdb-set detach-on-fork off",
+          "ignoreFailures": false
+        }
+      ]
+    }
+  ]
+}
