@@ -1,0 +1,288 @@
+diff --git a/src/tests/integration/test_IntegrationMcpTransport.cpp b/src/tests/integration/test_IntegrationMcpTransport.cpp
+index 723f230853..ff9ca74afa 100644
+--- a/src/tests/integration/test_IntegrationMcpTransport.cpp
++++ b/src/tests/integration/test_IntegrationMcpTransport.cpp
+@@ -587,161 +587,209 @@
+   // Trickle one byte per slot every 50 ms until the server drops them all.
+   using clock = std::chrono::steady_clock;
+   const auto t0 = clock::now();
+   std::size_t open = fds.size();
+   while (open && clock::now() - t0 < std::chrono::seconds(5)) {
+     for (int &fd : fds) {
+       if (fd < 0)
+         continue;
+       pollfd p{fd, POLLIN, 0};
+       if (::poll(&p, 1, 0) > 0) { // reply or EOF: server released it
+         ::close(fd);
+         fd = -1;
+         open--;
+         continue;
+       }
+       const char c = 'a';
+       ::send(fd, &c, 1, MSG_NOSIGNAL);
+     }
+     ::usleep(50 * 1000);
+   }
+   for (int fd : fds)
+     if (fd >= 0)
+       ::close(fd);
+   REQUIRE(open == 0);
+   REQUIRE(clock::now() - t0 < std::chrono::milliseconds(deadlineMs * 4));
+ 
+   // The released slots serve a legitimate client again.
+   REQUIRE(f.call(rpc("ping")).status == 200);
+ }
+ 
++SCENARIO("MCP frees the only slot before a sequential client can reconnect",
++    "[integration]")
++{
++  // Each call sends Connection: close, reads to EOF and reconnects at once.
++  // Addendum 11: the slot is free no later than the close the client sees.
++  Fixture f("127.0.0.1", {}, [](mcp::Config &c) { c.maxConnections = 1; });
++  for (int i = 0; i < 50; i++) {
++    INFO("round trip " << i);
++    REQUIRE(f.call(rpc("ping")).status == 200);
++  }
++}
++
+ // Holds one connection whose client reads a large tools/list response one
+ // byte every 10 ms, so the server stays inside sendAll for a long time.
+ struct SlowReader
+ {
+   using clock = std::chrono::steady_clock;
+   int fd{-1};
+   std::atomic<bool> stop{false};
+   std::atomic<bool> firstByte{false};
+   std::thread reader;
+ 
+   static void configure(mcp::Config &c, int deadlineMs)
+   {
+     c.maxConnections = 1;
+     c.responseDeadlineMs = deadlineMs;
+     // Far larger than any loopback socket buffering, so the response can
+     // only complete if the client actually reads it.
+     mcp::Tool big;
+     big.name = "big";
+     big.description = std::string(32u << 20, 'x');
+     big.handler = [](const session::Credentials &, const mcp::json::Value &) {
+       return mcp::ToolResult{};
+     };
+     c.tools.push_back(std::move(big));
+   }
+ 
+   // Connects, sends the request and waits (bounded) for the first byte.
+   bool start(Fixture &f)
+   {
+     fd = ::socket(AF_INET, SOCK_STREAM, 0);
+     if (fd < 0)
+       return false;
+     int rcvbuf = 4096;
+     ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+     sockaddr_in a{};
+     a.sin_family = AF_INET;
+     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+     a.sin_port = htons(f.server->port());
+     if (::connect(fd, reinterpret_cast<sockaddr *>(&a), sizeof(a)) != 0)
+       return false;
+     const std::string body = rpc("tools/list");
+     const std::string req = "POST /mcp HTTP/1.1\r\n" + f.hostHeader() + "\r\n"
+         + f.authHeader()
+         + "\r\nContent-Type: application/json\r\nConnection: close\r\n"
+           "Content-Length: "
+         + std::to_string(body.size()) + "\r\n\r\n" + body;
+     ::send(fd, req.data(), req.size(), MSG_NOSIGNAL);
+     reader = std::thread([this] {
+       const auto limit = clock::now() + std::chrono::seconds(90);
+       while (!stop && clock::now() < limit) {
+         pollfd p{fd, POLLIN, 0};
+         if (::poll(&p, 1, 10) > 0) {
+           char c;
+           if (::recv(fd, &c, 1, 0) <= 0)
+             break;
+           firstByte = true;
+         }
+         ::usleep(10 * 1000);
+       }
+     });
++    // The first byte is in the client's receive buffer as soon as the server
++    // thread's first send() lands, which needs no client progress; 10 s only
++    // bounds a wedged server and is far above any loaded-host scheduling delay.
++    // A longer wait would not help the short-deadline scenario anyway: once the
++    // server's response deadline passes it closes the socket and the reader
++    // thread exits without a first byte.
+     const auto t0 = clock::now();
+     while (!firstByte && clock::now() - t0 < std::chrono::seconds(10))
+       ::usleep(5 * 1000);
+     return firstByte;
+   }
+ 
+   ~SlowReader()
+   {
+     stop = true;
+     if (reader.joinable())
+       reader.join();
+     if (fd >= 0)
+       ::close(fd);
+   }
+ };
+ 
+ SCENARIO("MCP rejects a healthy client while a slow send holds the only slot",
+     "[integration]")
+ {
+   // A deadline far beyond the test's runtime, so the slot is provably still
+   // held when the ping arrives regardless of scheduling.
+   Fixture f("127.0.0.1", {}, [](mcp::Config &c) {
+     SlowReader::configure(c, 120000);
+   });
+   {
+     SlowReader slow;
+     REQUIRE(slow.start(f));
+     REQUIRE(f.call(rpc("ping")).status == 503);
+   }
+   // Closing the slow client ends the send with an error and frees the slot.
+   using clock = std::chrono::steady_clock;
+   const auto t0 = clock::now();
+   int status = 0;
+   while (clock::now() - t0 < std::chrono::seconds(10)) {
+     status = f.call(rpc("ping")).status;
+     if (status == 200)
+       break;
+     ::usleep(50 * 1000);
+   }
+   REQUIRE(status == 200);
+ }
+ 
+ SCENARIO("MCP frees a slow-reader connection at the response deadline",
+     "[integration]")
+ {
+   constexpr int deadlineMs = 500;
+   Fixture f("127.0.0.1", {}, [](mcp::Config &c) {
+     SlowReader::configure(c, deadlineMs);
+   });
+   SlowReader slow;
+   REQUIRE(slow.start(f));
+   using clock = std::chrono::steady_clock;
+   const auto sendStart = clock::now();
++  const auto elapsedMs = [&] {
++    return std::chrono::duration_cast<std::chrono::milliseconds>(
++        clock::now() - sendStart)
++        .count();
++  };
++
++  // Before the deadline the slow send still holds the only slot. The server's
++  // deadline started before the first byte reached us, so time measured from
++  // here underestimates it: a 200 whose reply arrived before deadlineMs from
++  // here is a genuine early release. Only probe while well inside the window,
++  // and treat a 200 that arrived after the deadline as inconclusive.
++  const auto beforeProbe = elapsedMs();
++  if (beforeProbe < deadlineMs * 4 / 10) {
++    const int early = f.call(rpc("ping")).status;
++    const auto afterProbe = elapsedMs();
++    INFO("probe sent at " << beforeProbe << " ms, replied at " << afterProbe
++                          << " ms, status " << early);
++    if (early != 503 && afterProbe >= deadlineMs)
++      WARN("held-slot probe inconclusive: reply arrived at "
++          << afterProbe << " ms, past the " << deadlineMs << " ms deadline");
++    else
++      REQUIRE(early == 503);
++  } else {
++    WARN("skipping held-slot probe: " << beforeProbe
++                                      << " ms already elapsed since the first "
++                                         "byte (deadline "
++                                      << deadlineMs << " ms)");
++  }
+ 
+   // The slot frees within the response deadline (plus scheduling slack),
+   // while the slow reader is still reading.
+   int status = 0;
+   while (clock::now() - sendStart < std::chrono::milliseconds(deadlineMs * 6)) {
+     status = f.call(rpc("ping")).status;
+     if (status == 200)
+       break;
+     ::usleep(50 * 1000);
+   }
+   INFO("elapsed ms: "
+       << std::chrono::duration_cast<std::chrono::milliseconds>(
+              clock::now() - sendStart)
+              .count());
+   REQUIRE(status == 200);
++  // The slot is free as soon as the previous reply's close is visible
++  // (addendum 11), so an immediate reconnect is served too.
+   REQUIRE(f.call(rpc("ping")).status == 200);
+ }
+ 
+ #endif
+diff --git a/src/vsr/integration/mcp/McpServer.hpp b/src/vsr/integration/mcp/McpServer.hpp
+index a65d6aa5c0..6beb9311ed 100644
+--- a/src/vsr/integration/mcp/McpServer.hpp
++++ b/src/vsr/integration/mcp/McpServer.hpp
+@@ -492,65 +492,64 @@
+     std::lock_guard<std::mutex> lock(m_connMutex);
+     // Reap finished connection threads.
+     for (auto it = m_conns.begin(); it != m_conns.end();) {
+       if (it->done) {
+         it->thread.join();
+         it = m_conns.erase(it);
+       } else
+         ++it;
+     }
+     if (m_conns.size() >= m_config.maxConnections) {
+       log("mcp: connection limit reached");
+       detail::sendAll(fd,
+           "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n"
+           "Connection: close\r\n\r\n",
+           m_config.responseDeadlineMs);
+       ::close(fd);
+       continue;
+     }
+     const auto toTimeval = [](int ms) {
+       return timeval{ms / 1000, (ms % 1000) * 1000};
+     };
+     const timeval rcv = toTimeval(m_config.requestDeadlineMs);
+     const timeval snd = toTimeval(m_config.sendTimeoutMs);
+     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcv, sizeof(rcv));
+     ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd, sizeof(snd));
+     m_conns.emplace_back();
+     Conn &c = m_conns.back();
+     c.fd = fd;
+     c.thread = std::thread([this, &c, fd] {
+       serve(fd);
+-      {
+-        std::lock_guard<std::mutex> l(m_connMutex);
+-        ::close(fd);
+-        c.fd = -1;
+-      }
++      // Addendum 11: the slot is free no later than the close is visible.
++      std::lock_guard<std::mutex> l(m_connMutex);
++      ::close(fd);
++      c.fd = -1;
+       c.done = true;
+     });
+   }
+ #endif
+ }
+ 
+ inline int McpServer::readRequest(int fd, std::string &buf, HttpRequest &req)
+ {
+ #if defined(__linux__)
+   constexpr std::size_t maxHeader = 8192;
+   using clock = std::chrono::steady_clock;
+   const auto deadline =
+       clock::now() + std::chrono::milliseconds(m_config.requestDeadlineMs);
+   // One bounded recv: waits no later than the request deadline.
+   // >0 bytes read; 0 peer closed; -1 error or deadline passed.
+   const auto recvBounded = [&](char *tmp, std::size_t size) -> ssize_t {
+     for (;;) {
+       const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+           deadline - clock::now())
+                             .count();
+       if (left <= 0)
+         return -1;
+       pollfd p{fd, POLLIN, 0};
+       const int pr = ::poll(&p, 1, int(left));
+       if (pr < 0 && errno == EINTR)
+         continue;
+       if (pr <= 0)
+         return -1;
+       const ssize_t n = ::recv(fd, tmp, size, 0);
+       if (n < 0 && errno == EINTR)

@@ -1,0 +1,4 @@
+src/tests/integration/test_IntegrationMcpTransport.cpp
+src/tests/integration/test_IntegrationOperations.cpp
+src/tests/integration/test_Registration.cpp
+src/vsr/integration/mcp/McpServer.hpp

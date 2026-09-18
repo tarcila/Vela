@@ -1,0 +1,4959 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 528eddb554..c32a8234dc 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -40,60 +40,65 @@
+ cmake_dependent_option(VSR_BUILD_INTERACTIVE_APPS
+   "Build interactive applications"
+   ON
+   VSR_BUILD_APPS
+   OFF
+ )
+ cmake_dependent_option(VSR_BUILD_UI_LIBRARY
+   "Build the VSR ImGui UI library"
+   ON
+   "NOT VSR_BUILD_INTERACTIVE_APPS"
+   ON
+ )
+ 
+ option(VSR_USE_HDF5 "Support loading AMR grids from HDF5" OFF)
+ option(VSR_USE_ASSIMP "Support loading geometry with libassimp" OFF)
+ option(VSR_USE_SDL3 "Use SDL3 interop in render pipeline" ON)
+ option(VSR_USE_TBB "Use TBB code paths where relevant" ON)
+ option(VSR_USE_USD "Use OpenUSD where relevant" OFF)
+ option(VSR_USE_TORCH "Use PyTorch for importing neural geometries" OFF)
+ option(VSR_USE_VTK "Use VTK for importing VTK file formats" OFF)
+ option(VSR_USE_SILO "Use Silo for importing Silo file formats" OFF)
+ option(VSR_USE_OIIO
+   "Use OpenImageIO to decode texture formats stb cannot (e.g. TIFF)" OFF)
+ option(VSR_USE_MPI "Enable MPI support" OFF)
+ option(VSR_USE_NETWORKING "Enable networking support via boost.asio" OFF)
+ option(VSR_NANOVDB_SKIP_INVALID_VOLUMES
+   "Skip NanoVDB volumes with zero active voxels" OFF)
+ option(VSR_NANOVDB_USE_ZIP
+   "Enable zlib so NanoVDB importer can read ZIP-compressed .nvdb files" ON)
+ option(VSR_USE_LUA "Enable Lua scripting support" ON)
++option(VSR_USE_INTEGRATION
++  "Build the headless agent-integration library" ON)
++cmake_dependent_option(VSR_USE_INTEGRATION_MCP
++  "Build the embedded loopback MCP server for agent integration" OFF
++  "VSR_USE_INTEGRATION" OFF)
+ 
+ if (APPLE)
+   set(VSR_USE_CUDA OFF)
+ else()
+   option(VSR_USE_CUDA "Use CUDA code paths where relevant" ON)
+ endif()
+ 
+ ## Establish project ##
+ 
+ project(vela LANGUAGES C CXX)
+ 
+ ## Linker selection ##
+ 
+ if (UNIX AND NOT APPLE)
+   foreach(candidate mold lld gold)
+     find_program(VSR_LD_${candidate} ld.${candidate})
+     if (VSR_LD_${candidate})
+       add_link_options(-fuse-ld=${candidate})
+       message(STATUS "Using ld.${candidate} for faster linking")
+       break()
+     endif()
+   endforeach()
+ endif()
+ 
+ ## Major dependencies ##
+ 
+ find_package(anari ${ANARI_REQUIRED_VERSION} REQUIRED)
+ 
+ if (VSR_USE_CUDA)
+   enable_language(CUDA)
+diff --git a/src/vsr/CMakeLists.txt b/src/vsr/CMakeLists.txt
+index d5d977394b..fba7dc5735 100644
+--- a/src/vsr/CMakeLists.txt
++++ b/src/vsr/CMakeLists.txt
+@@ -1,25 +1,28 @@
+ ## SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ ## SPDX-License-Identifier: Apache-2.0
+ 
+ # Always present components
+ add_subdirectory(app)
+ add_subdirectory(core)
+ add_subdirectory(algorithms)
+ add_subdirectory(io)
+ add_subdirectory(animation)
+ add_subdirectory(rendering)
+ add_subdirectory(scene)
+ 
+ # Optional components
+ if (VSR_USE_MPI)
+   add_subdirectory(mpi)
+ endif()
+ if (VSR_USE_NETWORKING)
+   add_subdirectory(network)
+ endif()
+ if (VSR_BUILD_UI_LIBRARY)
+   add_subdirectory(ui)
+ endif()
+ if (VSR_USE_LUA)
+   add_subdirectory(scripting)
+ endif()
++if (VSR_USE_INTEGRATION)
++  add_subdirectory(integration)
++endif()
+diff --git a/src/vsr/integration/CMakeLists.txt b/src/vsr/integration/CMakeLists.txt
+new file mode 100644
+index 0000000000..74dfe4fe96
+--- /dev/null
++++ b/src/vsr/integration/CMakeLists.txt
+@@ -0,0 +1,30 @@
++## SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++## SPDX-License-Identifier: Apache-2.0
++
++# Headless agent-integration core. Deliberately free of UI, Lua, Pi and
++# network dependencies. Sources, including those in module subdirectories, are
++# globbed so later additions need no edit to a shared CMake file.
++
++project(vsr_integration)
++
++project_add_library(STATIC)
++
++file(GLOB_RECURSE VSR_INTEGRATION_SOURCES CONFIGURE_DEPENDS
++  ${CMAKE_CURRENT_LIST_DIR}/*.cpp
++)
++project_sources(PRIVATE ${VSR_INTEGRATION_SOURCES})
++
++project_include_directories(
++PUBLIC
++  $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../..>
++)
++
++find_package(Threads REQUIRED)
++project_link_libraries(PUBLIC vsr_scene Threads::Threads)
++# PNG deflate via the vendored stb writer; an implementation detail.
++project_link_libraries(PRIVATE $<BUILD_INTERFACE:vela_ext_stb_image>)
++
++# Embedded MCP server (header-only under mcp/); opt-in, no extra dependency.
++if (VSR_USE_INTEGRATION_MCP)
++  project_compile_definitions(PUBLIC VSR_USE_INTEGRATION_MCP)
++endif()
+diff --git a/src/vsr/integration/Integration.cpp b/src/vsr/integration/Integration.cpp
+new file mode 100644
+index 0000000000..dae81e8641
+--- /dev/null
++++ b/src/vsr/integration/Integration.cpp
+@@ -0,0 +1,247 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++#include "Integration.hpp"
++// vsr_scene
++#include "vsr/scene/Scene.hpp"
++// std
++#include <cmath>
++#include <utility>
++
++namespace vsr::integration {
++
++namespace {
++
++bool validDuration(double seconds)
++{
++  return std::isfinite(seconds) && seconds > 0.0;
++}
++
++} // namespace
++
++Integration::~Integration() = default;
++
++// Queries ////////////////////////////////////////////////////////////////////
++
++bool Integration::active() const
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  return m_active;
++}
++
++bool Integration::isRegisteredScene(SceneId id) const
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  return id < m_scenes.size();
++}
++
++bool Integration::isRegisteredView(ViewId id) const
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  return id < m_views.size() && !m_views[id].removed;
++}
++
++std::vector<ViewId> Integration::viewsOfScene(SceneId id) const
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  std::vector<ViewId> views;
++  for (std::size_t i = 0; i < m_views.size(); i++) {
++    if (!m_views[i].removed && m_views[i].registration.scene == id)
++      views.push_back(ViewId(i));
++  }
++  return views;
++}
++
++std::optional<SceneId> Integration::sceneOfView(ViewId id) const
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  if (id >= m_views.size() || m_views[id].removed)
++    return {};
++  return m_views[id].registration.scene;
++}
++
++SceneGrants Integration::sceneGrants(SceneId id) const
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  if (!m_active || id >= m_scenes.size())
++    return {};
++  return m_scenes[id].registration.grants;
++}
++
++ViewGrants Integration::viewGrants(ViewId id) const
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  if (!m_active || id >= m_views.size() || m_views[id].removed)
++    return {};
++  return m_views[id].registration.grants;
++}
++
++SyncHook Integration::normalSyncHook(SceneId id) const
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  if (!m_active || id >= m_scenes.size())
++    return {};
++  return m_scenes[id].registration.normalSyncHook;
++}
++
++SyncHook Integration::recoveryCallback(SceneId id) const
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  if (!m_active || id >= m_scenes.size())
++    return {};
++  return m_scenes[id].registration.recoveryCallback;
++}
++
++const SessionTiming &Integration::timing() const
++{
++  return m_timing;
++}
++
++bool Integration::inServiceCall() const
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  return m_servicingThread == std::this_thread::get_id();
++}
++
++// Registration ///////////////////////////////////////////////////////////////
++
++std::optional<SceneId> Integration::registerScene(
++    SceneRegistration registration)
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  if (m_active || registration.scene == nullptr)
++    return {};
++  m_scenes.push_back({std::move(registration)});
++  return SceneId(m_scenes.size() - 1);
++}
++
++std::optional<ViewId> Integration::registerView(ViewRegistration registration)
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  if (registration.scene >= m_scenes.size())
++    return {};
++  if (m_active) {
++    // Post-activation: host scene work at a safe point only.
++    if (m_servicingThread != std::this_thread::get_id())
++      return {};
++    const auto &g = registration.grants;
++    if (g.render && !g.read)
++      return {};
++  }
++  m_views.push_back({std::move(registration)});
++  return ViewId(m_views.size() - 1);
++}
++
++bool Integration::unregisterView(ViewId id)
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  if (!m_active || m_servicingThread != std::this_thread::get_id()
++      || id >= m_views.size() || m_views[id].removed)
++    return false;
++  m_views[id].removed = true;
++  return true;
++}
++
++// Activation /////////////////////////////////////////////////////////////////
++
++ActivationResult Integration::validate(const SessionTiming &timing) const
++{
++  if (m_active)
++    return {ActivationError::ALREADY_ACTIVE, {}};
++  if (!validDuration(timing.leaseSeconds))
++    return {ActivationError::INVALID_LEASE, {}};
++  if (!validDuration(timing.renewalSeconds))
++    return {ActivationError::INVALID_RENEWAL, {}};
++  if (!(timing.renewalSeconds < timing.leaseSeconds))
++    return {ActivationError::RENEWAL_NOT_SHORTER_THAN_LEASE, {}};
++
++  for (const auto &s : m_scenes) {
++    const auto &r = s.registration;
++    if ((r.grants.edit || r.grants.resynchronize) && !r.grants.read)
++      return {ActivationError::ACTION_WITHOUT_READ, r.name};
++    if (r.grants.edit && !r.normalSyncHook)
++      return {ActivationError::MISSING_SYNC_HOOK, r.name};
++    if (r.grants.resynchronize && !r.recoveryCallback)
++      return {ActivationError::MISSING_RECOVERY_CALLBACK, r.name};
++  }
++
++  for (const auto &v : m_views) {
++    const auto &r = v.registration;
++    if (r.grants.render && !r.grants.read)
++      return {ActivationError::ACTION_WITHOUT_READ, r.name};
++  }
++
++  return {};
++}
++
++ActivationResult Integration::activate(SessionTiming timing)
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  auto result = validate(timing);
++  if (result.ok()) {
++    m_timing = timing;
++    m_active = true;
++  }
++  return result;
++}
++
++// Execution //////////////////////////////////////////////////////////////////
++
++bool Integration::submit(SceneId target, SceneWork work)
++{
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    if (!m_active || target >= m_scenes.size() || !work)
++      return false;
++    m_queue.push_back({target, std::move(work)});
++  }
++  m_workAvailable.notify_all();
++  return true;
++}
++
++std::size_t Integration::service()
++{
++  std::deque<PendingWork> batch;
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    batch.swap(m_queue);
++    m_servicingThread = std::this_thread::get_id();
++  }
++
++  for (auto &item : batch) {
++    // Registrations are immutable after activation, so the pointer is stable.
++    auto *scene = m_scenes[item.target].registration.scene;
++    item.work(*scene);
++  }
++
++  std::lock_guard<std::mutex> lock(m_mutex);
++  m_servicingThread = std::thread::id();
++  return batch.size();
++}
++
++void Integration::runServiceLoop()
++{
++  for (;;) {
++    {
++      std::unique_lock<std::mutex> lock(m_mutex);
++      m_workAvailable.wait(
++          lock, [&] { return m_stopRequested || !m_queue.empty(); });
++      if (m_stopRequested && m_queue.empty()) {
++        m_stopRequested = false;
++        return;
++      }
++    }
++    service();
++  }
++}
++
++void Integration::requestStop()
++{
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    m_stopRequested = true;
++  }
++  m_workAvailable.notify_all();
++}
++
++} // namespace vsr::integration
+diff --git a/src/vsr/integration/Integration.hpp b/src/vsr/integration/Integration.hpp
+new file mode 100644
+index 0000000000..220a734fa3
+--- /dev/null
++++ b/src/vsr/integration/Integration.hpp
+@@ -0,0 +1,193 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++// std
++#include <condition_variable>
++#include <cstdint>
++#include <deque>
++#include <functional>
++#include <limits>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace vsr::scene {
++struct Scene;
++} // namespace vsr::scene
++
++namespace vsr::integration {
++
++/*
++ * Headless, transport-independent agent-integration core.
++ *
++ * The host registers the scenes and views it chooses to expose, together with
++ * a per-target capability ceiling, then explicitly activates the integration.
++ * Nothing is controllable before activation. Work submitted from any thread is
++ * queued and only runs when the host services it at a safe execution point
++ * (service() or runServiceLoop()), on the servicing thread.
++ */
++
++using SceneId = std::uint32_t;
++using ViewId = std::uint32_t;
++
++constexpr SceneId INVALID_SCENE_ID = std::numeric_limits<SceneId>::max();
++constexpr ViewId INVALID_VIEW_ID = std::numeric_limits<ViewId>::max();
++
++// Omitted grants are denied, including read.
++struct SceneGrants
++{
++  bool read{false};
++  bool edit{false};
++  bool resynchronize{false};
++};
++
++struct ViewGrants
++{
++  bool read{false};
++  bool render{false};
++};
++
++// Returns true when the host confirms downstream state is ready to render.
++using SyncHook = std::function<bool(SceneId)>;
++
++struct SceneRegistration
++{
++  std::string name;
++  scene::Scene *scene{nullptr};
++  SceneGrants grants;
++  SyncHook normalSyncHook; // required when grants.edit
++  SyncHook recoveryCallback; // required when grants.resynchronize
++};
++
++struct ViewRegistration
++{
++  std::string name;
++  SceneId scene{INVALID_SCENE_ID};
++  ViewGrants grants;
++};
++
++struct SessionTiming
++{
++  double leaseSeconds{120.0};
++  double renewalSeconds{30.0};
++};
++
++enum class ActivationError
++{
++  NONE,
++  ALREADY_ACTIVE,
++  ACTION_WITHOUT_READ,
++  MISSING_SYNC_HOOK,
++  MISSING_RECOVERY_CALLBACK,
++  INVALID_LEASE,
++  INVALID_RENEWAL,
++  RENEWAL_NOT_SHORTER_THAN_LEASE
++};
++
++struct ActivationResult
++{
++  ActivationError error{ActivationError::NONE};
++  std::string target; // offending target name, when applicable
++
++  bool ok() const;
++};
++
++using SceneWork = std::function<void(scene::Scene &)>;
++
++class Integration
++{
++ public:
++  Integration() = default;
++  ~Integration();
++
++  Integration(const Integration &) = delete;
++  Integration &operator=(const Integration &) = delete;
++
++  // Queries //
++
++  bool active() const;
++  bool isRegisteredScene(SceneId id) const;
++  bool isRegisteredView(ViewId id) const;
++  std::optional<SceneId> sceneOfView(ViewId id) const;
++  // Effective ceilings; all-denied while inactive or for unregistered ids.
++  SceneGrants sceneGrants(SceneId id) const;
++  ViewGrants viewGrants(ViewId id) const;
++  // The registered normal-synchronization hook; empty while inactive or for
++  // unregistered ids.
++  SyncHook normalSyncHook(SceneId id) const;
++  // The registered recovery callback; empty while inactive or for
++  // unregistered ids.
++  SyncHook recoveryCallback(SceneId id) const;
++  const SessionTiming &timing() const;
++  // True only on the servicing thread while it runs submitted work.
++  bool inServiceCall() const;
++
++  // Host registration (host thread, before activation) //
++
++  std::optional<SceneId> registerScene(SceneRegistration registration);
++  // Before activation from the host thread; after activation only as host
++  // scene work on the servicing thread (see sync::SyncService), so the view
++  // set never changes while a synchronization hook runs.
++  std::optional<ViewId> registerView(ViewRegistration registration);
++  // After activation, servicing thread only. Ids are never reused.
++  bool unregisterView(ViewId id);
++  std::vector<ViewId> viewsOfScene(SceneId id) const;
++
++  // Activation //
++
++  ActivationResult activate(SessionTiming timing = {});
++
++  // Execution //
++
++  // Thread-safe. Rejected while inactive or for an unregistered scene.
++  bool submit(SceneId target, SceneWork work);
++  // Host safe point: runs all currently queued work on the calling thread.
++  std::size_t service();
++  // Blocking headless service loop; returns after requestStop().
++  void runServiceLoop();
++  // Thread-safe.
++  void requestStop();
++
++ private:
++  struct SceneEntry
++  {
++    SceneRegistration registration;
++  };
++
++  struct ViewEntry
++  {
++    ViewRegistration registration;
++    bool removed{false};
++  };
++
++  struct PendingWork
++  {
++    SceneId target{INVALID_SCENE_ID};
++    SceneWork work;
++  };
++
++  ActivationResult validate(const SessionTiming &timing) const;
++
++  mutable std::mutex m_mutex;
++  std::condition_variable m_workAvailable;
++  bool m_active{false};
++  bool m_stopRequested{false};
++  SessionTiming m_timing;
++  std::vector<SceneEntry> m_scenes;
++  std::vector<ViewEntry> m_views;
++  std::deque<PendingWork> m_queue;
++  std::thread::id m_servicingThread;
++};
++
++// Inlined definitions ////////////////////////////////////////////////////////
++
++inline bool ActivationResult::ok() const
++{
++  return error == ActivationError::NONE;
++}
++
++} // namespace vsr::integration
+diff --git a/src/vsr/integration/activity/Activity.hpp b/src/vsr/integration/activity/Activity.hpp
+new file mode 100644
+index 0000000000..a8829d4ea7
+--- /dev/null
++++ b/src/vsr/integration/activity/Activity.hpp
+@@ -0,0 +1,690 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++// Application-owned activity/history model (spec §4, §5, §9, §13).
++//
++// Headless and ImGui-free. Records survive client disconnect (the log is
++// owned by the application, not a session) but not restart (nothing is
++// persisted). Retention is bounded by bytes, entry count, restorable-batch
++// count and a separate retained-image byte budget.
++
++#include "vsr/integration/edit/AgentEdit.hpp"
++#include "vsr/integration/operations/Operations.hpp"
++#include "vsr/integration/session/SessionAuthority.hpp"
++// std
++#include <cstdint>
++#include <list>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <vector>
++
++namespace vsr::integration::activity {
++
++using edit::BatchRef;
++using operations::LocalRef;
++using operations::OperationRef;
++using operations::Outcome;
++using operations::Progress;
++using session::Capability;
++using session::Credentials;
++using session::SessionAuthority;
++using session::Target;
++
++struct Limits
++{
++  std::size_t bytes{16u << 20}; // activity + restoration payloads
++  std::size_t entries{1024};
++  std::size_t restorableBatches{32};
++  std::size_t imageBytes{32u << 20}; // retained images, counted only here
++
++  bool valid() const
++  {
++    return bytes > 0 && entries > 0 && restorableBatches > 0;
++  }
++};
++
++// Fixed per-entry accounting overhead, in bytes, on top of payloads.
++constexpr std::size_t ENTRY_OVERHEAD = 256;
++
++enum class OperationKind
++{
++  DISCOVERY,
++  INSPECTION,
++  RENDER,
++  EDIT,
++  RESTORE,
++  RESYNCHRONIZE,
++  STATUS_LOOKUP
++};
++
++inline const char *operationKindName(OperationKind k)
++{
++  switch (k) {
++  case OperationKind::DISCOVERY:
++    return "discovery";
++  case OperationKind::INSPECTION:
++    return "inspection";
++  case OperationKind::RENDER:
++    return "render";
++  case OperationKind::EDIT:
++    return "edit";
++  case OperationKind::RESTORE:
++    return "restore";
++  case OperationKind::RESYNCHRONIZE:
++    return "resynchronize";
++  case OperationKind::STATUS_LOOKUP:
++    return "status_lookup";
++  }
++  return "unknown";
++}
++
++enum class Eligibility
++{
++  NONE, // not a restorable batch
++  ELIGIBLE,
++  RESTORED,
++  EXPIRED, // evicted from the restorable set; metadata retained
++  CONFLICTING
++};
++
++// Where the record's facts come from. Client summaries never become
++// VSR-observed facts.
++struct ClientSummary
++{
++  std::string text; // attributed description, not proof or instruction
++};
++
++struct Entry
++{
++  // Correlation: external work has `ref`; host-local work has `localRef`.
++  std::optional<OperationRef> ref;
++  std::optional<LocalRef> localRef;
++
++  // VSR-observed facts //
++  OperationKind kind{OperationKind::INSPECTION};
++  // Covered targets, fixed per kind; see coveredTargets().
++  std::vector<Target> targets;
++  std::optional<Progress> progress;
++  std::optional<Outcome> terminal;
++  bool committed{false};
++  double admittedAt{0.0};
++  double finishedAt{0.0};
++  double cleanupElapsedSeconds{0.0};
++  std::size_t heldSlots{0};
++  std::optional<BatchRef> batchRef;
++  std::string result; // scene-bearing payload
++  std::size_t restorationBytes{0}; // payload retained for restoration
++  Eligibility eligibility{Eligibility::NONE};
++  std::vector<std::uint8_t> image; // retained image (own budget)
++  bool imageEvicted{false};
++
++  // Client-supplied, attributed separately //
++  std::optional<ClientSummary> clientSummary;
++
++  // Active work is never evicted.
++  bool active{false};
++};
++
++// Allowlisted owner receipt: no scene values, names, handles, tokens,
++// Batch References, images, summaries or diagnostics.
++struct Receipt
++{
++  OperationRef ref;
++  OperationKind kind{OperationKind::INSPECTION};
++  std::optional<Progress> progress;
++  std::optional<Outcome> terminal;
++  bool committed{false};
++  double admittedAt{0.0};
++  double finishedAt{0.0};
++  double cleanupElapsedSeconds{0.0};
++  std::size_t heldSlots{0};
++};
++
++struct Lookup
++{
++  Outcome code{Outcome::OK};
++  std::optional<Receipt> receipt;
++  // Present only with current read on every covered target.
++  std::optional<Entry> record;
++};
++
++struct Usage
++{
++  std::size_t bytes{0};
++  std::size_t entries{0};
++  std::size_t restorableBatches{0};
++  std::size_t imageBytes{0};
++};
++
++// Covered targets per operation kind (spec §9). `primary` is the
++// registered scene (or view for render); discovery pages list their items.
++inline std::vector<Target> coveredTargets(OperationKind kind,
++    Target primary,
++    const Integration &integration,
++    const std::vector<Target> &listed = {})
++{
++  switch (kind) {
++  case OperationKind::DISCOVERY:
++  case OperationKind::STATUS_LOOKUP:
++    return listed;
++  case OperationKind::RENDER: {
++    std::vector<Target> t{primary};
++    if (auto s = integration.sceneOfView(primary.id))
++      t.push_back(Target::scene(*s));
++    return t;
++  }
++  default:
++    return {primary};
++  }
++}
++
++class ActivityLog
++{
++ public:
++  using Id = std::uint64_t;
++
++  explicit ActivityLog(Limits limits = {}) : m_limits(limits) {}
++
++  const Limits &limits() const
++  {
++    return m_limits;
++  }
++
++  // Appends a record, evicting the oldest safe records to fit. Returns
++  // nullopt (busy) when the record cannot fit without evicting active work;
++  // callers must then reject before commit.
++  std::optional<Id> append(Entry entry)
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    if (entry.eligibility == Eligibility::ELIGIBLE && !makeRestorableRoom())
++      return std::nullopt;
++    const std::size_t need = cost(entry);
++    if (!makeRoom(need, 1))
++      return std::nullopt;
++    if (entry.image.size() > m_limits.imageBytes
++        || !makeImageRoom(entry.image.size()))
++      entry.image.clear(), entry.imageEvicted = true;
++    Slot s;
++    s.id = ++m_serial;
++    s.entry = std::move(entry);
++    m_usage.bytes += need;
++    m_usage.entries++;
++    m_usage.imageBytes += s.entry.image.size();
++    if (s.entry.eligibility == Eligibility::ELIGIBLE)
++      m_usage.restorableBatches++;
++    m_slots.push_back(std::move(s));
++    return m_serial;
++  }
++
++  // Replaces an entry's state (e.g. on completion). False when evicted or
++  // when the grown record cannot fit.
++  bool update(Id id, Entry entry)
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    auto it = findId(id);
++    if (it == m_slots.end())
++      return false;
++    if (it->restorationReserved) {
++      // The reservation is owned by reserve/cancel/publishRestoration.
++      entry.batchRef = it->entry.batchRef;
++      entry.restorationBytes = it->entry.restorationBytes;
++      entry.eligibility = Eligibility::NONE;
++    }
++    const std::size_t oldCost = cost(it->entry);
++    const std::size_t newCost = cost(entry);
++    it->pinned = true; // don't evict the record being updated
++    bool ok = newCost <= oldCost || makeRoom(newCost - oldCost, 0);
++    it->pinned = false;
++    if (!ok)
++      return false;
++    m_usage.bytes = m_usage.bytes - oldCost + newCost;
++    m_usage.imageBytes -= it->entry.image.size();
++    if (it->entry.eligibility == Eligibility::ELIGIBLE)
++      m_usage.restorableBatches--;
++    if (entry.eligibility == Eligibility::ELIGIBLE)
++      m_usage.restorableBatches++;
++    it->entry = std::move(entry);
++    m_usage.imageBytes += it->entry.image.size();
++    return true;
++  }
++
++  std::optional<Entry> get(Id id) const
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    auto it = findId(id);
++    if (it == m_slots.end())
++      return std::nullopt;
++    return it->entry;
++  }
++
++  // A retained entry with its log id.
++  struct Record
++  {
++    Id id{0};
++    Entry entry;
++  };
++
++  // Consistent, ordered (oldest first) snapshot of every retained entry,
++  // taken under the log's lock. Ids are strictly increasing.
++  std::vector<Record> snapshot() const
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    std::vector<Record> out;
++    out.reserve(m_slots.size());
++    for (auto &s : m_slots)
++      out.push_back({s.id, s.entry});
++    return out;
++  }
++
++  // Restoration eligibility of a Batch Reference while its metadata is
++  // retained; nullopt once the record is gone (outcome_unavailable).
++  std::optional<Eligibility> eligibility(const BatchRef &ref) const
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    for (auto &s : m_slots)
++      if (s.entry.batchRef && *s.entry.batchRef == ref)
++        return s.entry.eligibility;
++    return std::nullopt;
++  }
++
++  // Restoration storage for an admitted edit (spec §5): charges `bytes` of
++  // payload to the shared byte budget and holds one restorable-batch slot,
++  // visibly expiring the oldest eligible batches and evicting older safe
++  // records as needed. False (reject busy before commit) when it cannot fit
++  // without evicting active work; nothing is evicted then.
++  bool reserveRestoration(Id id, std::size_t bytes, BatchRef ref)
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    auto it = findId(id);
++    if (it == m_slots.end() || it->restorationReserved
++        || it->entry.eligibility != Eligibility::NONE)
++      return false;
++    Entry grown = it->entry;
++    grown.batchRef = std::move(ref);
++    grown.restorationBytes = bytes;
++    const std::size_t oldCost = cost(it->entry);
++    const std::size_t newCost = cost(grown);
++    it->pinned = true;
++    // Check the byte budget before expiring anything.
++    bool ok = newCost <= oldCost || feasible(newCost - oldCost, 0);
++    if (ok)
++      ok = makeRestorableRoom();
++    if (ok)
++      ok = newCost <= oldCost || makeRoom(newCost - oldCost, 0);
++    it->pinned = false;
++    if (!ok)
++      return false;
++    m_usage.bytes = m_usage.bytes - oldCost + newCost;
++    it->entry = std::move(grown);
++    it->restorationReserved = true;
++    m_reservedRestorable++;
++    return true;
++  }
++
++  // Releases an unpublished reservation and its payload bytes.
++  void cancelRestoration(Id id)
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    auto it = findId(id);
++    if (it == m_slots.end() || !it->restorationReserved)
++      return;
++    const std::size_t oldCost = cost(it->entry);
++    it->entry.batchRef.reset();
++    it->entry.restorationBytes = 0;
++    m_usage.bytes = m_usage.bytes - oldCost + cost(it->entry);
++    it->restorationReserved = false;
++    m_reservedRestorable--;
++  }
++
++  // Commit: the reserved batch becomes an eligible restorable batch.
++  void publishRestoration(Id id)
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    auto it = findId(id);
++    if (it == m_slots.end() || !it->restorationReserved)
++      return;
++    it->restorationReserved = false;
++    m_reservedRestorable--;
++    it->entry.eligibility = Eligibility::ELIGIBLE;
++    m_usage.restorableBatches++;
++  }
++
++  // Consumes eligibility at restoration commit and releases its payload.
++  bool markRestored(const BatchRef &ref)
++  {
++    return setEligibility(ref, Eligibility::RESTORED);
++  }
++  bool markConflicting(const BatchRef &ref)
++  {
++    return setEligibility(ref, Eligibility::CONFLICTING);
++  }
++
++  // Authorized lookup by complete Operation Reference (spec §4, §9).
++  Lookup lookup(SessionAuthority &authority,
++      const Credentials &credentials,
++      const OperationRef &ref) const
++  {
++    Lookup out;
++    out.code = operations::fromSessionCode(authority.authenticate(credentials));
++    if (out.code != Outcome::OK)
++      return out;
++    std::optional<Entry> e;
++    {
++      std::lock_guard<std::mutex> lock(m_mutex);
++      for (auto &s : m_slots)
++        if (s.entry.ref && s.entry.ref->sessionId == ref.sessionId
++            && s.entry.ref->requestId == ref.requestId)
++          e = s.entry;
++    }
++    if (!e) {
++      out.code = Outcome::OUTCOME_UNAVAILABLE;
++      return out;
++    }
++    // Discovery covers exactly the targets its page lists; like the engine,
++    // an empty page is readable by any live session (spec §9).
++    bool readAll = !e->targets.empty() || e->kind == OperationKind::DISCOVERY;
++    for (auto &t : e->targets)
++      if (authority.authorizeExecution(
++              credentials.sessionId, t, Capability::READ)
++          != session::Code::OK)
++        readAll = false;
++    const bool own = ref.sessionId == credentials.sessionId;
++    if (!readAll && !own) {
++      out.code = Outcome::FORBIDDEN; // whole record or nothing
++      return out;
++    }
++    if (own)
++      out.receipt = receiptOf(*e);
++    if (readAll)
++      out.record = std::move(e);
++    return out;
++  }
++
++  Usage usage() const
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    return m_usage;
++  }
++
++  static std::size_t cost(const Entry &e)
++  {
++    std::size_t c = ENTRY_OVERHEAD + e.result.size() + e.restorationBytes
++        + e.targets.size() * sizeof(Target);
++    if (e.ref)
++      c += e.ref->sessionId.size();
++    if (e.batchRef)
++      c += e.batchRef->launchId.size() + e.batchRef->batchId.size();
++    if (e.clientSummary)
++      c += e.clientSummary->text.size();
++    return c;
++  }
++
++  static Receipt receiptOf(const Entry &e)
++  {
++    Receipt r;
++    if (e.ref)
++      r.ref = *e.ref;
++    r.kind = e.kind;
++    r.progress = e.progress;
++    r.terminal = e.terminal;
++    r.committed = e.committed;
++    r.admittedAt = e.admittedAt;
++    r.finishedAt = e.finishedAt;
++    r.cleanupElapsedSeconds = e.cleanupElapsedSeconds;
++    r.heldSlots = e.heldSlots;
++    return r;
++  }
++
++ private:
++  struct Slot
++  {
++    Id id{0};
++    bool pinned{false};
++    bool restorationReserved{false}; // reserved, not yet published
++    Entry entry;
++  };
++  using Slots = std::list<Slot>;
++
++  Slots::iterator findId(Id id)
++  {
++    for (auto it = m_slots.begin(); it != m_slots.end(); ++it)
++      if (it->id == id)
++        return it;
++    return m_slots.end();
++  }
++  Slots::const_iterator findId(Id id) const
++  {
++    for (auto it = m_slots.begin(); it != m_slots.end(); ++it)
++      if (it->id == id)
++        return it;
++    return m_slots.end();
++  }
++
++  bool safe(const Slot &s) const
++  {
++    return !s.entry.active && !s.pinned;
++  }
++
++  bool setEligibility(const BatchRef &ref, Eligibility to)
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    for (auto &s : m_slots) {
++      if (!s.entry.batchRef || !(*s.entry.batchRef == ref))
++        continue;
++      if (s.entry.eligibility != Eligibility::ELIGIBLE)
++        return false;
++      loseEligibility(s, to);
++      return true;
++    }
++    return false;
++  }
++
++  void loseEligibility(Slot &s, Eligibility to)
++  {
++    s.entry.eligibility = to;
++    m_usage.restorableBatches--;
++    m_usage.bytes -= s.entry.restorationBytes;
++    s.entry.restorationBytes = 0; // payload released
++  }
++
++  // Oldest safe restorable batch visibly expires; its metadata stays.
++  // Unpublished reservations count against the limit and are never expired.
++  // Makes room for one more.
++  bool makeRestorableRoom()
++  {
++    if (m_reservedRestorable >= m_limits.restorableBatches)
++      return false;
++    while (m_usage.restorableBatches + m_reservedRestorable
++        >= m_limits.restorableBatches) {
++      Slot *victim = nullptr;
++      for (auto &s : m_slots)
++        if (safe(s) && s.entry.eligibility == Eligibility::ELIGIBLE) {
++          victim = &s;
++          break;
++        }
++      if (!victim)
++        return false;
++      loseEligibility(*victim, Eligibility::EXPIRED);
++    }
++    return true;
++  }
++
++  bool fits(std::size_t bytes, std::size_t entries) const
++  {
++    return m_usage.bytes + bytes <= m_limits.bytes
++        && m_usage.entries + entries <= m_limits.entries;
++  }
++
++  // True when evicting every safe record would make room.
++  bool feasible(std::size_t bytes, std::size_t entries) const
++  {
++    if (bytes > m_limits.bytes)
++      return false;
++    std::size_t freeBytes = 0, freeEntries = 0;
++    for (auto &s : m_slots)
++      if (safe(s))
++        freeBytes += cost(s.entry), freeEntries++;
++    return m_usage.bytes - freeBytes + bytes <= m_limits.bytes
++        && m_usage.entries - freeEntries + entries <= m_limits.entries;
++  }
++
++  bool makeRoom(std::size_t bytes, std::size_t entries)
++  {
++    // Check feasibility first so a failing append evicts nothing.
++    if (!feasible(bytes, entries))
++      return false;
++    auto it = m_slots.begin();
++    while (!fits(bytes, entries)) {
++      while (!safe(*it))
++        ++it;
++      m_usage.bytes -= cost(it->entry);
++      m_usage.entries--;
++      m_usage.imageBytes -= it->entry.image.size();
++      if (it->entry.eligibility == Eligibility::ELIGIBLE)
++        m_usage.restorableBatches--;
++      if (it->restorationReserved)
++        m_reservedRestorable--;
++      it = m_slots.erase(it);
++    }
++    return true;
++  }
++
++  // Oldest safe retained images are dropped; their records stay.
++  bool makeImageRoom(std::size_t bytes)
++  {
++    for (auto &s : m_slots) {
++      if (m_usage.imageBytes + bytes <= m_limits.imageBytes)
++        break;
++      if (!safe(s) || s.entry.image.empty())
++        continue;
++      m_usage.imageBytes -= s.entry.image.size();
++      s.entry.image.clear();
++      s.entry.image.shrink_to_fit();
++      s.entry.imageEvicted = true;
++    }
++    return m_usage.imageBytes + bytes <= m_limits.imageBytes;
++  }
++
++  Limits m_limits;
++  mutable std::mutex m_mutex;
++  Slots m_slots; // oldest first
++  Usage m_usage;
++  std::size_t m_reservedRestorable{0};
++  Id m_serial{0};
++};
++
++// Maps an operations::Request kind string onto an OperationKind; unknown
++// kinds (e.g. test or host-defined work) record as inspection.
++inline OperationKind operationKindOf(const std::string &kind)
++{
++  for (auto k : {OperationKind::DISCOVERY,
++           OperationKind::INSPECTION,
++           OperationKind::RENDER,
++           OperationKind::EDIT,
++           OperationKind::RESTORE,
++           OperationKind::RESYNCHRONIZE,
++           OperationKind::STATUS_LOOKUP})
++    if (kind == operationKindName(k))
++      return k;
++  return OperationKind::INSPECTION;
++}
++
++// Feeds OperationEngine transitions into an ActivityLog. Install with
++// OperationEngine::setActivitySink(&sink); the sink must outlive that
++// installation. Only VSR-observed fields are written: a client summary
++// already on the entry is preserved across updates.
++class EngineActivitySink : public operations::ActivitySink
++{
++ public:
++  EngineActivitySink(ActivityLog &log, const Integration &integration)
++      : m_log(log), m_integration(integration)
++  {}
++
++  std::optional<Id> admitted(const operations::ActivityEvent &ev) override
++  {
++    Entry e;
++    e.ref = ev.ref;
++    e.localRef = ev.localRef;
++    e.kind = operationKindOf(ev.kind);
++    e.targets = coveredTargets(e.kind, ev.target, m_integration);
++    e.admittedAt = ev.now;
++    apply(e, ev);
++    return m_log.append(std::move(e));
++  }
++
++  void updated(Id id, const operations::ActivityEvent &ev) override
++  {
++    auto e = m_log.get(id);
++    if (!e)
++      return; // cannot happen while active; evicted once terminal
++    apply(*e, ev);
++    // Session-wide work learns its covered targets only on completion.
++    if (e->kind == OperationKind::DISCOVERY && ev.status.terminal)
++      e->targets =
++          coveredTargets(e->kind, ev.target, m_integration, ev.covered);
++    Entry trimmed = *e;
++    if (m_log.update(id, std::move(*e)))
++      return;
++    // The grown result does not fit: keep the state, drop the payload, so
++    // the record still becomes evictable.
++    trimmed.result.clear();
++    m_log.update(id, std::move(trimmed));
++  }
++
++  bool reserveRestoration(Id id,
++      std::size_t bytes,
++      const std::string &launchId,
++      const std::string &batchId) override
++  {
++    return m_log.reserveRestoration(id, bytes, BatchRef{launchId, batchId});
++  }
++  void cancelRestoration(Id id) override
++  {
++    m_log.cancelRestoration(id);
++  }
++  void publishRestoration(Id id) override
++  {
++    m_log.publishRestoration(id);
++  }
++  bool restorationRetained(
++      const std::string &launchId, const std::string &batchId) override
++  {
++    return m_log.eligibility(BatchRef{launchId, batchId})
++        == Eligibility::ELIGIBLE;
++  }
++  void restorationRestored(
++      const std::string &launchId, const std::string &batchId) override
++  {
++    m_log.markRestored(BatchRef{launchId, batchId});
++  }
++  void restorationConflicting(
++      const std::string &launchId, const std::string &batchId) override
++  {
++    m_log.markConflicting(BatchRef{launchId, batchId});
++  }
++
++ private:
++  static void apply(Entry &e, const operations::ActivityEvent &ev)
++  {
++    const auto &s = ev.status;
++    e.progress = s.progress;
++    if (s.terminal && !e.terminal)
++      e.finishedAt = ev.now;
++    e.terminal = s.terminal;
++    e.committed = s.committed;
++    e.cleanupElapsedSeconds = s.cleanupElapsedSeconds;
++    e.heldSlots = s.heldSlots;
++    if (s.terminal)
++      e.result = s.result;
++    // Evictable once terminal and no backend resources remain held.
++    e.active = !s.terminal || s.heldSlots > 0;
++  }
++
++  ActivityLog &m_log;
++  const Integration &m_integration;
++};
++
++} // namespace vsr::integration::activity
+diff --git a/src/vsr/integration/identity/Identity.hpp b/src/vsr/integration/identity/Identity.hpp
+new file mode 100644
+index 0000000000..5e1466f3dc
+--- /dev/null
++++ b/src/vsr/integration/identity/Identity.hpp
+@@ -0,0 +1,674 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++// vsr
++#include "vsr/scene/Scene.hpp"
++// std
++#include <atomic>
++#include <cstdint>
++#include <functional>
++#include <optional>
++#include <random>
++#include <unordered_map>
++
++namespace vsr::integration::identity {
++
++/*
++ * External identity and revision tokens for the agent integration.
++ *
++ * Raw storage indices are never external identity. An IdentityAuthority is
++ * created once per activation (launch); every handle and token it issues
++ * carries that activation's stamp, so nothing from an earlier activation can
++ * resolve in a later one. A SceneIdentity observes one registered Scene and
++ * issues:
++ *
++ *   - ObjectHandle: never reused and never redirected within the authority.
++ *     Removal or scene replacement invalidates; defragmentation remaps.
++ *   - ParameterVersionToken: changes on every parameter change of that object,
++ *     including change-back-to-original. Metadata/labels are not parameters.
++ *   - SceneRevision: render-relevant scene content (objects other than
++ *     cameras/renderers, layers, transforms, arrays).
++ *   - InspectionRevision: everything inspection returns, including metadata,
++ *     names, membership/order, handle mapping and registration. Can change
++ *     without the scene revision or any parameter version changing.
++ *
++ * ViewRevisionTracker covers a view's camera, renderer, dimensions and Image
++ * Pipeline configuration.
++ *
++ * Threading: not thread-safe. Scene mutation and every query must happen on
++ * the host's safe-point thread (see Integration::service()). A SceneIdentity
++ * must be destroyed before the Scene it observes.
++ */
++
++struct LaunchStamp
++{
++  std::uint64_t activation{0}; // process-unique, monotonically assigned
++  std::uint64_t nonce{0}; // random per activation
++
++  friend bool operator==(const LaunchStamp &a, const LaunchStamp &b)
++  {
++    return a.activation == b.activation && a.nonce == b.nonce;
++  }
++  friend bool operator!=(const LaunchStamp &a, const LaunchStamp &b)
++  {
++    return !(a == b);
++  }
++};
++
++struct ObjectHandle
++{
++  LaunchStamp launch;
++  std::uint64_t domain{0}; // SceneIdentity instance within the launch
++  std::uint64_t serial{0}; // 0 is never issued
++
++  bool valid() const
++  {
++    return serial != 0;
++  }
++  friend bool operator==(const ObjectHandle &a, const ObjectHandle &b)
++  {
++    return a.launch == b.launch && a.domain == b.domain && a.serial == b.serial;
++  }
++  friend bool operator!=(const ObjectHandle &a, const ObjectHandle &b)
++  {
++    return !(a == b);
++  }
++};
++
++struct ParameterVersionToken
++{
++  ObjectHandle object;
++  std::uint64_t version{0};
++
++  friend bool operator==(
++      const ParameterVersionToken &a, const ParameterVersionToken &b)
++  {
++    return a.object == b.object && a.version == b.version;
++  }
++  friend bool operator!=(
++      const ParameterVersionToken &a, const ParameterVersionToken &b)
++  {
++    return !(a == b);
++  }
++};
++
++// Distinct revision kinds must not be interchangeable.
++template <typename TAG>
++struct Revision
++{
++  LaunchStamp launch;
++  std::uint64_t domain{0};
++  std::uint64_t value{0};
++
++  friend bool operator==(const Revision &a, const Revision &b)
++  {
++    return a.launch == b.launch && a.domain == b.domain && a.value == b.value;
++  }
++  friend bool operator!=(const Revision &a, const Revision &b)
++  {
++    return !(a == b);
++  }
++};
++
++struct SceneRevisionTag;
++struct ViewRevisionTag;
++struct InspectionRevisionTag;
++using SceneRevision = Revision<SceneRevisionTag>;
++using ViewRevision = Revision<ViewRevisionTag>;
++using InspectionRevision = Revision<InspectionRevisionTag>;
++
++class IdentityAuthority
++{
++ public:
++  IdentityAuthority();
++
++  const LaunchStamp &launch() const;
++  // Unique within this authority; never 0, never reused.
++  std::uint64_t nextDomain();
++  std::uint64_t nextSerial();
++
++ private:
++  LaunchStamp m_launch;
++  std::uint64_t m_nextDomain{1};
++  std::uint64_t m_nextSerial{1};
++};
++
++class SceneIdentity
++{
++ public:
++  SceneIdentity(IdentityAuthority &authority, scene::Scene &scene);
++  ~SceneIdentity();
++
++  SceneIdentity(const SceneIdentity &) = delete;
++  SceneIdentity &operator=(const SceneIdentity &) = delete;
++
++  scene::Scene *scene() const;
++
++  // Handles //
++
++  ObjectHandle handleOf(const scene::Object *o) const;
++  // nullptr for foreign, removed, replaced or earlier-launch handles.
++  scene::Object *resolve(const ObjectHandle &h) const;
++
++  // Parameter versions //
++
++  std::optional<ParameterVersionToken> parameterVersion(
++      const ObjectHandle &h) const;
++  // True only if the token names a live object and no parameter change on
++  // that object happened since the token was issued.
++  bool isCurrent(const ParameterVersionToken &t) const;
++
++  // Revisions //
++
++  SceneRevision sceneRevision() const;
++  InspectionRevision inspectionRevision() const;
++
++  // Name and metadata changes arrive incrementally through
++  // BaseUpdateDelegate::signalObjectMetadataChanged. These explicit refreshes
++  // remain for hosts that change names or metadata without emitting that
++  // signal; they return true on a change. refreshAllMetadata() is O(objects).
++  bool refreshMetadata(const ObjectHandle &h);
++  bool refreshAllMetadata();
++
++  // Host registration/membership changes relevant to inspection.
++  void noteRegistrationChanged();
++
++ private:
++  struct Key
++  {
++    anari::DataType type{ANARI_UNKNOWN};
++    std::size_t index{0};
++    friend bool operator==(const Key &a, const Key &b)
++    {
++      return a.type == b.type && a.index == b.index;
++    }
++  };
++  struct KeyHash
++  {
++    std::size_t operator()(const Key &k) const
++    {
++      return std::hash<std::size_t>{}(k.index) * 31u
++          ^ std::hash<int>{}(int(k.type));
++    }
++  };
++  struct Entry
++  {
++    Key key;
++    std::uint64_t parameterVersion{1};
++    std::size_t metadataFingerprint{0};
++  };
++
++  class Observer;
++  friend class Observer;
++
++  static anari::DataType normalize(anari::DataType t);
++  static bool isViewObject(anari::DataType t);
++  static std::size_t fingerprint(const scene::Object &o);
++
++  Entry *entryOf(const scene::Object *o);
++  void track(const scene::Object *o);
++  void untrack(const scene::Object *o);
++  void untrackAll();
++  void parameterChanged(const scene::Object *o);
++  void metadataChanged(const scene::Object *o);
++  void sceneContentChanged();
++  void inspectionChanged();
++  void remap(const scene::IndexRemapper &remapper);
++  void trackExisting();
++
++  IdentityAuthority *m_authority{nullptr};
++  scene::Scene *m_scene{nullptr};
++  std::uint64_t m_domain{0};
++  Observer *m_observer{nullptr};
++  std::size_t m_defragToken{0};
++  std::uint64_t m_sceneRevision{1};
++  std::uint64_t m_inspectionRevision{1};
++  std::unordered_map<Key, std::uint64_t, KeyHash> m_serialOf;
++  std::unordered_map<std::uint64_t, Entry> m_entries;
++};
++
++class ViewRevisionTracker
++{
++ public:
++  ViewRevisionTracker(IdentityAuthority &authority, SceneIdentity &scene);
++
++  void setCamera(const ObjectHandle &camera);
++  void setRenderer(const ObjectHandle &renderer);
++  void setDimensions(std::uint32_t width, std::uint32_t height);
++  // Host reports any Image Pipeline configuration change for this view.
++  void notePipelineChanged();
++
++  // Folds in camera/renderer parameter changes observed since the last call.
++  ViewRevision revision();
++
++ private:
++  struct Bound
++  {
++    ObjectHandle handle;
++    std::optional<ParameterVersionToken> seen;
++  };
++
++  void bind(Bound &b, const ObjectHandle &h);
++  bool poll(Bound &b) const;
++
++  IdentityAuthority *m_authority{nullptr};
++  SceneIdentity *m_scene{nullptr};
++  std::uint64_t m_domain{0};
++  std::uint64_t m_value{1};
++  Bound m_camera;
++  Bound m_renderer;
++  std::uint32_t m_width{0};
++  std::uint32_t m_height{0};
++};
++
++///////////////////////////////////////////////////////////////////////////////
++// Inlined definitions ////////////////////////////////////////////////////////
++///////////////////////////////////////////////////////////////////////////////
++
++// IdentityAuthority //
++
++inline IdentityAuthority::IdentityAuthority()
++{
++  static std::atomic<std::uint64_t> s_activations{0};
++  m_launch.activation = ++s_activations;
++  std::random_device rd;
++  m_launch.nonce = (std::uint64_t(rd()) << 32) ^ std::uint64_t(rd());
++}
++
++inline const LaunchStamp &IdentityAuthority::launch() const
++{
++  return m_launch;
++}
++
++inline std::uint64_t IdentityAuthority::nextDomain()
++{
++  return m_nextDomain++;
++}
++
++inline std::uint64_t IdentityAuthority::nextSerial()
++{
++  return m_nextSerial++;
++}
++
++// SceneIdentity::Observer //
++
++class SceneIdentity::Observer : public scene::BaseUpdateDelegate
++{
++ public:
++  explicit Observer(SceneIdentity *owner) : m_owner(owner) {}
++
++  void signalObjectAdded(const scene::Object *o) override
++  {
++    m_owner->track(o);
++  }
++  void signalParameterUpdated(
++      const scene::Object *o, const scene::Parameter *) override
++  {
++    m_owner->parameterChanged(o);
++  }
++  void signalParameterRemoved(
++      const scene::Object *o, const scene::Parameter *) override
++  {
++    m_owner->parameterChanged(o);
++  }
++  void signalParameterBatchUpdated(const scene::Object *o,
++      const std::vector<const scene::Parameter *> &) override
++  {
++    m_owner->parameterChanged(o);
++  }
++  void signalArrayMapped(const scene::Array *) override {}
++  void signalArrayUnmapped(const scene::Array *a) override
++  {
++    m_owner->parameterChanged(a);
++  }
++  void signalObjectParameterUseCountZero(const scene::Object *) override {}
++  void signalObjectLayerUseCountZero(const scene::Object *) override {}
++  void signalObjectRemoved(const scene::Object *o) override
++  {
++    m_owner->untrack(o);
++  }
++  void signalRemoveAllObjects() override
++  {
++    m_owner->untrackAll();
++  }
++  void signalLayerAdded(const scene::Layer *) override
++  {
++    m_owner->sceneContentChanged();
++  }
++  void signalLayerStructureUpdated(const scene::Layer *) override
++  {
++    m_owner->sceneContentChanged();
++  }
++  void signalLayerTransformUpdated(const scene::Layer *) override
++  {
++    m_owner->sceneContentChanged();
++  }
++  void signalLayerRemoved(const scene::Layer *) override
++  {
++    m_owner->sceneContentChanged();
++  }
++  void signalActiveLayersChanged() override
++  {
++    m_owner->sceneContentChanged();
++  }
++  void signalObjectFilteringChanged() override
++  {
++    m_owner->sceneContentChanged();
++  }
++  void signalObjectMetadataChanged(const scene::Object *o) override
++  {
++    m_owner->metadataChanged(o);
++  }
++  // Only emitted after defragmentation, which the defrag callback handles.
++  void signalInvalidateCachedObjects() override {}
++
++ private:
++  SceneIdentity *m_owner{nullptr};
++};
++
++// SceneIdentity //
++
++inline SceneIdentity::SceneIdentity(
++    IdentityAuthority &authority, scene::Scene &scene)
++    : m_authority(&authority), m_scene(&scene), m_domain(authority.nextDomain())
++{
++  trackExisting();
++  m_observer = scene.updateDelegate().emplace<Observer>(this);
++  m_defragToken = scene.addDefragCallback(
++      [this](const scene::IndexRemapper &r) { remap(r); });
++}
++
++inline SceneIdentity::~SceneIdentity()
++{
++  m_scene->removeDefragCallback(m_defragToken);
++  m_scene->updateDelegate().erase(m_observer);
++}
++
++inline scene::Scene *SceneIdentity::scene() const
++{
++  return m_scene;
++}
++
++inline ObjectHandle SceneIdentity::handleOf(const scene::Object *o) const
++{
++  if (!o || o->scene() != m_scene)
++    return {};
++  auto it = m_serialOf.find(Key{normalize(o->type()), o->index()});
++  if (it == m_serialOf.end())
++    return {};
++  return ObjectHandle{m_authority->launch(), m_domain, it->second};
++}
++
++inline scene::Object *SceneIdentity::resolve(const ObjectHandle &h) const
++{
++  if (!h.valid() || h.launch != m_authority->launch() || h.domain != m_domain)
++    return nullptr;
++  auto it = m_entries.find(h.serial);
++  if (it == m_entries.end())
++    return nullptr;
++  auto *o = m_scene->getObject(it->second.key.type, it->second.key.index);
++  // Defensive: never hand back an object that does not own this slot.
++  if (!o || normalize(o->type()) != it->second.key.type)
++    return nullptr;
++  return o;
++}
++
++inline std::optional<ParameterVersionToken> SceneIdentity::parameterVersion(
++    const ObjectHandle &h) const
++{
++  if (!resolve(h))
++    return std::nullopt;
++  return ParameterVersionToken{h, m_entries.at(h.serial).parameterVersion};
++}
++
++inline bool SceneIdentity::isCurrent(const ParameterVersionToken &t) const
++{
++  auto current = parameterVersion(t.object);
++  return current && *current == t;
++}
++
++inline SceneRevision SceneIdentity::sceneRevision() const
++{
++  return SceneRevision{m_authority->launch(), m_domain, m_sceneRevision};
++}
++
++inline InspectionRevision SceneIdentity::inspectionRevision() const
++{
++  return InspectionRevision{
++      m_authority->launch(), m_domain, m_inspectionRevision};
++}
++
++inline bool SceneIdentity::refreshMetadata(const ObjectHandle &h)
++{
++  auto *o = resolve(h);
++  if (!o)
++    return false;
++  auto &e = m_entries.at(h.serial);
++  const auto fp = fingerprint(*o);
++  if (fp == e.metadataFingerprint)
++    return false;
++  e.metadataFingerprint = fp;
++  inspectionChanged();
++  return true;
++}
++
++inline bool SceneIdentity::refreshAllMetadata()
++{
++  bool changed = false;
++  for (auto &[serial, e] : m_entries) {
++    auto *o = m_scene->getObject(e.key.type, e.key.index);
++    if (!o)
++      continue;
++    const auto fp = fingerprint(*o);
++    if (fp != e.metadataFingerprint) {
++      e.metadataFingerprint = fp;
++      changed = true;
++    }
++  }
++  if (changed)
++    inspectionChanged();
++  return changed;
++}
++
++inline void SceneIdentity::noteRegistrationChanged()
++{
++  inspectionChanged();
++}
++
++inline anari::DataType SceneIdentity::normalize(anari::DataType t)
++{
++  return anari::isArray(t) ? ANARI_ARRAY : t;
++}
++
++inline bool SceneIdentity::isViewObject(anari::DataType t)
++{
++  return t == ANARI_CAMERA || t == ANARI_RENDERER;
++}
++
++inline std::size_t SceneIdentity::fingerprint(const scene::Object &o)
++{
++  // The metadata version is not preserved across object moves, so it is
++  // combined with content that is; a spurious difference only over-reports.
++  std::size_t h = std::hash<std::string>{}(o.name());
++  h = h * 1099511628211ull ^ std::hash<std::uint64_t>{}(o.lastMetadataChange());
++  h = h * 1099511628211ull ^ std::hash<std::size_t>{}(o.numMetadata());
++  return h;
++}
++
++inline SceneIdentity::Entry *SceneIdentity::entryOf(const scene::Object *o)
++{
++  if (!o)
++    return nullptr;
++  auto it = m_serialOf.find(Key{normalize(o->type()), o->index()});
++  return it == m_serialOf.end() ? nullptr : &m_entries.at(it->second);
++}
++
++inline void SceneIdentity::track(const scene::Object *o)
++{
++  if (!o)
++    return;
++  const Key key{normalize(o->type()), o->index()};
++  // A stale mapping at a reused slot must never carry over to the newcomer.
++  if (auto it = m_serialOf.find(key); it != m_serialOf.end())
++    m_entries.erase(it->second);
++  const auto serial = m_authority->nextSerial();
++  m_serialOf[key] = serial;
++  m_entries[serial] = Entry{key, 1, fingerprint(*o)};
++  if (!isViewObject(key.type))
++    m_sceneRevision++;
++  inspectionChanged();
++}
++
++inline void SceneIdentity::untrack(const scene::Object *o)
++{
++  if (!o)
++    return;
++  const Key key{normalize(o->type()), o->index()};
++  auto it = m_serialOf.find(key);
++  if (it == m_serialOf.end())
++    return;
++  m_entries.erase(it->second);
++  m_serialOf.erase(it);
++  if (!isViewObject(key.type))
++    m_sceneRevision++;
++  inspectionChanged();
++}
++
++inline void SceneIdentity::untrackAll()
++{
++  m_serialOf.clear();
++  m_entries.clear();
++  m_sceneRevision++;
++  inspectionChanged();
++}
++
++inline void SceneIdentity::parameterChanged(const scene::Object *o)
++{
++  auto *e = entryOf(o);
++  if (!e)
++    return;
++  e->parameterVersion++;
++  if (!isViewObject(e->key.type))
++    m_sceneRevision++;
++  inspectionChanged();
++}
++
++inline void SceneIdentity::metadataChanged(const scene::Object *o)
++{
++  auto *e = entryOf(o);
++  if (!e)
++    return;
++  e->metadataFingerprint = fingerprint(*o);
++  inspectionChanged();
++}
++
++inline void SceneIdentity::sceneContentChanged()
++{
++  m_sceneRevision++;
++  inspectionChanged();
++}
++
++inline void SceneIdentity::inspectionChanged()
++{
++  m_inspectionRevision++;
++}
++
++inline void SceneIdentity::remap(const scene::IndexRemapper &remapper)
++{
++  // Handles survive defragmentation: re-key every serial to its new slot.
++  std::unordered_map<Key, std::uint64_t, KeyHash> remapped;
++  remapped.reserve(m_serialOf.size());
++  for (auto &[serial, e] : m_entries) {
++    e.key.index = remapper(e.key.type, e.key.index);
++    remapped[e.key] = serial;
++  }
++  m_serialOf = std::move(remapped);
++  // Enumeration order by storage slot may have changed.
++  inspectionChanged();
++}
++
++inline void SceneIdentity::trackExisting()
++{
++  auto trackPool = [&](auto &pool) {
++    for (std::size_t i = 0; i < pool.capacity(); i++) {
++      if (auto ref = pool.at(i); ref)
++        track(ref.data());
++    }
++  };
++  auto &db = m_scene->objectDB();
++  trackPool(db.array);
++  trackPool(db.surface);
++  trackPool(db.geometry);
++  trackPool(db.material);
++  trackPool(db.sampler);
++  trackPool(db.volume);
++  trackPool(db.field);
++  trackPool(db.light);
++  trackPool(db.camera);
++  trackPool(db.renderer);
++}
++
++// ViewRevisionTracker //
++
++inline ViewRevisionTracker::ViewRevisionTracker(
++    IdentityAuthority &authority, SceneIdentity &scene)
++    : m_authority(&authority), m_scene(&scene), m_domain(authority.nextDomain())
++{}
++
++inline void ViewRevisionTracker::setCamera(const ObjectHandle &camera)
++{
++  bind(m_camera, camera);
++}
++
++inline void ViewRevisionTracker::setRenderer(const ObjectHandle &renderer)
++{
++  bind(m_renderer, renderer);
++}
++
++inline void ViewRevisionTracker::setDimensions(
++    std::uint32_t width, std::uint32_t height)
++{
++  if (width == m_width && height == m_height)
++    return;
++  m_width = width;
++  m_height = height;
++  m_value++;
++}
++
++inline void ViewRevisionTracker::notePipelineChanged()
++{
++  m_value++;
++}
++
++inline ViewRevision ViewRevisionTracker::revision()
++{
++  const bool cameraChanged = poll(m_camera);
++  const bool rendererChanged = poll(m_renderer);
++  if (cameraChanged || rendererChanged)
++    m_value++;
++  return ViewRevision{m_authority->launch(), m_domain, m_value};
++}
++
++inline void ViewRevisionTracker::bind(Bound &b, const ObjectHandle &h)
++{
++  if (b.handle == h)
++    return;
++  b.handle = h;
++  b.seen = m_scene->parameterVersion(h);
++  m_value++;
++}
++
++inline bool ViewRevisionTracker::poll(Bound &b) const
++{
++  if (!b.handle.valid())
++    return false;
++  auto current = m_scene->parameterVersion(b.handle);
++  if (current == b.seen)
++    return false;
++  b.seen = current;
++  return true;
++}
++
++} // namespace vsr::integration::identity
+diff --git a/src/vsr/integration/operations/Operations.hpp b/src/vsr/integration/operations/Operations.hpp
+new file mode 100644
+index 0000000000..8aad93c3bc
+--- /dev/null
++++ b/src/vsr/integration/operations/Operations.hpp
+@@ -0,0 +1,1406 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++// Header-only: the vsr_integration library globs only top-level sources (see
++// ticket 19).
++
++#include "vsr/integration/Integration.hpp"
++#include "vsr/integration/session/SessionAuthority.hpp"
++// std
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace vsr::scene {
++struct Scene;
++} // namespace vsr::scene
++
++namespace vsr::integration::operations {
++
++/*
++ * Operation identity, admission and execution of integration scene work
++ * (spec §5, §9 and the cancellation rules of §4).
++ *
++ * All integration-submitted scene operations, external or local, share one
++ * bounded admission pool. A slot is held while an operation is queued,
++ * running, yielded or synchronizing, and while logically cancelled/timed-out
++ * work still retains backend resources (awaiting_cleanup). Admitted steps run
++ * only at the host's safe points, through Integration::submit/service.
++ *
++ * Control calls (renew, cancel, detach, status lookup) never take a scene
++ * slot; external ones pass a separate bounded ControlGate instead.
++ *
++ * The engine must outlive every Integration::service() call that may still
++ * run one of its steps.
++ */
++
++using session::Capability;
++using session::Credentials;
++using session::MonotonicClock;
++using session::SessionAuthority;
++using session::Target;
++
++// Frozen semantic outcome codes (spec §9), plus INVALID_REQUEST for envelope
++// errors the adapter maps to its carrier.
++enum class Outcome
++{
++  OK,
++  OCCUPIED,
++  BUSY,
++  CURSOR_STALE,
++  SUPERSEDED,
++  OUTCOME_UNAVAILABLE,
++  ALREADY_RESTORED,
++  ITEM_TOO_LARGE,
++  CONFLICT,
++  REQUEST_ID_CONFLICT,
++  CANCELLED,
++  TIMEOUT,
++  SESSION_EXPIRED,
++  UNKNOWN,
++  SYNC_REQUIRED,
++  APPLIED_WITH_SYNC_FAILURE,
++  UNAUTHENTICATED,
++  INVALID_SESSION_PROOF,
++  FORBIDDEN,
++  INVALID_REQUEST
++};
++
++const char *outcomeName(Outcome outcome);
++Outcome fromSessionCode(session::Code code);
++
++// Frozen non-terminal progress state names.
++enum class Progress
++{
++  QUEUED,
++  RUNNING,
++  YIELDED,
++  SYNCHRONIZING,
++  AWAITING_CLEANUP
++};
++
++const char *progressName(Progress progress);
++
++constexpr std::uint64_t MAX_REQUEST_ID = 9007199254740991ull; // 2^53 - 1
++
++bool validRequestId(std::uint64_t id);
++// A JSON number is a request ID only if integer-valued and in range.
++std::optional<std::uint64_t> requestIdFromNumber(double value);
++
++// Wire `operation_ref`: {session_id, request_id}.
++struct OperationRef
++{
++  std::string sessionId;
++  std::uint64_t requestId{0};
++};
++
++// Host-local correlation for in-process callers; never an OperationRef.
++struct LocalRef
++{
++  std::uint64_t id{0};
++};
++
++struct Limits
++{
++  std::size_t sceneSlots{32};
++  std::size_t controlSlots{8};
++  std::size_t statusRecords{1024};
++
++  bool valid() const;
++};
++
++// Executor contract ////////////////////////////////////////////////////////
++
++struct StepContext
++{
++  scene::Scene &scene;
++  // True once the operation is logically cancelled/timed out; any result is
++  // discarded and the step should only release resources.
++  bool abandoned{false};
++  // Thread-safe; reschedules this operation after BACKEND_PENDING.
++  std::function<void()> wake;
++
++  // Restoration storage in the application-owned activity budget (spec §5).
++  // Each forwards to the installed ActivitySink for this operation's record
++  // and trivially succeeds when none is installed. Call from the executor.
++  //
++  // Reserve `bytes` of restoration payload plus one restorable-batch slot
++  // for Batch Reference {launchId, batchId}; false means reject busy.
++  std::function<bool(std::size_t bytes,
++      const std::string &launchId,
++      const std::string &batchId)>
++      reserveRestoration;
++  // Releases an unpublished reservation.
++  std::function<void()> cancelRestoration;
++  // On commit: the record becomes an eligible restorable batch.
++  std::function<void()> publishRestoration;
++  // False once the sink no longer retains the batch as eligible.
++  std::function<bool(const std::string &launchId, const std::string &batchId)>
++      restorationRetained;
++  // Restoration of batch {launchId, batchId} committed (consumes eligibility)
++  // or found it conflicting; both release its retained payload.
++  std::function<void(const std::string &launchId, const std::string &batchId)>
++      markRestored;
++  std::function<void(const std::string &launchId, const std::string &batchId)>
++      markConflicting;
++};
++
++struct Step
++{
++  enum class Status
++  {
++    YIELD, // cooperative slice boundary; rescheduled at a later safe point
++    SYNCHRONIZING, // post-commit synchronization in progress; rescheduled
++    BACKEND_PENDING, // backend holds resources; call wake() when it changes
++    COMPLETE // terminal; all resources released
++  };
++
++  Status status{Status::COMPLETE};
++  Outcome outcome{Outcome::OK};
++  std::string result;
++  bool committed{false};
++  bool backendFault{false}; // an actual backend-reported fault
++  // Session-wide work only: on COMPLETE, the targets the result lists; they
++  // become the record's covered targets (spec §9).
++  std::vector<Target> covered;
++};
++
++using Executor = std::function<Step(StepContext &)>;
++
++struct Request
++{
++  std::string kind;
++  Target target;
++  Capability capability{Capability::READ};
++  // Session-wide work (discovery) names no single target: admission and
++  // execution check only the session, `target` is ignored, the executor
++  // filters by capability itself and reports the covered targets in its
++  // final Step. Runs on the servicing thread with the first registered scene.
++  bool sessionWide{false};
++  // Canonical semantic form of the parsed arguments (defaults applied,
++  // numbers normalized); identical retries compare equal.
++  std::string canonicalArguments;
++  // Logical deadline from admission; <= 0 means none.
++  double deadlineSeconds{0.0};
++  Executor executor;
++};
++
++struct Status
++{
++  Outcome code{Outcome::OK}; // lookup result; OK when the record was found
++  std::string kind;
++  std::optional<Progress> progress; // physical state while slot is held
++  std::optional<Outcome> terminal; // logical outcome once terminal
++  bool committed{false};
++  bool resultVisible{false}; // needs current read permission
++  std::string result;
++  double cleanupElapsedSeconds{0.0};
++  std::size_t heldSlots{0};
++  bool backendFault{false};
++};
++
++struct Admission
++{
++  Outcome code{Outcome::OK};
++  bool replayed{false};
++  Status status;
++};
++
++struct LocalAdmission
++{
++  Outcome code{Outcome::OK};
++  LocalRef ref;
++};
++
++// Activity sink ///////////////////////////////////////////////////////////
++
++// One engine transition, as observed by VSR. `status` is the full record
++// (result included); consumers apply their own read checks on lookup.
++struct ActivityEvent
++{
++  std::optional<OperationRef> ref; // external work
++  std::optional<LocalRef> localRef; // host-local work
++  std::string kind;
++  Target target;
++  // Session-wide work: the targets its completed result lists (else empty).
++  std::vector<Target> covered;
++  Status status;
++  double now{0.0};
++};
++
++// Application-owned activity record store fed by the engine. Declared here
++// because activity/Activity.hpp depends on this header; the adapter onto
++// activity::ActivityLog lives there. Called with the engine lock held: an
++// implementation must not call back into the engine.
++class ActivitySink
++{
++ public:
++  using Id = std::uint64_t;
++  virtual ~ActivitySink() = default;
++  // Reserves a record at admission; nullopt rejects the admission busy.
++  virtual std::optional<Id> admitted(const ActivityEvent &event) = 0;
++  // Progress, terminal and cleanup transitions of an admitted record.
++  virtual void updated(Id id, const ActivityEvent &event) = 0;
++
++  // Restoration payload accounting for an admitted record (StepContext).
++  virtual bool reserveRestoration(Id,
++      std::size_t /*bytes*/,
++      const std::string & /*launchId*/,
++      const std::string & /*batchId*/)
++  {
++    return true;
++  }
++  virtual void cancelRestoration(Id) {}
++  virtual void publishRestoration(Id) {}
++  virtual bool restorationRetained(
++      const std::string & /*launchId*/, const std::string & /*batchId*/)
++  {
++    return true;
++  }
++  virtual void restorationRestored(
++      const std::string & /*launchId*/, const std::string & /*batchId*/)
++  {}
++  virtual void restorationConflicting(
++      const std::string & /*launchId*/, const std::string & /*batchId*/)
++  {}
++};
++
++// Control gate //////////////////////////////////////////////////////////////
++
++enum class ControlKind
++{
++  RENEW,
++  CANCEL,
++  DETACH,
++  LOOKUP
++};
++
++// Bounds concurrent external control/metadata calls. Lookups may never take
++// the last slot, so polling cannot starve renew/cancel/detach; an identical
++// lifecycle call already in flight coalesces without a slot.
++class ControlGate
++{
++ public:
++  class Permit
++  {
++   public:
++    Permit() = default;
++    Permit(Permit &&o) noexcept;
++    Permit &operator=(Permit &&o) noexcept;
++    Permit(const Permit &) = delete;
++    Permit &operator=(const Permit &) = delete;
++    ~Permit();
++
++    bool granted() const;
++    bool coalesced() const;
++
++   private:
++    friend class ControlGate;
++    ControlGate *m_gate{nullptr};
++    std::size_t m_entry{0};
++    bool m_coalesced{false};
++  };
++
++  explicit ControlGate(std::size_t capacity);
++
++  Permit acquire(ControlKind kind, const std::string &key);
++  std::size_t capacity() const;
++  std::size_t inFlight() const;
++
++ private:
++  struct Entry
++  {
++    ControlKind kind{ControlKind::LOOKUP};
++    std::string key;
++    std::size_t holders{0};
++  };
++
++  void release(std::size_t entry);
++
++  mutable std::mutex m_mutex;
++  std::size_t m_capacity;
++  std::vector<Entry> m_entries; // one per used slot
++};
++
++// Engine ////////////////////////////////////////////////////////////////////
++
++class OperationEngine
++{
++ public:
++  // Returns null for invalid limits. Installs the authority's session-ended
++  // callback so ending a session cancels its outstanding work.
++  static std::unique_ptr<OperationEngine> create(Integration &integration,
++      SessionAuthority &authority,
++      Limits limits = {},
++      MonotonicClock clock = session::steadyClock());
++
++  ~OperationEngine();
++  OperationEngine(const OperationEngine &) = delete;
++  OperationEngine &operator=(const OperationEngine &) = delete;
++
++  const Limits &limits() const;
++
++  // Installs (or clears, with null) the activity record store. The sink must
++  // outlive the engine or be cleared first. Only work admitted afterwards is
++  // recorded.
++  void setActivitySink(ActivitySink *sink);
++
++  // External scene work //
++
++  Admission submit(
++      const Credentials &credentials, const OperationRef &ref, Request request);
++
++  // External control path (bounded by the ControlGate) //
++
++  Outcome renew(const Credentials &credentials);
++  Outcome detach(const Credentials &credentials);
++  // Cancels the caller's own session work. Unknown references above
++  // high-water return UNKNOWN, never a confirmed cancellation.
++  Status cancel(const Credentials &credentials, const OperationRef &ref);
++  // Own-session minimal receipt, or any session's record with current read
++  // on every covered target (spec §9).
++  Status status(const Credentials &credentials, const OperationRef &ref);
++  ControlGate &controlGate();
++
++  // Local host callers: same pool, no session, host authority //
++
++  LocalAdmission submitLocal(Request request);
++  Status cancelLocal(LocalRef ref);
++  Status statusLocal(LocalRef ref);
++
++  // Metrics //
++
++  std::size_t slotsInUse() const;
++  std::size_t awaitingCleanup() const;
++  std::uint64_t highWater(const std::string &sessionId) const;
++
++ private:
++  enum class Phase
++  {
++    QUEUED,
++    RUNNING,
++    YIELDED,
++    SYNCHRONIZING,
++    BACKEND,
++    TERMINAL
++  };
++
++  struct Record
++  {
++    std::uint64_t serial{0}; // admission order, for eviction
++    std::string sessionId; // empty for local callers
++    std::uint64_t requestId{0}; // or local counter
++    std::string kind;
++    Target target;
++    Capability capability{Capability::READ};
++    bool sessionWide{false};
++    std::vector<Target> covered; // session-wide only, set on completion
++    std::string canonicalArguments;
++    double deadlineSeconds{0.0};
++    double deadline{0.0};
++    Executor executor;
++
++    Phase phase{Phase::QUEUED};
++    bool executing{false};
++    bool dispatched{false};
++    std::optional<Outcome> pendingCancel;
++    bool holdsSlot{false};
++    bool awaitingCleanup{false};
++    double cleanupSince{0.0};
++    std::optional<Outcome> terminal;
++    bool committed{false};
++    bool backendFault{false};
++    std::string result;
++    std::optional<ActivitySink::Id> activityId;
++  };
++
++  using Key = std::pair<std::string, std::uint64_t>;
++
++  struct SessionState
++  {
++    std::uint64_t highWater{0};
++  };
++
++  OperationEngine(Integration &integration,
++      SessionAuthority &authority,
++      Limits limits,
++      MonotonicClock clock);
++
++  // Caller holds m_mutex unless stated otherwise.
++  Record *find(const Key &key);
++  bool sameRequest(const Record &r, const Request &q) const;
++  bool reserveRecord();
++  Key admit(std::string sessionId, std::uint64_t id, Request request);
++  void finish(Record &r, Outcome outcome, double now);
++  void releaseSlot(Record &r);
++  void expireDue(double now);
++  void cancelRecord(Record &r, Outcome outcome, double now);
++  Status describe(const Record &r, bool resultVisible, double now) const;
++  std::optional<SceneId> sceneFor(Target target) const;
++  // Carrier scene for a request: its target's scene, or for session-wide
++  // work the first registered scene.
++  std::optional<SceneId> sceneFor(bool sessionWide, Target target) const;
++  void dispatch(const Key &key); // m_mutex NOT held
++  void runStep(const Key &key, scene::Scene &scene);
++  void onSessionEnded(const std::string &sessionId);
++  Status lookup(const Key &key, bool cancel);
++  ActivityEvent eventOf(const Key &key, const Record &r, double now) const;
++  void notify(const Record &r, double now);
++  std::optional<ActivitySink::Id> reserveActivity(
++      const Key &key, const Request &request, double now);
++
++  Integration &m_integration;
++  SessionAuthority &m_authority;
++  Limits m_limits;
++  MonotonicClock m_clock;
++  ControlGate m_control;
++  std::shared_ptr<bool> m_alive;
++
++  mutable std::mutex m_mutex;
++  std::map<Key, Record> m_records;
++  std::map<std::string, SessionState> m_sessions;
++  std::size_t m_slotsInUse{0};
++  std::uint64_t m_serial{0};
++  std::uint64_t m_localCounter{0};
++  ActivitySink *m_sink{nullptr};
++};
++
++// Inlined definitions ////////////////////////////////////////////////////////
++
++inline const char *outcomeName(Outcome outcome)
++{
++  switch (outcome) {
++  case Outcome::OK:
++    return "ok";
++  case Outcome::OCCUPIED:
++    return "occupied";
++  case Outcome::BUSY:
++    return "busy";
++  case Outcome::CURSOR_STALE:
++    return "cursor_stale";
++  case Outcome::SUPERSEDED:
++    return "superseded";
++  case Outcome::OUTCOME_UNAVAILABLE:
++    return "outcome_unavailable";
++  case Outcome::ALREADY_RESTORED:
++    return "already_restored";
++  case Outcome::ITEM_TOO_LARGE:
++    return "item_too_large";
++  case Outcome::CONFLICT:
++    return "conflict";
++  case Outcome::REQUEST_ID_CONFLICT:
++    return "request_id_conflict";
++  case Outcome::CANCELLED:
++    return "cancelled";
++  case Outcome::TIMEOUT:
++    return "timeout";
++  case Outcome::SESSION_EXPIRED:
++    return "session_expired";
++  case Outcome::UNKNOWN:
++    return "unknown";
++  case Outcome::SYNC_REQUIRED:
++    return "sync_required";
++  case Outcome::APPLIED_WITH_SYNC_FAILURE:
++    return "applied_with_sync_failure";
++  case Outcome::UNAUTHENTICATED:
++    return "unauthenticated";
++  case Outcome::INVALID_SESSION_PROOF:
++    return "invalid_session_proof";
++  case Outcome::FORBIDDEN:
++    return "forbidden";
++  case Outcome::INVALID_REQUEST:
++    return "invalid_request";
++  }
++  return "unknown";
++}
++
++inline Outcome fromSessionCode(session::Code code)
++{
++  switch (code) {
++  case session::Code::OK:
++    return Outcome::OK;
++  case session::Code::OCCUPIED:
++    return Outcome::OCCUPIED;
++  case session::Code::UNAUTHENTICATED:
++    return Outcome::UNAUTHENTICATED;
++  case session::Code::INVALID_SESSION_PROOF:
++    return Outcome::INVALID_SESSION_PROOF;
++  case session::Code::FORBIDDEN:
++    return Outcome::FORBIDDEN;
++  case session::Code::SESSION_EXPIRED:
++    return Outcome::SESSION_EXPIRED;
++  }
++  return Outcome::UNKNOWN;
++}
++
++inline const char *progressName(Progress progress)
++{
++  switch (progress) {
++  case Progress::QUEUED:
++    return "queued";
++  case Progress::RUNNING:
++    return "running";
++  case Progress::YIELDED:
++    return "yielded";
++  case Progress::SYNCHRONIZING:
++    return "synchronizing";
++  case Progress::AWAITING_CLEANUP:
++    return "awaiting_cleanup";
++  }
++  return "unknown";
++}
++
++inline bool validRequestId(std::uint64_t id)
++{
++  return id >= 1 && id <= MAX_REQUEST_ID;
++}
++
++inline std::optional<std::uint64_t> requestIdFromNumber(double value)
++{
++  if (!std::isfinite(value) || value < 1.0 || value > double(MAX_REQUEST_ID)
++      || std::floor(value) != value)
++    return std::nullopt;
++  return std::uint64_t(value);
++}
++
++inline bool Limits::valid() const
++{
++  return sceneSlots > 0 && controlSlots > 0 && statusRecords > 0;
++}
++
++// ControlGate //
++
++inline ControlGate::Permit::Permit(Permit &&o) noexcept
++    : m_gate(o.m_gate), m_entry(o.m_entry), m_coalesced(o.m_coalesced)
++{
++  o.m_gate = nullptr;
++}
++
++inline ControlGate::Permit &ControlGate::Permit::operator=(Permit &&o) noexcept
++{
++  if (this != &o) {
++    if (m_gate)
++      m_gate->release(m_entry);
++    m_gate = o.m_gate;
++    m_entry = o.m_entry;
++    m_coalesced = o.m_coalesced;
++    o.m_gate = nullptr;
++  }
++  return *this;
++}
++
++inline ControlGate::Permit::~Permit()
++{
++  if (m_gate)
++    m_gate->release(m_entry);
++}
++
++inline bool ControlGate::Permit::granted() const
++{
++  return m_gate != nullptr;
++}
++
++inline bool ControlGate::Permit::coalesced() const
++{
++  return m_coalesced;
++}
++
++inline ControlGate::ControlGate(std::size_t capacity) : m_capacity(capacity) {}
++
++inline ControlGate::Permit ControlGate::acquire(
++    ControlKind kind, const std::string &key)
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  Permit p;
++  std::size_t used = 0;
++  std::size_t lookups = 0;
++  for (std::size_t i = 0; i < m_entries.size(); ++i) {
++    auto &e = m_entries[i];
++    if (e.holders == 0)
++      continue;
++    ++used;
++    if (e.kind == ControlKind::LOOKUP)
++      ++lookups;
++    if (kind != ControlKind::LOOKUP && e.kind == kind && e.key == key) {
++      ++e.holders;
++      p.m_gate = this;
++      p.m_entry = i;
++      p.m_coalesced = true;
++      return p;
++    }
++  }
++
++  if (used >= m_capacity)
++    return p;
++  // Keep one slot for lifecycle calls whenever there is more than one.
++  if (kind == ControlKind::LOOKUP && m_capacity > 1
++      && lookups + 1 >= m_capacity)
++    return p;
++
++  std::size_t slot = m_entries.size();
++  for (std::size_t i = 0; i < m_entries.size(); ++i) {
++    if (m_entries[i].holders == 0) {
++      slot = i;
++      break;
++    }
++  }
++  if (slot == m_entries.size())
++    m_entries.emplace_back();
++  m_entries[slot] = {kind, key, 1};
++  p.m_gate = this;
++  p.m_entry = slot;
++  return p;
++}
++
++inline std::size_t ControlGate::capacity() const
++{
++  return m_capacity;
++}
++
++inline std::size_t ControlGate::inFlight() const
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  std::size_t n = 0;
++  for (const auto &e : m_entries)
++    n += e.holders > 0 ? 1 : 0;
++  return n;
++}
++
++inline void ControlGate::release(std::size_t entry)
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  if (entry < m_entries.size() && m_entries[entry].holders > 0)
++    --m_entries[entry].holders;
++}
++
++// OperationEngine //
++
++inline std::unique_ptr<OperationEngine> OperationEngine::create(
++    Integration &integration,
++    SessionAuthority &authority,
++    Limits limits,
++    MonotonicClock clock)
++{
++  if (!limits.valid() || !integration.active() || !clock)
++    return nullptr;
++  std::unique_ptr<OperationEngine> engine(
++      new OperationEngine(integration, authority, limits, std::move(clock)));
++  auto *raw = engine.get();
++  std::weak_ptr<bool> alive = engine->m_alive;
++  authority.setSessionEndedCallback(
++      [raw, alive](const std::string &id, session::EndReason) {
++        if (alive.lock())
++          raw->onSessionEnded(id);
++      });
++  return engine;
++}
++
++inline OperationEngine::OperationEngine(Integration &integration,
++    SessionAuthority &authority,
++    Limits limits,
++    MonotonicClock clock)
++    : m_integration(integration),
++      m_authority(authority),
++      m_limits(limits),
++      m_clock(std::move(clock)),
++      m_control(limits.controlSlots),
++      m_alive(std::make_shared<bool>(true))
++{}
++
++inline OperationEngine::~OperationEngine()
++{
++  m_authority.setSessionEndedCallback({});
++  m_alive.reset();
++}
++
++inline const Limits &OperationEngine::limits() const
++{
++  return m_limits;
++}
++
++inline void OperationEngine::setActivitySink(ActivitySink *sink)
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  m_sink = sink;
++}
++
++inline ActivityEvent OperationEngine::eventOf(
++    const Key &key, const Record &r, double now) const
++{
++  ActivityEvent e;
++  if (key.first.empty())
++    e.localRef = LocalRef{key.second};
++  else
++    e.ref = OperationRef{key.first, key.second};
++  e.kind = r.kind;
++  e.target = r.target;
++  e.covered = r.covered;
++  e.status = describe(r, true, now);
++  e.now = now;
++  return e;
++}
++
++inline std::optional<ActivitySink::Id> OperationEngine::reserveActivity(
++    const Key &key, const Request &request, double now)
++{
++  // Describes the record admit() is about to create: queued, one slot.
++  Record r;
++  r.kind = request.kind;
++  r.target = request.target;
++  r.holdsSlot = true;
++  return m_sink->admitted(eventOf(key, r, now));
++}
++
++inline void OperationEngine::notify(const Record &r, double now)
++{
++  if (m_sink && r.activityId)
++    m_sink->updated(*r.activityId, eventOf({r.sessionId, r.requestId}, r, now));
++}
++
++inline ControlGate &OperationEngine::controlGate()
++{
++  return m_control;
++}
++
++inline OperationEngine::Record *OperationEngine::find(const Key &key)
++{
++  auto it = m_records.find(key);
++  return it == m_records.end() ? nullptr : &it->second;
++}
++
++inline bool OperationEngine::sameRequest(
++    const Record &r, const Request &q) const
++{
++  return r.kind == q.kind && r.sessionWide == q.sessionWide
++      && (r.sessionWide
++          || (r.target.kind == q.target.kind && r.target.id == q.target.id))
++      && r.capability == q.capability
++      && r.canonicalArguments == q.canonicalArguments
++      && r.deadlineSeconds == q.deadlineSeconds;
++}
++
++inline bool OperationEngine::reserveRecord()
++{
++  if (m_records.size() < m_limits.statusRecords)
++    return true;
++  // Evict the oldest record that no active work needs.
++  auto victim = m_records.end();
++  for (auto it = m_records.begin(); it != m_records.end(); ++it) {
++    const auto &r = it->second;
++    if (!r.terminal || r.holdsSlot || r.executing || r.dispatched)
++      continue;
++    if (victim == m_records.end() || r.serial < victim->second.serial)
++      victim = it;
++  }
++  if (victim == m_records.end())
++    return false;
++  m_records.erase(victim);
++  return true;
++}
++
++inline OperationEngine::Key OperationEngine::admit(
++    std::string sessionId, std::uint64_t id, Request request)
++{
++  Key key{sessionId, id};
++  Record r;
++  r.serial = ++m_serial;
++  r.sessionId = std::move(sessionId);
++  r.requestId = id;
++  r.kind = std::move(request.kind);
++  r.target = request.target;
++  r.capability = request.capability;
++  r.sessionWide = request.sessionWide;
++  r.canonicalArguments = std::move(request.canonicalArguments);
++  r.deadlineSeconds = request.deadlineSeconds;
++  r.deadline =
++      request.deadlineSeconds > 0.0 ? m_clock() + request.deadlineSeconds : 0.0;
++  r.executor = std::move(request.executor);
++  r.holdsSlot = true;
++  r.dispatched = true;
++  ++m_slotsInUse;
++  m_records[key] = std::move(r);
++  return key;
++}
++
++inline std::optional<SceneId> OperationEngine::sceneFor(Target target) const
++{
++  if (target.kind == Target::Kind::SCENE) {
++    if (m_integration.isRegisteredScene(target.id))
++      return target.id;
++    return std::nullopt;
++  }
++  return m_integration.sceneOfView(target.id);
++}
++
++inline std::optional<SceneId> OperationEngine::sceneFor(
++    bool sessionWide, Target target) const
++{
++  if (!sessionWide)
++    return sceneFor(target);
++  if (m_integration.isRegisteredScene(0))
++    return SceneId{0};
++  return std::nullopt;
++}
++
++inline Admission OperationEngine::submit(
++    const Credentials &credentials, const OperationRef &ref, Request request)
++{
++  Admission a;
++  a.code = fromSessionCode(request.sessionWide
++          ? m_authority.authenticate(credentials)
++          : m_authority.authorize(
++                credentials, request.target, request.capability));
++  if (a.code != Outcome::OK)
++    return a;
++  if (ref.sessionId != credentials.sessionId || !validRequestId(ref.requestId)
++      || !request.executor
++      || !sceneFor(request.sessionWide, request.target)) {
++    a.code = Outcome::INVALID_REQUEST;
++    return a;
++  }
++
++  Key key;
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    const double now = m_clock();
++    expireDue(now);
++    auto &s = m_sessions[ref.sessionId];
++    if (auto *r = find({ref.sessionId, ref.requestId})) {
++      if (!sameRequest(*r, request)) {
++        a.code = Outcome::REQUEST_ID_CONFLICT;
++        return a;
++      }
++      a.replayed = true;
++      a.status = describe(*r, true, now);
++      return a;
++    }
++    if (ref.requestId <= s.highWater) {
++      a.code = Outcome::OUTCOME_UNAVAILABLE;
++      return a;
++    }
++    if (m_slotsInUse >= m_limits.sceneSlots || !reserveRecord()) {
++      a.code = Outcome::BUSY;
++      return a;
++    }
++    std::optional<ActivitySink::Id> activity;
++    if (m_sink) {
++      activity = reserveActivity({ref.sessionId, ref.requestId}, request, now);
++      if (!activity) {
++        a.code = Outcome::BUSY; // cannot record without evicting active work
++        return a;
++      }
++    }
++    key = admit(ref.sessionId, ref.requestId, std::move(request));
++    find(key)->activityId = activity;
++    s.highWater = ref.requestId;
++    a.status = describe(*find(key), true, now);
++  }
++  dispatch(key);
++  return a;
++}
++
++inline LocalAdmission OperationEngine::submitLocal(Request request)
++{
++  LocalAdmission a;
++  if (!request.executor || !sceneFor(request.sessionWide, request.target)) {
++    a.code = Outcome::INVALID_REQUEST;
++    return a;
++  }
++  if (!request.sessionWide
++      && !m_authority.authorizeLocal(request.target, request.capability)) {
++    a.code = Outcome::FORBIDDEN;
++    return a;
++  }
++  Key key;
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    const double now = m_clock();
++    expireDue(now);
++    if (m_slotsInUse >= m_limits.sceneSlots || !reserveRecord()) {
++      a.code = Outcome::BUSY;
++      return a;
++    }
++    std::optional<ActivitySink::Id> activity;
++    if (m_sink) {
++      activity =
++          reserveActivity({std::string(), m_localCounter + 1}, request, now);
++      if (!activity) {
++        a.code = Outcome::BUSY;
++        return a;
++      }
++    }
++    a.ref.id = ++m_localCounter;
++    key = admit({}, a.ref.id, std::move(request));
++    find(key)->activityId = activity;
++  }
++  dispatch(key);
++  return a;
++}
++
++inline void OperationEngine::releaseSlot(Record &r)
++{
++  if (r.holdsSlot) {
++    r.holdsSlot = false;
++    --m_slotsInUse;
++  }
++  r.awaitingCleanup = false;
++  r.executor = {};
++}
++
++inline void OperationEngine::finish(Record &r, Outcome outcome, double now)
++{
++  r.terminal = outcome;
++  r.pendingCancel.reset();
++  if (r.phase == Phase::BACKEND) {
++    // Logically terminal; resources stay held until safe release.
++    r.awaitingCleanup = true;
++    r.cleanupSince = now;
++  } else {
++    releaseSlot(r);
++  }
++  r.phase = Phase::TERMINAL;
++  notify(r, now);
++}
++
++inline void OperationEngine::cancelRecord(
++    Record &r, Outcome outcome, double now)
++{
++  if (r.terminal || r.committed)
++    return; // completed or committing work finishes safely
++  if (r.executing) {
++    r.pendingCancel = outcome;
++    return;
++  }
++  finish(r, outcome, now);
++}
++
++inline void OperationEngine::expireDue(double now)
++{
++  for (auto &[key, r] : m_records) {
++    if (!r.terminal && r.deadline > 0.0 && now >= r.deadline)
++      cancelRecord(r, Outcome::TIMEOUT, now);
++  }
++}
++
++inline Status OperationEngine::describe(
++    const Record &r, bool resultVisible, double now) const
++{
++  Status s;
++  s.kind = r.kind;
++  s.terminal = r.terminal;
++  s.committed = r.committed;
++  s.backendFault = r.backendFault;
++  s.heldSlots = r.holdsSlot ? 1 : 0;
++  if (r.awaitingCleanup) {
++    s.progress = Progress::AWAITING_CLEANUP;
++    s.cleanupElapsedSeconds = now - r.cleanupSince;
++  } else if (!r.terminal) {
++    switch (r.phase) {
++    case Phase::QUEUED:
++      s.progress = Progress::QUEUED;
++      break;
++    case Phase::YIELDED:
++      s.progress = Progress::YIELDED;
++      break;
++    case Phase::SYNCHRONIZING:
++      s.progress = Progress::SYNCHRONIZING;
++      break;
++    default:
++      s.progress = Progress::RUNNING;
++      break;
++    }
++  }
++  if (r.terminal && resultVisible) {
++    s.resultVisible = true;
++    s.result = r.result;
++  }
++  return s;
++}
++
++inline void OperationEngine::dispatch(const Key &key)
++{
++  std::optional<SceneId> scene;
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    auto *r = find(key);
++    if (!r)
++      return;
++    scene = sceneFor(r->sessionWide, r->target);
++    r->dispatched = true;
++  }
++  std::weak_ptr<bool> alive = m_alive;
++  const bool ok = scene
++      && m_integration.submit(*scene, [this, alive, key](scene::Scene &s) {
++           if (alive.lock())
++             runStep(key, s);
++         });
++  if (!ok) {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    if (auto *r = find(key))
++      r->dispatched = false;
++  }
++}
++
++inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
++{
++  std::string sessionId;
++  Target target;
++  Capability capability;
++  bool sessionWide = false;
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    auto *r = find(key);
++    if (!r)
++      return;
++    r->dispatched = false;
++    const double now = m_clock();
++    if (!r->terminal && r->deadline > 0.0 && now >= r->deadline)
++      cancelRecord(*r, Outcome::TIMEOUT, now);
++    if (r->terminal && !r->awaitingCleanup)
++      return; // expired or cancelled queued work never starts
++    sessionId = r->sessionId;
++    target = r->target;
++    capability = r->capability;
++    sessionWide = r->sessionWide;
++  }
++
++  // Current policy applies at the safe point; checked without m_mutex since
++  // the authority may call back into onSessionEnded.
++  Outcome auth = Outcome::OK;
++  if (sessionId.empty()) {
++    if (!sessionWide && !m_authority.authorizeLocal(target, capability))
++      auth = Outcome::FORBIDDEN;
++  } else {
++    const auto code =
++        m_authority.authorizeExecution(sessionId, target, capability);
++    // Session-wide work needs only a live session: FORBIDDEN proves it is.
++    auth = sessionWide && code == session::Code::FORBIDDEN
++        ? Outcome::OK
++        : fromSessionCode(code);
++  }
++
++  Executor executor;
++  bool abandoned = false;
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    auto *r = find(key);
++    if (!r || (r->terminal && !r->awaitingCleanup))
++      return;
++    if (!r->terminal && auth != Outcome::OK) {
++      // Session ended or permission withdrawn before execution.
++      cancelRecord(*r,
++          auth == Outcome::FORBIDDEN ? Outcome::FORBIDDEN : Outcome::CANCELLED,
++          m_clock());
++      if (!r->awaitingCleanup)
++        return;
++    }
++    abandoned = r->terminal.has_value();
++    executor = r->executor;
++    r->executing = true;
++    // Committed work re-dispatched to run its normal-synchronization hook
++    // keeps reporting `synchronizing` while the hook executes (addendum 03
++    // §5).
++    const bool hookStep = r->committed && r->phase == Phase::SYNCHRONIZING;
++    if (!abandoned && !hookStep && r->phase != Phase::RUNNING) {
++      r->phase = Phase::RUNNING;
++      notify(*r, m_clock());
++    }
++  }
++
++  std::weak_ptr<bool> alive = m_alive;
++  StepContext ctx{scene, abandoned, [this, alive, key] {
++                    if (!alive.lock())
++                      return;
++                    bool resume = false;
++                    {
++                      std::lock_guard<std::mutex> lock(m_mutex);
++                      auto *r = find(key);
++                      resume = r && !r->executing && !r->dispatched
++                          && (r->phase == Phase::BACKEND || r->awaitingCleanup);
++                    }
++                    if (resume)
++                      dispatch(key);
++                  }};
++  // Serialized with notify() under the engine lock.
++  auto withSink = [this, alive, key](auto &&fn) {
++    if (!alive.lock())
++      return;
++    std::lock_guard<std::mutex> lock(m_mutex);
++    auto *r = find(key);
++    if (m_sink && r && r->activityId)
++      fn(*m_sink, *r->activityId);
++  };
++  ctx.reserveRestoration = [withSink](std::size_t bytes,
++                               const std::string &launchId,
++                               const std::string &batchId) {
++    bool ok = true;
++    withSink([&](ActivitySink &s, ActivitySink::Id id) {
++      ok = s.reserveRestoration(id, bytes, launchId, batchId);
++    });
++    return ok;
++  };
++  ctx.cancelRestoration = [withSink] {
++    withSink(
++        [](ActivitySink &s, ActivitySink::Id id) { s.cancelRestoration(id); });
++  };
++  ctx.publishRestoration = [withSink] {
++    withSink(
++        [](ActivitySink &s, ActivitySink::Id id) { s.publishRestoration(id); });
++  };
++  ctx.restorationRetained = [this, alive](const std::string &launchId,
++                                const std::string &batchId) {
++    if (!alive.lock())
++      return true;
++    std::lock_guard<std::mutex> lock(m_mutex);
++    return !m_sink || m_sink->restorationRetained(launchId, batchId);
++  };
++  ctx.markRestored = [this, alive](
++                         const std::string &launchId, const std::string &batchId) {
++    if (!alive.lock())
++      return;
++    std::lock_guard<std::mutex> lock(m_mutex);
++    if (m_sink)
++      m_sink->restorationRestored(launchId, batchId);
++  };
++  ctx.markConflicting = [this, alive](
++                            const std::string &launchId, const std::string &batchId) {
++    if (!alive.lock())
++      return;
++    std::lock_guard<std::mutex> lock(m_mutex);
++    if (m_sink)
++      m_sink->restorationConflicting(launchId, batchId);
++  };
++  Step step = executor ? executor(ctx) : Step{};
++
++  bool redispatch = false;
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    auto *r = find(key);
++    if (!r)
++      return;
++    r->executing = false;
++    const double now = m_clock();
++    r->backendFault = r->backendFault || step.backendFault;
++    if (step.committed)
++      r->committed = true;
++
++    if (r->terminal) {
++      // Abandoned: late results never make the operation succeed.
++      if (step.status == Step::Status::BACKEND_PENDING)
++        r->awaitingCleanup = true;
++      else
++        releaseSlot(*r);
++      notify(*r, now);
++      return;
++    }
++
++    if (r->pendingCancel && !r->committed) {
++      const Outcome o = *r->pendingCancel;
++      r->phase = step.status == Step::Status::BACKEND_PENDING ? Phase::BACKEND
++                                                              : Phase::RUNNING;
++      finish(*r, o, now);
++      return;
++    }
++    r->pendingCancel.reset();
++
++    switch (step.status) {
++    case Step::Status::YIELD:
++      r->phase = Phase::YIELDED;
++      redispatch = true;
++      notify(*r, now);
++      break;
++    case Step::Status::SYNCHRONIZING:
++      r->phase = Phase::SYNCHRONIZING;
++      redispatch = true;
++      notify(*r, now);
++      break;
++    case Step::Status::BACKEND_PENDING:
++      r->phase = Phase::BACKEND;
++      notify(*r, now);
++      break;
++    case Step::Status::COMPLETE:
++      r->result = std::move(step.result);
++      if (r->sessionWide)
++        r->covered = std::move(step.covered);
++      r->phase = Phase::RUNNING;
++      finish(*r, step.outcome, now);
++      break;
++    }
++  }
++  if (redispatch)
++    dispatch(key);
++}
++
++inline void OperationEngine::onSessionEnded(const std::string &sessionId)
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  const double now = m_clock();
++  for (auto &[key, r] : m_records) {
++    if (r.sessionId == sessionId)
++      cancelRecord(r, Outcome::CANCELLED, now);
++  }
++}
++
++inline Status OperationEngine::lookup(const Key &key, bool cancel)
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  const double now = m_clock();
++  expireDue(now);
++  Status s;
++  auto *r = find(key);
++  if (!r) {
++    std::uint64_t highWater = 0;
++    if (key.first.empty()) {
++      highWater = m_localCounter;
++    } else {
++      auto it = m_sessions.find(key.first);
++      if (it != m_sessions.end())
++        highWater = it->second.highWater;
++    }
++    // Above high-water the request may still be in transit.
++    s.code = key.second <= highWater ? Outcome::OUTCOME_UNAVAILABLE
++                                     : Outcome::UNKNOWN;
++    return s;
++  }
++  if (cancel)
++    cancelRecord(*r, Outcome::CANCELLED, now);
++  return describe(*r, true, now);
++}
++
++inline Status OperationEngine::cancel(
++    const Credentials &credentials, const OperationRef &ref)
++{
++  Status s;
++  auto permit = m_control.acquire(ControlKind::CANCEL, credentials.sessionId);
++  if (!permit.granted()) {
++    s.code = Outcome::BUSY;
++    return s;
++  }
++  s.code = fromSessionCode(m_authority.authenticate(credentials));
++  if (s.code != Outcome::OK)
++    return s;
++  if (ref.sessionId != credentials.sessionId) {
++    s.code = Outcome::FORBIDDEN; // never another session's work
++    return s;
++  }
++  return lookup({ref.sessionId, ref.requestId}, true);
++}
++
++inline Status OperationEngine::status(
++    const Credentials &credentials, const OperationRef &ref)
++{
++  Status s;
++  auto permit = m_control.acquire(ControlKind::LOOKUP, credentials.sessionId);
++  if (!permit.granted()) {
++    s.code = Outcome::BUSY;
++    return s;
++  }
++  s.code = fromSessionCode(m_authority.authenticate(credentials));
++  if (s.code != Outcome::OK)
++    return s;
++  const bool own = ref.sessionId == credentials.sessionId;
++  s = lookup({ref.sessionId, ref.requestId}, false);
++  // A foreign session has ended, so nothing of its is still in transit.
++  if (!own && s.code == Outcome::UNKNOWN)
++    s.code = Outcome::OUTCOME_UNAVAILABLE;
++  if (s.code != Outcome::OK)
++    return s; // missing/evicted: outcome_unavailable
++  // Covered targets: the record's target, plus a view's scene.
++  // Session-wide records cover exactly the targets their result lists.
++  std::vector<Target> covered;
++  bool sessionWide = false;
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    if (auto *r = find({ref.sessionId, ref.requestId})) {
++      sessionWide = r->sessionWide;
++      if (sessionWide)
++        covered = r->covered;
++      else
++        covered.push_back(r->target);
++    }
++  }
++  if (!sessionWide && !covered.empty()
++      && covered[0].kind == Target::Kind::VIEW) {
++    if (auto sc = m_integration.sceneOfView(covered[0].id))
++      covered.push_back(Target::scene(*sc));
++  }
++  bool readAll = sessionWide || !covered.empty();
++  for (auto &t : covered)
++    if (m_authority.authorizeExecution(
++            credentials.sessionId, t, Capability::READ)
++        != session::Code::OK)
++      readAll = false;
++  if (!own && !readAll) {
++    // Foreign records need read on every covered target; never partial.
++    Status denied;
++    denied.code = Outcome::FORBIDDEN;
++    return denied;
++  }
++  if (!readAll) {
++    // Payloads need current read; the own minimal receipt does not.
++    s.resultVisible = false;
++    s.result.clear();
++  }
++  return s;
++}
++
++inline Outcome OperationEngine::renew(const Credentials &credentials)
++{
++  auto permit = m_control.acquire(ControlKind::RENEW, credentials.sessionId);
++  if (!permit.granted())
++    return Outcome::BUSY;
++  return fromSessionCode(m_authority.renew(credentials));
++}
++
++inline Outcome OperationEngine::detach(const Credentials &credentials)
++{
++  auto permit = m_control.acquire(ControlKind::DETACH, credentials.sessionId);
++  if (!permit.granted())
++    return Outcome::BUSY;
++  return fromSessionCode(m_authority.detach(credentials));
++}
++
++inline Status OperationEngine::cancelLocal(LocalRef ref)
++{
++  return lookup({std::string(), ref.id}, true);
++}
++
++inline Status OperationEngine::statusLocal(LocalRef ref)
++{
++  return lookup({std::string(), ref.id}, false);
++}
++
++inline std::size_t OperationEngine::slotsInUse() const
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  return m_slotsInUse;
++}
++
++inline std::size_t OperationEngine::awaitingCleanup() const
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  std::size_t n = 0;
++  for (const auto &[key, r] : m_records)
++    n += r.awaitingCleanup ? 1 : 0;
++  return n;
++}
++
++inline std::uint64_t OperationEngine::highWater(
++    const std::string &sessionId) const
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  auto it = m_sessions.find(sessionId);
++  return it == m_sessions.end() ? 0 : it->second.highWater;
++}
++
++} // namespace vsr::integration::operations
+diff --git a/src/vsr/integration/session/SessionAuthority.hpp b/src/vsr/integration/session/SessionAuthority.hpp
+new file mode 100644
+index 0000000000..6db37e4683
+--- /dev/null
++++ b/src/vsr/integration/session/SessionAuthority.hpp
+@@ -0,0 +1,710 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++// Header-only: the vsr_integration library globs only top-level sources, and
++// this ticket may not edit that shared CMake file (see ticket 19).
++
++#include "vsr/integration/Integration.hpp"
++// std
++#include <array>
++#include <chrono>
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <string_view>
++#include <vector>
++// posix
++#if defined(__linux__)
++#include <sys/random.h>
++#endif
++
++namespace vsr::integration::session {
++
++/*
++ * Logical sessions, launch/session authentication and effective per-target
++ * capabilities for one activation of an Integration.
++ *
++ * One SessionAuthority is created per activation; it generates a fresh launch
++ * credential and public launch identity that are never reused. At most one
++ * external logical session exists at a time. Local host callers use host
++ * authority (the configured ceiling) and never consume the external slot.
++ *
++ * Restrictions (including Disable agent edits) belong to the application and
++ * persist across detach, expiry and replacement attachments. Only the host
++ * API can relax them, and never beyond the configured ceiling.
++ *
++ * No function here logs, and no returned text ever contains a secret.
++ */
++
++// Frozen semantic outcome codes (spec §9) produced by this module.
++enum class Code
++{
++  OK,
++  OCCUPIED,
++  UNAUTHENTICATED,
++  INVALID_SESSION_PROOF,
++  FORBIDDEN,
++  SESSION_EXPIRED
++};
++
++// Stable machine-readable name, e.g. "invalid_session_proof".
++const char *codeName(Code code);
++// Short human explanation; never contains request data or secrets.
++const char *codeMessage(Code code);
++
++enum class Capability
++{
++  READ,
++  RENDER,
++  EDIT,
++  RESYNCHRONIZE
++};
++
++struct Target
++{
++  enum class Kind
++  {
++    SCENE,
++    VIEW
++  };
++
++  Kind kind{Kind::SCENE};
++  std::uint32_t id{0};
++
++  static Target scene(SceneId id);
++  static Target view(ViewId id);
++};
++
++struct EffectiveCapabilities
++{
++  bool read{false};
++  bool render{false};
++  bool edit{false};
++  bool resynchronize{false};
++};
++
++// What a request presents. Transport adapters strip their carrier syntax
++// (e.g. "Bearer ") before filling this in.
++struct Credentials
++{
++  std::string launchCredential;
++  std::string sessionId;
++  std::string sessionProof;
++};
++
++struct Attachment
++{
++  Code code{Code::OK};
++  std::string sessionId; // 32 lowercase hex; public correlation only
++  std::string sessionSecret; // unpadded base64url of 32 random bytes
++  double leaseSeconds{0.0};
++  double renewalSeconds{0.0};
++};
++
++enum class EndReason
++{
++  DETACHED,
++  EXPIRED,
++  REVOKED
++};
++
++// Monotonic time in seconds.
++using MonotonicClock = std::function<double()>;
++// Session-ended signal for later tickets (cancellation, cursors).
++using SessionEndedCallback =
++    std::function<void(const std::string &sessionId, EndReason reason)>;
++
++MonotonicClock steadyClock();
++
++class SessionAuthority
++{
++ public:
++  // Returns null when the integration is inactive or secure randomness is
++  // unavailable.
++  static std::unique_ptr<SessionAuthority> create(
++      const Integration &integration, MonotonicClock clock = steadyClock());
++
++  SessionAuthority(const SessionAuthority &) = delete;
++  SessionAuthority &operator=(const SessionAuthority &) = delete;
++
++  // Launch values (host only; for descriptor publication) //
++
++  const std::string &launchId() const;
++  const std::string &launchCredential() const;
++
++  // External client calls //
++
++  // Launch-authenticated; creates the single external logical session.
++  Attachment attach(std::string_view launchCredential);
++  // Launch + current session proof; no capability needed.
++  Code authenticate(const Credentials &credentials);
++  // Explicit renewal extends the lease from now.
++  Code renew(const Credentials &credentials);
++  Code detach(const Credentials &credentials);
++  // Admission check for a session-scoped action on a target.
++  Code authorize(
++      const Credentials &credentials, Target target, Capability capability);
++  // Safe-point re-check for work admitted under sessionId.
++  Code authorizeExecution(
++      std::string_view sessionId, Target target, Capability capability);
++  EffectiveCapabilities effectiveCapabilities(Target target) const;
++
++  // Host / local operator //
++
++  // Local host authority: the configured ceiling, independent of the
++  // external restriction mask. Consumes no session slot.
++  bool authorizeLocal(Target target, Capability capability) const;
++  // Local whole-session revocation (viewer Disconnect).
++  bool revokeSession();
++  void setAgentEditsDisabled(bool disabled);
++  bool agentEditsDisabled() const;
++  void restrict(Target target, Capability capability);
++  // Relaxing can never exceed the configured ceiling.
++  void relax(Target target, Capability capability);
++  // Ends the current session if its lease has passed.
++  void expireIfDue();
++  bool hasSession() const;
++  void setSessionEndedCallback(SessionEndedCallback callback);
++
++ private:
++  struct Session
++  {
++    std::string id;
++    std::string secret;
++    double expiresAt{0.0};
++  };
++
++  struct EndedSession
++  {
++    std::string id;
++    std::string secret;
++    EndReason reason{EndReason::DETACHED};
++  };
++
++  SessionAuthority(const Integration &integration, MonotonicClock clock);
++
++  bool ceiling(Target target, Capability capability) const;
++  bool restricted(Target target, Capability capability) const;
++  bool effective(Target target, Capability capability) const;
++  Code checkSession(const Credentials &credentials, double now);
++  // Caller holds m_mutex; notify(ended) after unlocking.
++  void endSession(EndReason reason, std::vector<EndedSession> &ended);
++  void notify(const std::vector<EndedSession> &ended);
++
++  const Integration &m_integration;
++  MonotonicClock m_clock;
++  std::string m_launchId;
++  std::string m_launchCredential;
++
++  mutable std::mutex m_mutex;
++  std::unique_ptr<Session> m_session;
++  EndedSession m_lastEnded;
++  bool m_hasLastEnded{false};
++  bool m_agentEditsDisabled{false};
++  std::vector<std::array<bool, 4>> m_sceneRestrictions;
++  std::vector<std::array<bool, 4>> m_viewRestrictions;
++  SessionEndedCallback m_onEnded;
++};
++
++// Encoding helpers (exposed for tests and the descriptor ticket) //
++
++bool secureRandom(std::uint8_t *out, std::size_t size);
++std::string toLowerHex(const std::uint8_t *data, std::size_t size);
++std::string toBase64Url(const std::uint8_t *data, std::size_t size);
++bool constantTimeEqual(std::string_view a, std::string_view b);
++
++// Inlined definitions ////////////////////////////////////////////////////////
++
++inline const char *codeName(Code code)
++{
++  switch (code) {
++  case Code::OK:
++    return "ok";
++  case Code::OCCUPIED:
++    return "occupied";
++  case Code::UNAUTHENTICATED:
++    return "unauthenticated";
++  case Code::INVALID_SESSION_PROOF:
++    return "invalid_session_proof";
++  case Code::FORBIDDEN:
++    return "forbidden";
++  case Code::SESSION_EXPIRED:
++    return "session_expired";
++  }
++  return "unknown";
++}
++
++inline const char *codeMessage(Code code)
++{
++  switch (code) {
++  case Code::OK:
++    return "ok";
++  case Code::OCCUPIED:
++    return "the external session slot is occupied";
++  case Code::UNAUTHENTICATED:
++    return "missing or invalid launch credential";
++  case Code::INVALID_SESSION_PROOF:
++    return "missing, wrong or stale session proof";
++  case Code::FORBIDDEN:
++    return "capability absent or not exposed for this target";
++  case Code::SESSION_EXPIRED:
++    return "the session lease expired";
++  }
++  return "unknown";
++}
++
++inline Target Target::scene(SceneId id)
++{
++  return {Kind::SCENE, id};
++}
++
++inline Target Target::view(ViewId id)
++{
++  return {Kind::VIEW, id};
++}
++
++inline MonotonicClock steadyClock()
++{
++  return [] {
++    using namespace std::chrono;
++    return duration<double>(steady_clock::now().time_since_epoch()).count();
++  };
++}
++
++inline bool secureRandom(std::uint8_t *out, std::size_t size)
++{
++#if defined(__linux__)
++  std::size_t filled = 0;
++  while (filled < size) {
++    auto n = getrandom(out + filled, size - filled, 0);
++    if (n <= 0)
++      return false;
++    filled += std::size_t(n);
++  }
++  return true;
++#else
++  // Unvalidated platforms report unsupported rather than use a weak source.
++  (void)out;
++  (void)size;
++  return false;
++#endif
++}
++
++inline std::string toLowerHex(const std::uint8_t *data, std::size_t size)
++{
++  static const char *digits = "0123456789abcdef";
++  std::string s;
++  s.reserve(size * 2);
++  for (std::size_t i = 0; i < size; i++) {
++    s.push_back(digits[data[i] >> 4]);
++    s.push_back(digits[data[i] & 0xf]);
++  }
++  return s;
++}
++
++inline std::string toBase64Url(const std::uint8_t *data, std::size_t size)
++{
++  static const char *alphabet =
++      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
++  std::string s;
++  std::uint32_t acc = 0;
++  int bits = 0;
++  for (std::size_t i = 0; i < size; i++) {
++    acc = (acc << 8) | data[i];
++    bits += 8;
++    while (bits >= 6) {
++      bits -= 6;
++      s.push_back(alphabet[(acc >> bits) & 0x3f]);
++    }
++  }
++  if (bits > 0)
++    s.push_back(alphabet[(acc << (6 - bits)) & 0x3f]);
++  return s;
++}
++
++inline bool constantTimeEqual(std::string_view a, std::string_view b)
++{
++  if (a.size() != b.size())
++    return false;
++  unsigned char diff = 0;
++  for (std::size_t i = 0; i < a.size(); i++)
++    diff |= static_cast<unsigned char>(a[i] ^ b[i]);
++  return diff == 0;
++}
++
++namespace detail {
++
++inline bool randomHex(std::string &out, std::size_t bytes)
++{
++  std::vector<std::uint8_t> buf(bytes);
++  if (!secureRandom(buf.data(), bytes))
++    return false;
++  out = toLowerHex(buf.data(), bytes);
++  return true;
++}
++
++inline bool randomBase64Url(std::string &out, std::size_t bytes)
++{
++  std::vector<std::uint8_t> buf(bytes);
++  if (!secureRandom(buf.data(), bytes))
++    return false;
++  out = toBase64Url(buf.data(), bytes);
++  return true;
++}
++
++inline std::size_t capIndex(Capability c)
++{
++  return static_cast<std::size_t>(c);
++}
++
++} // namespace detail
++
++inline std::unique_ptr<SessionAuthority> SessionAuthority::create(
++    const Integration &integration, MonotonicClock clock)
++{
++  if (!integration.active() || !clock)
++    return {};
++  std::unique_ptr<SessionAuthority> a(
++      new SessionAuthority(integration, std::move(clock)));
++  if (!detail::randomHex(a->m_launchId, 16)
++      || !detail::randomBase64Url(a->m_launchCredential, 32))
++    return {};
++  return a;
++}
++
++inline SessionAuthority::SessionAuthority(
++    const Integration &integration, MonotonicClock clock)
++    : m_integration(integration), m_clock(std::move(clock))
++{}
++
++inline const std::string &SessionAuthority::launchId() const
++{
++  return m_launchId;
++}
++
++inline const std::string &SessionAuthority::launchCredential() const
++{
++  return m_launchCredential;
++}
++
++inline Attachment SessionAuthority::attach(std::string_view launchCredential)
++{
++  Attachment result;
++  if (launchCredential.empty()
++      || !constantTimeEqual(launchCredential, m_launchCredential)) {
++    result.code = Code::UNAUTHENTICATED;
++    return result;
++  }
++
++  std::vector<EndedSession> ended;
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    const double now = m_clock();
++    if (m_session && now >= m_session->expiresAt)
++      endSession(EndReason::EXPIRED, ended);
++
++    if (m_session) {
++      result.code = Code::OCCUPIED;
++    } else {
++      auto s = std::make_unique<Session>();
++      if (!detail::randomHex(s->id, 16)
++          || !detail::randomBase64Url(s->secret, 32)) {
++        // No secure randomness: refuse rather than weaken.
++        result.code = Code::OCCUPIED;
++      } else {
++        const auto &timing = m_integration.timing();
++        s->expiresAt = now + timing.leaseSeconds;
++        result.sessionId = s->id;
++        result.sessionSecret = s->secret;
++        result.leaseSeconds = timing.leaseSeconds;
++        result.renewalSeconds = timing.renewalSeconds;
++        m_session = std::move(s);
++      }
++    }
++  }
++  notify(ended);
++  return result;
++}
++
++inline Code SessionAuthority::checkSession(
++    const Credentials &credentials, double now)
++{
++  if (credentials.launchCredential.empty()
++      || !constantTimeEqual(credentials.launchCredential, m_launchCredential))
++    return Code::UNAUTHENTICATED;
++  if (credentials.sessionId.empty() || credentials.sessionProof.empty())
++    return Code::INVALID_SESSION_PROOF;
++
++  if (m_session && credentials.sessionId == m_session->id
++      && constantTimeEqual(credentials.sessionProof, m_session->secret)) {
++    if (now >= m_session->expiresAt)
++      return Code::SESSION_EXPIRED; // caller ends the session
++    return Code::OK;
++  }
++
++  if (m_hasLastEnded && m_lastEnded.reason == EndReason::EXPIRED
++      && credentials.sessionId == m_lastEnded.id
++      && constantTimeEqual(credentials.sessionProof, m_lastEnded.secret))
++    return Code::SESSION_EXPIRED;
++
++  return Code::INVALID_SESSION_PROOF;
++}
++
++inline Code SessionAuthority::authenticate(const Credentials &credentials)
++{
++  std::vector<EndedSession> ended;
++  Code code;
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    code = checkSession(credentials, m_clock());
++    if (code == Code::SESSION_EXPIRED && m_session
++        && credentials.sessionId == m_session->id)
++      endSession(EndReason::EXPIRED, ended);
++  }
++  notify(ended);
++  return code;
++}
++
++inline Code SessionAuthority::renew(const Credentials &credentials)
++{
++  std::vector<EndedSession> ended;
++  Code code;
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    const double now = m_clock();
++    code = checkSession(credentials, now);
++    if (code == Code::OK)
++      m_session->expiresAt = now + m_integration.timing().leaseSeconds;
++    else if (code == Code::SESSION_EXPIRED && m_session
++        && credentials.sessionId == m_session->id)
++      endSession(EndReason::EXPIRED, ended);
++  }
++  notify(ended);
++  return code;
++}
++
++inline Code SessionAuthority::detach(const Credentials &credentials)
++{
++  std::vector<EndedSession> ended;
++  Code code;
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    code = checkSession(credentials, m_clock());
++    if (code == Code::OK)
++      endSession(EndReason::DETACHED, ended);
++    else if (code == Code::SESSION_EXPIRED && m_session
++        && credentials.sessionId == m_session->id)
++      endSession(EndReason::EXPIRED, ended);
++  }
++  notify(ended);
++  return code;
++}
++
++inline Code SessionAuthority::authorize(
++    const Credentials &credentials, Target target, Capability capability)
++{
++  const Code code = authenticate(credentials);
++  if (code != Code::OK)
++    return code;
++  std::lock_guard<std::mutex> lock(m_mutex);
++  return effective(target, capability) ? Code::OK : Code::FORBIDDEN;
++}
++
++inline Code SessionAuthority::authorizeExecution(
++    std::string_view sessionId, Target target, Capability capability)
++{
++  std::vector<EndedSession> ended;
++  Code code = Code::OK;
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    if (m_session && sessionId == m_session->id) {
++      if (m_clock() >= m_session->expiresAt) {
++        endSession(EndReason::EXPIRED, ended);
++        code = Code::SESSION_EXPIRED;
++      } else if (!effective(target, capability)) {
++        code = Code::FORBIDDEN;
++      }
++    } else if (m_hasLastEnded && m_lastEnded.reason == EndReason::EXPIRED
++        && sessionId == m_lastEnded.id) {
++      code = Code::SESSION_EXPIRED;
++    } else {
++      code = Code::INVALID_SESSION_PROOF;
++    }
++  }
++  notify(ended);
++  return code;
++}
++
++inline EffectiveCapabilities SessionAuthority::effectiveCapabilities(
++    Target target) const
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  EffectiveCapabilities e;
++  e.read = effective(target, Capability::READ);
++  e.render = effective(target, Capability::RENDER);
++  e.edit = effective(target, Capability::EDIT);
++  e.resynchronize = effective(target, Capability::RESYNCHRONIZE);
++  return e;
++}
++
++inline bool SessionAuthority::authorizeLocal(
++    Target target, Capability capability) const
++{
++  return ceiling(target, capability);
++}
++
++inline bool SessionAuthority::revokeSession()
++{
++  std::vector<EndedSession> ended;
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    if (!m_session)
++      return false;
++    endSession(EndReason::REVOKED, ended);
++  }
++  notify(ended);
++  return true;
++}
++
++inline void SessionAuthority::setAgentEditsDisabled(bool disabled)
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  m_agentEditsDisabled = disabled;
++}
++
++inline bool SessionAuthority::agentEditsDisabled() const
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  return m_agentEditsDisabled;
++}
++
++inline void SessionAuthority::restrict(Target target, Capability capability)
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  auto &table = target.kind == Target::Kind::SCENE ? m_sceneRestrictions
++                                                   : m_viewRestrictions;
++  if (table.size() <= target.id)
++    table.resize(std::size_t(target.id) + 1, {false, false, false, false});
++  table[target.id][detail::capIndex(capability)] = true;
++}
++
++inline void SessionAuthority::relax(Target target, Capability capability)
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  auto &table = target.kind == Target::Kind::SCENE ? m_sceneRestrictions
++                                                   : m_viewRestrictions;
++  if (target.id < table.size())
++    table[target.id][detail::capIndex(capability)] = false;
++}
++
++inline void SessionAuthority::expireIfDue()
++{
++  std::vector<EndedSession> ended;
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    if (m_session && m_clock() >= m_session->expiresAt)
++      endSession(EndReason::EXPIRED, ended);
++  }
++  notify(ended);
++}
++
++inline bool SessionAuthority::hasSession() const
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  return m_session != nullptr;
++}
++
++inline void SessionAuthority::setSessionEndedCallback(
++    SessionEndedCallback callback)
++{
++  std::lock_guard<std::mutex> lock(m_mutex);
++  m_onEnded = std::move(callback);
++}
++
++inline bool SessionAuthority::ceiling(
++    Target target, Capability capability) const
++{
++  if (target.kind == Target::Kind::SCENE) {
++    if (!m_integration.isRegisteredScene(target.id))
++      return false;
++    const auto g = m_integration.sceneGrants(target.id);
++    switch (capability) {
++    case Capability::READ:
++      return g.read;
++    case Capability::EDIT:
++      return g.read && g.edit;
++    case Capability::RESYNCHRONIZE:
++      return g.read && g.resynchronize;
++    case Capability::RENDER:
++      return false; // scenes are not renderable targets
++    }
++    return false;
++  }
++
++  if (!m_integration.isRegisteredView(target.id))
++    return false;
++  const auto g = m_integration.viewGrants(target.id);
++  switch (capability) {
++  case Capability::READ:
++    return g.read;
++  case Capability::RENDER:
++    return g.read && g.render;
++  case Capability::EDIT:
++  case Capability::RESYNCHRONIZE:
++    return false; // views expose only read/render
++  }
++  return false;
++}
++
++inline bool SessionAuthority::restricted(
++    Target target, Capability capability) const
++{
++  const auto &table = target.kind == Target::Kind::SCENE ? m_sceneRestrictions
++                                                         : m_viewRestrictions;
++  return target.id < table.size()
++      && table[target.id][detail::capIndex(capability)];
++}
++
++inline bool SessionAuthority::effective(
++    Target target, Capability capability) const
++{
++  if (!ceiling(target, capability) || restricted(target, capability))
++    return false;
++  if (capability == Capability::EDIT && m_agentEditsDisabled)
++    return false;
++  // Actions depend on current read; withdrawing read withdraws them.
++  if (capability != Capability::READ && restricted(target, Capability::READ))
++    return false;
++  return true;
++}
++
++inline void SessionAuthority::endSession(
++    EndReason reason, std::vector<EndedSession> &ended)
++{
++  m_lastEnded = {m_session->id, m_session->secret, reason};
++  m_hasLastEnded = true;
++  ended.push_back({m_session->id, {}, reason});
++  m_session.reset();
++}
++
++inline void SessionAuthority::notify(const std::vector<EndedSession> &ended)
++{
++  if (ended.empty())
++    return;
++  SessionEndedCallback cb;
++  {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    cb = m_onEnded;
++  }
++  if (cb) {
++    for (const auto &e : ended)
++      cb(e.id, e.reason);
++  }
++}
++
++} // namespace vsr::integration::session
+diff --git a/src/vsr/integration/values/EditableValues.hpp b/src/vsr/integration/values/EditableValues.hpp
+new file mode 100644
+index 0000000000..2dd37a34e0
+--- /dev/null
++++ b/src/vsr/integration/values/EditableValues.hpp
+@@ -0,0 +1,369 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++// vsr_scene
++#include "vsr/core/VSRMath.hpp"
++#include "vsr/scene/Object.hpp"
++#include "vsr/scene/objects/Light.hpp"
++#include "vsr/scene/objects/Material.hpp"
++// std
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++#include <optional>
++#include <vector>
++
++namespace vsr::integration {
++
++using core::Token;
++
++/*
++ * The v1 agent edit surface and its deterministic numeric conversion.
++ *
++ * Input is an already-parsed JSON value: a kind tag plus, for numbers, the
++ * parser's correctly rounded binary64. Validation happens entirely on the
++ * binary64 value (domain and binary32 range) before a single deterministic
++ * round-to-nearest-ties-to-even step to binary32. Nothing here mutates a
++ * scene: prepareEdit() inspects a const Object and returns the value to store.
++ *
++ * Example:
++ *   auto e = prepareEdit(*light, "irradiance", JsonValue::number(2.5));
++ *   if (e.ok()) light->setParameter("irradiance", e.value.get<float>());
++ */
++
++enum class JsonKind
++{
++  NUMBER,
++  BOOLEAN,
++  STRING,
++  NULL_VALUE,
++  ARRAY,
++  OBJECT,
++  MALFORMED
++};
++
++struct JsonValue
++{
++  JsonKind kind{JsonKind::MALFORMED};
++  double number{0.0}; // meaningful only for NUMBER
++  std::vector<JsonValue> elements; // meaningful only for ARRAY
++
++  static JsonValue fromNumber(double v);
++  static JsonValue ofKind(JsonKind k);
++  static JsonValue array(std::vector<JsonValue> e);
++  static JsonValue numbers(std::initializer_list<double> v);
++};
++
++enum class EditableField
++{
++  MATTE_COLOR,
++  MATTE_OPACITY,
++  DIRECTIONAL_COLOR,
++  DIRECTIONAL_IRRADIANCE,
++  DIRECTIONAL_DIRECTION
++};
++
++enum class ValueError
++{
++  NONE,
++  UNSUPPORTED_PARAMETER, // not on the edit surface for this object/subtype
++  INCOMPATIBLE_TYPE, // wrong JSON kind/arity, or stored parameter type differs
++  NON_FINITE,
++  OUT_OF_DOMAIN // includes exceeding the largest finite binary32
++};
++
++struct Domain
++{
++  double min{0.0};
++  double max{0.0};
++};
++
++struct FieldSpec
++{
++  EditableField field;
++  anari::DataType objectType;
++  const Token *subtype;
++  const char *parameter;
++  anari::DataType storedType;
++  size_t components;
++  Domain domain;
++};
++
++struct ScalarResult
++{
++  ValueError error{ValueError::NONE};
++  float value{0.f};
++
++  bool ok() const;
++};
++
++struct PreparedEdit
++{
++  ValueError error{ValueError::NONE};
++  std::optional<EditableField> field;
++  core::Any value; // FLOAT32, FLOAT32_VEC2 or FLOAT32_VEC3 when ok()
++
++  bool ok() const;
++};
++
++// Deterministic binary64 -> binary32, round-to-nearest ties-to-even, computed
++// on the bit patterns so the ambient floating-point mode is irrelevant.
++// Precondition: finite and |v| <= FLT_MAX. Zero results are +0.
++float roundToBinary32(double v);
++
++// Validate one binary64 against a domain, then round.
++ScalarResult convertScalar(const JsonValue &v, Domain domain);
++
++// The edit surface. Returns nullptr when (object, parameter) is not editable.
++const std::vector<FieldSpec> &editSurface();
++const FieldSpec *findEditableField(
++    anari::DataType objectType, Token subtype, Token parameter);
++
++// Validates target and value without mutating the object.
++PreparedEdit prepareEdit(
++    const scene::Object &obj, Token parameter, const JsonValue &value);
++
++// VSR's azimuth/elevation (degrees) convention; no wrapping/canonicalization.
++core::math::float3 directionFromAngles(core::math::float2 azimuthElevation);
++
++// Inlined definitions ////////////////////////////////////////////////////////
++
++inline JsonValue JsonValue::fromNumber(double v)
++{
++  JsonValue j;
++  j.kind = JsonKind::NUMBER;
++  j.number = v;
++  return j;
++}
++
++inline JsonValue JsonValue::ofKind(JsonKind k)
++{
++  JsonValue j;
++  j.kind = k;
++  return j;
++}
++
++inline JsonValue JsonValue::array(std::vector<JsonValue> e)
++{
++  JsonValue j;
++  j.kind = JsonKind::ARRAY;
++  j.elements = std::move(e);
++  return j;
++}
++
++inline JsonValue JsonValue::numbers(std::initializer_list<double> v)
++{
++  std::vector<JsonValue> e;
++  for (double d : v)
++    e.push_back(fromNumber(d));
++  return array(std::move(e));
++}
++
++inline bool ScalarResult::ok() const
++{
++  return error == ValueError::NONE;
++}
++
++inline bool PreparedEdit::ok() const
++{
++  return error == ValueError::NONE;
++}
++
++inline float roundToBinary32(double v)
++{
++  std::uint64_t bits = 0;
++  std::memcpy(&bits, &v, sizeof(bits));
++  const std::uint32_t sign = std::uint32_t(bits >> 63);
++  const int biased = int((bits >> 52) & 0x7ff);
++  const std::uint64_t mantissa = bits & ((std::uint64_t(1) << 52) - 1);
++
++  if (biased == 0 && mantissa == 0)
++    return 0.f; // normalizes -0 to +0
++
++  // value = sig * 2^exp2
++  std::uint64_t sig = biased ? (mantissa | (std::uint64_t(1) << 52)) : mantissa;
++  const int exp2 = (biased ? biased : 1) - 1075;
++  int bitLength = 0;
++  for (std::uint64_t s = sig; s; s >>= 1)
++    bitLength++;
++  const int lead = exp2 + bitLength - 1; // floor(log2(|value|))
++
++  // Binary32 quantum: 2^(lead-23) for normals, 2^-149 for subnormals.
++  const bool normal = lead >= -126;
++  const int quantumExp = normal ? lead - 23 : -149;
++  const int shift = quantumExp - exp2; // >= 29 for every binary64 input
++
++  std::uint64_t q = 0;
++  if (shift < 64) {
++    q = sig >> shift;
++    const std::uint64_t rem = sig & ((std::uint64_t(1) << shift) - 1);
++    const std::uint64_t half = std::uint64_t(1) << (shift - 1);
++    if (rem > half || (rem == half && (q & 1)))
++      q++;
++  }
++  if (q == 0)
++    return 0.f; // positive underflow (or sign-less zero) stores +0
++
++  std::uint32_t out = 0;
++  if (normal) {
++    int e = lead + 127;
++    if (q == (std::uint64_t(1) << 24)) {
++      q >>= 1;
++      e++;
++    }
++    out = (std::uint32_t(e) << 23) | (std::uint32_t(q) & 0x7fffffu);
++  } else {
++    // q <= 2^23; q == 2^23 is exactly the smallest normal's encoding.
++    out = std::uint32_t(q);
++  }
++  out |= sign << 31;
++
++  float f = 0.f;
++  std::memcpy(&f, &out, sizeof(f));
++  return f;
++}
++
++inline ScalarResult convertScalar(const JsonValue &v, Domain domain)
++{
++  ScalarResult r;
++  if (v.kind != JsonKind::NUMBER) {
++    r.error = ValueError::INCOMPATIBLE_TYPE;
++    return r;
++  }
++  const double d = v.number;
++  if (!std::isfinite(d)) {
++    r.error = ValueError::NON_FINITE;
++    return r;
++  }
++  const double maxFinite = double(std::numeric_limits<float>::max());
++  if (d < domain.min || d > domain.max || std::fabs(d) > maxFinite) {
++    r.error = ValueError::OUT_OF_DOMAIN;
++    return r;
++  }
++  r.value = roundToBinary32(d);
++  if (!std::isfinite(r.value) || double(r.value) < domain.min
++      || double(r.value) > domain.max) {
++    r.error = ValueError::OUT_OF_DOMAIN; // unreachable for closed domains
++  }
++  return r;
++}
++
++inline const std::vector<FieldSpec> &editSurface()
++{
++  constexpr double MAX_F = double(std::numeric_limits<float>::max());
++  static const std::vector<FieldSpec> surface = {
++      {EditableField::MATTE_COLOR,
++          ANARI_MATERIAL,
++          &scene::tokens::material::matte,
++          "color",
++          ANARI_FLOAT32_VEC3,
++          3,
++          {0.0, 1.0}},
++      {EditableField::MATTE_OPACITY,
++          ANARI_MATERIAL,
++          &scene::tokens::material::matte,
++          "opacity",
++          ANARI_FLOAT32,
++          1,
++          {0.0, 1.0}},
++      {EditableField::DIRECTIONAL_COLOR,
++          ANARI_LIGHT,
++          &scene::tokens::light::directional,
++          "color",
++          ANARI_FLOAT32_VEC3,
++          3,
++          {0.0, 1.0}},
++      {EditableField::DIRECTIONAL_IRRADIANCE,
++          ANARI_LIGHT,
++          &scene::tokens::light::directional,
++          "irradiance",
++          ANARI_FLOAT32,
++          1,
++          {0.0, MAX_F}},
++      {EditableField::DIRECTIONAL_DIRECTION,
++          ANARI_LIGHT,
++          &scene::tokens::light::directional,
++          "direction",
++          ANARI_FLOAT32_VEC2,
++          2,
++          {0.0, 360.0}},
++  };
++  return surface;
++}
++
++inline const FieldSpec *findEditableField(
++    anari::DataType objectType, Token subtype, Token parameter)
++{
++  for (const auto &f : editSurface()) {
++    if (f.objectType == objectType && *f.subtype == subtype
++        && parameter == Token(f.parameter))
++      return &f;
++  }
++  return nullptr;
++}
++
++inline PreparedEdit prepareEdit(
++    const scene::Object &obj, Token parameter, const JsonValue &value)
++{
++  PreparedEdit r;
++  const FieldSpec *spec =
++      findEditableField(obj.type(), obj.subtype(), parameter);
++  const scene::Parameter *p = spec ? obj.parameter(parameter) : nullptr;
++  if (!spec || !p) {
++    r.error = ValueError::UNSUPPORTED_PARAMETER;
++    return r;
++  }
++  r.field = spec->field;
++  if (p->value().type() != spec->storedType) {
++    r.error = ValueError::INCOMPATIBLE_TYPE;
++    return r;
++  }
++
++  float out[3] = {};
++  if (spec->components == 1) {
++    auto s = convertScalar(value, spec->domain);
++    if (!s.ok()) {
++      r.error = s.error;
++      return r;
++    }
++    out[0] = s.value;
++  } else {
++    if (value.kind != JsonKind::ARRAY
++        || value.elements.size() != spec->components) {
++      r.error = ValueError::INCOMPATIBLE_TYPE;
++      return r;
++    }
++    for (size_t i = 0; i < spec->components; i++) {
++      auto s = convertScalar(value.elements[i], spec->domain);
++      if (!s.ok()) {
++        r.error = s.error;
++        return r;
++      }
++      out[i] = s.value;
++    }
++  }
++
++  switch (spec->components) {
++  case 1:
++    r.value = core::Any(out[0]);
++    break;
++  case 2:
++    r.value = core::Any(core::math::float2(out[0], out[1]));
++    break;
++  default:
++    r.value = core::Any(core::math::float3(out[0], out[1], out[2]));
++    break;
++  }
++  return r;
++}
++
++inline core::math::float3 directionFromAngles(
++    core::math::float2 azimuthElevation)
++{
++  return core::math::azelToDir(azimuthElevation);
++}
++
++} // namespace vsr::integration
+diff --git a/src/vsr/scene/Object.cpp b/src/vsr/scene/Object.cpp
+index 18c987799f..fd86fba2b7 100644
+--- a/src/vsr/scene/Object.cpp
++++ b/src/vsr/scene/Object.cpp
+@@ -269,122 +269,120 @@
+   }
+ 
+   if (*useCount > 0)
+     (*useCount)--;
+   else {
+     logError(
+         "Object::decUseCount() called on object with zero use count on object"
+         " of type %s, idx %zu, and name '%s', with use kind of {%s}",
+         anari::toString(type()),
+         index(),
+         name().c_str(),
+         typeStr);
+   }
+ 
+   if (kind == UseKind::PARAMETER && *useCount == 0 && m_scene) {
+     // If parameter use count just went to zero, notify scene that this object's
+     // corresponding ANARI handle might be garbage-collectable now.
+     m_scene->signalObjectParameterUseCountZero(this);
+   } else if (kind == UseKind::LAYER && *useCount == 0 && m_scene) {
+     // If parameter use count just went to zero, notify scene that this object's
+     // corresponding ANARI handle might be garbage-collectable now.
+     m_scene->signalObjectLayerUseCountZero(this);
+   }
+ }
+ 
+ const std::string &Object::name() const
+ {
+   return m_name;
+ }
+ 
+-std::string &Object::editableName()
+-{
+-  return m_name;
+-}
+-
+ void Object::setName(const char *n)
+ {
+-  m_name = n;
++  setName(std::string(n ? n : ""));
+ }
+ 
+ void Object::setName(const std::string &n)
+ {
++  if (m_name == n)
++    return;
+   m_name = n;
++  metadataChanged();
+ }
+ 
+ Any Object::getMetadataValue(std::string_view name) const
+ {
+   if (!m_metadata)
+     return {};
+   else if (const auto *c = m_metadata->root().child(name); c != nullptr)
+     return c->getValue();
+   else
+     return {};
+ }
+ 
+ void Object::getMetadataArray(std::string_view name,
+     anari::DataType *type,
+     const void **ptr,
+     size_t *size) const
+ {
+   *type = ANARI_UNKNOWN;
+   *ptr = nullptr;
+   *size = 0;
+   if (!m_metadata)
+     return;
+   if (const auto *c = m_metadata->root().child(name); c != nullptr)
+     c->getValueAsArray(type, ptr, size);
+ }
+ 
+ void Object::setMetadataValue(std::string_view name, Any v)
+ {
+   initMetadata();
+   m_metadata->root().append(name) = v;
+-  m_versions.metadata++;
++  metadataChanged();
+ }
+ 
+ void Object::setMetadataArray(std::string_view name,
+     anari::DataType type,
+     const void *v,
+     size_t numElements)
+ {
+   initMetadata();
+   m_metadata->root().append(name).setValueAsArray(type, v, numElements);
+-  m_versions.metadata++;
++  metadataChanged();
+ }
+ 
+ void Object::removeMetadata(std::string_view name)
+ {
+   if (!m_metadata)
+     return;
+   m_metadata->root().remove(name);
+-  m_versions.metadata++;
++  metadataChanged();
+ }
+ 
+ size_t Object::numMetadata() const
+ {
+   if (!m_metadata)
+     return 0;
+   return m_metadata->root().numChildren();
+ }
+ 
+ const char *Object::getMetadataName(size_t i) const
+ {
+   if (!m_metadata)
+     return "";
+   if (const auto *c = m_metadata->root().child(i); c != nullptr)
+     return c->name().c_str();
+   else
+     return "";
+ }
+ 
+ Parameter &Object::addParameter(Token name)
+ {
+   m_parameters.set(name, Parameter(this, name.c_str()));
+   m_versions.parameter++;
+   return *parameter(name);
+ }
+ 
+ Parameter *Object::setParameter(Token name, anari::DataType type, const void *v)
+ {
+   if (anari::isObject(type))
+     return nullptr;
+@@ -553,60 +551,67 @@
+   m_updateDelegate = ud;
+ }
+ 
+ void Object::parameterChanged(const Parameter *p, const Any &oldValue)
+ {
+   if (m_scene) {
+     if (auto *obj = m_scene->getObject(oldValue); obj != nullptr)
+       obj->decUseCount(UseKind::PARAMETER);
+   }
+   incObjectUseCountParameter(p);
+   if (m_inParameterBatch) {
+     m_batchedParameters.push_back(p);
+   } else if (m_updateDelegate) {
+     m_updateDelegate->signalParameterUpdated(this, p);
+     m_versions.parameter++;
+   }
+ }
+ 
+ void Object::removeParameter(const Parameter *p)
+ {
+   if (m_inParameterBatch) {
+     logError(
+         "Object::removeParameter() called while in a parameter batch update. "
+         "This is not supported and will lead to unexpected behavior.");
+   }
+ 
+   removeParameter(p->name());
+   m_versions.parameter++;
+ }
+ 
++void Object::metadataChanged()
++{
++  m_versions.metadata++;
++  if (m_updateDelegate)
++    m_updateDelegate->signalObjectMetadataChanged(this);
++}
++
+ BaseUpdateDelegate *Object::updateDelegate() const
+ {
+   return m_updateDelegate;
+ }
+ 
+ void Object::incObjectUseCountParameter(const Parameter *p)
+ {
+   if (!m_scene)
+     return;
+   if (auto *obj = m_scene->getObject(p->value()); obj != nullptr)
+     obj->incUseCount(UseKind::PARAMETER);
+ }
+ 
+ void Object::decObjectUseCountParameter(const Parameter *p)
+ {
+   if (!m_scene)
+     return;
+   if (auto *obj = m_scene->getObject(p->value()); obj != nullptr)
+     obj->decUseCount(UseKind::PARAMETER);
+ }
+ 
+ void Object::initMetadata() const
+ {
+   if (!m_metadata)
+     m_metadata = std::make_unique<core::DataTree>();
+ }
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+ ///////////////////////////////////////////////////////////////////////////////
+ ///////////////////////////////////////////////////////////////////////////////
+diff --git a/src/vsr/scene/Object.hpp b/src/vsr/scene/Object.hpp
+index 3eac0758cd..1d51ecba4b 100644
+--- a/src/vsr/scene/Object.hpp
++++ b/src/vsr/scene/Object.hpp
+@@ -64,61 +64,60 @@
+ {
+   using ParameterMap = FlatMap<Token, Parameter>;
+   // clang-format off
+   enum class UseKind { APP, PARAMETER, LAYER, ANIM, INTERNAL };
+   // clang-format on
+ 
+   Object(anari::DataType type = ANARI_UNKNOWN, Token subtype = tokens::none);
+   virtual ~Object();
+ 
+   // Movable, not copyable
+   VSR_NOT_COPYABLE(Object)
+   Object(Object &&);
+   Object &operator=(Object &&);
+ 
+   virtual anari::DataType type() const;
+   Token subtype() const;
+   size_t index() const;
+   Scene *scene() const;
+   Token rendererDeviceName() const; // only populated by Renderer
+ 
+   //// Use count tracking (Scene garbage collection) ////
+ 
+   size_t totalUseCount() const;
+   size_t useCount(UseKind kind) const;
+   void incUseCount(UseKind kind = UseKind::APP);
+   void decUseCount(UseKind kind = UseKind::APP);
+ 
+   //// Metadata ////
+ 
+   const std::string &name() const;
+-  std::string &editableName();
+   void setName(const char *n);
+   void setName(const std::string &n);
+ 
+   Any getMetadataValue(std::string_view name) const;
+   void getMetadataArray(std::string_view name,
+       anari::DataType *type,
+       const void **ptr,
+       size_t *size) const;
+ 
+   void setMetadataValue(std::string_view name, Any v);
+   void setMetadataArray(std::string_view name,
+       anari::DataType type,
+       const void *v,
+       size_t numElements);
+   void removeMetadata(std::string_view name);
+ 
+   size_t numMetadata() const;
+   const char *getMetadataName(size_t i) const;
+ 
+   //// Parameters ////
+ 
+   // Token-based access
+   Parameter &addParameter(Token name);
+   template <typename T>
+   Parameter *setParameter(Token name, T value);
+   Parameter *setParameter(Token name, anari::DataType type, const void *v);
+   Parameter *setParameterObject(Token name, const Object &obj);
+ 
+   const Parameter *parameter(Token name) const;
+   Parameter *parameter(Token name);
+@@ -149,60 +148,62 @@
+   //// ANARI Objects /////
+ 
+   virtual anari::Object makeANARIObject(anari::Device d) const;
+ 
+   void updateANARIParameter(anari::Device d,
+       anari::Object o,
+       const Parameter &p,
+       const char *n,
+       AnariHandleCache *cache = nullptr) const;
+   void updateAllANARIParameters(anari::Device d,
+       anari::Object o,
+       AnariHandleCache *cache = nullptr) const;
+ 
+   //// Updates ////
+ 
+   void setUpdateDelegate(BaseUpdateDelegate *ud);
+ 
+  protected:
+   virtual void parameterChanged(const Parameter *p, const Any &oldVal) override;
+   virtual void removeParameter(const Parameter *p) override;
+   BaseUpdateDelegate *updateDelegate() const;
+ 
+   Token m_rendererDeviceName{}; // only used by Renderer
+ 
+  private:
+   friend struct Scene;
+   void incObjectUseCountParameter(const Parameter *p);
+   void decObjectUseCountParameter(const Parameter *p);
+ 
+   void initMetadata() const;
++  // Bumps the metadata version and signals the update delegate.
++  void metadataChanged();
+ 
+   Scene *m_scene{nullptr};
+ 
+   ParameterMap m_parameters;
+   bool m_inParameterBatch{false};
+   std::vector<const Parameter *> m_batchedParameters;
+ 
+   anari::DataType m_type{ANARI_UNKNOWN};
+   Token m_subtype;
+   std::string m_name;
+   std::string m_description;
+   size_t m_index{0};
+   BaseUpdateDelegate *m_updateDelegate{nullptr};
+   mutable std::unique_ptr<core::DataTree> m_metadata;
+   struct UseCounts
+   {
+     size_t app{0};
+     size_t parameter{0};
+     size_t layer{0};
+     size_t anim{0};
+     size_t internal{0};
+   } m_useCounts;
+   struct Versions
+   {
+     ObjectVersion parameter{0};
+     ObjectVersion metadata{0};
+   } m_versions;
+ };
+ 
+ void print(const Object &obj, std::ostream &out = std::cout);
+diff --git a/src/vsr/scene/UpdateDelegate.cpp b/src/vsr/scene/UpdateDelegate.cpp
+index 5cf6de29e5..c643c1a141 100644
+--- a/src/vsr/scene/UpdateDelegate.cpp
++++ b/src/vsr/scene/UpdateDelegate.cpp
+@@ -135,31 +135,37 @@
+ void MultiUpdateDelegate::signalActiveLayersChanged()
+ {
+   for (auto &d : m_delegates)
+     d->signalActiveLayersChanged();
+ }
+ 
+ void MultiUpdateDelegate::signalObjectFilteringChanged()
+ {
+   for (auto &d : m_delegates)
+     d->signalObjectFilteringChanged();
+ }
+ 
+ void MultiUpdateDelegate::signalInvalidateCachedObjects()
+ {
+   for (auto &d : m_delegates)
+     d->signalInvalidateCachedObjects();
+ }
+ 
+ void MultiUpdateDelegate::signalUpdateBatchBegin()
+ {
+   for (auto &d : m_delegates)
+     d->signalUpdateBatchBegin();
+ }
+ 
+ void MultiUpdateDelegate::signalUpdateBatchEnd()
+ {
+   for (auto &d : m_delegates)
+     d->signalUpdateBatchEnd();
+ }
+ 
++void MultiUpdateDelegate::signalObjectMetadataChanged(const Object *o)
++{
++  for (auto &d : m_delegates)
++    d->signalObjectMetadataChanged(o);
++}
++
+ } // namespace vsr::scene
+diff --git a/src/vsr/scene/UpdateDelegate.hpp b/src/vsr/scene/UpdateDelegate.hpp
+index 3b320e5c50..704d30f2f3 100644
+--- a/src/vsr/scene/UpdateDelegate.hpp
++++ b/src/vsr/scene/UpdateDelegate.hpp
+@@ -35,60 +35,64 @@
+   BaseUpdateDelegate() = default;
+   virtual ~BaseUpdateDelegate() = default;
+ 
+   virtual void signalObjectAdded(const Object *o) = 0;
+   virtual void signalParameterUpdated(const Object *o, const Parameter *p) = 0;
+   virtual void signalParameterRemoved(const Object *o, const Parameter *p) = 0;
+   virtual void signalParameterBatchUpdated(
+       const Object *o, const std::vector<const Parameter *> &ps) = 0;
+   virtual void signalArrayMapped(const Array *a) = 0;
+   virtual void signalArrayUnmapped(const Array *a) = 0;
+   virtual void signalObjectParameterUseCountZero(const Object *obj) = 0;
+   virtual void signalObjectLayerUseCountZero(const Object *obj) = 0;
+   virtual void signalObjectRemoved(const Object *o) = 0;
+   virtual void signalRemoveAllObjects() = 0;
+   virtual void signalLayerAdded(const Layer *l) = 0;
+   virtual void signalLayerStructureUpdated(const Layer *l) = 0;
+   virtual void signalLayerTransformUpdated(const Layer *l) = 0;
+   virtual void signalLayerRemoved(const Layer *l) = 0;
+   virtual void signalActiveLayersChanged() = 0;
+   virtual void signalObjectFilteringChanged() = 0;
+   virtual void signalInvalidateCachedObjects() = 0;
+ 
+   // Bracket a run of mutations that should produce at most one downstream
+   // rebuild. Nesting is counted, so an outer batch is not ended by an inner
+   // one. Every signal above still arrives; only the work they trigger is
+   // coalesced. Optional hooks (STYLEGUIDE section 13): a delegate that has
+   // nothing to coalesce need not say so.
+   virtual void signalUpdateBatchBegin() {}
+   virtual void signalUpdateBatchEnd() {}
+ 
++  // An object's name or metadata changed (not a parameter change). Optional
++  // hook: observers that do not report metadata need not handle it.
++  virtual void signalObjectMetadataChanged(const Object *) {}
++
+   VSR_NOT_COPYABLE(BaseUpdateDelegate)
+   VSR_DEFAULT_MOVEABLE(BaseUpdateDelegate)
+ };
+ 
+ /*
+  * Concrete BaseUpdateDelegate that silently discards every signal; useful as a
+  * placeholder or base for delegates that only need to handle a subset of
+  * events.
+  *
+  * Example:
+  *   scene.updateDelegate().emplace<EmptyUpdateDelegate>();
+  */
+ struct EmptyUpdateDelegate : public BaseUpdateDelegate
+ {
+   EmptyUpdateDelegate() = default;
+   virtual ~EmptyUpdateDelegate() override = default;
+ 
+   void signalObjectAdded(const Object *) override {}
+   void signalParameterUpdated(const Object *, const Parameter *) override {}
+   void signalParameterRemoved(const Object *, const Parameter *) override {}
+   void signalParameterBatchUpdated(
+       const Object *, const std::vector<const Parameter *> &) override
+   {}
+   void signalArrayMapped(const Array *) override {}
+   void signalArrayUnmapped(const Array *) override {}
+   void signalObjectParameterUseCountZero(const Object *obj) override {};
+   void signalObjectLayerUseCountZero(const Object *obj) override {};
+   void signalObjectRemoved(const Object *) override {}
+   void signalRemoveAllObjects() override {}
+   void signalLayerAdded(const Layer *) override {}
+@@ -119,45 +123,46 @@
+   size_t size() const;
+   void clear();
+   void erase(const BaseUpdateDelegate *d);
+ 
+   const BaseUpdateDelegate *get(size_t i) const;
+   BaseUpdateDelegate *get(size_t i);
+ 
+   const BaseUpdateDelegate *operator[](size_t i) const;
+   BaseUpdateDelegate *operator[](size_t i);
+ 
+   void signalObjectAdded(const Object *o) override;
+   void signalParameterUpdated(const Object *o, const Parameter *p) override;
+   void signalParameterRemoved(const Object *o, const Parameter *p) override;
+   void signalParameterBatchUpdated(
+       const Object *o, const std::vector<const Parameter *> &ps) override;
+   void signalArrayMapped(const Array *a) override;
+   void signalArrayUnmapped(const Array *a) override;
+   void signalObjectParameterUseCountZero(const Object *obj) override;
+   void signalObjectLayerUseCountZero(const Object *obj) override;
+   void signalObjectRemoved(const Object *o) override;
+   void signalRemoveAllObjects() override;
+   void signalLayerAdded(const Layer *) override;
+   void signalLayerStructureUpdated(const Layer *) override;
+   void signalLayerTransformUpdated(const Layer *) override;
+   void signalLayerRemoved(const Layer *) override;
+   void signalActiveLayersChanged() override;
+   void signalObjectFilteringChanged() override;
+   void signalInvalidateCachedObjects() override;
+   void signalUpdateBatchBegin() override;
+   void signalUpdateBatchEnd() override;
++  void signalObjectMetadataChanged(const Object *o) override;
+ 
+  private:
+   std::vector<std::unique_ptr<BaseUpdateDelegate>> m_delegates;
+ };
+ 
+ // Inline definitions /////////////////////////////////////////////////////////
+ 
+ template <typename T, typename... Args>
+ inline T *MultiUpdateDelegate::emplace(Args &&...args)
+ {
+   m_delegates.push_back(std::make_unique<T>(std::forward<Args>(args)...));
+   return (T *)m_delegates.back().get();
+ }
+ 
+ } // namespace vsr::scene

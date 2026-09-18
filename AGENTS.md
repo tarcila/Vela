@@ -110,3 +110,20 @@ and [docs/adr/0040](docs/adr/0040-keep-ui-state-per-application-not-per-document
 | `VSR_ANARI_LIBRARIES` | Comma-separated Device Identifiers (`[subtype@]library`) shown in `vsrViewer` device selector |
 | `ANARI_VSR_LIBRARY` | Backend Device Identifier used by `anari_vsr` device (default: `helide`) |
 | `VSR_LUA_PACKAGE_PATHS` | Additional Lua module search paths |
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live as markdown files under `.scratch/`, never on GitHub.
+See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical roles, each label string equal to its name, recorded as a
+`Status:` line per ticket. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Multi-context: `CONTEXT-MAP.md` at the root points at one `CONTEXT.md` per
+area, with all ADRs centralised in `docs/adr/`. See `docs/agents/domain.md`.

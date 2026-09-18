@@ -1,0 +1,545 @@
+diff --git a/src/tests/integration/test_IntegrationMcpTransport.cpp b/src/tests/integration/test_IntegrationMcpTransport.cpp
+index c7e5467e9f..723f230853 100644
+--- a/src/tests/integration/test_IntegrationMcpTransport.cpp
++++ b/src/tests/integration/test_IntegrationMcpTransport.cpp
+@@ -587,124 +587,161 @@
+   // Trickle one byte per slot every 50 ms until the server drops them all.
+   using clock = std::chrono::steady_clock;
+   const auto t0 = clock::now();
+   std::size_t open = fds.size();
+   while (open && clock::now() - t0 < std::chrono::seconds(5)) {
+     for (int &fd : fds) {
+       if (fd < 0)
+         continue;
+       pollfd p{fd, POLLIN, 0};
+       if (::poll(&p, 1, 0) > 0) { // reply or EOF: server released it
+         ::close(fd);
+         fd = -1;
+         open--;
+         continue;
+       }
+       const char c = 'a';
+       ::send(fd, &c, 1, MSG_NOSIGNAL);
+     }
+     ::usleep(50 * 1000);
+   }
+   for (int fd : fds)
+     if (fd >= 0)
+       ::close(fd);
+   REQUIRE(open == 0);
+   REQUIRE(clock::now() - t0 < std::chrono::milliseconds(deadlineMs * 4));
+ 
+   // The released slots serve a legitimate client again.
+   REQUIRE(f.call(rpc("ping")).status == 200);
+ }
+ 
+-SCENARIO("MCP frees a slow-reader connection at the response deadline",
+-    "[integration]")
++// Holds one connection whose client reads a large tools/list response one
++// byte every 10 ms, so the server stays inside sendAll for a long time.
++struct SlowReader
+ {
+-  constexpr int deadlineMs = 500;
+-  Fixture f("127.0.0.1", {}, [](mcp::Config &c) {
++  using clock = std::chrono::steady_clock;
++  int fd{-1};
++  std::atomic<bool> stop{false};
++  std::atomic<bool> firstByte{false};
++  std::thread reader;
++
++  static void configure(mcp::Config &c, int deadlineMs)
++  {
+     c.maxConnections = 1;
+     c.responseDeadlineMs = deadlineMs;
+     // Far larger than any loopback socket buffering, so the response can
+     // only complete if the client actually reads it.
+     mcp::Tool big;
+     big.name = "big";
+     big.description = std::string(32u << 20, 'x');
+     big.handler = [](const session::Credentials &, const mcp::json::Value &) {
+       return mcp::ToolResult{};
+     };
+     c.tools.push_back(std::move(big));
+-  });
+-
+-  // Slow reader: tiny receive buffer, one byte every 10 ms.
+-  const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+-  REQUIRE(fd >= 0);
+-  int rcvbuf = 4096;
+-  ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+-  sockaddr_in a{};
+-  a.sin_family = AF_INET;
+-  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+-  a.sin_port = htons(f.server->port());
+-  if (::connect(fd, reinterpret_cast<sockaddr *>(&a), sizeof(a)) != 0) {
+-    ::close(fd);
+-    FAIL("connect failed");
+   }
+-  const std::string body = rpc("tools/list");
+-  const std::string req = "POST /mcp HTTP/1.1\r\n" + f.hostHeader() + "\r\n"
+-      + f.authHeader()
+-      + "\r\nContent-Type: application/json\r\nConnection: close\r\n"
+-        "Content-Length: "
+-      + std::to_string(body.size()) + "\r\n\r\n" + body;
+-  ::send(fd, req.data(), req.size(), MSG_NOSIGNAL);
+ 
+-  using clock = std::chrono::steady_clock;
+-  std::atomic<bool> stop{false};
+-  std::atomic<bool> firstByte{false};
+-  std::thread reader([&] {
+-    const auto limit = clock::now() + std::chrono::seconds(20);
+-    while (!stop && clock::now() < limit) {
+-      pollfd p{fd, POLLIN, 0};
+-      if (::poll(&p, 1, 10) > 0) {
+-        char c;
+-        if (::recv(fd, &c, 1, 0) <= 0)
+-          break;
+-        firstByte = true;
++  // Connects, sends the request and waits (bounded) for the first byte.
++  bool start(Fixture &f)
++  {
++    fd = ::socket(AF_INET, SOCK_STREAM, 0);
++    if (fd < 0)
++      return false;
++    int rcvbuf = 4096;
++    ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
++    sockaddr_in a{};
++    a.sin_family = AF_INET;
++    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    a.sin_port = htons(f.server->port());
++    if (::connect(fd, reinterpret_cast<sockaddr *>(&a), sizeof(a)) != 0)
++      return false;
++    const std::string body = rpc("tools/list");
++    const std::string req = "POST /mcp HTTP/1.1\r\n" + f.hostHeader() + "\r\n"
++        + f.authHeader()
++        + "\r\nContent-Type: application/json\r\nConnection: close\r\n"
++          "Content-Length: "
++        + std::to_string(body.size()) + "\r\n\r\n" + body;
++    ::send(fd, req.data(), req.size(), MSG_NOSIGNAL);
++    reader = std::thread([this] {
++      const auto limit = clock::now() + std::chrono::seconds(90);
++      while (!stop && clock::now() < limit) {
++        pollfd p{fd, POLLIN, 0};
++        if (::poll(&p, 1, 10) > 0) {
++          char c;
++          if (::recv(fd, &c, 1, 0) <= 0)
++            break;
++          firstByte = true;
++        }
++        ::usleep(10 * 1000);
+       }
+-      ::usleep(10 * 1000);
+-    }
+-  });
+-  struct Cleanup
++    });
++    const auto t0 = clock::now();
++    while (!firstByte && clock::now() - t0 < std::chrono::seconds(10))
++      ::usleep(5 * 1000);
++    return firstByte;
++  }
++
++  ~SlowReader()
+   {
+-    std::atomic<bool> &stop;
+-    std::thread &reader;
+-    int fd;
+-    ~Cleanup()
+-    {
+-      stop = true;
+-      if (reader.joinable())
+-        reader.join();
++    stop = true;
++    if (reader.joinable())
++      reader.join();
++    if (fd >= 0)
+       ::close(fd);
+-    }
+-  } cleanup{stop, reader, fd};
++  }
++};
+ 
+-  // Wait (bounded) until the server is sending, then check it holds the slot.
++SCENARIO("MCP rejects a healthy client while a slow send holds the only slot",
++    "[integration]")
++{
++  // A deadline far beyond the test's runtime, so the slot is provably still
++  // held when the ping arrives regardless of scheduling.
++  Fixture f("127.0.0.1", {}, [](mcp::Config &c) {
++    SlowReader::configure(c, 120000);
++  });
++  {
++    SlowReader slow;
++    REQUIRE(slow.start(f));
++    REQUIRE(f.call(rpc("ping")).status == 503);
++  }
++  // Closing the slow client ends the send with an error and frees the slot.
++  using clock = std::chrono::steady_clock;
+   const auto t0 = clock::now();
+-  while (!firstByte && clock::now() - t0 < std::chrono::seconds(10))
+-    ::usleep(5 * 1000);
+-  REQUIRE(firstByte);
++  int status = 0;
++  while (clock::now() - t0 < std::chrono::seconds(10)) {
++    status = f.call(rpc("ping")).status;
++    if (status == 200)
++      break;
++    ::usleep(50 * 1000);
++  }
++  REQUIRE(status == 200);
++}
++
++SCENARIO("MCP frees a slow-reader connection at the response deadline",
++    "[integration]")
++{
++  constexpr int deadlineMs = 500;
++  Fixture f("127.0.0.1", {}, [](mcp::Config &c) {
++    SlowReader::configure(c, deadlineMs);
++  });
++  SlowReader slow;
++  REQUIRE(slow.start(f));
++  using clock = std::chrono::steady_clock;
+   const auto sendStart = clock::now();
+-  REQUIRE(f.call(rpc("ping")).status == 503);
+ 
+-  // The slot frees within the response deadline (plus scheduling slack).
++  // The slot frees within the response deadline (plus scheduling slack),
++  // while the slow reader is still reading.
+   int status = 0;
+   while (clock::now() - sendStart < std::chrono::milliseconds(deadlineMs * 6)) {
+     status = f.call(rpc("ping")).status;
+     if (status == 200)
+       break;
+     ::usleep(50 * 1000);
+   }
+   INFO("elapsed ms: "
+       << std::chrono::duration_cast<std::chrono::milliseconds>(
+              clock::now() - sendStart)
+              .count());
+   REQUIRE(status == 200);
+   REQUIRE(f.call(rpc("ping")).status == 200);
+ }
+ 
+ #endif
+diff --git a/src/tests/integration/test_IntegrationOperations.cpp b/src/tests/integration/test_IntegrationOperations.cpp
+index 33e0fcf434..9435e828d3 100644
+--- a/src/tests/integration/test_IntegrationOperations.cpp
++++ b/src/tests/integration/test_IntegrationOperations.cpp
+@@ -1,45 +1,47 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ // catch
+ #include "catch.hpp"
+ // vsr
+ #include "vsr/integration/Integration.hpp"
+ #include "vsr/integration/activity/Activity.hpp"
+ #include "vsr/integration/inspection/Inspection.hpp"
+ #include "vsr/integration/operations/Operations.hpp"
+ #include "vsr/integration/session/SessionAuthority.hpp"
+ #include "vsr/scene/Scene.hpp"
+ // std
+ #include <atomic>
+ #include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include <functional>
+ #include <memory>
+ #include <string>
+ #include <thread>
+ #include <vector>
+ 
+ using namespace vsr::integration;
+ using namespace vsr::integration::operations;
+ using session::Attachment;
+ using session::Code;
+ 
+ namespace {
+ 
+ bool confirmReady(SceneId)
+ {
+   return true;
+ }
+ 
+ // A generic test operation kind whose behaviour each test scripts.
+ struct FakeOp
+ {
+   int runs{0};
+   std::function<Step(StepContext &, int)> script;
+ 
+   Executor executor()
+   {
+     return [this](StepContext &ctx) {
+       ++runs;
+       if (script)
+         return script(ctx, runs);
+@@ -871,95 +873,133 @@
+   REQUIRE(a.code == Outcome::OK);
+   while (integration.service() > 0) {
+   }
+   auto s = engine->status(creds, {att.sessionId, 1});
+   REQUIRE(s.code == Outcome::OK);
+   REQUIRE(s.terminal == Outcome::OK);
+   REQUIRE(s.result.find("\"returned\":0") != std::string::npos);
+   REQUIRE(s.result.find("\"complete\":true") != std::string::npos);
+   REQUIRE(engine->slotsInUse() == 0);
+ 
+   // Non-session-wide work still needs a registered target.
+   FakeOp op;
+   Request r;
+   r.kind = "test";
+   r.target = session::Target::scene(0);
+   r.executor = op.executor();
+   REQUIRE(engine->submitLocal(std::move(r)).code == Outcome::INVALID_REQUEST);
+ }
+ 
+ SCENARIO("Concurrent RENDER-kind submits with a sink do not deadlock service()",
+     "[integration]")
+ {
+   Fixture f;
+   activity::ActivityLog log;
+   activity::EngineActivitySink sink(log, f.integration);
+   f.engine->setActivitySink(&sink);
+ 
+   std::atomic<bool> stop{false};
+   std::atomic<int> completed{0};
+   std::atomic<int> rejected{0};
++  std::atomic<bool> hostDone{false};
+   std::thread host([&] {
+     while (!stop)
+       f.integration.service();
+     while (f.integration.service() > 0) {
+     }
++    hostDone = true;
+   });
+ 
+   const int threads = 4;
+   const int perThread = 50;
+   using clock = std::chrono::steady_clock;
+   const auto deadline = clock::now() + std::chrono::seconds(30);
+   std::atomic<int> timedOut{0};
+   std::vector<std::thread> submitters;
++  std::unique_ptr<std::atomic<bool>[]> submitterDone(
++      new std::atomic<bool>[threads]);
++  for (int t = 0; t < threads; t++)
++    submitterDone[t] = false;
+   for (int t = 0; t < threads; t++) {
+     submitters.emplace_back([&, t] {
++      struct MarkDone
++      {
++        std::atomic<bool> &flag;
++        ~MarkDone()
++        {
++          flag = true;
++        }
++      } markDone{submitterDone[t]};
+       for (int i = 0; i < perThread; i++) {
+         Request r;
+         r.kind = "render";
+         r.target = session::Target::view(f.viewId);
+         r.capability = Capability::RENDER;
+         r.executor = [&](StepContext &ctx) {
+           // Engine callbacks and Integration queries from inside the step.
+           ctx.restorationRetained("l", "b");
+           f.integration.sceneOfView(f.viewId);
+           Step st;
+           st.status = Step::Status::COMPLETE;
+           completed++;
+           return st;
+         };
+         LocalAdmission a;
+         do {
+           a = f.engine->submitLocal(r);
+           if (a.code == Outcome::BUSY)
+             std::this_thread::yield();
+         } while (a.code == Outcome::BUSY && clock::now() < deadline);
+         if (a.code == Outcome::BUSY) {
+           timedOut++; // retry deadline passed; give up this thread
+           return;
+         }
+         if (a.code != Outcome::OK)
+           rejected++; // Catch assertions are not thread-safe
+         else // Status and Integration queries under the engine lock.
+           f.engine->statusLocal(a.ref);
+         (void)t;
+       }
+     });
+   }
+-  for (auto &s : submitters)
+-    s.join();
++  // A thread stuck past the deadline means a real deadlock: report it and
++  // abort rather than hang (a Catch FAIL would unwind past joinable threads).
++  const auto joinWithin = [&](std::thread &th,
++                              const std::atomic<bool> &done,
++                              const char *what,
++                              clock::time_point limit) {
++    while (!done && clock::now() < limit)
++      std::this_thread::sleep_for(std::chrono::milliseconds(1));
++    if (!done) {
++      std::fprintf(stderr,
++          "deadlock scenario: %s did not finish before its deadline "
++          "(completed steps: %d); aborting\n",
++          what,
++          completed.load());
++      std::fflush(stderr);
++      std::abort();
++    }
++    th.join();
++  };
++  const auto joinDeadline = deadline + std::chrono::seconds(10);
++  for (int t = 0; t < threads; t++)
++    joinWithin(
++        submitters[t], submitterDone[t], "a submitter thread", joinDeadline);
+   // Every admitted step either ran or was finished at dispatch failure.
+   bool drained = false;
+   while (!(drained = f.engine->slotsInUse() == 0) && clock::now() < deadline)
+     std::this_thread::yield();
+   stop = true;
+-  host.join();
++  joinWithin(host,
++      hostDone,
++      "the host service() thread",
++      clock::now() + std::chrono::seconds(10));
+   INFO("slots still in use at deadline: " << f.engine->slotsInUse());
+   REQUIRE(drained);
+   INFO("submitters that hit the BUSY retry deadline: " << timedOut.load());
+   REQUIRE(timedOut == 0);
+   REQUIRE(rejected == 0);
+   REQUIRE(completed <= threads * perThread);
+   REQUIRE(completed > 0);
+   REQUIRE(f.engine->slotsInUse() == 0);
+   f.engine->setActivitySink(nullptr);
+ }
+diff --git a/src/vsr/integration/mcp/McpServer.hpp b/src/vsr/integration/mcp/McpServer.hpp
+index 62aa8c6ca4..a65d6aa5c0 100644
+--- a/src/vsr/integration/mcp/McpServer.hpp
++++ b/src/vsr/integration/mcp/McpServer.hpp
+@@ -76,61 +76,62 @@
+   std::string structuredJson;
+   // Admitted work that ended in a non-ok terminal outcome (MCP tool error).
+   bool isError{false};
+ };
+ 
+ struct Tool
+ {
+   std::string name;
+   std::string description;
+   std::string inputSchemaJson{"{\"type\":\"object\"}"};
+   // Called on a network thread with authenticated session credentials; it
+   // must not touch live scene state (submit work through the engine).
+   std::function<ToolResult(
+       const session::Credentials &, const json::Value &arguments)>
+       handler;
+ };
+ 
+ struct Config
+ {
+   std::string host{"127.0.0.1"}; // "127.0.0.1" or "::1" only
+   std::uint16_t port{0}; // 0 picks a free port
+   std::size_t maxConnections{16};
+   std::size_t maxBodyBytes{64 * 1024};
+   // Total time allowed to read one request (headers plus body), measured
+   // from the start of the read; bounds slow-drip clients and idle
+   // keep-alive connections alike.
+   int requestDeadlineMs{10000};
+   // Per-send timeout on every connection socket.
+   int sendTimeoutMs{10000};
+   // Total time allowed to write one whole response, measured from the
+-  // first byte sent. A slow reader that keeps making partial progress is
++  // start of the write, including time spent waiting for the socket to
++  // accept data. A slow reader that keeps making partial progress is
+   // cut off here: the server stops sending, closes the connection and frees
+   // its slot. 0 means "use sendTimeoutMs".
+   int responseDeadlineMs{0};
+   std::vector<Tool> tools;
+   // Fixed-text diagnostics; never receives request data or secrets.
+   std::function<void(std::string_view)> log;
+ };
+ 
+ enum class StartCode
+ {
+   OK,
+   UNSUPPORTED_PLATFORM,
+   INVALID_CONFIG,
+   LISTEN_FAILED,
+   PUBLISH_FAILED
+ };
+ 
+ struct StartStatus
+ {
+   StartCode code{StartCode::OK};
+   std::string reason; // never contains secrets
+ 
+   bool ok() const
+   {
+     return code == StartCode::OK;
+   }
+ };
+ 
+ class McpServer
+ {
+@@ -262,61 +263,63 @@
+ }
+ 
+ inline const char *statusText(int status)
+ {
+   switch (status) {
+   case 200:
+     return "OK";
+   case 202:
+     return "Accepted";
+   case 400:
+     return "Bad Request";
+   case 401:
+     return "Unauthorized";
+   case 403:
+     return "Forbidden";
+   case 404:
+     return "Not Found";
+   case 405:
+     return "Method Not Allowed";
+   case 413:
+     return "Payload Too Large";
+   case 415:
+     return "Unsupported Media Type";
+   case 503:
+     return "Service Unavailable";
+   }
+   return "Error";
+ }
+ 
+ #if defined(__linux__)
+-// Sends all of `data` within `deadlineMs` in total, measured from the call.
++// Sends all of `data` within `deadlineMs` in total, measured from the start
++// of the call (so time spent waiting for the socket to accept the first byte
++// counts against it).
+ // Returns false on error or when the deadline passes before the last byte.
+ inline bool sendAll(int fd, const std::string &data, int deadlineMs)
+ {
+   using clock = std::chrono::steady_clock;
+   const auto deadline = clock::now() + std::chrono::milliseconds(deadlineMs);
+   std::size_t sent = 0;
+   while (sent < data.size()) {
+     const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+         deadline - clock::now())
+                           .count();
+     if (left <= 0)
+       return false;
+     pollfd p{fd, POLLOUT, 0};
+     const int pr = ::poll(&p, 1, int(left));
+     if (pr < 0 && errno == EINTR)
+       continue;
+     if (pr <= 0)
+       return false;
+     const ssize_t n = ::send(fd,
+         data.data() + sent,
+         data.size() - sent,
+         MSG_NOSIGNAL | MSG_DONTWAIT);
+     if (n <= 0) {
+       if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+         continue;
+       return false;
+     }
+     sent += std::size_t(n);
+   }
+   return true;

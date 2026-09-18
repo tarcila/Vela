@@ -1,0 +1,8 @@
+src/vsr/integration/context/ContextAdapter.hpp
+src/vsr/integration/edit/AgentEdit.hpp
+src/vsr/integration/image/ImageNormalization.hpp
+src/vsr/integration/image/PngEncode.cpp
+src/vsr/integration/inspection/Inspection.hpp
+src/vsr/integration/render/RevisionRender.hpp
+src/vsr/integration/restore/BatchRestore.hpp
+src/vsr/integration/sync/SceneSync.hpp

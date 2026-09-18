@@ -1,0 +1,2 @@
+src/tests/integration/test_IntegrationMcpTransport.cpp
+src/vsr/integration/mcp/McpServer.hpp
