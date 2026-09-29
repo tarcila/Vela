@@ -11,6 +11,7 @@
 // std
 #include <algorithm>
 #include <cstring>
+#include <type_traits>
 
 namespace vsr::rendering {
 
@@ -166,8 +167,17 @@ ImageChannels AnariSceneRenderPass::supportedChannels() const
 
 void AnariSceneRenderPass::updateChannels()
 {
-  const ImageChannels wanted = channels();
+  const bool added = setFrameChannels(channels());
+  resizeStaging();
 
+  // A frame already in flight lacks the added channels: restart once, at the
+  // next render(), so they are produced before being read.
+  if (added)
+    m_pendingRestart = true;
+}
+
+bool AnariSceneRenderPass::setFrameChannels(ImageChannels wanted)
+{
   bool changed = false;
   bool added = false;
   for (const auto &c : FRAME_CHANNELS) {
@@ -188,12 +198,62 @@ void AnariSceneRenderPass::updateChannels()
     anari::commitParameters(m_device, m_frame);
 
   m_frameChannels = wanted;
-  resizeStaging();
+  return added;
+}
 
-  // A frame already in flight lacks the added channels: restart once, at the
-  // next render(), so they are produced before being read.
-  if (added)
-    m_pendingRestart = true;
+vsr::math::uint2 AnariSceneRenderPass::pickImageSize() const
+{
+  return dimensions();
+}
+
+std::optional<PickSample> AnariSceneRenderPass::renderPickSample(
+    vsr::math::uint2 pixel)
+{
+  const auto size = dimensions();
+  if (!m_device || size.x == 0 || size.y == 0)
+    return {};
+
+  constexpr ImageChannels PICK_CHANNELS = ImageChannels::DEPTH
+      | ImageChannels::OBJECT_ID | ImageChannels::INSTANCE_ID
+      | ImageChannels::PRIMITIVE_ID;
+  const ImageChannels displayChannels = m_frameChannels;
+  setFrameChannels(displayChannels | (PICK_CHANNELS & m_deviceChannels));
+
+  anari::discard(m_device, m_frame);
+  waitForCompletion();
+  anari::render(m_device, m_frame);
+  waitForCompletion();
+  m_firstFrame = false;
+
+  // Host-mapped channels: only one pixel is read.
+  const size_t i = size_t(pixel.y) * size.x + pixel.x;
+  auto read = [&](const char *channel, auto &out) {
+    using T = std::remove_reference_t<decltype(out)>;
+    auto mapped = anari::map<T>(m_device, m_frame, channel);
+    const bool ok =
+        mapped.data && mapped.width == size.x && mapped.height == size.y;
+    if (ok)
+      out = mapped.data[i];
+    anari::unmap(m_device, m_frame, channel);
+  };
+
+  PickSample sample;
+  const auto has = [&](ImageChannels c) {
+    return hasChannels(m_frameChannels, c);
+  };
+  if (has(ImageChannels::DEPTH))
+    read("channel.depth", sample.depth);
+  if (has(ImageChannels::OBJECT_ID))
+    read("channel.objectId", sample.objectId);
+  if (has(ImageChannels::INSTANCE_ID))
+    read("channel.instanceId", sample.instanceId);
+  if (has(ImageChannels::PRIMITIVE_ID))
+    read("channel.primitiveId", sample.primitiveId);
+
+  // The display frame goes back to what the pipeline asked for; dropping
+  // channels needs no restart.
+  setFrameChannels(displayChannels);
+  return sample;
 }
 
 void AnariSceneRenderPass::resizeStaging()
