@@ -327,8 +327,7 @@ bool StudioServer::setupRendering(std::string *error)
   // out; the server has no tonemap stage in between.
   m_viewport.setup(m_pipeline, m_scenePass, m_device);
 
-  auto *copy =
-      m_pipeline.addSink<vsr::rendering::CopyFromColorBufferPass>();
+  auto *copy = m_pipeline.addSink<vsr::rendering::CopyFromColorBufferPass>();
   copy->setExternalBuffer(m_colorBytes);
 
   m_sceneRecorder = scene.updateDelegate().emplace<ServerPushDelegate>();
@@ -1105,17 +1104,11 @@ bool StudioServer::servicePendingPick()
 
   PickReply reply;
   reply.requestId = pick.requestId;
-  reply.objectIdentity = sample ? sample->identity() : std::nullopt;
+  reply.objectIdentity = sample ? sceneObjectRef(*sample) : std::nullopt;
   reply.hit = reply.objectIdentity.has_value();
   if (reply.hit) {
-    if (const auto *camera = shotCameraObject()) {
-      reply.worldPosition = pickWorldPosition(readCameraView(*camera),
-          m_frameWidth,
-          m_frameHeight,
-          pick.x,
-          pick.y,
-          sample->depth);
-    }
+    if (sample->position)
+      reply.worldPosition = *sample->position;
     vsr::core::logStatus(
         "[StudioServer] Pick %llu at (%d, %d): %s %zu, depth %f",
         static_cast<unsigned long long>(pick.requestId),
@@ -1132,8 +1125,8 @@ bool StudioServer::servicePendingPick()
   }
   send(encode(reply));
 
-  // The frame that carried the ids is as good as any: send it when the
-  // client is streaming and the previous one is off the wire.
+  // The display frame is untouched by the separate Pick Request: send it
+  // when the client is streaming and the previous one is off the wire.
   if (m_streaming && vsr::network::is_ready(m_session.frameInFlight)) {
     sendRenderedFrame();
     return true;
@@ -1241,8 +1234,8 @@ void StudioServer::onMessage(const Message &msg)
     vsr::network::messages::TransferArrayData parsed(msg, nullptr);
     const auto &root = parsed.tree().root();
     if (root.child("a") == nullptr || root.child("d") == nullptr) {
-      refuseRequest(msg,
-          "malformed " + std::string(toString(*type)) + " payload");
+      refuseRequest(
+          msg, "malformed " + std::string(toString(*type)) + " payload");
       return;
     }
     std::lock_guard lock(m_controlMutex);

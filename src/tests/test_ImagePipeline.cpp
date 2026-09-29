@@ -5,8 +5,13 @@
 #include "catch.hpp"
 // vsr_rendering
 #include "vsr/rendering/pipeline/ImagePipeline.h"
+#include "vsr/rendering/pipeline/saveImage.h"
+// stb_image
+#include "stb_image.h"
 // std
+#include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -481,4 +486,47 @@ TEST_CASE(
   REQUIRE(probe->sawColor);
   REQUIRE(!probe->sawDepth);
   REQUIRE(!probe->sawObjectId);
+}
+
+// Saving
+// ///////////////////////////////////////////////////////////////////////
+
+TEST_CASE("saveImage writes the pipeline's color buffer as top-down PNG",
+    "[ImagePipeline]")
+{
+  const auto path =
+      (std::filesystem::temp_directory_path() / "vsr_save_image.png").string();
+  std::filesystem::remove(path);
+
+  rendering::ImagePipeline pipeline(2, 2);
+
+  SECTION("nothing rendered yet: no file")
+  {
+    REQUIRE(!rendering::saveImage(pipeline, path));
+    REQUIRE(!std::filesystem::exists(path));
+  }
+
+  SECTION("rendered frame round-trips, bottom row last")
+  {
+    // Row 0 (bottom in ANARI order) is 0xAA, row 1 (top) is 0xBB.
+    std::vector<uint8_t> frame(2 * 2 * 4);
+    std::fill(frame.begin(), frame.begin() + 8, uint8_t(0xAA));
+    std::fill(frame.begin() + 8, frame.end(), uint8_t(0xBB));
+    auto *source = pipeline.setSource<rendering::ExternalFrameSource>();
+    source->setFrame(&frame);
+    pipeline.render();
+
+    REQUIRE(rendering::saveImage(pipeline, path));
+
+    int w = 0, h = 0, n = 0;
+    auto *pixels = stbi_load(path.c_str(), &w, &h, &n, 4);
+    REQUIRE(pixels);
+    REQUIRE(w == 2);
+    REQUIRE(h == 2);
+    REQUIRE(pixels[0] == 0xBB); // file row 0 is the top
+    REQUIRE(pixels[2 * 4] == 0xAA);
+    stbi_image_free(pixels);
+  }
+
+  std::filesystem::remove(path);
 }
