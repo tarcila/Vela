@@ -396,10 +396,6 @@ void Viewport::imagePipeline_populate(vsr::rendering::ImagePipeline &p)
   if (!sourceSupports(vsr::rendering::requiredChannels(m_visualizeAOV)))
     m_visualizeAOV = vsr::rendering::AOVType::NONE;
 
-  m_saveToFilePass = p.addSink<vsr::rendering::SaveToFilePass>();
-  m_saveToFilePass->setEnabled(false);
-  m_saveToFilePass->setSingleShotMode(true);
-
   m_autoExposurePass = p.addPass<vsr::rendering::AutoExposurePass>();
 
   m_toneMapPass = p.addPass<vsr::rendering::ToneMapPass>();
@@ -539,7 +535,6 @@ void Viewport::teardownDevice()
   m_outlinePass = nullptr;
   m_boundsOutlinePass = nullptr;
   m_outputPass = nullptr;
-  m_saveToFilePass = nullptr;
 
   if (m_rIdx)
     appContext()->anari.releaseRenderIndex(appContext()->vsr.scene, m_device);
@@ -1074,8 +1069,8 @@ void Viewport::ui_menubar_Viewport()
       std::filesystem::path workingDir = std::filesystem::current_path();
       std::filesystem::path filename = workingDir / ss.str();
 
-      m_saveToFilePass->setFilename(filename.string());
-      m_saveToFilePass->setEnabled(true);
+      // The last rendered frame, as displayed.
+      vsr::rendering::saveImage(imagePipeline(), filename.string());
     }
 
     ImGui::EndMenu();

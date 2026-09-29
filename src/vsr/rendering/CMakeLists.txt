@@ -22,11 +22,11 @@ PRIVATE
   pipeline/passes/PrimitiveOutlineRenderPass.cpp
   pipeline/passes/OutputTransformPass.cpp
   pipeline/passes/ImagePass.cpp
-  pipeline/passes/SaveToFilePass.cpp
   pipeline/passes/ToneMapPass.cpp
   pipeline/passes/VisualizeAOVPass.cpp
   pick/PickRequest.cpp
   pipeline/ImagePipeline.cpp
+  pipeline/saveImage.cpp
   view/CameraView.cpp
   view/Manipulator.cpp
   view/ManipulatorToAnari.cpp

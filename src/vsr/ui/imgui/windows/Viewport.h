@@ -18,9 +18,9 @@
 #include "vsr/rendering/pipeline/passes/OutlineRenderPass.h"
 #include "vsr/rendering/pipeline/passes/OutputTransformPass.h"
 #include "vsr/rendering/pipeline/passes/PrimitiveOutlineRenderPass.h"
-#include "vsr/rendering/pipeline/passes/SaveToFilePass.h"
 #include "vsr/rendering/pipeline/passes/ToneMapPass.h"
 #include "vsr/rendering/pipeline/passes/VisualizeAOVPass.h"
+#include "vsr/rendering/pipeline/saveImage.h"
 #include "vsr/rendering/view/Manipulator.hpp"
 // anari
 #include <anari/frontend/anari_enums.h>
@@ -149,7 +149,6 @@ struct Viewport : public BaseViewport
   vsr::rendering::OutlineRenderPass *m_outlinePass{nullptr};
   vsr::rendering::BoxOutlineRenderPass *m_boundsOutlinePass{nullptr};
   vsr::rendering::CopyToSDLTexturePass *m_outputPass{nullptr};
-  vsr::rendering::SaveToFilePass *m_saveToFilePass{nullptr};
 
   float m_latestFL{0.f};
   float m_latestAnariFL{0.f};

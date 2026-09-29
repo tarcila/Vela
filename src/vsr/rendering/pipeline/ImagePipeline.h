@@ -14,7 +14,6 @@
 #include "passes/MultiDeviceSceneRenderPass.h"
 #include "passes/OutlineRenderPass.h"
 #include "passes/PrimitiveOutlineRenderPass.h"
-#include "passes/SaveToFilePass.h"
 #include "passes/VisualizeAOVPass.h"
 // std
 #include <memory>
@@ -61,7 +60,9 @@ struct ImagePipeline final
   VSR_NOT_COPYABLE(ImagePipeline)
   VSR_NOT_MOVEABLE(ImagePipeline)
 
+  // Null until the first render() at a non-zero size.
   const uint32_t *getColorBuffer() const;
+  vsr::math::uint2 dimensions() const;
   const std::vector<PassTiming> &getPassTimings() const;
   ImageSource *source() const;
   bool empty() const;

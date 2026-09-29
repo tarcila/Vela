@@ -65,6 +65,7 @@ PRIVATE
   vsr_rendering
   vsr_scene
   vela_ext_catch2
+  vela_ext_stb_image
 )
 if (TARGET vsr_scivis_studio_model)
   target_link_libraries(${PROJECT_NAME} PRIVATE vsr_scivis_studio_model)
