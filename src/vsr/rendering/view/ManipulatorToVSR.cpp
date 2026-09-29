@@ -15,7 +15,7 @@ void updateCameraObject(
 
   if (c.subtype() == scene::tokens::camera::orthographic) {
     c.setParameter("position", m.eye_FixedDistance());
-    c.setParameter("height", m.distance() * 0.75f);
+    c.setParameter("height", orthographicHeight(m));
   } else {
     c.setParameter("position", m.eye());
   }
@@ -30,6 +30,21 @@ void updateCameraObject(
   }
 
   c.endParameterBatch();
+}
+
+std::optional<CameraView> makeCameraView(
+    const vsr::scene::Camera &c, const Manipulator &m)
+{
+  if (c.subtype() == scene::tokens::camera::perspective) {
+    const float fovy =
+        c.parameterValueAs<float>("fovy").value_or(math::radians(40.f));
+    return CameraView::perspective(m.eye(), m.dir(), m.up(), fovy);
+  }
+  if (c.subtype() == scene::tokens::camera::orthographic) {
+    return CameraView::orthographic(
+        m.eye_FixedDistance(), m.dir(), m.up(), orthographicHeight(m));
+  }
+  return {};
 }
 
 void updateManipulatorFromCamera(Manipulator &m, const vsr::scene::Camera &c)

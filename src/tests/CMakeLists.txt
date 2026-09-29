@@ -40,6 +40,7 @@ project_add_executable(
   test_Scene.cpp
   test_SceneArchive.cpp
   test_Token.cpp
+  test_WorldBoundsOverlay.cpp
   test_UsdImport.cpp
   test_UsdImport_animation.cpp
   test_UsdImport_geometry.cpp
@@ -108,6 +109,8 @@ add_test(NAME vsr::RenderIndex   COMMAND ${PROJECT_NAME} "[RenderIndex]"  )
 add_test(NAME vsr::Scene         COMMAND ${PROJECT_NAME} "[Scene]"        )
 add_test(NAME vsr::SceneArchive  COMMAND ${PROJECT_NAME} "[SceneArchive]" )
 add_test(NAME vsr::Token         COMMAND ${PROJECT_NAME} "[Token]"        )
+add_test(NAME vsr::WorldBoundsOverlay
+  COMMAND ${PROJECT_NAME} "[WorldBoundsOverlay]")
 add_test(NAME vsr::UsdImport     COMMAND ${PROJECT_NAME} "[UsdImport]"    )
 if (TARGET vsr_scivis_studio_model)
   add_test(NAME vsr::SciVisStudio COMMAND ${PROJECT_NAME} "[SciVisStudio]")
