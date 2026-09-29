@@ -12,12 +12,13 @@ struct AutoExposurePass : public ImagePass
   AutoExposurePass();
   ~AutoExposurePass() override;
   const char *name() const override;
+  ImageChannels requiredChannels() const override;
 
   void setHDREnabled(bool enabled);
   float currentExposure() const;
 
  private:
-  void render(ImageBuffers &b) override;
+  void render(ImageBuffers &b, FrameState &frame) override;
 
   bool m_hdrEnabled{false};
   bool m_hasExposure{false};

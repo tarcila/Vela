@@ -33,12 +33,17 @@ void AutoExposurePass::setHDREnabled(bool enabled)
   m_hdrEnabled = enabled;
 }
 
+ImageChannels AutoExposurePass::requiredChannels() const
+{
+  return m_hdrEnabled ? ImageChannels::HDR_COLOR : ImageChannels::NONE;
+}
+
 float AutoExposurePass::currentExposure() const
 {
   return m_currentExposure;
 }
 
-void AutoExposurePass::render(ImageBuffers &b)
+void AutoExposurePass::render(ImageBuffers &b, FrameState &frame)
 {
   if (!m_hdrEnabled)
     return;
@@ -76,7 +81,7 @@ void AutoExposurePass::render(ImageBuffers &b)
     m_currentExposure += (targetExposure - m_currentExposure) * m_response;
   }
 
-  b.exposure = m_currentExposure;
+  frame.exposure = m_currentExposure;
 }
 
 } // namespace vsr::rendering
