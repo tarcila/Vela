@@ -17,7 +17,7 @@ struct AutoExposurePass : public ImagePass
   float currentExposure() const;
 
  private:
-  void render(ImageBuffers &b, int stageId) override;
+  void render(ImageBuffers &b) override;
 
   bool m_hdrEnabled{false};
   bool m_hasExposure{false};
