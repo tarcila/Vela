@@ -8,6 +8,7 @@
 // std
 #include <algorithm>
 #include <sstream>
+#include <utility>
 #if defined(__cpp_rtti) || defined(__GXX_RTTI) || defined(_CPPRTTI)
 #include <typeinfo>
 #endif
@@ -901,22 +902,27 @@ LayerNodeRef Scene::cloneLayerSubtree(
 
 void Scene::removeNode(LayerNodeRef obj, bool deleteReferencedObjects)
 {
-  if (obj->isRoot())
+  if (!obj || obj->isRoot())
     return;
 
   auto *layer = (*obj)->layer();
 
+  // Collect the referenced objects first, but erase the subtree before
+  // removing them: removeObject() erases every layer node still referencing
+  // an object, which includes the nodes of this subtree, so removing objects
+  // first would free 'obj' before it is erased here.
+  std::vector<std::pair<anari::DataType, size_t>> objects;
   if (deleteReferencedObjects) {
-    std::vector<LayerNodeRef> objects;
-
-    layer->traverse(obj, [&](auto &node, int level) {
-      if (node.isLeaf())
-        objects.push_back(layer->at(node.index()));
+    layer->traverse(obj, [&](auto &node, int) {
+      if (node.isLeaf()) {
+        if (const auto *o = node.value().getObject(); o) {
+          const auto key = std::make_pair(o->type(), o->index());
+          if (std::find(objects.begin(), objects.end(), key) == objects.end())
+            objects.push_back(key);
+        }
+      }
       return true;
     });
-
-    for (auto &o : objects)
-      removeObject(o->value().getObject());
   }
 
   // removeObject() already erased every node that referenced its object --
@@ -924,6 +930,9 @@ void Scene::removeNode(LayerNodeRef obj, bool deleteReferencedObjects)
   if (layer->at(obj.index()))
     layer->erase(obj);
   signalLayerStructureChanged(layer);
+
+  for (const auto &[type, index] : objects)
+    removeObject(getObject(type, index));
 }
 
 void Scene::beginLayerEditBatch()

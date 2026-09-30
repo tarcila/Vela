@@ -351,3 +351,73 @@ SCENARIO("vsr::scene::Scene delegate registration controls live signaling",
     }
   }
 }
+
+SCENARIO(
+    "vsr::scene::Scene removes a node together with the objects it "
+    "references",
+    "[Scene]")
+{
+  GIVEN("An object node, alone and under a transform")
+  {
+    vsr::scene::Scene scene;
+    auto *layer = scene.defaultLayer();
+    const size_t layerSizeBefore = layer->size();
+
+    auto light = scene.createObject<vsr::scene::Light>(
+        vsr::scene::tokens::light::directional);
+    const size_t lightIndex = light->index();
+
+    WHEN("The object node itself is removed with its objects")
+    {
+      auto node = scene.insertChildObjectNode(layer->root(), light, "inst");
+      scene.removeNode(node, true);
+
+      THEN("The node and the object are gone")
+      {
+        REQUIRE(layer->size() == layerSizeBefore);
+        REQUIRE(scene.getObject(ANARI_LIGHT, lightIndex) == nullptr);
+      }
+    }
+
+    WHEN("A transform over the object node is removed with its objects")
+    {
+      auto group = scene.insertChildTransformNode(
+          layer->root(), vsr::math::IDENTITY_MAT4, "group");
+      scene.insertChildObjectNode(group, light, "inst");
+      scene.removeNode(group, true);
+
+      THEN("The subtree and the object are gone")
+      {
+        REQUIRE(layer->size() == layerSizeBefore);
+        REQUIRE(scene.getObject(ANARI_LIGHT, lightIndex) == nullptr);
+      }
+    }
+
+    WHEN("An invalid node is removed")
+    {
+      scene.removeNode({});
+      scene.removeNode({}, true);
+
+      THEN("Nothing changes")
+      {
+        REQUIRE(layer->size() == layerSizeBefore);
+        REQUIRE(scene.getObject(ANARI_LIGHT, lightIndex) != nullptr);
+      }
+    }
+
+    WHEN("The same object is referenced twice under the removed transform")
+    {
+      auto group = scene.insertChildTransformNode(
+          layer->root(), vsr::math::IDENTITY_MAT4, "group");
+      scene.insertChildObjectNode(group, light, "a");
+      scene.insertChildObjectNode(group, light, "b");
+      scene.removeNode(group, true);
+
+      THEN("The subtree and the object are gone")
+      {
+        REQUIRE(layer->size() == layerSizeBefore);
+        REQUIRE(scene.getObject(ANARI_LIGHT, lightIndex) == nullptr);
+      }
+    }
+  }
+}
