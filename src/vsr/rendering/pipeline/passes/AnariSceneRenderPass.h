@@ -43,7 +43,8 @@ struct AnariSceneRenderPass : public ImageSource, public PickableSource
 
   anari::Frame getFrame() const;
 
-  // PickableSource: one synchronous frame on this source's own ANARI frame.
+  // PickableSource: one synchronous render of a temporary frame sharing this
+  // source's camera, renderer and world; the display frame is untouched.
   vsr::math::uint2 pickImageSize() const override;
   std::optional<PickSample> renderPickSample(vsr::math::uint2 pixel) override;
 
