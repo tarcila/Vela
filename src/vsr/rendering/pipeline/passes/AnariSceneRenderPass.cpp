@@ -448,34 +448,59 @@ void AnariSceneRenderPass::copyFrameData()
 
   if (enableDepth)
     detail::copy(m_buffers.depth, depth.data, totalSize);
+  // A requested channel that fails to map this frame reads as background
+  // rather than keeping an earlier frame's values.
+  const uint32_t totalPixels = uint32_t(totalSize);
+  auto fillIds = [&](uint32_t *buf) {
+#ifdef VSR_ALGORITHMS_HAS_CUDA
+    if (m_buffers.stream) {
+      vsr::algorithms::cuda::fill(m_buffers.stream, buf, totalPixels, ~0u);
+      return;
+    }
+#endif
+    vsr::algorithms::cpu::fill(buf, totalPixels, ~0u);
+  };
+  auto fillZero3 = [&](vsr::math::float3 *buf) {
+    auto *f = reinterpret_cast<float *>(buf);
+#ifdef VSR_ALGORITHMS_HAS_CUDA
+    if (m_buffers.stream) {
+      vsr::algorithms::cuda::fill(m_buffers.stream, f, totalPixels * 3, 0.f);
+      return;
+    }
+#endif
+    vsr::algorithms::cpu::fill(f, totalPixels * 3, 0.f);
+  };
+  auto copyOr = [&](auto *dst, const auto &mapped, auto &&background) {
+    if (mapped.data)
+      detail::copy(dst, mapped.data, totalSize);
+    else
+      background(dst);
+  };
+
   if (has(ImageChannels::OBJECT_ID)) {
-    auto objectId = anari::map<uint32_t>(m_device, m_frame, objectIdChannel);
-    if (objectId.data)
-      detail::copy(m_buffers.objectId, objectId.data, totalSize);
+    copyOr(m_buffers.objectId,
+        anari::map<uint32_t>(m_device, m_frame, objectIdChannel),
+        fillIds);
   }
   if (has(ImageChannels::PRIMITIVE_ID)) {
-    auto primitiveId =
-        anari::map<uint32_t>(m_device, m_frame, primitiveIdChannel);
-    if (primitiveId.data)
-      detail::copy(m_buffers.primitiveId, primitiveId.data, totalSize);
+    copyOr(m_buffers.primitiveId,
+        anari::map<uint32_t>(m_device, m_frame, primitiveIdChannel),
+        fillIds);
   }
   if (has(ImageChannels::INSTANCE_ID)) {
-    auto instanceId =
-        anari::map<uint32_t>(m_device, m_frame, instanceIdChannel);
-    if (instanceId.data)
-      detail::copy(m_buffers.instanceId, instanceId.data, totalSize);
+    copyOr(m_buffers.instanceId,
+        anari::map<uint32_t>(m_device, m_frame, instanceIdChannel),
+        fillIds);
   }
   if (has(ImageChannels::ALBEDO)) {
-    auto albedo =
-        anari::map<vsr::math::float3>(m_device, m_frame, albedoChannel);
-    if (albedo.data)
-      detail::copy(m_buffers.albedo, albedo.data, totalSize);
+    copyOr(m_buffers.albedo,
+        anari::map<vsr::math::float3>(m_device, m_frame, albedoChannel),
+        fillZero3);
   }
   if (has(ImageChannels::NORMAL)) {
-    auto normal =
-        anari::map<vsr::math::float3>(m_device, m_frame, normalChannel);
-    if (normal.data)
-      detail::copy(m_buffers.normal, normal.data, totalSize);
+    copyOr(m_buffers.normal,
+        anari::map<vsr::math::float3>(m_device, m_frame, normalChannel),
+        fillZero3);
   }
 
   anari::unmap(m_device, m_frame, colorChannel);
