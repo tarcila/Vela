@@ -242,6 +242,22 @@ TEST_CASE("Pick request places the hit in world space", "[PickRequest]")
         4.f * math::normalize(math::float3(2.f / 3.f, 2.f / 3.f, -1.f)));
   }
 
+  SECTION("the view's own aspect wins over the image's")
+  {
+    // A 3x3 image rendered by a camera with aspect 2: pixel (2, 1) sits
+    // 1/3 of the way to the right edge of a plane twice as wide as tall.
+    rendering::PickRequest request;
+    request.view = rendering::CameraView::perspective(
+        math::float3(0.f), dir, up, math::radians(90.f));
+    request.view->aspect = 2.f;
+
+    request.pixel = {2, 1};
+    const auto hit = rendering::pick(source, request);
+    REQUIRE(hit->position);
+    requireNear(*hit->position,
+        4.f * math::normalize(math::float3(2.f / 3.f * 2.f, 0.f, -1.f)));
+  }
+
   SECTION("orthographic: depth is measured from the eye plane")
   {
     rendering::PickRequest request;

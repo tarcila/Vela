@@ -61,7 +61,7 @@ void BoxOutlineRenderPass::render(ImageBuffers &b, FrameState & /*frame*/)
   if (size.x == 0 || size.y == 0)
     return;
 
-  const float aspect = size.x / float(size.y);
+  const float aspect = effectiveAspect(v, size.x / float(size.y));
 
   const auto view = linalg::lookat_matrix(v.eye, v.eye + v.dir, v.up);
 

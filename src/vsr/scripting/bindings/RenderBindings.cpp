@@ -268,6 +268,7 @@ void registerRenderBindings(sol::state &lua)
         camera.direction,
         camera.up,
         math::radians(camera.fovy));
+    renderer->view.aspect = camera.aspect; // what the ANARI camera is given
 
     auto cam = anari::newObject<anari::Camera>(dev->device, "perspective");
     anari::setParameter(dev->device, cam, "aspect", camera.aspect);

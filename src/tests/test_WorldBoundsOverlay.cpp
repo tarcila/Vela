@@ -179,6 +179,39 @@ TEST_CASE("World Bounds Overlay is depth-tested against the scene",
   REQUIRE(countNonZero(pipeline) == 0);
 }
 
+TEST_CASE(
+    "World Bounds Overlay follows the view's aspect", "[WorldBoundsOverlay]")
+{
+  rendering::ImagePipeline pipeline(64, 64);
+  pipeline.setSource<FlatSource>();
+  rendering::WorldBoundsOverlay overlay(pipeline);
+  overlay.setShown(true);
+
+  // A camera with a much wider aspect than the square image squeezes the box
+  // horizontally, so fewer columns are covered.
+  auto columnsCovered = [&]() {
+    const auto *c = pipeline.getColorBuffer();
+    int lo = 64, hi = -1;
+    for (int y = 0; y < 64; y++)
+      for (int x = 0; x < 64; x++)
+        if (c[y * 64 + x]) {
+          lo = std::min(lo, x);
+          hi = std::max(hi, x);
+        }
+    return hi - lo;
+  };
+
+  overlay.update(UNIT_BOX, frontView());
+  pipeline.render();
+  const int square = columnsCovered();
+
+  auto wide = frontView();
+  wide.aspect = 4.f;
+  overlay.update(UNIT_BOX, wide);
+  pipeline.render();
+  REQUIRE(columnsCovered() < square);
+}
+
 TEST_CASE("World Bounds Overlay applies its style", "[WorldBoundsOverlay]")
 {
   rendering::ImagePipeline pipeline(64, 64);

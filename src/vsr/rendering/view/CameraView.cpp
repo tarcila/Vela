@@ -35,11 +35,17 @@ CameraView CameraView::orthographic(const vsr::math::float3 &eye,
   return v;
 }
 
+float effectiveAspect(const CameraView &view, float imageAspect)
+{
+  return view.aspect > 0.f ? view.aspect : imageAspect;
+}
+
 Ray primaryRay(
-    const CameraView &view, const vsr::math::float2 &screen, float aspect)
+    const CameraView &view, const vsr::math::float2 &screen, float imageAspect)
 {
   using namespace vsr::math;
 
+  const float aspect = effectiveAspect(view, imageAspect);
   const float3 dir = normalize(view.dir);
   const float3 right = normalize(cross(dir, view.up));
   const float3 up = cross(right, dir);

@@ -41,6 +41,9 @@ struct CameraView
   vsr::math::float3 up{0.f, 1.f, 0.f};
   float fovy{0.f}; // radians, perspective only
   float height{0.f}; // world units, orthographic only
+  // Width / height of the camera's image plane, when the camera sets it
+  // explicitly (ANARI "aspect"); 0 follows the rendered image.
+  float aspect{0.f};
 };
 
 struct Ray
@@ -49,10 +52,14 @@ struct Ray
   vsr::math::float3 direction{0.f, 0.f, -1.f}; // normalized
 };
 
+// The image-plane aspect 'view' renders with into an image of 'imageAspect'
+// (width / height).
+float effectiveAspect(const CameraView &view, float imageAspect);
+
 // Ray through 'screen', the image position in [0, 1]^2 with (0, 0) at the
-// bottom-left corner (ANARI frame row order). 'aspect' is width / height.
+// bottom-left corner (ANARI frame row order), for an image of 'imageAspect'.
 // ANARI depth along this ray is the distance from 'origin'.
 Ray primaryRay(
-    const CameraView &view, const vsr::math::float2 &screen, float aspect);
+    const CameraView &view, const vsr::math::float2 &screen, float imageAspect);
 
 } // namespace vsr::rendering
