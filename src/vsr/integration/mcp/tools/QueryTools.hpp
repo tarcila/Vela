@@ -28,10 +28,68 @@ struct QueryDeps
 
 namespace detail {
 
-inline const char *pageSchemaProps()
+inline std::string pageSchemaProps(const inspection::PageLimits &limits)
 {
-  return "\"page_size\":{\"type\":\"integer\",\"minimum\":1},"
-         "\"cursor\":{\"type\":\"string\"}";
+  return "\"page_size\":{\"type\":\"integer\",\"minimum\":1,\"default\":"
+      + std::to_string(limits.defaultItems) + ",\"maximum\":"
+      + std::to_string(limits.maxItems) + "},\"cursor\":{\"type\":\"string\"}";
+}
+
+inline std::string filterSchemaProps(const inspection::PageLimits &limits)
+{
+  const std::string text = "{\"type\":\"string\",\"maxLength\":"
+      + std::to_string(limits.displayString) + "}";
+  std::string props = "\"kind\":{\"type\":\"string\",\"enum\":[\"objects\"],"
+                     "\"default\":\"objects\"},\"name\":"
+      + text + ",\"name_contains\":" + text + ",\"object_subtype\":" + text
+      + ",\"handle\":{\"type\":\"string\",\"pattern\":\"^[0-9a-f]{32}$\"},"
+        "\"object_type\":{\"type\":\"string\",\"enum\":[";
+  bool first = true;
+  for (auto type : {ANARI_ARRAY,
+           ANARI_ARRAY1D,
+           ANARI_ARRAY2D,
+           ANARI_ARRAY3D,
+           ANARI_SURFACE,
+           ANARI_GEOMETRY,
+           ANARI_MATERIAL,
+           ANARI_SAMPLER,
+           ANARI_VOLUME,
+           ANARI_SPATIAL_FIELD,
+           ANARI_LIGHT,
+           ANARI_CAMERA,
+           ANARI_RENDERER}) {
+    if (!first)
+      props += ",";
+    first = false;
+    props += json::quote(anari::toString(type));
+  }
+  return props + "]}";
+}
+
+inline bool filterArgs(const json::Value &args, inspection::PageArgs &out)
+{
+  if (const auto *kind = args.get("kind")) {
+    if (!kind->isString())
+      return false;
+    out.kind = kind->s;
+  }
+  for (const char *key : {"node_kind", "layer_handle", "parent_handle"})
+    if (args.get(key))
+      return false;
+  auto text = [&](const char *key, std::optional<std::string> &value) {
+    const auto *v = args.get(key);
+    if (!v)
+      return true;
+    if (!v->isString())
+      return false;
+    value = v->s;
+    return true;
+  };
+  return text("name", out.filters.name)
+      && text("name_contains", out.filters.nameContains)
+      && text("handle", out.filters.handle)
+      && text("object_type", out.filters.objectType)
+      && text("object_subtype", out.filters.objectSubtype);
 }
 
 inline bool pageArgs(const json::Value &args, inspection::PageArgs &out)
@@ -44,12 +102,19 @@ inline bool pageArgs(const json::Value &args, inspection::PageArgs &out)
 
 inline void addQueryTools(std::vector<Tool> &tools, QueryDeps deps)
 {
+  const auto &limits = deps.inspector.limits();
+  const std::string paging = " Default page size "
+      + std::to_string(limits.defaultItems) + ", maximum "
+      + std::to_string(limits.maxItems)
+      + "; supported inspection kind: objects.";
   Tool discover;
   discover.name = "vsr_discover";
   discover.description =
-      "List readable exposed scenes and views with current capabilities.";
-  discover.inputSchemaJson = std::string("{\"type\":\"object\",\"properties\":{")
-      + requestIdSchema() + "," + detail::pageSchemaProps()
+      "List readable exposed scenes and views with current capabilities."
+      + paging;
+  discover.inputSchemaJson =
+      std::string("{\"type\":\"object\",\"properties\":{") + requestIdSchema()
+      + "," + detail::pageSchemaProps(limits)
       + "},\"required\":[\"request_id\"]}";
   discover.handler = [deps](const session::Credentials &c,
                          const json::Value &args) {
@@ -65,16 +130,25 @@ inline void addQueryTools(std::vector<Tool> &tools, QueryDeps deps)
 
   Tool inspect;
   inspect.name = "vsr_inspect";
-  inspect.description = "Page through objects and parameters of one scene.";
+  inspect.description =
+      "Page through scene objects and parameters, not layer nodes. "
+      "Optional exact name, handle, ANARI object_type and "
+      "object_subtype filters intersect with literal, "
+      "case-sensitive name_contains (not regex/glob). "
+      "Filter strings are limited to "
+      + std::to_string(limits.displayString) + " UTF-8 bytes." + paging;
   inspect.inputSchemaJson = std::string("{\"type\":\"object\",\"properties\":{")
-      + requestIdSchema() + ",\"scene_id\":{\"type\":\"integer\",\"minimum\":0},"
-      + detail::pageSchemaProps()
+      + requestIdSchema()
+      + ",\"scene_id\":{\"type\":\"integer\",\"minimum\":0},"
+      + detail::pageSchemaProps(limits) + ","
+      + detail::filterSchemaProps(limits)
       + "},\"required\":[\"request_id\",\"scene_id\"]}";
   inspect.handler = [deps](const session::Credentials &c,
                         const json::Value &args) {
     inspection::PageArgs page;
     const auto scene = targetIdArg(args, "scene_id");
-    if (!scene || !detail::pageArgs(args, page))
+    if (!scene || !detail::pageArgs(args, page)
+        || !detail::filterArgs(args, page))
       return rejected(Outcome::INVALID_REQUEST);
     auto built = deps.inspector.makeInspection(c.sessionId, *scene, page);
     if (built.code != Outcome::OK)

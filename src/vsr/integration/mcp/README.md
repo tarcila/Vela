@@ -67,9 +67,25 @@ block on a safe point.
 | Tool | Arguments | Capability | Slot / ID |
 |---|---|---|---|
 | `vsr_discover` | `request_id`, `page_size?`, `cursor?` | read | one scene slot, one request ID |
-| `vsr_inspect` | `request_id`, `scene_id`, `page_size?`, `cursor?` | read on `scene_id` | one scene slot, one request ID |
+| `vsr_inspect` | `request_id`, `scene_id`, `kind?`, `name?`, `name_contains?`, `handle?`, `object_type?`, `object_subtype?`, `page_size?`, `cursor?` | read on `scene_id` | one scene slot, one request ID |
 | `vsr_operation_status` | `operation_ref` | current proof; read on every covered target for payload or foreign records | control gate, no ID |
 | `vsr_cancel` | `operation_ref` (own session only) | current proof | control gate, no ID |
+
+Object inspection defaults to `kind: "objects"` (currently the only supported
+mode); these are scene objects, not layer nodes. Filters intersect. `name` and
+`object_subtype` compare exactly, `name_contains` is case-sensitive literal text
+(not regex/glob), `object_type` uses the advertised ANARI enum strings, and
+`handle` is the opaque object handle returned by inspection. Filter strings are
+bounded to 4096 UTF-8 bytes by default. Malformed or unsupported filters reject
+before admission; a stale exact handle returns `conflict`, and no matches return
+an empty complete page (or a marked work-budget continuation).
+
+Discovery scene items advertise `inspection.kinds`, `default_page_size`, and
+`max_page_size`. Both query schemas/descriptions use the host's active limits:
+default 64 and maximum 256 unless configured otherwise. Oversized pages reject
+before admission. Cursors bind the entire filter set and effective page size;
+changing either returns `cursor_stale`. Identical request replay retains its
+historical page rather than observing fresh state.
 
 - Revision tokens (addendum 04 §8): an inspection page's `result` carries
   `scene_revision`, and each discovery `view` item carries `view_revision`,

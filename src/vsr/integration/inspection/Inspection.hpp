@@ -368,10 +368,21 @@ enum class Query
   INSPECT
 };
 
+struct ObjectFilters
+{
+  std::optional<std::string> name;
+  std::optional<std::string> nameContains;
+  std::optional<std::string> handle;
+  std::optional<std::string> objectType;
+  std::optional<std::string> objectSubtype;
+};
+
 struct PageArgs
 {
   std::optional<std::int64_t> pageSize; // omitted -> default
   std::string cursor; // empty -> first page
+  ObjectFilters filters;
+  std::string kind{"objects"};
 };
 
 struct Built
@@ -461,6 +472,9 @@ class Inspector
 
     std::shared_ptr<ScratchPool> pool;
     Query query;
+    ObjectFilters filters;
+    std::string policy;
+    scene::Object *exactObject{nullptr}; // resolved only at the safe point
     std::string sessionId;
     Target target;
     std::size_t maxItems{0};
@@ -484,32 +498,79 @@ class Inspector
   {
     return std::to_string(int(j.query)) + ":" + j.sessionId + ":"
         + std::to_string(int(j.target.kind)) + ":" + std::to_string(j.target.id)
-        + ":" + std::to_string(revision);
+        + ":" + std::to_string(revision) + ":" + j.policy;
   }
 
   std::string encodeCursor(const Job &j) const
   {
     const std::string payload = detail::hex64(j.pos.pool)
-        + detail::hex64(j.pos.index) + detail::hex64(j.revision);
-    return payload + mac(binding(j, j.revision) + ":" + payload);
+        + detail::hex64(j.pos.index) + detail::hex64(j.revision)
+        + mac(binding(j, j.revision));
+    return payload + mac(payload);
   }
 
-  // Returns false for tampered/foreign cursors.
-  bool decodeCursor(const std::string &c, Job &j) const
+  Outcome decodeCursor(const std::string &c, Job &j) const
   {
-    if (c.size() != 64)
-      return false;
+    if (c.size() != 80)
+      return Outcome::INVALID_REQUEST;
     for (char ch : c)
       if (!std::isxdigit(std::uint8_t(ch)) || std::isupper(std::uint8_t(ch)))
-        return false;
-    const std::string payload = c.substr(0, 48);
+        return Outcome::INVALID_REQUEST;
+    const std::string payload = c.substr(0, 64);
+    if (mac(payload) != c.substr(64))
+      return Outcome::INVALID_REQUEST;
     const std::uint64_t rev = std::stoull(c.substr(32, 16), nullptr, 16);
-    if (mac(binding(j, rev) + ":" + payload) != c.substr(48))
-      return false;
+    if (mac(binding(j, rev)) != c.substr(48, 16))
+      return Outcome::CURSOR_STALE;
     j.pos.pool = std::stoull(c.substr(0, 16), nullptr, 16);
     j.pos.index = std::stoull(c.substr(16, 16), nullptr, 16);
     j.revision = rev;
     j.started = true;
+    return Outcome::OK;
+  }
+
+  static std::string filterPolicy(const PageArgs &args, std::int64_t size)
+  {
+    auto value = [](const std::optional<std::string> &s) {
+      return s ? detail::jsonString(*s) : std::string("null");
+    };
+    const auto &f = args.filters;
+    return "{\"kind\":" + detail::jsonString(args.kind) + ",\"page_size\":"
+        + std::to_string(size) + ",\"name\":" + value(f.name)
+        + ",\"name_contains\":" + value(f.nameContains) + ",\"handle\":"
+        + value(f.handle) + ",\"object_type\":" + value(f.objectType)
+        + ",\"object_subtype\":" + value(f.objectSubtype) + "}";
+  }
+
+  bool validFilters(Query q, const PageArgs &args) const
+  {
+    if (args.kind != "objects")
+      return false;
+    const auto &f = args.filters;
+    for (const auto *s : {&f.name,
+             &f.nameContains,
+             &f.handle,
+             &f.objectType,
+             &f.objectSubtype}) {
+      if (*s && (q == Query::DISCOVER || (*s)->size() > m_limits.displayString))
+        return false;
+    }
+    if (f.handle) {
+      if (f.handle->size() != 32)
+        return false;
+      for (char c : *f.handle)
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+          return false;
+    }
+    if (f.objectType) {
+      bool supported = false;
+      for (auto type : kPools)
+        supported |= *f.objectType == anari::toString(type);
+      for (auto type : {ANARI_ARRAY1D, ANARI_ARRAY2D, ANARI_ARRAY3D})
+        supported |= *f.objectType == anari::toString(type);
+      if (!supported)
+        return false;
+    }
     return true;
   }
 
@@ -546,26 +607,44 @@ class Inspector
   {
     Built b;
     const std::int64_t size = args.pageSize.value_or(m_limits.defaultItems);
-    if (size < 1 || size > m_limits.maxItems) {
+    if (size < 1 || size > m_limits.maxItems || !validFilters(q, args)) {
       b.code = Outcome::INVALID_REQUEST;
       return b;
     }
     auto job = std::make_shared<Job>();
     job->pool = m_scratch;
     job->query = q;
+    job->filters = args.filters;
     job->sessionId = sessionId;
     job->target = target;
     job->maxItems = std::size_t(size);
-    if (!args.cursor.empty() && !decodeCursor(args.cursor, *job)) {
-      b.code = Outcome::INVALID_REQUEST;
+    job->policy = filterPolicy(args, size);
+    // Charge retained query/filter state to the same global scratch budget as
+    // returned items, including no-match scans. Job owns release on every path.
+    std::size_t queryBytes = job->policy.size() + job->sessionId.size();
+    for (const auto *s : {&job->filters.name,
+             &job->filters.nameContains,
+             &job->filters.handle,
+             &job->filters.objectType,
+             &job->filters.objectSubtype})
+      if (*s)
+        queryBytes += (*s)->size();
+    if (!m_scratch->reserve(queryBytes)) {
+      b.code = Outcome::BUSY;
       return b;
+    }
+    job->reserved = queryBytes;
+    if (!args.cursor.empty()) {
+      b.code = decodeCursor(args.cursor, *job);
+      if (b.code != Outcome::OK)
+        return b;
     }
     b.request.kind = q == Query::DISCOVER ? "discover" : "inspect";
     b.request.target = target;
     b.request.capability = session::Capability::READ;
     b.request.sessionWide = q == Query::DISCOVER;
-    b.request.canonicalArguments = "{\"page_size\":" + std::to_string(size)
-        + ",\"cursor\":" + detail::jsonString(args.cursor) + "}";
+    b.request.canonicalArguments =
+        job->policy + ":" + detail::jsonString(args.cursor);
     b.request.deadlineSeconds = m_limits.deadlineSeconds;
     b.request.executor = [this, job](StepContext &ctx) {
       Step s = run(*job, ctx);
@@ -656,6 +735,10 @@ class Inspector
     std::string item = std::string("{\"kind\":\"") + (views ? "view" : "scene")
         + "\",\"id\":" + std::to_string(i)
         + ",\"capabilities\":" + capsJson(caps);
+    if (!views)
+      item += ",\"inspection\":{\"kinds\":[\"objects\"],\"default_page_size\":"
+          + std::to_string(m_limits.defaultItems)
+          + ",\"max_page_size\":" + std::to_string(m_limits.maxItems) + "}";
     if (views && m_views)
       if (auto *tracker = m_views(i))
         item += ",\"view_revision\":\""
@@ -738,17 +821,35 @@ class Inspector
       exhausted = true;
       return false;
     }
-    if (j.pos.index >= poolCapacity(scene, j.pos.pool)) {
+    if (!j.exactObject && j.pos.index >= poolCapacity(scene, j.pos.pool)) {
       j.pos = {j.pos.pool + 1, 0};
       return true;
     }
     j.visited++;
-    auto *o = scene.getObject(kPools[j.pos.pool], j.pos.index);
+    auto *o = j.exactObject ? j.exactObject
+                            : scene.getObject(kPools[j.pos.pool], j.pos.index);
+    auto advance = [&] {
+      if (j.exactObject)
+        j.pos.pool = std::size(kPools);
+      else
+        j.pos.index++;
+    };
     if (!o) {
       j.pos.index++;
       return true;
     }
     const auto h = ids.handleOf(o);
+    const auto handle = detail::hex64(h.domain) + detail::hex64(h.serial);
+    const auto &f = j.filters;
+    if ((f.name && o->name() != *f.name)
+        || (f.nameContains
+            && o->name().find(*f.nameContains) == std::string::npos)
+        || (f.handle && handle != *f.handle)
+        || (f.objectType && *f.objectType != anari::toString(o->type()))
+        || (f.objectSubtype && *f.objectSubtype != o->subtype().str())) {
+      advance();
+      return true;
+    }
     const auto v = ids.parameterVersion(h);
     std::string item = "{\"handle\":\"" + detail::hex64(h.domain)
         + detail::hex64(h.serial)
@@ -788,7 +889,7 @@ class Inspector
     item += "}";
     if (!append(j, item, tooLarge))
       return false;
-    j.pos.index++;
+    advance();
     return true;
   }
 
@@ -812,6 +913,16 @@ class Inspector
       j.revision = *rev;
     } else if (*rev != j.revision) {
       return done(Outcome::CURSOR_STALE);
+    }
+
+    if (ids && j.filters.handle) {
+      const auto &s = *j.filters.handle;
+      identity::ObjectHandle h{ids->inspectionRevision().launch,
+          std::stoull(s.substr(0, 16), nullptr, 16),
+          std::stoull(s.substr(16, 16), nullptr, 16)};
+      j.exactObject = ids->resolve(h);
+      if (!j.exactObject)
+        return done(Outcome::CONFLICT);
     }
 
     std::size_t slice = 0;

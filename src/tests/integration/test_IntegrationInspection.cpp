@@ -394,23 +394,176 @@ SCENARIO("page_size defaults, bounds and rejection", "[integration]")
   CHECK(field(s.result, "stop") == "item");
   const auto cursor = field(s.result, "cursor");
 
-  // Changing page size on the continuation keeps the cursor valid.
-  auto s2 = f.inspect({200, cursor}, 2);
+  // Continuations retain the effective page policy.
+  CHECK(insp.makeInspection(f.creds.sessionId, f.sceneId, {200, cursor}).code
+      == Outcome::CURSOR_STALE);
+  auto s2 = f.inspect({64, cursor}, 2);
   REQUIRE(*s2.terminal == Outcome::OK);
-  CHECK(field(s2.result, "returned") == "200");
+  CHECK(field(s2.result, "returned") == "64");
 
   // Identical retry replays the retained page.
   auto b =
-      f.inspector->makeInspection(f.creds.sessionId, f.sceneId, {200, cursor});
+      f.inspector->makeInspection(f.creds.sessionId, f.sceneId, {64, cursor});
   auto replay = f.submit(std::move(b), 2);
   REQUIRE(replay.replayed);
   CHECK(replay.status.result == s2.result);
 
-  auto s3 = f.inspect({256, field(s2.result, "cursor")}, 3);
+  auto s3 = f.inspect({64, field(s2.result, "cursor")}, 3);
+  for (std::uint64_t id = 4; field(s3.result, "complete") == "false"; id++) {
+    REQUIRE(id < 10);
+    s3 = f.inspect({64, field(s3.result, "cursor")}, id);
+  }
   CHECK(field(s3.result, "complete") == "true");
   CHECK(field(s3.result, "returned") != "0");
   CHECK(field(s3.result, "cursor").empty());
   CHECK(f.engine->slotsInUse() == 0);
+  CHECK(f.inspector->scratch().used() == 0);
+}
+
+SCENARIO("object filters intersect with literal case-sensitive names",
+    "[integration][object-filters]")
+{
+  Fixture f(0);
+  f.scene.createObject<vsr::scene::Material>("matte")->setName("Queen.*");
+  f.scene.createObject<vsr::scene::Material>("matte")->setName("Queen.*");
+  f.scene.createObject<vsr::scene::Material>("physicallyBased")
+      ->setName("Queen.*");
+  f.scene.createObject<vsr::scene::Light>("directional")->setName("Queen.*");
+  f.scene.createObject<vsr::scene::Material>("matte")->setName("queen.*");
+
+  PageArgs args;
+  args.filters.name = "Queen.*";
+  auto s = f.inspect(args, 1);
+  REQUIRE(*s.terminal == Outcome::OK);
+  CHECK(field(s.result, "returned") == "4");
+  CHECK(field(s.result, "complete") == "true");
+
+  args.filters.objectType = "ANARI_MATERIAL";
+  args.filters.objectSubtype = "matte";
+  s = f.inspect(args, 2);
+  REQUIRE(*s.terminal == Outcome::OK);
+  CHECK(field(s.result, "returned") == "2");
+  const auto handle = field(s.result, "handle");
+
+  args.filters.name.reset();
+  args.filters.nameContains = ".*";
+  s = f.inspect(args, 3);
+  CHECK(field(s.result, "returned") == "3");
+  args.filters.handle = handle;
+  s = f.inspect(args, 4);
+  CHECK(field(s.result, "returned") == "1");
+  CHECK(field(s.result, "handle") == handle);
+  args.filters.name = "queen.*";
+  s = f.inspect(args, 5);
+  CHECK(field(s.result, "returned") == "0");
+  CHECK(field(s.result, "complete") == "true");
+}
+
+SCENARIO("object filter validation, handle lifetime and historical replay",
+    "[integration][object-filters]")
+{
+  Fixture f(3);
+  PageArgs args;
+  args.filters.nameContains = "";
+  args.pageSize = 1;
+  auto s = f.inspect(args, 1);
+  REQUIRE(*s.terminal == Outcome::OK);
+  const auto cursor = field(s.result, "cursor");
+  const auto handle = field(s.result, "handle");
+  args.cursor = cursor;
+  args.filters.name = "substituted";
+  CHECK(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args).code
+      == Outcome::CURSOR_STALE);
+  args.cursor.clear();
+  args.filters.name.reset();
+  args.filters.handle = handle;
+  auto direct = f.inspect(args, 2);
+  CHECK(field(direct.result, "returned") == "1");
+  auto *target = f.scene.getObject<vsr::scene::Material>(0).data();
+  f.scene.removeObject(target);
+  f.scene.createObject<vsr::scene::Material>("matte");
+  CHECK(*f.inspect(args, 3).terminal == Outcome::CONFLICT);
+  auto replay = f.submit(
+      f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args), 2);
+  REQUIRE(replay.replayed);
+  CHECK(replay.status.result == direct.result);
+
+  for (const char *bad : {"", "ANARI_FLOAT32", "material"}) {
+    args = {};
+    args.filters.objectType = bad;
+    CHECK(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args).code
+        == Outcome::INVALID_REQUEST);
+  }
+  args = {};
+  args.filters.handle = "not-a-handle";
+  CHECK(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args).code
+      == Outcome::INVALID_REQUEST);
+  args = {};
+  args.filters.name = std::string(4097, 'x');
+  CHECK(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args).code
+      == Outcome::INVALID_REQUEST);
+  args = {};
+  args.kind = "nodes";
+  CHECK(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args).code
+      == Outcome::INVALID_REQUEST);
+  args = {};
+  args.filters.name = "Queen";
+  CHECK(f.inspector->makeDiscovery(f.creds.sessionId, args).code
+      == Outcome::INVALID_REQUEST);
+}
+
+SCENARIO("object filter policy consumes shared scratch even without matches",
+    "[integration][object-filters]")
+{
+  PageLimits limits;
+  limits.scratchBytes = 128;
+  Fixture f(0, limits);
+  PageArgs args;
+  args.filters.name = std::string(4096, 'x');
+  CHECK(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args).code
+      == Outcome::BUSY);
+  CHECK(f.inspector->scratch().used() == 0);
+}
+
+SCENARIO("sparse object filters retain bounded work and continuation",
+    "[integration][object-filters]")
+{
+  PageLimits limits;
+  limits.visits = 3;
+  limits.sliceVisits = 1;
+  Fixture f(8, limits);
+  f.scene.getObject<vsr::scene::Material>(7)->setName("needle");
+  PageArgs args;
+  args.filters.name = "needle";
+  auto ack = f.submit(
+      f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args), 1);
+  REQUIRE(ack.code == Outcome::OK);
+  f.integration.service();
+  CHECK_FALSE(f.engine->status(f.creds, {f.creds.sessionId, 1}).terminal);
+  auto page = f.drain(1);
+  CHECK(field(page.result, "stop") == "work");
+  CHECK(field(page.result, "complete") == "false");
+  CHECK(field(page.result, "returned") == "0");
+  CHECK(field(page.result, "visited") == "3");
+  int returned = 0;
+  for (std::uint64_t id = 2; field(page.result, "complete") == "false"; id++) {
+    REQUIRE(id < 8);
+    args.cursor = field(page.result, "cursor");
+    REQUIRE_FALSE(args.cursor.empty());
+    page = f.inspect(args, id);
+    REQUIRE(*page.terminal == Outcome::OK);
+    returned += std::stoi(field(page.result, "returned"));
+  }
+  CHECK(returned == 1);
+  CHECK(f.inspector->scratch().used() == 0);
+
+  args = {};
+  args.filters.nameContains = "absent";
+  ack = f.submit(
+      f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args), 10);
+  REQUIRE(ack.code == Outcome::OK);
+  f.now += 6.0;
+  CHECK(*f.drain(10).terminal == Outcome::TIMEOUT);
   CHECK(f.inspector->scratch().used() == 0);
 }
 
@@ -460,9 +613,9 @@ SCENARIO("cursors are stale on returned-field change and tamper-proof",
       f.inspector->makeInspection(f.creds.sessionId, f.sceneId, {10, bad}).code
       == Outcome::INVALID_REQUEST);
   CHECK(f.inspector->makeInspection("other", f.sceneId, {10, cursor}).code
-      == Outcome::INVALID_REQUEST);
+      == Outcome::CURSOR_STALE);
   CHECK(f.inspector->makeDiscovery(f.creds.sessionId, {10, cursor}).code
-      == Outcome::INVALID_REQUEST);
+      == Outcome::CURSOR_STALE);
 
   f.scene.getObject<vsr::scene::Material>(0)->setName("renamed");
   auto st = f.inspect({10, cursor}, 2);
@@ -477,6 +630,9 @@ SCENARIO("discovery lists readable targets with current capabilities",
   REQUIRE(a.code == Outcome::OK);
   auto s = f.drain(1);
   CHECK(s.result.find("\"kind\":\"scene\"") != std::string::npos);
+  CHECK(s.result.find("\"inspection\":{\"kinds\":[\"objects\"],"
+                      "\"default_page_size\":64,\"max_page_size\":256}")
+      != std::string::npos);
   CHECK(s.result.find("\"edit\":true") != std::string::npos);
   const auto cursor = field(s.result, "cursor");
   REQUIRE(!cursor.empty());

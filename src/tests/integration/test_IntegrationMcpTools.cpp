@@ -409,11 +409,78 @@ SCENARIO(
   f.tool(s,
       "vsr_inspect",
       "{\"request_id\":4,\"scene_id\":" + std::to_string(f.sceneId)
-          + ",\"cursor\":\"" + cursor + "\"}");
+          + ",\"page_size\":2,\"cursor\":\"" + cursor + "\"}");
   f.drain();
   st = f.status(s, s.id, 4);
   CHECK(st.str("outcome") == "cursor_stale");
   CHECK(st.isError());
+}
+
+SCENARIO("MCP object filters and active paging limits are exposed",
+    "[integration][object-filters]")
+{
+  inspection::PageLimits limits;
+  limits.defaultItems = 2;
+  limits.maxItems = 3;
+  Fixture f(limits);
+  f.scene.getObject<vsr::scene::Material>(1)->setName("Queen.*");
+  auto list = f.rpc("tools/list", "{}");
+  const auto *tools = list.json.get("result")->get("tools");
+  REQUIRE(tools);
+  for (const auto &tool : tools->a) {
+    if (tool.get("name")->s != "vsr_inspect"
+        && tool.get("name")->s != "vsr_discover")
+      continue;
+    const auto *props = tool.get("inputSchema")->get("properties");
+    REQUIRE(props->get("page_size")->get("maximum"));
+    CHECK(props->get("page_size")->get("maximum")->n == 3);
+    CHECK(props->get("page_size")->get("default")->n == 2);
+    if (tool.get("name")->s == "vsr_inspect") {
+      CHECK(props->get("kind")->get("enum")->a.at(0).s == "objects");
+      CHECK(props->get("name")->get("maxLength")->n == 4096);
+      REQUIRE(props->get("object_type")->get("enum"));
+    }
+  }
+  auto s = f.attach();
+  const auto scene = "\"scene_id\":" + std::to_string(f.sceneId);
+  for (const char *bad : {"\"page_size\":500",
+           "\"kind\":\"nodes\"",
+           "\"name\":1",
+           "\"object_type\":\"ANARI_FLOAT32\"",
+           "\"node_kind\":\"transform\"",
+           "\"layer_handle\":\"x\"",
+           "\"parent_handle\":\"x\"",
+           "\"handle\":\"bad\""}) {
+    CHECK(
+        f.tool(s, "vsr_inspect", "{\"request_id\":1," + scene + "," + bad + "}")
+            .errorCode()
+        == "invalid_request");
+  }
+  CHECK(f.engine->highWater(s.id) == 0);
+  auto ack = f.tool(s, "vsr_inspect", "{\"request_id\":1," + scene
+      + ",\"kind\":\"objects\",\"name\":\"Queen.*\","
+        "\"name_contains\":\".*\",\"object_type\":\"ANARI_MATERIAL\","
+        "\"object_subtype\":\"matte\"}");
+  REQUIRE(ack.errorCode().empty());
+  f.drain();
+  auto st = f.status(s, s.id, 1);
+  REQUIRE(st.str("outcome") == "ok");
+  CHECK(st.result()->get("returned")->n == 1);
+  const auto handle = st.result()->get("items")->a.at(0).get("handle")->s;
+  f.tool(s,
+      "vsr_inspect",
+      "{\"request_id\":2," + scene + ",\"handle\":\"" + handle + "\"}");
+  f.drain();
+  st = f.status(s, s.id, 2);
+  CHECK(st.str("outcome") == "ok");
+  CHECK(st.result()->get("returned")->n == 1);
+  f.tool(s, "vsr_discover", "{\"request_id\":3}");
+  f.drain();
+  st = f.status(s, s.id, 3);
+  const auto *policy = st.result()->get("items")->a.at(0).get("inspection");
+  REQUIRE(policy);
+  CHECK(policy->get("default_page_size")->n == 2);
+  CHECK(policy->get("max_page_size")->n == 3);
 }
 
 SCENARIO("MCP inspection carries typed values without granting writes",
