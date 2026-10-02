@@ -1,0 +1,23 @@
+Filters: *discovery lists readable targets*
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+vsrIntegrationTests is a Catch v2.13.7 host application.
+Run with -? for options
+
+-------------------------------------------------------------------------------
+Scenario: discovery lists readable targets with current capabilities
+-------------------------------------------------------------------------------
+/home/tarcila/Code/ANARI/vela/broad-editing-filters/src/tests/integration/test_IntegrationInspection.cpp:220
+...............................................................................
+
+/home/tarcila/Code/ANARI/vela/broad-editing-filters/src/tests/integration/test_IntegrationInspection.cpp:228: FAILED:
+  CHECK( s.result.find("\"inspection\":{\"kinds\":[\"objects\"]," "\"default_page_size\":64,\"max_page_size\":256}") != std::string::npos )
+with expansion:
+  18446744073709551615 (0xffffffffffffffff)
+  !=
+  18446744073709551615 (0xffffffffffffffff)
+
+===============================================================================
+test cases:  1 |  0 passed | 1 failed
+assertions: 13 | 12 passed | 1 failed
+

@@ -2,7 +2,7 @@
 
 **What to build:** Understand a placement's scene-space transform and determine whether position, rotation, scale, or matrix editing is valid before issuing an edit.
 
-**Blocked by:** 03
+**Blocked by:** 28
 **Status:** ready-for-agent
 **Milestone:** 1
 **Specification:** [Broad Editing](../spec.md), Implementation Decisions 4 and 6; Testing Decisions 2, 5, and 6 observation behavior.
@@ -25,3 +25,10 @@ The preceding hierarchy slice exposes local state and safe identities. Derived w
 Writing transforms, bounds queries, editing array instances, camera/capture controls, and lossy transform repair.
 
 ## Comments
+
+### Orchestrator dependency update
+
+03 was split before implementation into 25–28. This ticket waits for terminal
+replacement 28, which establishes the complete original observation/identity/
+version/dependency contract; the specification and this ticket's scope are
+unchanged.

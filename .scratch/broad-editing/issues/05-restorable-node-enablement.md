@@ -2,7 +2,7 @@
 
 **What to build:** Show/hide existing nodes through the complete authorized node-edit path, with truthful activity, synchronization, and exact conditional restoration.
 
-**Blocked by:** 03
+**Blocked by:** 28
 **Status:** ready-for-agent
 **Milestone:** 1
 **Specification:** [Broad Editing](../spec.md), Implementation Decisions 1, 5, 7, 8, and 9 for enabled-state edits; Testing Decisions 7–12 as applicable.
@@ -27,3 +27,9 @@ Nodes can be inspected and versioned, but Agent Edit Batches and restoration jou
 Transform edits, layer activation changes, structural editing, broader object fields, and journal/result-store redesign.
 
 ## Comments
+
+### Orchestrator dependency update
+
+03 was split before implementation into 25–28. This ticket waits for terminal
+replacement 28, so it cannot ship editable nodes with partial identity,
+change-back, or ancestry safety. No edit/restoration requirement was weakened.

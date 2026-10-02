@@ -78,3 +78,20 @@ configurations. CUDA is not automatically claimed as tested.
 - Ticket graph published: 12 tickets; first frontier 01 and 02.
 - Reserved new-ticket ranges for first frontier: 01 gets 13–18; 02 gets 19–24.
   Numbers are reservations only; do not create dummy ticket files.
+- First workers hit stdout-event limits before committing. Their code-only WIP
+  and scratch records were parked independently; bounded continuations resolved
+  01 and 02 with no holes. Both were merged in qwzpvrloxzvookurnwzonwkllvzkyppo
+  (807cc536). Merger verified 186 integration cases / 7,980 assertions, CTest,
+  formatting, and CPU build/install. No status is inferred from aborted work.
+- 03 was split before implementation in owwpsxpxmvmkvrtwxpksynymrmtuyntz,
+  scratch only. No code or test success was claimed. Replacement chain is
+  25 layers/root lifetimes → 26 node navigation/lifetimes → 27 fine versions →
+  28 structural/ancestry dependencies. Original 03 is wontfix/split. 04 and 05
+  are reblocked on terminal replacement 28. All original requirements remain.
+- 25 split before code into 31 direct layer/root inspection/lifetimes and 32
+  name-filtered layer inspection. Both are vertical headless/MCP slices; the
+  orchestrator corrected the draft split's headless-only boundary before work.
+  26 now waits for terminal replacement32. No partial code is claimed done.
+- 31 is the next frontier. Reserved new-ticket range:37–42. Normal-core
+  ABA/change-back safety and bounded work remain non-negotiable; no snapshot,
+  raw-pointer/slot or blanket layer-token fallback is authorized.

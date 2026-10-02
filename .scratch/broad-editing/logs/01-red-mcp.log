@@ -1,0 +1,21 @@
+Filters: *MCP object filters*
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+vsrIntegrationTests is a Catch v2.13.7 host application.
+Run with -? for options
+
+-------------------------------------------------------------------------------
+Scenario: MCP object filters and active paging limits are exposed
+-------------------------------------------------------------------------------
+/home/tarcila/Code/ANARI/vela/broad-editing-filters/src/tests/integration/test_IntegrationMcpTools.cpp:422
+...............................................................................
+
+/home/tarcila/Code/ANARI/vela/broad-editing-filters/src/tests/integration/test_IntegrationMcpTools.cpp:422: FAILED:
+  {Unknown expression after the reported line}
+due to a fatal error condition:
+  SIGSEGV - Segmentation violation signal
+
+===============================================================================
+test cases:  1 |  0 passed | 1 failed
+assertions: 12 | 11 passed | 1 failed
+
