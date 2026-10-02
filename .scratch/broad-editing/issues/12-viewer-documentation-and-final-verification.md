@@ -2,7 +2,7 @@
 
 **What to build:** Make the full broader-inspection/placement-editing feature usable and documented in the live viewer, and verify that all branches of the implementation preserve existing integration behavior.
 
-**Blocked by:** 02, 08, 10, 11
+**Blocked by:** 02, 08, 10, 11, 74
 **Status:** ready-for-agent
 **Milestone:** 1
 **Specification:** [Broad Editing](../spec.md), Implementation Decisions 9; Testing Decisions 11, 12, and Acceptance workflow.
@@ -25,3 +25,10 @@ The preceding tickets individually deliver read/edit/restore slices and the port
 New features beyond the specification, publishing PRs/issues, silently weakening acceptance, shared result-store/FlatMap changes, and modifying user-local MCP config or screenshot artifacts.
 
 ## Comments
+
+### Orchestrator audit dependency
+
+74 completes the existing bounded name-filter requirement after direct stored-
+name find calls were found during implementation audit. Final verification must
+include oversized-name/beyond-preview continuation tests; this is not a new
+feature or a reason to weaken the specification.

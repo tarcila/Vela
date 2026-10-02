@@ -92,6 +92,21 @@ configurations. CUDA is not automatically claimed as tested.
   name-filtered layer inspection. Both are vertical headless/MCP slices; the
   orchestrator corrected the draft split's headless-only boundary before work.
   26 now waits for terminal replacement32. No partial code is claimed done.
-- 31 is the next frontier. Reserved new-ticket range:37–42. Normal-core
-  ABA/change-back safety and bounded work remain non-negotiable; no snapshot,
-  raw-pointer/slot or blanket layer-token fallback is authorized.
+- Resolved/landed since the initial wave: 31,32 (layers/root identities and
+  filtering),26 (node navigation/lifetimes),27 (fine write versions),28
+  (structure/ancestry dependencies),04 (world/SRT observations),05 (atomic
+  restorable enablement),06 (local position),07 (full matrix). Split parents
+  03 and25 are closed wontfix/split; their requirements are covered by the
+  terminal replacement28. Heavy workers hit stdout caps; code-only WIP and
+  failure comments were preserved and bounded continuations completed them.
+- Current source tip before dispatch bookkeeping: zxzpmvyy /516e4882, real
+  06+07 merge. The merger consolidated exact-state setter semantics and
+  verified 232 integration cases, 15,040 assertions, CTest36/36 and formatting.
+- Next frontier:08 localSRT/grouping,09 worldposition,10 mixedbatches, and74
+  bounded name matching. Reservations:08 gets91–96;09 gets97–102;10 gets103–108;
+  74 gets109–114. No dummy ticket files are created for unused reservations.
+- 73 is a nonblocking needs-triage implementation assumption: structural_version
+  wire carrier and4096 aggregate preparation steps. It preserves required
+  structural history and boundedness; no semantic safety requirement was
+  relaxed.12 waits for74, an audit-discovered gap in existing bounded string
+  matching, as well as its original blockers.
