@@ -209,7 +209,9 @@ struct Fixture
   descriptor::RuntimeDirectory dir;
   std::unique_ptr<mcp::McpServer> server;
 
-  explicit Fixture(inspection::PageLimits limits = {}, bool editable = false)
+  explicit Fixture(inspection::PageLimits limits = {},
+      bool editable = false,
+      bool nodeEdits = false)
   {
     for (int i = 0; i < 5; i++)
       scene.createObject<vsr::scene::Material>("matte")->setParameter(
@@ -218,6 +220,7 @@ struct Fixture
     s.name = "scene";
     s.scene = &scene;
     s.grants.read = true;
+    s.nodeEdits = nodeEdits;
     if (editable) {
       s.grants.edit = true;
       s.normalSyncHook = [this](SceneId) { return hookOk; };
@@ -1495,6 +1498,71 @@ SCENARIO("MCP render maps sync_required and busy; resynchronize recovers",
             .errorCode()
       == "forbidden");
   CHECK(f.engine->highWater(s.id) == hw);
+}
+
+SCENARIO("MCP node enabled edit inspect restore uses only wire tokens",
+    "[integration][node-mcp][node-edit]")
+{
+  Fixture f({}, true, true);
+  auto *layer = f.scene.defaultLayer();
+  auto node = layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, "wire-edit"));
+  f.scene.signalLayerStructureChanged(layer);
+  auto s = f.attach();
+  const auto scene = "\"scene_id\":" + std::to_string(f.sceneId);
+  auto inspect = [&](std::uint64_t id) {
+    REQUIRE(
+        f.tool(s,
+             "vsr_inspect",
+             "{\"request_id\":" + std::to_string(id) + "," + scene
+                 + ",\"kind\":\"nodes\",\"name\":\"wire-edit\"}")
+            .errorCode()
+            .empty());
+    f.drain();
+    auto result = f.status(s, s.id, id);
+    REQUIRE(result.str("outcome") == "ok");
+    REQUIRE(result.result()->get("items")->a.size() == 1);
+    return result.result()->get("items")->a[0];
+  };
+  auto item = inspect(1);
+  std::string entry = "\"target_kind\":\"node\",\"handle\":"
+      + json::quote(item.get("handle")->s)
+      + ",\"version\":" + json::quote(item.get("node_edit_version")->s)
+      + ",\"structural_version\":"
+      + json::quote(item.get("structural_version")->s)
+      + ",\"parameter\":\"enabled\"";
+  auto args = [&](std::uint64_t id, const std::string &value) {
+    return "{\"request_id\":" + std::to_string(id) + "," + scene
+        + ",\"edits\":[{" + entry + ",\"value\":" + value + "}]}";
+  };
+  auto list = f.rpc("tools/list", "{}");
+  REQUIRE(list.json.get("result"));
+  bool schemaFound = false;
+  for (const auto &tool : list.json.get("result")->get("tools")->a) {
+    if (tool.get("name")->s == "vsr_edit") {
+      auto schema = json::write(*tool.get("inputSchema"));
+      CHECK(schema.find("structural_version") != std::string::npos);
+      CHECK(schema.find("target_kind") != std::string::npos);
+      schemaFound = true;
+    }
+  }
+  CHECK(schemaFound);
+  CHECK(f.tool(s, "vsr_edit", args(2, "0")).errorCode() == "invalid_request");
+  REQUIRE(f.tool(s, "vsr_edit", args(2, "false")).errorCode().empty());
+  f.drain();
+  auto done = f.status(s, s.id, 2);
+  REQUIRE(done.str("outcome") == "ok");
+  REQUIRE(done.result()->get("batch_ref"));
+  CHECK(done.result()->get("node_versions")->a.size() == 1);
+  CHECK(done.result()->get("versions")->a.empty());
+  auto batch = *done.result()->get("batch_ref");
+  CHECK_FALSE(inspect(3).get("enabled")->b);
+  CHECK(f.tool(s, "vsr_edit", args(2, "false")).flag("replayed"));
+  REQUIRE(f.restoreBatch(s, 4, batch).errorCode().empty());
+  f.drain();
+  REQUIRE(f.status(s, s.id, 4).str("outcome") == "ok");
+  CHECK(inspect(5).get("enabled")->b);
+  CHECK(node->value().isEnabled());
 }
 
 #endif

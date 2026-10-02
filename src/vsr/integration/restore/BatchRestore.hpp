@@ -72,6 +72,7 @@ struct RestoreResult
   BatchRef targetBatchRef;
   std::optional<SceneRevision> sceneRevision; // resulting, on commit
   std::vector<ParameterVersionToken> versions; // resulting, per object
+  std::vector<edit::NodeVersion> nodeVersions;
   // outcome_unavailable because the log/store expired the batch; unknown
   // and wrong-launch references leave this false (addendum 04 §7).
   bool expired{false};
@@ -238,7 +239,8 @@ inline operations::Request RestoreService::makeRequest(
     step.committed = true;
     step.result = "{\"target_batch_ref\":"
         + edit::detail::batchRefJson(res.targetBatchRef) + ","
-        + edit::detail::commitDetailJson(true, res.sceneRevision, res.versions)
+        + edit::detail::commitDetailJson(
+            true, res.sceneRevision, res.versions, res.nodeVersions)
         + "}";
     *slot = std::move(res);
     return step;
@@ -367,7 +369,8 @@ inline RestoreResult RestoreService::commit(
     res.outcome = Outcome::OUTCOME_UNAVAILABLE;
     res.expired = !record
         && request.targetBatchRef.launchId == m_edits.launchId()
-        && (logExpired || m_edits.restorations().expired(request.targetBatchRef));
+        && (logExpired
+            || m_edits.restorations().expired(request.targetBatchRef));
     return res;
   }
 
@@ -381,6 +384,31 @@ inline RestoreResult RestoreService::commit(
     }
   }
 
+  std::size_t remaining = 4096;
+  std::vector<identity::NodeDependencyWalk> dependencies;
+  try {
+    dependencies.reserve(record->nodeChanges.size());
+  } catch (const std::bad_alloc &) {
+    res.outcome = Outcome::BUSY;
+    return res;
+  }
+  for (const auto &c : record->nodeChanges) {
+    identity::NodeDependencyWalk current;
+    auto status = edit::detail::nodeDependencies(
+        *ident, c.resulting.expected.node, current, remaining);
+    if (status == Outcome::BUSY) {
+      res.outcome = status;
+      return res;
+    }
+    if (status != Outcome::OK || !ident->isCurrent(c.resulting.expected)
+        || !current.matchesStructure(c.resulting.dependencies)) {
+      markConflicting(request.targetBatchRef, ctx);
+      res.outcome = Outcome::CONFLICT;
+      return res;
+    }
+    dependencies.push_back(current);
+  }
+
   // 3. Prepare in bounded temporary memory; nothing mutates on failure. //
 
   struct Planned
@@ -390,15 +418,26 @@ inline RestoreResult RestoreService::commit(
   };
   std::vector<Planned> plan;
   std::vector<scene::Object *> objects;
+  std::vector<const scene::Layer *> layers;
+  std::vector<scene::LayerNodeRef> nodes;
   try {
     if (fault && fault())
       throw std::bad_alloc();
+    nodes.reserve(record->nodeChanges.size());
+    layers.reserve(record->nodeChanges.size());
+    res.nodeVersions.reserve(record->nodeChanges.size());
+    for (const auto &c : record->nodeChanges) {
+      auto n = ident->resolve(c.resulting.expected.node);
+      nodes.push_back(n);
+      const auto *layer = n->value().layer();
+      if (std::find(layers.begin(), layers.end(), layer) == layers.end())
+        layers.push_back(layer);
+    }
     plan.reserve(record->changes.size());
     objects.reserve(record->resultingVersions.size());
     for (auto &c : record->changes) {
       auto *o = ident->resolve(c.object);
-      if (!o || !c.before.valid()
-          || !o->parameter(core::Token(c.parameter))) {
+      if (!o || !c.before.valid() || !o->parameter(core::Token(c.parameter))) {
         markConflicting(request.targetBatchRef, ctx);
         res.outcome = Outcome::CONFLICT; // missing/incompatible reference
         return res;
@@ -423,8 +462,12 @@ inline RestoreResult RestoreService::commit(
         p.change->before.type(),
         p.change->before.data());
   }
+  for (std::size_t i = 0; i < nodes.size(); ++i)
+    nodes[i]->value().setEnabled(record->nodeChanges[i].beforeEnabled);
   for (auto *o : objects)
     o->endParameterBatch();
+  for (const auto *layer : layers)
+    scene.signalLayerStructureChanged(layer);
   scene.endUpdateBatch();
 
   {
@@ -438,6 +481,12 @@ inline RestoreResult RestoreService::commit(
   for (auto *o : objects) {
     if (auto v = ident->parameterVersion(ident->handleOf(o)))
       res.versions.push_back(*v);
+  }
+  for (std::size_t i = 0; i < record->nodeChanges.size(); ++i) {
+    auto v = record->nodeChanges[i].resulting;
+    v.expected = *ident->nodeEditVersion(v.expected.node);
+    v.dependencies = dependencies[i];
+    res.nodeVersions.push_back(v);
   }
   res.committed = true;
   res.sceneRevision = ident->sceneRevision();

@@ -47,6 +47,7 @@ struct ContextSceneOptions
   SceneGrants grants;
   SyncHook normalSyncHook; // required when grants.edit
   SyncHook recoveryCallback; // required when grants.resynchronize
+  bool nodeEdits{false};
 };
 
 // Host thread, before activation. Same result as Integration::registerScene.
@@ -106,6 +107,7 @@ inline std::optional<SceneId> registerContextScene(
   r.name = std::move(options.name);
   r.scene = &ctx.vsr.scene;
   r.grants = options.grants;
+  r.nodeEdits = options.nodeEdits;
   r.normalSyncHook = std::move(options.normalSyncHook);
   r.recoveryCallback = std::move(options.recoveryCallback);
   return integration.registerScene(std::move(r));

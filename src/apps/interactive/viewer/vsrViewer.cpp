@@ -41,8 +41,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
-#include <optional>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace vsr_viewer {
@@ -101,7 +101,8 @@ struct AgentView : vsr::integration::render::RenderBackend
             ANARI_WAIT))
       return false;
     for (int i = 0; i < 3; i++) {
-      if (!std::isfinite(b[0][i]) || !std::isfinite(b[1][i]) || b[0][i] > b[1][i])
+      if (!std::isfinite(b[0][i]) || !std::isfinite(b[1][i])
+          || b[0][i] > b[1][i])
         return false;
     }
     vsr::rendering::Manipulator pose;
@@ -267,8 +268,7 @@ class Application : public VSRApplication
   {
     if (metadata.status == vsr::core::DataTreeMetadataReadStatus::Missing) {
       if (auto *projectKindNode = root.child("projectKind")) {
-        const auto projectKind =
-            projectKindNode->getValueOr<std::string>("");
+        const auto projectKind = projectKindNode->getValueOr<std::string>("");
         vsr::core::logError(
             "[vsrViewer] Refusing to load '%s': projectKind='%s' is not a "
             "vsrViewer state file",
@@ -652,11 +652,13 @@ void Application::setupIntegration()
   options.name = "scene";
   options.grants.read = true;
   options.grants.edit = true;
+  options.nodeEdits = true;
   options.grants.resynchronize = true;
   auto *view = m_agentView.get();
   options.normalSyncHook = [view](vi::SceneId) { return view->synchronize(); };
   options.recoveryCallback = [view](vi::SceneId) { return view->recover(); };
-  auto sceneId = vi::context::registerContextScene(*m_integration, *ctx, options);
+  auto sceneId =
+      vi::context::registerContextScene(*m_integration, *ctx, options);
   std::optional<vi::ViewId> viewId;
   if (sceneId) {
     vi::ViewRegistration vr;
@@ -675,7 +677,8 @@ void Application::setupIntegration()
 
   m_authority = vi::session::SessionAuthority::create(*m_integration);
   if (m_authority)
-    m_engine = vi::operations::OperationEngine::create(*m_integration, *m_authority);
+    m_engine =
+        vi::operations::OperationEngine::create(*m_integration, *m_authority);
   if (!m_engine) {
     vsr::core::logError("[vsrViewer] agent integration setup failed");
     teardownIntegration();
@@ -688,7 +691,8 @@ void Application::setupIntegration()
   m_edits = std::make_unique<vi::edit::EditService>(
       *m_integration, *m_engine, m_authority->launchId());
   m_edits->attachScene(*sceneId, *m_identity);
-  m_restores = std::make_unique<vi::restore::RestoreService>(*m_engine, *m_edits);
+  m_restores =
+      std::make_unique<vi::restore::RestoreService>(*m_engine, *m_edits);
   m_restores->attachScene(*sceneId, *m_identity);
   m_sync = std::make_unique<vi::sync::SyncService>(
       *m_integration, *m_engine, m_edits->syncStates());
@@ -740,7 +744,7 @@ void Application::setupIntegration()
     vsr::core::logError("[vsrViewer] runtime directory: %s", st.reason.c_str());
   else if (auto st = vi::mcp::McpServer::start(
                cfg, *m_authority, *m_engine, m_runtimeDir, m_mcp);
-           !st.ok())
+      !st.ok())
     vsr::core::logError("[vsrViewer] MCP listener: %s", st.reason.c_str());
   else
     services.descriptorPath = m_mcp->published().path();

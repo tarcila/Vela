@@ -105,6 +105,19 @@ inline JsonValue editValue(const json::Value &v, int depth = 0)
   return JsonValue::ofKind(JsonKind::MALFORMED);
 }
 
+inline std::optional<std::uint64_t> tokenNumber(const std::string &s)
+{
+  if (s.empty() || s.size() > 20 || (s.size() > 1 && s[0] == '0'))
+    return {};
+  std::uint64_t n = 0;
+  for (char c : s) {
+    if (c < '0' || c > '9' || n > (UINT64_MAX - (c - '0')) / 10)
+      return {};
+    n = n * 10 + (c - '0');
+  }
+  return n ? std::optional<std::uint64_t>(n) : std::nullopt;
+}
+
 inline std::optional<edit::EditBatch> editBatchArg(
     const json::Value &args, const identity::LaunchStamp &launch)
 {
@@ -119,13 +132,41 @@ inline std::optional<edit::EditBatch> editBatchArg(
     const auto handle = handleArg(e.get("handle"), launch);
     const auto *param = e.get("parameter");
     const auto *value = e.get("value");
-    if (!e.isObject() || !handle || !optionalIntArg(e, "version", version)
-        || !version || *version < 0 || !param || !param->isString()
-        || !value)
+    if (!e.isObject() || !handle || !param || !param->isString() || !value)
       return std::nullopt;
     edit::EditEntry entry;
-    entry.expected.object = *handle;
-    entry.expected.version = std::uint64_t(*version);
+    const auto *kind = e.get("target_kind");
+    if (kind
+        && (!kind->isString() || (kind->s != "node" && kind->s != "object")))
+      return {};
+    if (kind && kind->s == "node") {
+      const auto *v = e.get("version");
+      const auto *d = e.get("structural_version");
+      const auto prefix = "ne:" + e.get("handle")->s + ":";
+      const auto dp = "ns:" + e.get("handle")->s + ":";
+      if (!v || !v->isString() || v->s.compare(0, prefix.size(), prefix) || !d
+          || !d->isString() || d->s.compare(0, dp.size(), dp)
+          || d->s.size() < dp.size() + 34 || d->s[dp.size() + 32] != ':'
+          || e.get("space"))
+        return {};
+      auto nv = tokenNumber(v->s.substr(prefix.size()));
+      auto ds = tokenNumber(d->s.substr(dp.size() + 33));
+      json::Value lv;
+      lv.type = json::Value::Type::STRING;
+      lv.s = d->s.substr(dp.size(), 32);
+      auto lh = handleArg(&lv, launch);
+      if (!nv || !ds || !lh)
+        return {};
+      entry.targetKind = edit::TargetKind::NODE;
+      entry.nodeExpected = {{launch, handle->domain, handle->serial}, *nv};
+      entry.nodeDependencies = {
+          entry.nodeExpected.node, {launch, lh->domain, lh->serial}, 0, *ds, 0};
+    } else {
+      if (!optionalIntArg(e, "version", version) || !version || *version < 0)
+        return {};
+      entry.expected.object = *handle;
+      entry.expected.version = std::uint64_t(*version);
+    }
     entry.parameter = param->s;
     entry.value = editValue(*value);
     batch.edits.push_back(std::move(entry));
@@ -165,7 +206,7 @@ inline void addEditTools(std::vector<Tool> &tools, EditDeps deps)
   Tool editTool;
   editTool.name = "vsr_edit";
   editTool.description =
-      "Atomically apply up to 64 parameter edits to one scene; returns a "
+      "Atomically apply up to 64 object parameter or explicitly exposed node enabled edits to one scene; node entries require target_kind=node, opaque version and structural_version from inspection. Returns a "
       "batch_ref on commit.";
   editTool.inputSchemaJson = std::string("{\"type\":\"object\",\"properties\":{")
       + requestIdSchema()
@@ -173,12 +214,14 @@ inline void addEditTools(std::vector<Tool> &tools, EditDeps deps)
         "\"edits\":{\"type\":\"array\",\"minItems\":1,\"maxItems\":64,"
         "\"items\":{\"type\":\"object\",\"properties\":{"
         "\"handle\":{\"type\":\"string\"},"
-        "\"version\":{\"type\":\"integer\",\"minimum\":0},"
+        "\"target_kind\":{\"enum\":[\"object\",\"node\"]},"
+        "\"structural_version\":{\"type\":\"string\"},"
+        "\"version\":{\"type\":[\"integer\",\"string\"]},"
         "\"parameter\":{\"type\":\"string\"},\"value\":{}},"
         "\"required\":[\"handle\",\"version\",\"parameter\",\"value\"]}}},"
         "\"required\":[\"request_id\",\"scene_id\",\"edits\"]}";
   editTool.handler = [deps](const session::Credentials &c,
-                     const json::Value &args) {
+                         const json::Value &args) {
     const auto id = requestIdArg(args.get("request_id"));
     auto batch = detail::editBatchArg(args, deps.ids.launch());
     if (!id || !batch)
@@ -201,7 +244,7 @@ inline void addEditTools(std::vector<Tool> &tools, EditDeps deps)
         "\"required\":[\"launch_id\",\"batch_id\"]}},"
         "\"required\":[\"request_id\",\"scene_id\",\"target_batch_ref\"]}";
   restoreTool.handler = [deps](const session::Credentials &c,
-                        const json::Value &args) {
+                            const json::Value &args) {
     const auto id = requestIdArg(args.get("request_id"));
     auto req = detail::restoreArg(args);
     if (!id || !req)

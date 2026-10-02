@@ -7,7 +7,10 @@
 #include "vsr/integration/Integration.hpp"
 #include "vsr/integration/activity/Activity.hpp"
 #include "vsr/integration/edit/AgentEdit.hpp"
+#include "vsr/integration/restore/BatchRestore.hpp"
+#include "vsr/integration/sync/SceneSync.hpp"
 #include "vsr/scene/Scene.hpp"
+#include "vsr/ui/imgui/windows/IntegrationActivityModel.h"
 // std
 #include <functional>
 #include <memory>
@@ -29,6 +32,13 @@ struct Recorder : vsr::scene::EmptyUpdateDelegate
 {
   std::function<void()> onParameters;
   int parameterSignals{0};
+  int layerSignals{0};
+  void signalLayerStructureUpdated(const vsr::scene::Layer *) override
+  {
+    ++layerSignals;
+    if (onParameters)
+      onParameters();
+  }
 
   void signalParameterUpdated(
       const vsr::scene::Object *, const vsr::scene::Parameter *) override
@@ -65,7 +75,7 @@ struct Fixture
   vsr::scene::LightRef light;
   Recorder *recorder{nullptr};
 
-  Fixture()
+  Fixture(bool nodeEdits = false)
   {
     matte = scene.createObject<vsr::scene::Material>(tokens::material::matte);
     light = scene.createObject<vsr::scene::Light>(tokens::light::directional);
@@ -78,6 +88,9 @@ struct Fixture
     s.scene = &scene;
     s.grants.read = true;
     s.grants.edit = true;
+    s.nodeEdits = nodeEdits;
+    s.grants.resynchronize = true;
+    s.recoveryCallback = [](SceneId) { return true; };
     s.normalSyncHook = [this](SceneId) {
       ++hookCalls;
       return hook();
@@ -119,6 +132,20 @@ struct Fixture
   EditEntry entry(const vsr::scene::Object *o, std::string p, JsonValue v)
   {
     return {version(o), std::move(p), std::move(v)};
+  }
+
+  EditEntry nodeEntry(vsr::scene::LayerNodeRef n, bool enabled = false)
+  {
+    EditEntry e;
+    e.targetKind = TargetKind::NODE;
+    e.nodeExpected = *identity->nodeEditVersion(identity->handleOf(n));
+    e.nodeDependencies = *identity->beginNodeDependencies(e.nodeExpected.node);
+    while (e.nodeDependencies.ancestorSlot)
+      REQUIRE(identity->advanceNodeDependencies(e.nodeDependencies));
+    e.parameter = "enabled";
+    e.value = JsonValue::ofKind(JsonKind::BOOLEAN);
+    e.value.boolean = enabled;
+    return e;
   }
 
   EditBatch batch(std::vector<EditEntry> e)
@@ -212,8 +239,8 @@ SCENARIO("An Agent Edit Batch commits in full and publishes a Batch Reference",
       REQUIRE(status.result.find("\"scene_revision\":\"" + token + "\"")
           != std::string::npos);
       for (const auto &v : r.versions)
-        REQUIRE(status.result.find(
-                    "\"version\":" + std::to_string(v.version) + "}")
+        REQUIRE(
+            status.result.find("\"version\":" + std::to_string(v.version) + "}")
             != std::string::npos);
       REQUIRE(status.result.find("\"versions\":[{\"handle\":\"")
           != std::string::npos);
@@ -554,7 +581,8 @@ struct LoggedFixture
   std::unique_ptr<activity::ActivityLog> log;
   std::unique_ptr<activity::EngineActivitySink> sink;
 
-  explicit LoggedFixture(activity::Limits limits)
+  explicit LoggedFixture(activity::Limits limits, bool nodeEdits = false)
+      : fx(nodeEdits)
   {
     log = std::make_unique<activity::ActivityLog>(limits);
     sink = std::make_unique<activity::EngineActivitySink>(*log, fx.integration);
@@ -762,4 +790,427 @@ SCENARIO("Canonical arguments carry the full content of every JSON kind",
     CHECK(other.code == Outcome::REQUEST_ID_CONFLICT);
     CHECK_FALSE(other.replayed);
   }
+}
+
+TEST_CASE("enabled nodes commit atomically and restore exactly",
+    "[integration][node-edit]")
+{
+  Fixture f(true);
+  auto *layer = f.scene.addLayer("nodes");
+  auto a =
+      layer->root()->insert_last_child(vsr::scene::LayerNodeData(layer, "a"));
+  auto b = a->insert_last_child(vsr::scene::LayerNodeData(layer, "b"));
+  f.scene.signalLayerStructureChanged(layer);
+  auto entry = [&](vsr::scene::LayerNodeRef n) {
+    EditEntry e;
+    e.targetKind = TargetKind::NODE;
+    e.nodeExpected = *f.identity->nodeEditVersion(f.identity->handleOf(n));
+    e.nodeDependencies =
+        *f.identity->beginNodeDependencies(e.nodeExpected.node);
+    while (e.nodeDependencies.ancestorSlot)
+      REQUIRE(f.identity->advanceNodeDependencies(e.nodeDependencies));
+    e.parameter = "enabled";
+    e.value = JsonValue::ofKind(JsonKind::BOOLEAN);
+    e.value.boolean = false;
+    return e;
+  };
+  auto batch = f.batch({entry(a), entry(b)});
+  f.recorder->layerSignals = 0;
+  f.recorder->onParameters = [&] {
+    CHECK_FALSE(a->value().isEnabled());
+    CHECK_FALSE(b->value().isEnabled());
+  };
+  auto r = f.run(1, batch);
+  REQUIRE(r.committed);
+  REQUIRE(r.batchRef);
+  CHECK(r.versions.empty());
+  CHECK(r.nodeVersions.size() == 2);
+  CHECK(f.recorder->layerSignals == 1);
+  CHECK(f.hookCalls == 1);
+  auto replay = f.submit(1, batch);
+  CHECK(replay.replayed);
+  restore::RestoreService restores(*f.engine, *f.edits);
+  restores.attachScene(f.sceneId, *f.identity);
+  f.recorder->onParameters = [&] {
+    CHECK(a->value().isEnabled());
+    CHECK(b->value().isEnabled());
+  };
+  auto restore = restores.submitLocal({f.sceneId, *r.batchRef});
+  REQUIRE(restore.code == Outcome::OK);
+  while (f.integration.service()) {
+  }
+  REQUIRE(restores.resultLocal(restore.ref));
+  CHECK(restores.resultLocal(restore.ref)->committed);
+  CHECK_FALSE(restores.eligible(*r.batchRef));
+  CHECK(restores.resultLocal(restore.ref)->nodeVersions.size() == 2);
+  CHECK(restores.resultLocal(restore.ref)->versions.empty());
+  CHECK(f.recorder->layerSignals == 2);
+  CHECK(f.hookCalls == 2);
+}
+
+TEST_CASE("Node validation and preparation never partially commit",
+    "[integration][node-edit]")
+{
+  Fixture f(true);
+  auto *l = f.scene.addLayer("nodes");
+  auto a = l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "a"));
+  auto b = l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "b"));
+  f.scene.signalLayerStructureChanged(l);
+  auto batch = f.batch({f.nodeEntry(a), f.nodeEntry(b)});
+  const auto version = batch.edits[0].nodeExpected;
+  const auto revision = f.identity->sceneRevision();
+  f.recorder->layerSignals = 0;
+  SECTION("stale second entry")
+  {
+    ++batch.edits[1].nodeExpected.version;
+    CHECK(f.run(1, batch).outcome == Outcome::CONFLICT);
+  }
+  SECTION("all preparation failure stages")
+  {
+    std::uint64_t id = 1;
+    for (auto stage : {FaultStage::PREPARE,
+             FaultStage::ALLOCATE,
+             FaultStage::RESERVE_RESTORATION}) {
+      f.edits->setFaultInjector([stage](FaultStage s) { return s == stage; });
+      auto r = f.run(id++, batch);
+      CHECK(r.outcome == Outcome::BUSY);
+      CHECK_FALSE(r.committed);
+      CHECK_FALSE(r.batchRef);
+    }
+  }
+  SECTION("malformed, duplicate and oversized envelopes")
+  {
+    auto bad = batch;
+    bad.edits[1].value = JsonValue::fromNumber(0);
+    CHECK(f.submit(1, bad).code == Outcome::INVALID_REQUEST);
+    bad = batch;
+    bad.edits[1].nodeDependencies.structuralVersion = 0;
+    CHECK(f.submit(2, bad).code == Outcome::INVALID_REQUEST);
+    bad = batch;
+    bad.edits.push_back(bad.edits[0]);
+    CHECK(f.submit(3, bad).code == Outcome::INVALID_REQUEST);
+    bad.edits.resize(65, batch.edits[0]);
+    CHECK(f.submit(4, bad).code == Outcome::INVALID_REQUEST);
+  }
+  CHECK(a->value().isEnabled());
+  CHECK(b->value().isEnabled());
+  CHECK(f.identity->isCurrent(version));
+  CHECK(f.identity->sceneRevision() == revision);
+  CHECK(f.recorder->layerSignals == 0);
+  CHECK(f.hookCalls == 0);
+  CHECK(f.edits->restorations().size() == 0);
+}
+
+TEST_CASE("Node edits use precise target and structural history",
+    "[integration][node-edit]")
+{
+  Fixture f(true);
+  auto *l = f.scene.addLayer("nodes");
+  auto parent = l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "p"));
+  auto a = parent->insert_last_child(vsr::scene::LayerNodeData(l, "a"));
+  auto sibling =
+      l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "s"));
+  f.scene.signalLayerStructureChanged(l);
+  auto batch = f.batch({f.nodeEntry(a)});
+  SECTION("unrelated sibling and parent enabled writes are not dependencies")
+  {
+    sibling->value().setEnabled(false);
+    parent->value().setEnabled(false);
+    f.scene.signalLayerStructureChanged(l);
+    auto r = f.run(1, batch);
+    REQUIRE(r.committed);
+    restore::RestoreService restores(*f.engine, *f.edits);
+    restores.attachScene(f.sceneId, *f.identity);
+    sibling->value().name() = "preserved";
+    auto adm = restores.submitLocal({f.sceneId, *r.batchRef});
+    REQUIRE(adm.code == Outcome::OK);
+    while (f.integration.service()) {
+    }
+    REQUIRE(restores.resultLocal(adm.ref)->committed);
+    CHECK(a->value().isEnabled());
+    CHECK_FALSE(sibling->value().isEnabled());
+    CHECK_FALSE(parent->value().isEnabled());
+    CHECK(sibling->value().name() == "preserved");
+  }
+  SECTION("target change-back conflicts")
+  {
+    a->value().setEnabled(false);
+    a->value().setEnabled(true);
+    CHECK(f.run(1, batch).outcome == Outcome::CONFLICT);
+    CHECK(a->value().isEnabled());
+  }
+  SECTION("removed ancestor and reused slots conflict")
+  {
+    l->erase(parent);
+    l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "replacement"));
+    f.scene.signalLayerStructureChanged(l);
+    CHECK(f.run(1, batch).outcome == Outcome::CONFLICT);
+  }
+}
+
+TEST_CASE(
+    "Node restore failures preserve eligibility except permanent conflicts",
+    "[integration][node-edit]")
+{
+  Fixture f(true);
+  auto *l = f.scene.addLayer("nodes");
+  auto a = l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "a"));
+  f.scene.signalLayerStructureChanged(l);
+  auto r = f.run(1, f.batch({f.nodeEntry(a)}));
+  REQUIRE(r.committed);
+  restore::RestoreService restores(*f.engine, *f.edits);
+  restores.attachScene(f.sceneId, *f.identity);
+  SECTION("preparation failure can be retried after disable and disconnect")
+  {
+    restores.setFaultInjector([] { return true; });
+    auto adm = restores.submitLocal({f.sceneId, *r.batchRef});
+    REQUIRE(adm.code == Outcome::OK);
+    while (f.integration.service()) {
+    }
+    CHECK(restores.resultLocal(adm.ref)->outcome == Outcome::BUSY);
+    CHECK(restores.eligible(*r.batchRef));
+    CHECK_FALSE(a->value().isEnabled());
+    f.authority->setAgentEditsDisabled(true);
+    f.authority->detach(f.creds);
+    restores.setFaultInjector({});
+    adm = restores.submitLocal({f.sceneId, *r.batchRef});
+    REQUIRE(adm.code == Outcome::OK);
+    while (f.integration.service()) {
+    }
+    CHECK(restores.resultLocal(adm.ref)->committed);
+    CHECK(a->value().isEnabled());
+    adm = restores.submitLocal({f.sceneId, *r.batchRef});
+    REQUIRE(adm.code == Outcome::OK);
+    while (f.integration.service()) {
+    }
+    CHECK(restores.resultLocal(adm.ref)->outcome == Outcome::ALREADY_RESTORED);
+  }
+  SECTION("change-back consumes eligibility permanently")
+  {
+    a->value().setEnabled(true);
+    a->value().setEnabled(false);
+    for (int i = 0; i < 2; ++i) {
+      auto adm = restores.submitLocal({f.sceneId, *r.batchRef});
+      REQUIRE(adm.code == Outcome::OK);
+      while (f.integration.service()) {
+      }
+      CHECK(restores.resultLocal(adm.ref)->outcome == Outcome::CONFLICT);
+      CHECK_FALSE(restores.eligible(*r.batchRef));
+      CHECK_FALSE(a->value().isEnabled());
+    }
+  }
+}
+
+TEST_CASE(
+    "Node exposure, live authority and committed synchronization stay honest",
+    "[integration][node-edit]")
+{
+  bool exposed = true;
+  SECTION("old object grants do not expose nodes")
+  {
+    exposed = false;
+  }
+  Fixture f(exposed);
+  auto *l = f.scene.addLayer("nodes");
+  auto a = l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "a"));
+  f.scene.signalLayerStructureChanged(l);
+  auto batch = f.batch({f.nodeEntry(a)});
+  if (!exposed) {
+    CHECK(f.run(1, batch).outcome == Outcome::FORBIDDEN);
+    CHECK(a->value().isEnabled());
+    return;
+  }
+  SECTION("disable before safe point")
+  {
+    REQUIRE(f.submit(1, batch).code == Outcome::OK);
+    f.authority->setAgentEditsDisabled(true);
+    while (f.integration.service()) {
+    }
+    CHECK_FALSE(f.edits->result(f.ref(1))->committed);
+    CHECK(a->value().isEnabled());
+  }
+  SECTION("disconnect before safe point")
+  {
+    REQUIRE(f.submit(1, batch).code == Outcome::OK);
+    f.authority->detach(f.creds);
+    while (f.integration.service()) {
+    }
+    CHECK(a->value().isEnabled());
+    CHECK(f.hookCalls == 0);
+  }
+  SECTION("sync failure retains committed restore then consumes it")
+  {
+    f.hook = [] { return false; };
+    auto r = f.run(1, batch);
+    CHECK(r.outcome == Outcome::APPLIED_WITH_SYNC_FAILURE);
+    REQUIRE(r.committed);
+    REQUIRE(r.batchRef);
+    CHECK_FALSE(a->value().isEnabled());
+    restore::RestoreService restores(*f.engine, *f.edits);
+    restores.attachScene(f.sceneId, *f.identity);
+    auto adm = restores.submitLocal({f.sceneId, *r.batchRef});
+    REQUIRE(adm.code == Outcome::OK);
+    while (f.integration.service()) {
+    }
+    CHECK(restores.resultLocal(adm.ref)->outcome
+        == Outcome::APPLIED_WITH_SYNC_FAILURE);
+    CHECK(restores.resultLocal(adm.ref)->committed);
+    CHECK_FALSE(restores.eligible(*r.batchRef));
+    CHECK(a->value().isEnabled());
+    CHECK(f.hookCalls == 2);
+    sync::SyncService sync(f.integration, *f.engine, f.edits->syncStates());
+    auto recovery = sync.submitLocalResynchronize(f.sceneId);
+    REQUIRE(recovery.code == Outcome::OK);
+    while (f.integration.service()) {
+    }
+    CHECK(f.edits->syncState(f.sceneId) == SyncState::READY);
+  }
+  SECTION("post-commit cancellation is not a rollback")
+  {
+    f.hook = [&] {
+      f.engine->cancel(f.creds, f.ref(1));
+      return true;
+    };
+    auto r = f.run(1, batch);
+    CHECK(r.committed);
+    CHECK_FALSE(a->value().isEnabled());
+    CHECK(f.hookCalls == 1);
+  }
+}
+
+TEST_CASE("Node journal shares activity budgets and expires oldest batches",
+    "[integration][node-edit]")
+{
+  activity::Limits limits;
+  limits.restorableBatches = 2;
+  LoggedFixture lf(limits, true);
+  auto &f = lf.fx;
+  auto *l = f.scene.addLayer("nodes");
+  auto a = l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "a"));
+  f.scene.signalLayerStructureChanged(l);
+  std::vector<BatchRef> refs;
+  for (std::uint64_t id = 1; id <= 3; ++id) {
+    auto r = f.run(id, f.batch({f.nodeEntry(a, id % 2 == 0)}));
+    REQUIRE(r.committed);
+    refs.push_back(*r.batchRef);
+    auto activity = lf.log->get(id);
+    REQUIRE(activity);
+    CHECK(activity->committed);
+    CHECK(activity->restorationBytes > 0);
+    CHECK(activity->batchRef == r.batchRef);
+  }
+  CHECK(lf.log->usage().restorableBatches == 2);
+  CHECK(f.edits->restorations().expired(refs[0]));
+  restore::RestoreService restores(*f.engine, *f.edits);
+  restores.attachScene(f.sceneId, *f.identity);
+  auto adm = restores.submitLocal({f.sceneId, refs[0]});
+  REQUIRE(adm.code == Outcome::OK);
+  while (f.integration.service()) {
+  }
+  CHECK(restores.resultLocal(adm.ref)->outcome == Outcome::OUTCOME_UNAVAILABLE);
+}
+
+TEST_CASE("Enabled edits preserve every node payload and stored default",
+    "[integration][node-edit]")
+{
+  Fixture f(true);
+  auto *l = f.scene.addLayer("nodes");
+  auto empty =
+      l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "empty"));
+  auto object = l->root()->insert_last_child(
+      vsr::scene::LayerNodeData(l, f.matte, "object"));
+  auto matrix = vsr::math::IDENTITY_MAT4;
+  matrix[3][0] = 7.f;
+  auto transform = l->root()->insert_last_child(
+      vsr::scene::LayerNodeData(l, matrix, "transform"));
+  transform->value().setCurrentValueAsDefault();
+  auto array = f.scene.createArray(ANARI_FLOAT32_MAT4, 2);
+  auto instanced =
+      l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "array"));
+  instanced->value().setAsTransformArray(array.data());
+  f.scene.signalLayerStructureChanged(l);
+  auto batch = f.batch({f.nodeEntry(empty),
+      f.nodeEntry(object),
+      f.nodeEntry(transform),
+      f.nodeEntry(instanced),
+      f.nodeEntry(l->root())});
+  auto r = f.run(1, batch);
+  REQUIRE(r.committed);
+  CHECK(empty->value().isEmpty());
+  CHECK(object->value().getObject() == f.matte.data());
+  CHECK(transform->value().getTransform()[3][0] == 7.f);
+  CHECK(transform->value().hasDefault());
+  CHECK(transform->value().isDefaultValue());
+  CHECK(instanced->value().getTransformArray() == array.data());
+  restore::RestoreService restores(*f.engine, *f.edits);
+  restores.attachScene(f.sceneId, *f.identity);
+  auto adm = restores.submitLocal({f.sceneId, *r.batchRef});
+  REQUIRE(adm.code == Outcome::OK);
+  while (f.integration.service()) {
+  }
+  CHECK(restores.resultLocal(adm.ref)->committed);
+  CHECK(transform->value().getTransform()[3][0] == 7.f);
+  CHECK(transform->value().isDefaultValue());
+  CHECK(instanced->value().getTransformArray() == array.data());
+  CHECK(l->root()->value().isEnabled());
+}
+
+TEST_CASE("Viewer activity controls restore enabled nodes after disconnect",
+    "[integration][node-edit][node-viewer]")
+{
+  LoggedFixture logged({}, true);
+  auto &f = logged.fx;
+  auto *layer = f.scene.defaultLayer();
+  auto node = layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, "viewer-node"));
+  f.scene.signalLayerStructureChanged(layer);
+  restore::RestoreService restores(*f.engine, *f.edits);
+  restores.attachScene(f.sceneId, *f.identity);
+  vsr::ui::imgui::IntegrationServices services;
+  services.integration = &f.integration;
+  services.authority = f.authority.get();
+  services.activity = logged.log.get();
+  services.restore = &restores;
+  services.scenes = {{f.sceneId, "nodes"}};
+  vsr::ui::imgui::IntegrationActivityModel model(std::move(services));
+  auto result = f.run(1, f.batch({f.nodeEntry(node)}));
+  REQUIRE(result.committed);
+  REQUIRE(result.batchRef);
+  CHECK_FALSE(node->value().isEnabled());
+  const auto &state = model.refresh();
+  REQUIRE(state.activity.size() == 1);
+  CHECK(state.activity[0].entry.committed);
+  CHECK(state.activity[0].entry.batchRef == result.batchRef);
+  CHECK(state.activity[0].entry.eligibility == activity::Eligibility::ELIGIBLE);
+  REQUIRE(model.disconnect());
+  REQUIRE(model.setAgentEditsDisabled(true));
+  auto admission = model.restore(f.sceneId, *result.batchRef);
+  REQUIRE(admission.code == Outcome::OK);
+  while (f.integration.service()) {
+  }
+  REQUIRE(restores.resultLocal(admission.ref));
+  CHECK(restores.resultLocal(admission.ref)->committed);
+  CHECK(node->value().isEnabled());
+  CHECK_FALSE(restores.eligible(*result.batchRef));
+}
+
+TEST_CASE("Deep node preparation fails boundedly without mutation",
+    "[integration][node-edit]")
+{
+  Fixture f(true);
+  auto *l = f.scene.addLayer("deep");
+  auto n = l->root();
+  for (int i = 0; i < 4097; ++i)
+    n = n->insert_last_child(vsr::scene::LayerNodeData(l, "deep"));
+  f.scene.signalLayerStructureChanged(l);
+  auto entry = f.nodeEntry(n);
+  const auto revision = f.identity->sceneRevision();
+  auto r = f.run(1, f.batch({entry}));
+  CHECK(r.outcome == Outcome::BUSY);
+  CHECK_FALSE(r.committed);
+  CHECK_FALSE(r.batchRef);
+  CHECK(n->value().isEnabled());
+  CHECK(f.identity->isCurrent(entry.nodeExpected));
+  CHECK(f.identity->sceneRevision() == revision);
+  CHECK(f.hookCalls == 0);
 }

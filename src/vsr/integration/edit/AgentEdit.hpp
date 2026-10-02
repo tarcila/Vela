@@ -60,12 +60,27 @@ using operations::Outcome;
 
 constexpr std::size_t MAX_BATCH_EDITS = 64;
 
+enum class TargetKind
+{
+  OBJECT,
+  NODE
+};
+
+struct NodeVersion
+{
+  identity::NodeEditVersionToken expected;
+  identity::NodeDependencyWalk dependencies;
+};
+
 struct EditEntry
 {
   // Names the object and the version the client inspected.
   ParameterVersionToken expected;
   std::string parameter;
   JsonValue value;
+  TargetKind targetKind{TargetKind::OBJECT};
+  identity::NodeEditVersionToken nodeExpected;
+  identity::NodeDependencyWalk nodeDependencies;
 };
 
 struct EditBatch
@@ -94,6 +109,7 @@ struct EditResult
   std::optional<BatchRef> batchRef; // set on every commit
   std::optional<SceneRevision> sceneRevision; // resulting, on commit
   std::vector<ParameterVersionToken> versions; // resulting, per edited object
+  std::vector<NodeVersion> nodeVersions;
   // On a value rejection: the offending entry and its error.
   std::optional<std::size_t> failedEntry;
   ValueError valueError{ValueError::NONE};
@@ -138,7 +154,8 @@ inline std::string batchRefJson(const BatchRef &r)
 // members (no braces). `handle` matches vsr_inspect's 32-hex form.
 inline std::string commitDetailJson(bool committed,
     const std::optional<SceneRevision> &revision,
-    const std::vector<ParameterVersionToken> &versions)
+    const std::vector<ParameterVersionToken> &versions,
+    const std::vector<NodeVersion> &nodes = {})
 {
   std::string j =
       std::string("\"committed\":") + (committed ? "true" : "false");
@@ -154,8 +171,47 @@ inline std::string commitDetailJson(bool committed,
           + hex64(versions[i].object.domain) + hex64(versions[i].object.serial)
           + "\",\"version\":" + std::to_string(versions[i].version) + "}";
     j += "]";
+    if (!nodes.empty()) {
+      j += ",\"node_versions\":[";
+      for (std::size_t i = 0; i < nodes.size(); ++i) {
+        const auto &n = nodes[i];
+        const auto h =
+            hex64(n.expected.node.domain) + hex64(n.expected.node.serial);
+        const auto l = hex64(n.dependencies.layer.domain)
+            + hex64(n.dependencies.layer.serial);
+        j += std::string(i ? "," : "") + "{\"handle\":\"" + h
+            + "\",\"version\":\"ne:" + h + ":"
+            + std::to_string(n.expected.version)
+            + "\",\"structural_version\":\"ns:" + h + ":" + l + ":"
+            + std::to_string(n.dependencies.structuralVersion)
+            + "\",\"ancestry_version\":\"na:" + h + ":" + l + ":"
+            + std::to_string(n.dependencies.structuralVersion) + ":"
+            + std::to_string(n.dependencies.transformVersion) + "\"}";
+      }
+      j += "]";
+    }
   }
   return j;
+}
+
+// One bounded walk for the whole request; no retained ancestor snapshots.
+inline Outcome nodeDependencies(SceneIdentity &ids,
+    const identity::NodeHandle &h,
+    identity::NodeDependencyWalk &out,
+    std::size_t &remaining)
+{
+  auto walk = ids.beginNodeDependencies(h);
+  if (!walk)
+    return Outcome::CONFLICT;
+  while (walk->ancestorSlot) {
+    if (!remaining)
+      return Outcome::BUSY;
+    --remaining;
+    if (!ids.advanceNodeDependencies(*walk))
+      return Outcome::CONFLICT;
+  }
+  out = *walk;
+  return Outcome::OK;
 }
 
 } // namespace detail
@@ -169,6 +225,12 @@ struct Change
   core::Any after;
 };
 
+struct NodeChange
+{
+  NodeVersion resulting;
+  bool beforeEnabled{true};
+};
+
 struct RestorationRecord
 {
   BatchRef ref;
@@ -177,6 +239,7 @@ struct RestorationRecord
   std::optional<LocalRef> localProvenance; // host-local work
   std::vector<Change> changes;
   std::vector<ParameterVersionToken> resultingVersions;
+  std::vector<NodeChange> nodeChanges;
 };
 
 // Bounded restorable-batch store (spec §5: 32 by default). Publishing past
@@ -375,6 +438,7 @@ inline std::size_t restorationBytes(const RestorationRecord &record)
   std::size_t n = sizeof(RestorationRecord) + record.ref.launchId.size()
       + record.ref.batchId.size()
       + record.resultingVersions.capacity() * sizeof(ParameterVersionToken);
+  n += record.nodeChanges.capacity() * sizeof(NodeChange);
   for (auto &c : record.changes)
     n += sizeof(Change) + c.parameter.size() + anyBytes(c.before)
         + anyBytes(c.after);
@@ -486,12 +550,29 @@ inline bool EditService::validEnvelope(const EditBatch &batch)
 {
   if (batch.edits.empty() || batch.edits.size() > MAX_BATCH_EDITS)
     return false;
-  std::set<std::pair<std::uint64_t, std::string>> seen;
+  std::set<std::tuple<TargetKind, std::uint64_t, std::uint64_t, std::string>>
+      seen;
   for (auto &e : batch.edits) {
-    if (!e.expected.object.valid() || e.parameter.empty())
+    if (e.parameter.empty())
       return false;
-    if (!seen.insert({e.expected.object.serial, e.parameter}).second)
-      return false; // one value per (object, parameter)
+    const auto domain = e.targetKind == TargetKind::NODE
+        ? e.nodeExpected.node.domain
+        : e.expected.object.domain;
+    const auto serial = e.targetKind == TargetKind::NODE
+        ? e.nodeExpected.node.serial
+        : e.expected.object.serial;
+    if (e.targetKind == TargetKind::NODE) {
+      if (!e.nodeExpected.node.valid() || !e.nodeExpected.version
+          || e.nodeDependencies.node != e.nodeExpected.node
+          || !e.nodeDependencies.layer.valid()
+          || e.nodeDependencies.ancestorSlot
+          || !e.nodeDependencies.structuralVersion || e.parameter != "enabled"
+          || e.value.kind != JsonKind::BOOLEAN)
+        return false;
+    } else if (e.targetKind != TargetKind::OBJECT || !e.expected.object.valid())
+      return false;
+    if (!seen.insert({e.targetKind, domain, serial, e.parameter}).second)
+      return false;
   }
   return true;
 }
@@ -569,6 +650,20 @@ inline std::string EditService::canonicalArguments(const EditBatch &batch)
 {
   std::string s = "edit;scene=" + std::to_string(batch.scene) + ";";
   for (auto &e : batch.edits) {
+    if (e.targetKind == TargetKind::NODE) {
+      const auto &h = e.nodeExpected.node;
+      const auto &d = e.nodeDependencies;
+      s += "node:" + std::to_string(h.launch.activation) + "/"
+          + std::to_string(h.launch.nonce) + "/" + std::to_string(h.domain)
+          + "/" + std::to_string(h.serial) + "@"
+          + std::to_string(e.nodeExpected.version) + ":"
+          + std::to_string(d.layer.domain) + "/"
+          + std::to_string(d.layer.serial) + "/"
+          + std::to_string(d.structuralVersion) + ":" + e.parameter + "=";
+      detail::appendValue(s, e.value);
+      s += ";";
+      continue;
+    }
     const auto &h = e.expected.object;
     s += std::to_string(h.launch.activation) + "/"
         + std::to_string(h.launch.nonce) + "/" + std::to_string(h.domain) + "/"
@@ -633,7 +728,9 @@ inline operations::Request EditService::makeRequest(EditBatch batch, Slot slot)
     step.outcome = res.outcome;
     step.committed = true;
     step.result = "{\"batch_ref\":" + detail::batchRefJson(*res.batchRef) + ","
-        + detail::commitDetailJson(true, res.sceneRevision, res.versions) + "}";
+        + detail::commitDetailJson(
+            true, res.sceneRevision, res.versions, res.nodeVersions)
+        + "}";
     *slot = std::move(res);
     return step;
   };
@@ -721,24 +818,66 @@ inline EditResult EditService::commit(
     const EditEntry *entry;
     core::Any value;
   };
+  struct PlannedNode
+  {
+    scene::LayerNodeRef node;
+    const EditEntry *entry;
+    identity::NodeDependencyWalk dependencies;
+  };
+  std::vector<PlannedNode> nodes;
+  std::vector<const scene::Layer *> layers;
   std::vector<Planned> plan;
+  std::size_t remaining = 4096;
   bool stale = false;
   std::size_t index = 0;
-  for (auto &e : batch.edits) {
-    auto *o = ident->resolve(e.expected.object);
-    if (!o || !ident->isCurrent(e.expected)) {
-      stale = true; // removed, replaced or changed since inspection
-    } else {
-      auto p = prepareEdit(*o, core::Token(e.parameter), e.value);
-      if (!p.ok()) {
-        res.outcome = Outcome::INVALID_REQUEST;
-        res.failedEntry = index;
-        res.valueError = p.error;
-        return res;
+  try {
+    nodes.reserve(batch.edits.size());
+    layers.reserve(batch.edits.size());
+    plan.reserve(batch.edits.size());
+    for (auto &e : batch.edits) {
+      if (e.targetKind == TargetKind::NODE) {
+        if (!m_integration.nodeEditsExposed(batch.scene)) {
+          res.outcome = Outcome::FORBIDDEN;
+          return res;
+        }
+        identity::NodeDependencyWalk d;
+        const auto status =
+            detail::nodeDependencies(*ident, e.nodeExpected.node, d, remaining);
+        if (status == Outcome::BUSY) {
+          res.outcome = status;
+          return res;
+        }
+        auto node = ident->resolve(e.nodeExpected.node);
+        if (status != Outcome::OK || !ident->isCurrent(e.nodeExpected)
+            || !d.matchesStructure(e.nodeDependencies))
+          stale = true;
+        else {
+          nodes.push_back({node, &e, d});
+          const auto *layer = node->value().layer();
+          if (std::find(layers.begin(), layers.end(), layer) == layers.end())
+            layers.push_back(layer);
+        }
+        ++index;
+        continue;
       }
-      plan.push_back({o, &e, p.value});
+      auto *o = ident->resolve(e.expected.object);
+      if (!o || !ident->isCurrent(e.expected)) {
+        stale = true; // removed, replaced or changed since inspection
+      } else {
+        auto p = prepareEdit(*o, core::Token(e.parameter), e.value);
+        if (!p.ok()) {
+          res.outcome = Outcome::INVALID_REQUEST;
+          res.failedEntry = index;
+          res.valueError = p.error;
+          return res;
+        }
+        plan.push_back({o, &e, p.value});
+      }
+      ++index;
     }
-    ++index;
+  } catch (const std::bad_alloc &) {
+    res.outcome = Outcome::BUSY;
+    return res;
   }
   if (stale) {
     res.outcome = Outcome::CONFLICT;
@@ -757,6 +896,12 @@ inline EditResult EditService::commit(
     if (fault(FaultStage::ALLOCATE))
       throw std::bad_alloc();
     record.scene = batch.scene;
+    record.nodeChanges.reserve(nodes.size());
+    res.nodeVersions.reserve(nodes.size());
+    res.versions.reserve(plan.size());
+    for (auto &p : nodes)
+      record.nodeChanges.push_back({{p.entry->nodeExpected, p.dependencies},
+          p.node->value().isEnabled()});
     record.changes.reserve(plan.size());
     objects.reserve(plan.size());
     for (auto &p : plan) {
@@ -803,14 +948,22 @@ inline EditResult EditService::commit(
     p.object->setParameter(
         core::Token(p.entry->parameter), p.value.type(), p.value.data());
   }
+  for (auto &p : nodes)
+    p.node->value().setEnabled(p.entry->value.boolean);
   for (auto *o : objects)
     o->endParameterBatch();
+  for (const auto *layer : layers)
+    scene.signalLayerStructureChanged(layer);
   scene.endUpdateBatch();
 
   for (auto *o : objects) {
     auto v = ident->parameterVersion(ident->handleOf(o));
     if (v)
       record.resultingVersions.push_back(*v);
+  }
+  for (auto &c : record.nodeChanges) {
+    c.resulting.expected = *ident->nodeEditVersion(c.resulting.expected.node);
+    res.nodeVersions.push_back(c.resulting);
   }
   res.committed = true;
   res.batchRef = record.ref;

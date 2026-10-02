@@ -61,6 +61,7 @@ struct SceneRegistration
   SceneGrants grants;
   SyncHook normalSyncHook; // required when grants.edit
   SyncHook recoveryCallback; // required when grants.resynchronize
+  bool nodeEdits{false}; // explicit exposure, in addition to the edit grant
 };
 
 struct ViewRegistration
@@ -123,6 +124,7 @@ class Integration
   std::optional<SceneId> sceneOfView(ViewId id) const;
   // Effective ceilings; all-denied while inactive or for unregistered ids.
   SceneGrants sceneGrants(SceneId id) const;
+  bool nodeEditsExposed(SceneId id) const;
   ViewGrants viewGrants(ViewId id) const;
   // The registered normal-synchronization hook; empty while inactive or for
   // unregistered ids.

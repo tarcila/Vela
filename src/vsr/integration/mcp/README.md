@@ -241,6 +241,23 @@ historical page rather than observing fresh state.
   (`handle` is 32 lowercase hex, domain then serial; the adapter qualifies it
   with the current launch). `value` is the §8 edit-surface JSON value; the
   headless value rules accept or reject it at the safe point.
+- Node writes require explicit host registration with `SceneRegistration::nodeEdits`
+  (or `ContextSceneOptions::nodeEdits`) in addition to the session's scene
+  edit grant. Discovery scene items advertise `node_edits_exposed`; existing
+  object grants alone do not expose nodes. The integration-enabled viewer opts
+  in. This slice supports only the own `enabled` flag, on any existing node
+  kind; it does not change layer activation, payloads, or default transforms.
+- A node entry is `{target_kind: "node", handle, version, structural_version,
+  parameter: "enabled", value: <Boolean>}`. Copy `handle`, `node_edit_version`
+  (as `version`), and `structural_version` verbatim from node inspection.
+  `structural_version` is required even for enabled-only edits: it pins the
+  inspected target/layer/parent-chain history, not ancestor transform state.
+  Missing/malformed tokens, non-Boolean values, or unsupported fields reject
+  before admission. Live target writes (including change-back) or relevant
+  topology changes conflict; unrelated sibling and live-parent state writes do
+  not. All entries share the existing 64-entry batch and authority limits.
+  Preparation checks at most 4096 ancestor steps per batch; excess returns
+  `busy` without mutation or lost restore eligibility.
 - `vsr_restore` has its own `operation_ref`, distinct from the target batch
   and from the original edit's provenance. It never selects a batch
   implicitly. Changing `target_batch_ref` under the same `request_id` is
@@ -253,7 +270,16 @@ historical page rather than observing fresh state.
   parameter version, in `vsr_inspect`'s `handle` form, ready for the next
   edit; `scene_revision` is the resulting scene token for `vsr_render`. All
   are present for `applied_with_sync_failure` too, because that outcome
-  committed.
+  committed. Node edit/restore results additionally carry `node_versions:
+  [{handle, version, structural_version, ancestry_version}]`, with fresh opaque
+  tokens in inspection's format. Node-only results keep `versions: []`; no
+  object parameter token is invented. Object-only result shape is unchanged.
+  Enabled-only Restore changes only the recorded own flag, validates target
+  and structural history, and preserves unrelated state/defaults. It uses the
+  same journal/activity budgets, permanent conflict, consumption, expiry,
+  replay, local/external authority, and synchronization behavior as object
+  Restore. All batch state is committed before coalesced layer notifications
+  and one normal scene-sync acknowledgement; sync failure is not rollback.
 - A value rejection's `result` is `{"committed": false, "failed_entry": <0-based
   index>, "value_error": "unsupported_parameter"|"incompatible_type"|
   "non_finite"|"out_of_domain"}`.

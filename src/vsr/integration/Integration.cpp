@@ -74,6 +74,14 @@ SceneGrants Integration::sceneGrants(SceneId id) const
   return m_scenes[id].registration.grants;
 }
 
+bool Integration::nodeEditsExposed(SceneId id) const
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  return m_active && id < m_scenes.size() && m_scenes[id].registration.nodeEdits
+      && m_scenes[id].registration.grants.read
+      && m_scenes[id].registration.grants.edit;
+}
+
 ViewGrants Integration::viewGrants(ViewId id) const
 {
   std::lock_guard<std::mutex> lock(m_mutex);

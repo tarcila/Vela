@@ -824,6 +824,9 @@ class Inspector
         + "\",\"id\":" + std::to_string(i)
         + ",\"capabilities\":" + capsJson(caps);
     if (!views)
+      item += std::string(",\"node_edits_exposed\":")
+          + (m_integration.nodeEditsExposed(i) ? "true" : "false");
+    if (!views)
       item +=
           ",\"inspection\":{\"kinds\":[\"objects\",\"layers\",\"nodes\"],\"default_page_size\":"
           + std::to_string(m_limits.defaultItems)
