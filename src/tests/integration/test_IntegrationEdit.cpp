@@ -148,6 +148,14 @@ struct Fixture
     return e;
   }
 
+  EditEntry positionEntry(vsr::scene::LayerNodeRef n, JsonValue value)
+  {
+    auto e = nodeEntry(n);
+    e.parameter = "position";
+    e.value = std::move(value);
+    return e;
+  }
+
   EditBatch batch(std::vector<EditEntry> e)
   {
     return {sceneId, std::move(e)};
@@ -1102,7 +1110,17 @@ TEST_CASE("Node validation and preparation never partially commit",
   auto a = l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "a"));
   auto b = l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "b"));
   f.scene.signalLayerStructureChanged(l);
-  auto batch = f.batch({f.nodeEntry(a), f.nodeEntry(b)});
+  const bool position = GENERATE(false, true);
+  if (position) {
+    a->value().setAsTransform(vsr::core::math::IDENTITY_MAT4);
+    b->value().setAsTransform(vsr::core::math::IDENTITY_MAT4);
+  }
+  auto moved = JsonValue::array({JsonValue::fromNumber(4),
+      JsonValue::fromNumber(-5),
+      JsonValue::fromNumber(6)});
+  auto batch = position
+      ? f.batch({f.positionEntry(a, moved), f.positionEntry(b, moved)})
+      : f.batch({f.nodeEntry(a), f.nodeEntry(b)});
   const auto version = batch.edits[0].nodeExpected;
   const auto revision = f.identity->sceneRevision();
   f.recorder->layerSignals = 0;
@@ -1128,7 +1146,10 @@ TEST_CASE("Node validation and preparation never partially commit",
   {
     auto bad = batch;
     bad.edits[1].value = JsonValue::fromNumber(0);
-    CHECK(f.submit(1, bad).code == Outcome::INVALID_REQUEST);
+    if (position)
+      CHECK(f.run(1, bad).outcome == Outcome::INVALID_REQUEST);
+    else
+      CHECK(f.submit(1, bad).code == Outcome::INVALID_REQUEST);
     bad = batch;
     bad.edits[1].nodeDependencies.structuralVersion = 0;
     CHECK(f.submit(2, bad).code == Outcome::INVALID_REQUEST);
@@ -1140,11 +1161,342 @@ TEST_CASE("Node validation and preparation never partially commit",
   }
   CHECK(a->value().isEnabled());
   CHECK(b->value().isEnabled());
+  if (position) {
+    CHECK(a->value().getTransform() == vsr::core::math::IDENTITY_MAT4);
+    CHECK(b->value().getTransform() == vsr::core::math::IDENTITY_MAT4);
+  }
   CHECK(f.identity->isCurrent(version));
   CHECK(f.identity->sceneRevision() == revision);
   CHECK(f.recorder->layerSignals == 0);
   CHECK(f.hookCalls == 0);
   CHECK(f.edits->restorations().size() == 0);
+}
+
+TEST_CASE("Local position preserves exact linear and cached representation",
+    "[integration][node-edit][node-position]")
+{
+  Fixture f(true);
+  auto *l = f.scene.defaultLayer();
+  auto n = l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "move"));
+  auto original = vsr::core::math::IDENTITY_MAT4;
+  original[0] = {-2.f, 0.f, 0.f, 0.f};
+  original[1] = {3.f, 4.f, 0.f, 0.f};
+  original[2] = {0.f, 0.f, 0.f, 0.f};
+  original[3] = {5.f, -6.f, 7.f, 1.f};
+  n->value().setAsTransform(original);
+  n->value().setCurrentValueAsDefault();
+  auto cached = n->value().getTransformSRT();
+  f.scene.signalLayerStructureChanged(l);
+  auto e = f.positionEntry(n,
+      JsonValue::array({JsonValue::fromNumber(11),
+          JsonValue::fromNumber(-12),
+          JsonValue::fromNumber(13)}));
+  auto result = f.run(1, f.batch({e}));
+  REQUIRE(result.committed);
+  REQUIRE(result.batchRef);
+  auto moved = n->value().getTransform();
+  for (int c = 0; c < 3; ++c)
+    for (int row = 0; row < 4; ++row)
+      CHECK(moved[c][row] == original[c][row]);
+  CHECK(moved[3] == vsr::core::math::float4(11.f, -12.f, 13.f, 1.f));
+  CHECK_FALSE(n->value().isDefaultValue());
+  restore::RestoreService restores(*f.engine, *f.edits);
+  restores.attachScene(f.sceneId, *f.identity);
+  auto restore = restores.submitLocal({f.sceneId, *result.batchRef});
+  REQUIRE(restore.code == Outcome::OK);
+  while (f.integration.service()) {
+  }
+  REQUIRE(restores.resultLocal(restore.ref)->committed);
+  auto restored = n->value().getTransform();
+  auto restoredSrt = n->value().getTransformSRT();
+  CHECK(std::memcmp(&restored, &original, sizeof(original)) == 0);
+  CHECK(std::memcmp(&restoredSrt, &cached, sizeof(cached)) == 0);
+  CHECK(n->value().isDefaultValue());
+  n->value().setToDefaultValue();
+  CHECK(n->value().getTransform() == original);
+}
+
+TEST_CASE("Local position groups publish final versions and restore atomically",
+    "[integration][node-edit][node-position]")
+{
+  Fixture f(true);
+  auto *l = f.scene.defaultLayer();
+  auto parent =
+      l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "parent"));
+  auto child = parent->insert_last_child(vsr::scene::LayerNodeData(l, "child"));
+  vsr::core::math::mat3 srt;
+  srt[0] = {-2.f, 3.f, 4.f};
+  srt[1] = {725.f, -380.f, 1090.f};
+  srt[2] = {3.f, 4.f, 5.f};
+  parent->value().setAsTransform(srt);
+  child->value().setAsTransform(vsr::core::math::IDENTITY_MAT4);
+  const auto original = parent->value().getTransform();
+  const auto childOriginal = child->value().getTransform();
+  f.scene.signalLayerStructureChanged(l);
+  auto position = [](double x, double y, double z) {
+    return JsonValue::array({JsonValue::fromNumber(x),
+        JsonValue::fromNumber(y),
+        JsonValue::fromNumber(z)});
+  };
+  auto batch = f.batch({f.positionEntry(parent, position(7, 8, 9)),
+      f.nodeEntry(parent),
+      f.positionEntry(child, position(-1, -2, -3))});
+  SECTION("reverse entry order")
+  {
+    std::reverse(batch.edits.begin(), batch.edits.end());
+  }
+  SECTION("forward entry order") {}
+  SECTION("position and full matrix groups share one journal")
+  {
+    auto &matrix = batch.edits.back();
+    matrix.parameter = "transform";
+    matrix.value = JsonValue::array({JsonValue::numbers({-2, 3, 0, -1}),
+        JsonValue::numbers({0, 0, 0, -2}),
+        JsonValue::numbers({0, 1, 4, -3}),
+        JsonValue::numbers({0, 0, 0, 1})});
+    batch.edits.push_back(f.nodeEntry(child, false));
+    if (GENERATE(false, true))
+      std::reverse(batch.edits.begin(), batch.edits.end());
+  }
+  f.recorder->layerSignals = 0;
+  f.recorder->onParameters = [&] {
+    CHECK(parent->value().getTransform()[3].xyz() == float3(7, 8, 9));
+    CHECK(child->value().getTransform()[3].xyz() == float3(-1, -2, -3));
+    CHECK_FALSE(parent->value().isEnabled());
+  };
+  auto r = f.run(1, batch);
+  REQUIRE(r.committed);
+  REQUIRE(r.batchRef);
+  REQUIRE(r.nodeVersions.size() == 2);
+  const auto journal = f.edits->restorations().find(*r.batchRef);
+  REQUIRE(journal);
+  REQUIRE(journal->nodeChanges.size() == 2);
+  for (const auto &c : journal->nodeChanges)
+    CHECK(f.identity->isCurrent(c.resulting.expected));
+  for (const auto &v : r.nodeVersions)
+    CHECK(f.identity->isCurrent(v.expected));
+  CHECK(f.recorder->layerSignals == 1);
+  auto movedSrt = parent->value().getTransformSRT();
+  CHECK(movedSrt[0] == srt[0]);
+  CHECK(movedSrt[1] == srt[1]);
+  CHECK(movedSrt[2] == float3(7, 8, 9));
+  parent->value().name() = "renamed";
+  restore::RestoreService restores(*f.engine, *f.edits);
+  restores.attachScene(f.sceneId, *f.identity);
+  f.recorder->onParameters = [&] {
+    CHECK(parent->value().getTransform() == original);
+    CHECK(child->value().getTransform() == childOriginal);
+    CHECK(parent->value().isEnabled());
+  };
+  auto restore = restores.submitLocal({f.sceneId, *r.batchRef});
+  REQUIRE(restore.code == Outcome::OK);
+  while (f.integration.service()) {
+  }
+  REQUIRE(restores.resultLocal(restore.ref)->committed);
+  auto restoredSrt = parent->value().getTransformSRT();
+  CHECK(std::memcmp(&restoredSrt, &srt, sizeof(srt)) == 0);
+  CHECK(parent->value().name() == "renamed");
+  CHECK(f.recorder->layerSignals == 2);
+}
+
+TEST_CASE("Local position rejects bad values without any mutation",
+    "[integration][node-edit][node-position]")
+{
+  Fixture f(true);
+  auto *l = f.scene.defaultLayer();
+  auto a = l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "a"));
+  auto b = l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "b"));
+  a->value().setAsTransform(vsr::core::math::IDENTITY_MAT4);
+  b->value().setAsTransform(vsr::core::math::IDENTITY_MAT4);
+  f.scene.signalLayerStructureChanged(l);
+  auto vector = JsonValue::array({JsonValue::fromNumber(1),
+      JsonValue::fromNumber(2),
+      JsonValue::fromNumber(3)});
+  auto good = f.positionEntry(a, vector);
+  auto bad = f.positionEntry(b, vector);
+  auto error = ValueError::INCOMPATIBLE_TYPE;
+  SECTION("wrong arity")
+  {
+    bad.value.elements.pop_back();
+  }
+  SECTION("wrong kind")
+  {
+    bad.value.elements[1] = JsonValue::ofKind(JsonKind::BOOLEAN);
+  }
+  SECTION("non finite")
+  {
+    bad.value.elements[1] =
+        JsonValue::fromNumber(std::numeric_limits<double>::infinity());
+    error = ValueError::NON_FINITE;
+  }
+  SECTION("finite overflow before rounding")
+  {
+    bad.value.elements[1] = JsonValue::fromNumber(
+        std::nextafter(double(std::numeric_limits<float>::max()),
+            std::numeric_limits<double>::infinity()));
+    error = ValueError::OUT_OF_DOMAIN;
+  }
+  SECTION("unsupported empty node")
+  {
+    b->value().setEmpty();
+    bad = f.positionEntry(b, vector);
+    error = ValueError::UNSUPPORTED_NODE_KIND;
+  }
+  SECTION("unsupported object node")
+  {
+    b->value().setAsObject(f.matte.data());
+    bad = f.positionEntry(b, vector);
+    error = ValueError::UNSUPPORTED_NODE_KIND;
+  }
+  SECTION("unsupported transform array node")
+  {
+    auto array = f.scene.createArray(ANARI_FLOAT32_MAT4, 2);
+    b->value().setAsTransformArray(array.data());
+    bad = f.positionEntry(b, vector);
+    error = ValueError::UNSUPPORTED_NODE_KIND;
+  }
+  const auto versionA = good.nodeExpected;
+  const auto versionB = bad.nodeExpected;
+  auto revision = f.identity->sceneRevision();
+  f.recorder->layerSignals = 0;
+  auto r = f.run(1, f.batch({good, bad}));
+  CHECK(r.outcome == Outcome::INVALID_REQUEST);
+  CHECK(r.valueError == error);
+  CHECK(r.failedEntry == std::optional<std::size_t>(1));
+  CHECK_FALSE(r.committed);
+  CHECK_FALSE(r.batchRef);
+  CHECK(f.identity->isCurrent(versionA));
+  CHECK(f.identity->isCurrent(versionB));
+  CHECK(f.identity->sceneRevision() == revision);
+  CHECK(a->value().getTransform() == vsr::core::math::IDENTITY_MAT4);
+  CHECK(f.recorder->layerSignals == 0);
+  CHECK(f.hookCalls == 0);
+  CHECK(f.edits->restorations().size() == 0);
+}
+
+TEST_CASE("Local position keeps narrow dependencies and binary64 identity",
+    "[integration][node-edit][node-position]")
+{
+  Fixture f(true);
+  auto *l = f.scene.defaultLayer();
+  auto p = l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "parent"));
+  auto n = p->insert_last_child(vsr::scene::LayerNodeData(l, "child"));
+  p->value().setAsTransform(vsr::core::math::IDENTITY_MAT4);
+  n->value().setAsTransform(vsr::core::math::IDENTITY_MAT4);
+  f.scene.signalLayerStructureChanged(l);
+  auto e = f.positionEntry(n,
+      JsonValue::array({JsonValue::fromNumber(1.000000059604644775390625),
+          JsonValue::fromNumber(-0.0),
+          JsonValue::fromNumber(3)}));
+  auto batch = f.batch({e});
+  auto other = batch;
+  other.edits[0].value.elements[0] = JsonValue::fromNumber(1.0);
+  CHECK(EditService::canonicalArguments(batch)
+      != EditService::canonicalArguments(other));
+  SECTION("parent writes alone permit edit and restore")
+  {
+    auto matrix = vsr::core::math::IDENTITY_MAT4;
+    matrix[3].x = 42.f;
+    p->value().setAsTransform(matrix);
+    auto r = f.run(1, batch);
+    REQUIRE(r.committed);
+    CHECK(n->value().getTransform()[3].x == 1.f); // exact halfway: ties to even
+    matrix[3].x = -9.f;
+    p->value().setAsTransform(matrix);
+    restore::RestoreService restores(*f.engine, *f.edits);
+    restores.attachScene(f.sceneId, *f.identity);
+    auto a = restores.submitLocal({f.sceneId, *r.batchRef});
+    while (f.integration.service()) {
+    }
+    REQUIRE(restores.resultLocal(a.ref)->committed);
+    CHECK(n->value().getTransform() == vsr::core::math::IDENTITY_MAT4);
+    CHECK(p->value().getTransform()[3].x == -9.f);
+  }
+  SECTION("target change back conflicts")
+  {
+    n->value().setAsTransform(vsr::core::math::IDENTITY_MAT4);
+    CHECK(f.run(1, batch).outcome == Outcome::CONFLICT);
+  }
+  SECTION("restore target change back conflicts permanently")
+  {
+    auto r = f.run(1, batch);
+    REQUIRE(r.committed);
+    n->value().setAsTransform(n->value().getTransform());
+    restore::RestoreService restores(*f.engine, *f.edits);
+    restores.attachScene(f.sceneId, *f.identity);
+    auto a = restores.submitLocal({f.sceneId, *r.batchRef});
+    while (f.integration.service()) {
+    }
+    CHECK(restores.resultLocal(a.ref)->outcome == Outcome::CONFLICT);
+    CHECK_FALSE(restores.eligible(*r.batchRef));
+  }
+  SECTION("duplicate fields and inconsistent versions reject")
+  {
+    batch.edits.push_back(e);
+    CHECK(f.submit(1, batch).code == Outcome::INVALID_REQUEST);
+    batch.edits[1] = f.nodeEntry(n);
+    ++batch.edits[1].nodeExpected.version;
+    CHECK(f.submit(2, batch).code == Outcome::INVALID_REQUEST);
+  }
+  SECTION("unsupported space rejects")
+  {
+    batch.edits[0].space = "world";
+    CHECK(f.submit(1, batch).code == Outcome::INVALID_REQUEST);
+    batch.edits[0].space = "other";
+    CHECK(f.submit(2, batch).code == Outcome::INVALID_REQUEST);
+  }
+}
+
+TEST_CASE("Local position restore preparation replay and field isolation",
+    "[integration][node-edit][node-position]")
+{
+  Fixture f(true);
+  auto *l = f.scene.defaultLayer();
+  auto n = l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "move"));
+  n->value().setAsTransform(vsr::core::math::IDENTITY_MAT4);
+  auto batch = f.batch({f.positionEntry(n,
+      JsonValue::array({JsonValue::fromNumber(4),
+          JsonValue::fromNumber(5),
+          JsonValue::fromNumber(6)}))});
+  auto r = f.run(1, batch);
+  REQUIRE(r.committed);
+  REQUIRE(r.batchRef);
+  auto version = r.nodeVersions[0].expected;
+  CHECK(f.submit(1, batch).replayed);
+  CHECK(f.identity->isCurrent(version));
+  CHECK(f.hookCalls == 1);
+  restore::RestoreService restores(*f.engine, *f.edits);
+  restores.attachScene(f.sceneId, *f.identity);
+  restores.setFaultInjector([] { return true; });
+  f.recorder->layerSignals = 0;
+  auto a = restores.submitLocal({f.sceneId, *r.batchRef});
+  while (f.integration.service()) {
+  }
+  CHECK(restores.resultLocal(a.ref)->outcome == Outcome::BUSY);
+  CHECK(restores.eligible(*r.batchRef));
+  CHECK(f.identity->isCurrent(version));
+  CHECK(n->value().getTransform()[3].xyz() == float3(4, 5, 6));
+  CHECK(f.recorder->layerSignals == 0);
+  n->value().name() = "keep name";
+  auto baseline = n->value().getTransform();
+  n->value().setCurrentValueAsDefault();
+  f.authority->setAgentEditsDisabled(true);
+  f.authority->detach(f.creds);
+  restores.setFaultInjector({});
+  a = restores.submitLocal({f.sceneId, *r.batchRef});
+  while (f.integration.service()) {
+  }
+  REQUIRE(restores.resultLocal(a.ref)->committed);
+  CHECK(n->value().getTransform() == vsr::core::math::IDENTITY_MAT4);
+  CHECK(n->value().name() == "keep name");
+  CHECK_FALSE(restores.eligible(*r.batchRef));
+  CHECK_FALSE(n->value().isDefaultValue());
+  n->value().setToDefaultValue();
+  CHECK(n->value().getTransform() == baseline);
+  a = restores.submitLocal({f.sceneId, *r.batchRef});
+  while (f.integration.service()) {
+  }
+  CHECK(restores.resultLocal(a.ref)->outcome == Outcome::ALREADY_RESTORED);
 }
 
 TEST_CASE("Node edits use precise target and structural history",
@@ -1156,8 +1508,15 @@ TEST_CASE("Node edits use precise target and structural history",
   auto a = parent->insert_last_child(vsr::scene::LayerNodeData(l, "a"));
   auto sibling =
       l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "s"));
+  const bool position = GENERATE(false, true);
+  a->value().setAsTransform(vsr::core::math::IDENTITY_MAT4);
   f.scene.signalLayerStructureChanged(l);
-  auto batch = f.batch({f.nodeEntry(a)});
+  auto batch =
+      f.batch({position ? f.positionEntry(a,
+                              JsonValue::array({JsonValue::fromNumber(4),
+                                  JsonValue::fromNumber(5),
+                                  JsonValue::fromNumber(6)}))
+                        : f.nodeEntry(a)});
   SECTION("unrelated sibling and parent enabled writes are not dependencies")
   {
     sibling->value().setEnabled(false);
@@ -1177,6 +1536,12 @@ TEST_CASE("Node edits use precise target and structural history",
     CHECK_FALSE(sibling->value().isEnabled());
     CHECK_FALSE(parent->value().isEnabled());
     CHECK(sibling->value().name() == "preserved");
+    CHECK(a->value().getTransform() == vsr::core::math::IDENTITY_MAT4);
+  }
+  SECTION("reparent conflicts")
+  {
+    l->root()->container()->move_subtree(a, sibling);
+    CHECK(f.run(1, batch).outcome == Outcome::CONFLICT);
   }
   SECTION("target change-back conflicts")
   {
@@ -1259,8 +1624,15 @@ TEST_CASE(
   Fixture f(exposed);
   auto *l = f.scene.addLayer("nodes");
   auto a = l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "a"));
+  const bool position = GENERATE(false, true);
+  a->value().setAsTransform(vsr::core::math::IDENTITY_MAT4);
   f.scene.signalLayerStructureChanged(l);
-  auto batch = f.batch({f.nodeEntry(a)});
+  auto batch =
+      f.batch({position ? f.positionEntry(a,
+                              JsonValue::array({JsonValue::fromNumber(4),
+                                  JsonValue::fromNumber(5),
+                                  JsonValue::fromNumber(6)}))
+                        : f.nodeEntry(a)});
   if (!exposed) {
     CHECK(f.run(1, batch).outcome == Outcome::FORBIDDEN);
     CHECK(a->value().isEnabled());
@@ -1291,7 +1663,9 @@ TEST_CASE(
     CHECK(r.outcome == Outcome::APPLIED_WITH_SYNC_FAILURE);
     REQUIRE(r.committed);
     REQUIRE(r.batchRef);
-    CHECK_FALSE(a->value().isEnabled());
+    CHECK(a->value().isEnabled() == position);
+    if (position)
+      CHECK(a->value().getTransform()[3].xyz() == float3(4, 5, 6));
     restore::RestoreService restores(*f.engine, *f.edits);
     restores.attachScene(f.sceneId, *f.identity);
     auto adm = restores.submitLocal({f.sceneId, *r.batchRef});
@@ -1319,7 +1693,9 @@ TEST_CASE(
     };
     auto r = f.run(1, batch);
     CHECK(r.committed);
-    CHECK_FALSE(a->value().isEnabled());
+    CHECK(a->value().isEnabled() == position);
+    if (position)
+      CHECK(a->value().getTransform()[3].xyz() == float3(4, 5, 6));
     CHECK(f.hookCalls == 1);
   }
 }
@@ -1333,10 +1709,18 @@ TEST_CASE("Node journal shares activity budgets and expires oldest batches",
   auto &f = lf.fx;
   auto *l = f.scene.addLayer("nodes");
   auto a = l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "a"));
+  const bool position = GENERATE(false, true);
+  a->value().setAsTransform(vsr::core::math::IDENTITY_MAT4);
   f.scene.signalLayerStructureChanged(l);
   std::vector<BatchRef> refs;
   for (std::uint64_t id = 1; id <= 3; ++id) {
-    auto r = f.run(id, f.batch({f.nodeEntry(a, id % 2 == 0)}));
+    auto entry = position
+        ? f.positionEntry(a,
+              JsonValue::array({JsonValue::fromNumber(double(id)),
+                  JsonValue::fromNumber(2),
+                  JsonValue::fromNumber(3)}))
+        : f.nodeEntry(a, id % 2 == 0);
+    auto r = f.run(id, f.batch({entry}));
     REQUIRE(r.committed);
     refs.push_back(*r.batchRef);
     auto activity = lf.log->get(id);

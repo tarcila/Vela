@@ -81,6 +81,7 @@ struct EditEntry
   TargetKind targetKind{TargetKind::OBJECT};
   identity::NodeEditVersionToken nodeExpected;
   identity::NodeDependencyWalk nodeDependencies;
+  std::string space{"local"}; // position only; world is not yet supported
 };
 
 struct EditBatch
@@ -601,13 +602,20 @@ inline bool EditService::validEnvelope(const EditBatch &batch)
           || !e.nodeDependencies.layer.valid()
           || e.nodeDependencies.ancestorSlot
           || !e.nodeDependencies.structuralVersion
-          || (e.parameter != "enabled" && e.parameter != "transform")
+          || (e.parameter != "enabled" && e.parameter != "position"
+              && e.parameter != "transform")
+          || e.space != "local"
           || (e.parameter == "enabled" && e.value.kind != JsonKind::BOOLEAN))
         return false;
       auto inserted =
           expectedNodes.emplace(std::make_pair(domain, serial), e.nodeExpected);
       if (!inserted.second
           && inserted.first->second.version != e.nodeExpected.version)
+        return false;
+      const auto exclusive =
+          e.parameter == "transform" ? "position" : "transform";
+      if (e.parameter != "enabled"
+          && seen.count({TargetKind::NODE, domain, serial, exclusive}))
         return false;
     } else if (e.targetKind != TargetKind::OBJECT || !e.expected.object.valid())
       return false;
@@ -700,6 +708,8 @@ inline std::string EditService::canonicalArguments(const EditBatch &batch)
           + std::to_string(d.layer.domain) + "/"
           + std::to_string(d.layer.serial) + "/"
           + std::to_string(d.structuralVersion) + ":" + e.parameter + "=";
+      if (e.parameter == "position")
+        detail::appendText(s, e.space);
       detail::appendValue(s, e.value);
       s += ";";
       continue;
@@ -897,17 +907,49 @@ inline EditResult EditService::commit(
             || !d.matchesStructure(e.nodeDependencies))
           stale = true;
         else {
-          auto existing = std::find_if(
-              nodes.begin(), nodes.end(), [&](const PlannedNode &p) {
-                return p.entry->nodeExpected.node == e.nodeExpected.node;
-              });
-          if (existing == nodes.end()) {
+          auto it = std::find_if(nodes.begin(),
+              nodes.end(),
+              [&](const PlannedNode &p) { return p.node == node; });
+          if (it == nodes.end()) {
             nodes.push_back({node, &e, d});
-            existing = std::prev(nodes.end());
+            it = std::prev(nodes.end());
           }
           if (e.parameter == "enabled") {
-            existing->changedEnabled = true;
-            existing->enabled = e.value.boolean;
+            it->changedEnabled = true;
+            it->enabled = e.value.boolean;
+          } else if (e.parameter == "position") {
+            ValueError error = ValueError::NONE;
+            core::math::float3 position;
+            if (!node->value().isTransform())
+              error = ValueError::UNSUPPORTED_NODE_KIND;
+            else if (e.value.kind != JsonKind::ARRAY
+                || e.value.elements.size() != 3)
+              error = ValueError::INCOMPATIBLE_TYPE;
+            else {
+              const double limit = std::numeric_limits<float>::max();
+              for (int c = 0; c < 3; ++c) {
+                auto component =
+                    convertScalar(e.value.elements[c], {-limit, limit});
+                if (!component.ok()) {
+                  error = component.error;
+                  break;
+                }
+                position[c] = component.value;
+              }
+            }
+            if (error != ValueError::NONE) {
+              res.outcome = Outcome::INVALID_REQUEST;
+              res.failedEntry = index;
+              res.valueError = error;
+              return res;
+            }
+            it->changedTransform = true;
+            it->matrix = node->value().getTransform();
+            it->srt = node->value().getTransformSRT();
+            it->matrix[3].x = position.x;
+            it->matrix[3].y = position.y;
+            it->matrix[3].z = position.z;
+            it->srt[2] = position;
           } else {
             if (!node->value().isTransform()) {
               res.outcome = Outcome::INVALID_REQUEST;
@@ -915,7 +957,7 @@ inline EditResult EditService::commit(
               res.valueError = ValueError::UNSUPPORTED_NODE_KIND;
               return res;
             }
-            res.valueError = detail::prepareMatrix(e.value, existing->matrix);
+            res.valueError = detail::prepareMatrix(e.value, it->matrix);
             if (res.valueError != ValueError::NONE) {
               res.outcome = Outcome::INVALID_REQUEST;
               res.failedEntry = index;
@@ -923,9 +965,9 @@ inline EditResult EditService::commit(
             }
             // Decompose only the cache, never reconstruct the authoritative
             // matrix.
-            scene::LayerNodeData prepared(nullptr, existing->matrix);
-            existing->srt = prepared.getTransformSRT();
-            existing->changedTransform = true;
+            scene::LayerNodeData prepared(nullptr, it->matrix);
+            it->srt = prepared.getTransformSRT();
+            it->changedTransform = true;
           }
           const auto *layer = node->value().layer();
           if (std::find(layers.begin(), layers.end(), layer) == layers.end())

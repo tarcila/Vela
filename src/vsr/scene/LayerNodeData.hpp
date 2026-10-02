@@ -71,7 +71,7 @@ struct LayerNodeData
   void setAsTransform(const math::mat4 &m, const math::mat4 &defaultM);
   void setAsTransform(const math::mat3 &srt);
   // Apply a prepared exact matrix/cache pair without decomposition or changing
-  // the stored default baseline. Used by conditional transform restoration.
+  // the stored default baseline. Advances transform and edit write history.
   void setTransformState(const math::mat4 &matrix, const math::mat3 &srt);
   void setAsTransformArray(Array *a);
   void setEmpty();

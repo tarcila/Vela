@@ -245,9 +245,10 @@ historical page rather than observing fresh state.
   (or `ContextSceneOptions::nodeEdits`) in addition to the session's scene
   edit grant. Discovery scene items advertise `node_edits_exposed`; existing
   object grants alone do not expose nodes. The integration-enabled viewer opts
-  in. The own `enabled` flag is supported on any existing node kind. Scalar
-  transform nodes also support full local `transform` replacement; neither
-  operation changes layer activation or stored default baselines.
+  in. Supported fields are own `enabled` on any existing node kind and local
+  `position` or full local `transform` replacement on scalar-transform nodes.
+  None changes layer activation or stored default baselines. World positioning,
+  rotation, and scale conveniences are not exposed.
 - A node entry is `{target_kind: "node", handle, version, structural_version,
   parameter: "enabled", value: <Boolean>}`. Copy `handle`, `node_edit_version`
   (as `version`), and `structural_version` verbatim from node inspection.
@@ -256,7 +257,19 @@ historical page rather than observing fresh state.
   Missing/malformed tokens, non-Boolean values, or unsupported fields reject
   before admission. Live target writes (including change-back) or relevant
   topology changes conflict; unrelated sibling and live-parent state writes do
-  not. All entries share the existing 64-entry batch and authority limits.
+  not. Local position uses the same narrow structural dependency: parent
+  transform changes alone do not conflict. All entries share the existing
+  64-entry batch and authority limits.
+- Local movement uses `{target_kind: "node", handle, version,
+  structural_version, parameter: "position", value: [x, y, z]}`. Optional
+  `space: "local"` is equivalent to omission. Exactly three finite binary64
+  numbers within float32 range are required; values are correctly rounded,
+  never clamped. Empty/object/transform-array nodes reject without mutation.
+  Only the translation column changes: shear, reflection, singular linear
+  parts, cached SRT scale/angles, and reset defaults are preserved. Position
+  and enabled entries may share a node with one expected version, in either
+  order; repeated fields or inconsistent versions reject. Multi-node groups
+  prepare and commit atomically and publish one final version per node.
   Preparation checks at most 4096 ancestor steps per batch; excess returns
   `busy` without mutation or lost restore eligibility.
 - A `transform` value is four rows of four finite binary64 numbers, using
@@ -286,8 +299,9 @@ historical page rather than observing fresh state.
   [{handle, version, structural_version, ancestry_version}]`, with fresh opaque
   tokens in inspection's format. Node-only results keep `versions: []`; no
   object parameter token is invented. Object-only result shape is unchanged.
-  Enabled-only Restore changes only the recorded own flag, validates target
-  and structural history, and preserves unrelated state/defaults. It uses the
+  Restore changes only recorded fields (own enabled flag and/or exact local
+  matrix with its cached representation), validates target and structural
+  history, and preserves unrelated names, state, and reset defaults. It uses the
   same journal/activity budgets, permanent conflict, consumption, expiry,
   replay, local/external authority, and synchronization behavior as object
   Restore. All batch state is committed before coalesced layer notifications

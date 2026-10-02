@@ -146,8 +146,7 @@ inline std::optional<edit::EditBatch> editBatchArg(
       const auto dp = "ns:" + e.get("handle")->s + ":";
       if (!v || !v->isString() || v->s.compare(0, prefix.size(), prefix) || !d
           || !d->isString() || d->s.compare(0, dp.size(), dp)
-          || d->s.size() < dp.size() + 34 || d->s[dp.size() + 32] != ':'
-          || e.get("space"))
+          || d->s.size() < dp.size() + 34 || d->s[dp.size() + 32] != ':')
         return {};
       auto nv = tokenNumber(v->s.substr(prefix.size()));
       auto ds = tokenNumber(d->s.substr(dp.size() + 33));
@@ -157,6 +156,12 @@ inline std::optional<edit::EditBatch> editBatchArg(
       auto lh = handleArg(&lv, launch);
       if (!nv || !ds || !lh)
         return {};
+      const auto *space = e.get("space");
+      if (space) {
+        if (param->s != "position" || !space->isString() || space->s != "local")
+          return {};
+        entry.space = space->s;
+      }
       entry.targetKind = edit::TargetKind::NODE;
       entry.nodeExpected = {{launch, handle->domain, handle->serial}, *nv};
       entry.nodeDependencies = {
@@ -206,7 +211,7 @@ inline void addEditTools(std::vector<Tool> &tools, EditDeps deps)
   Tool editTool;
   editTool.name = "vsr_edit";
   editTool.description =
-      "Atomically apply up to 64 object parameter or explicitly exposed node enabled/transform edits to one scene; transform replaces a scalar node's complete local affine matrix (four rows of four finite numbers, column-vector math, last-column translation, exact last row [0,0,0,1]). Shear, reflection and singular affine matrices are supported. Transform cannot combine with position/rotation/scale on the same node but may combine with Boolean enabled. Node entries require target_kind=node, opaque version and structural_version from inspection. Returns a "
+      "Atomically apply up to 64 object parameter or explicitly exposed node enabled/local position/transform edits to one scene; position is three finite float32-representable numbers, space defaults to local, and only scalar-transform nodes accept position or transform (no world, rotation or scale edits). Transform replaces a scalar node's complete local affine matrix (four rows of four finite numbers, column-vector math, last-column translation, exact last row [0,0,0,1]). Shear, reflection and singular affine matrices are supported. Transform cannot combine with position/rotation/scale on the same node but may combine with Boolean enabled. Node entries require target_kind=node, opaque version and structural_version from inspection. Returns a "
       "batch_ref on commit.";
   editTool.inputSchemaJson = std::string("{\"type\":\"object\",\"properties\":{")
       + requestIdSchema()
@@ -216,6 +221,7 @@ inline void addEditTools(std::vector<Tool> &tools, EditDeps deps)
         "\"handle\":{\"type\":\"string\"},"
         "\"target_kind\":{\"enum\":[\"object\",\"node\"]},"
         "\"structural_version\":{\"type\":\"string\"},"
+        "\"space\":{\"enum\":[\"local\"]},"
         "\"version\":{\"type\":[\"integer\",\"string\"]},"
         "\"parameter\":{\"type\":\"string\"},\"value\":{}},"
         "\"required\":[\"handle\",\"version\",\"parameter\",\"value\"]}}},"
