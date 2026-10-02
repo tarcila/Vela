@@ -1,7 +1,7 @@
 # Broad editing implementation
 
 Task: broad-editing
-Status: implementing
+Status: done (implementation complete; nonblocking triage 73 retained)
 Integration bookmark: broad-editing
 Integration workspace: sibling `broad-editing`
 Code base: milestone-1 (74b61ddb before ticket publication)
@@ -41,9 +41,12 @@ camera/capture/script feature belongs in this work.
 
 - Jujutsu only, never raw git. Every ticket uses an isolated sibling workspace
   based on the current integration bookmark; no writer shares a working copy.
-- Follow ticket-implementer's scratch preflight and deliverable/scratch commit
-  separation. Track all ignored local working records explicitly. Do not edit
-  the specification or sibling tickets to make a partial result look complete.
+- Follow the currently deployed ticket-implementer workflow. The host updated
+  it during tickets11/12 to one code-plus-ticket commit and removed the home
+  scratch-commit hook; do not recreate retired host tooling. Earlier separated
+  code/scratch commits and private recovery refs remain valid history. Track
+  ignored local working records explicitly; never edit the specification to
+  make a partial result look complete.
 - Use the confirmed public headless seam and TDD. Read the TDD skill and its
   referenced testing guidance. A ticket is resolved only after actual tests.
 - Keep communication sparse: ticket/spec pointers, exact verification commands,
@@ -102,11 +105,36 @@ configurations. CUDA is not automatically claimed as tested.
 - Current source tip before dispatch bookkeeping: zxzpmvyy /516e4882, real
   06+07 merge. The merger consolidated exact-state setter semantics and
   verified 232 integration cases, 15,040 assertions, CTest36/36 and formatting.
-- Next frontier:08 localSRT/grouping,09 worldposition,10 mixedbatches, and74
-  bounded name matching. Reservations:08 gets91–96;09 gets97–102;10 gets103–108;
-  74 gets109–114. No dummy ticket files are created for unused reservations.
-- 73 is a nonblocking needs-triage implementation assumption: structural_version
-  wire carrier and4096 aggregate preparation steps. It preserves required
-  structural history and boundedness; no semantic safety requirement was
-  relaxed.12 waits for74, an audit-discovered gap in existing bounded string
-  matching, as well as its original blockers.
+- Completed08/09/10/74 and merged them, preserving grouped final-parent
+  conversion and post-write dependency journals. 74 closes the audit gap in
+  unbounded stored-name substring scans with authenticated resumable linear
+  matching, charged work/scratch, and beyond-preview tests.
+- Completed11 portable Fool's Mate through both headless and actual loopback
+  MCP: four moves in one batch, exact Restore, other28/sharedobjects/parent/
+  names/defaults unchanged. 12 verified the actual imported viewer under
+  private authenticated UNIX-only Xvfb, isolated XDG configuration, and CPU
+  helide; existing views rendered before/moved/restored. All owned test
+  processes were stopped; generated build artifacts were excluded.
+- Full CPU/UI/network/Lua/SDL3 build/install:68/68 CTest. Integration-disabled
+  configuration:35/35. MCP-disabled:36/36. Positive chess filters:6233 headless
+  assertions and2666 MCP assertions. No GPU-quality or CUDA-build claim.
+- Final two-axis review: original Standards request-changes, Spec approve.
+  Single follow-up75 documented the scene-sized registry/container rationale,
+  typed transform issue states, and extracted small field-preparation helpers.
+  Both targeted postfix axes approved f6499616; final main-workspace68/68
+  CTest and focused15796assertions29cases passed. No panel gate was claimed.
+- Implementation graph is closed:18 resolved tickets, split parents03/25
+  closed wontfix, no ready-for-agent/ready-for-human/needs-info blockers.
+  Nonblocking73 remains needs-triage for explicit structural_version carrier
+  naming and4096 preparation cap; its safe implementation is documented/tested.
+- Configured clangd checks could not resolve the new workspace's project include
+  paths despite a generated compilation database; fallback diagnostics were
+  unusable, not source compiler failures. No bogus code fixes or host config
+  changes were applied. Compiler/build tests are authoritative; temporary
+  compile-database link was removed.
+- Acceptance evidence retained locally outside the tracked task subtree in
+  `.scratch/broad-editing-logs/acceptance/` (selected ASCII logs and scene/UI
+  images only, no private descriptors/proofs/Xauthority/runtime files). Worker
+  workspaces are cleaned after their completed commits land; integration
+  workspace/bookmark broad-editing remains for testing. Original pi-integration
+  user config/screenshot are untouched. No PR, issue publication, or push.
