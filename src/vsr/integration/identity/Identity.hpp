@@ -111,6 +111,29 @@ struct NodeHandleTag;
 using LayerHandle = HierarchyHandle<LayerHandleTag>;
 using NodeHandle = HierarchyHandle<NodeHandleTag>;
 
+// Fixed-size incremental chain observation. Each advance charges one ancestor
+// at the caller's safe point; callers must abort/restart on inspection revision
+// changes between slices. No recursive walk or retained scene snapshot.
+struct NodeDependencyWalk
+{
+  NodeHandle node;
+  LayerHandle layer;
+  std::uint64_t ancestorSlot{0}; // slot+1, zero means complete
+  std::uint64_t structuralVersion{0};
+  std::uint64_t transformVersion{0};
+
+  bool matchesStructure(const NodeDependencyWalk &other) const
+  {
+    return !ancestorSlot && !other.ancestorSlot && node == other.node
+        && layer == other.layer && structuralVersion == other.structuralVersion;
+  }
+  bool matchesAncestry(const NodeDependencyWalk &other) const
+  {
+    return matchesStructure(other)
+        && transformVersion == other.transformVersion;
+  }
+};
+
 struct NodeEditVersionToken
 {
   NodeHandle node;
@@ -212,6 +235,10 @@ class SceneIdentity
   NodeHandle rootHandle(const scene::Layer *layer) const;
   NodeHandle handleOf(scene::LayerNodeRef node) const;
   scene::LayerNodeRef resolve(const NodeHandle &h) const;
+
+  std::optional<NodeDependencyWalk> beginNodeDependencies(
+      const NodeHandle &h) const;
+  bool advanceNodeDependencies(NodeDependencyWalk &walk) const;
 
   // Local node editable versions; no query-time fingerprints or retained
   // observations. Core history survives coalesced/absent notifications.
@@ -593,6 +620,40 @@ inline scene::LayerNodeRef SceneIdentity::resolve(const NodeHandle &h) const
   const auto &entry = m_layers.at(it->second);
   auto root = entry.layer->root();
   return root->lifetime() == entry.rootLifetime ? root : scene::LayerNodeRef{};
+}
+
+inline std::optional<NodeDependencyWalk> SceneIdentity::beginNodeDependencies(
+    const NodeHandle &h) const
+{
+  auto node = resolve(h);
+  if (!node || handleOf(node) != h)
+    return {};
+  return NodeDependencyWalk{h,
+      handleOf(node->value().layer()),
+      node->isRoot() ? 0 : node->parent().index() + 1,
+      node->topologyVersion(),
+      0};
+}
+
+inline bool SceneIdentity::advanceNodeDependencies(
+    NodeDependencyWalk &walk) const
+{
+  auto target = resolve(walk.node);
+  auto *layer = resolve(walk.layer);
+  if (!target || !layer || target->value().layer() != layer
+      || layer->at(target.index()) != target)
+    return false;
+  if (!walk.ancestorSlot)
+    return true;
+  auto ancestor = layer->at(walk.ancestorSlot - 1);
+  if (!ancestor)
+    return false;
+  walk.structuralVersion =
+      std::max(walk.structuralVersion, ancestor->topologyVersion());
+  walk.transformVersion =
+      std::max(walk.transformVersion, ancestor->value().transformVersion());
+  walk.ancestorSlot = ancestor->isRoot() ? 0 : ancestor->parent().index() + 1;
+  return true;
 }
 
 inline std::optional<NodeEditVersionToken> SceneIdentity::nodeEditVersion(

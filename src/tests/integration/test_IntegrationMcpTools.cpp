@@ -441,6 +441,12 @@ SCENARIO("MCP node queries parse filters and expose placement records",
   REQUIRE(items[0].get("node_edit_version"));
   const auto version = items[0].get("node_edit_version")->s;
   CHECK(!version.empty());
+  REQUIRE(items[0].get("structural_version"));
+  REQUIRE(items[0].get("ancestry_version"));
+  const auto structure = items[0].get("structural_version")->s;
+  const auto ancestry = items[0].get("ancestry_version")->s;
+  CHECK(!structure.empty());
+  CHECK(!ancestry.empty());
   auto direct = f.tool(s,
       "vsr_inspect",
       "{\"request_id\":2," + scene + ",\"kind\":\"nodes\",\"handle\":"
@@ -468,6 +474,24 @@ SCENARIO("MCP node queries parse filters and expose placement records",
   REQUIRE(changed.result()->get("items")->a.size() == 1);
   CHECK(changed.result()->get("items")->a[0].get("node_edit_version")->s
       != version);
+  CHECK(changed.result()->get("items")->a[0].get("structural_version")->s
+      == structure);
+  CHECK(changed.result()->get("items")->a[0].get("ancestry_version")->s
+      == ancestry);
+  layer->root()->value().setAsTransform(vsr::math::IDENTITY_MAT4);
+  f.scene.signalLayerTransformChanged(layer);
+  REQUIRE(
+      f.tool(s,
+           "vsr_inspect",
+           "{\"request_id\":5," + scene
+               + ",\"kind\":\"nodes\",\"name\":\"wire\"}")
+          .errorCode()
+          .empty());
+  f.drain();
+  const auto parentChanged = f.status(s, s.id, 5);
+  const auto &placement = parentChanged.result()->get("items")->a[0];
+  CHECK(placement.get("structural_version")->s == structure);
+  CHECK(placement.get("ancestry_version")->s != ancestry);
   CHECK(f.tool(s,
              "vsr_inspect",
              "{\"request_id\":3," + scene

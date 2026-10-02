@@ -5,6 +5,7 @@
 #include "vsr/scene/Layer.hpp"
 #include "vsr/scene/Scene.hpp"
 // std
+#include <atomic>
 #include <exception>
 
 namespace vsr::scene {
@@ -34,7 +35,7 @@ LayerNodeData::LayerNodeData(Layer *layer, Object *o, const char *n)
 }
 
 LayerNodeData::LayerNodeData(const LayerNodeData &o)
-    : m_editVersion(o.m_editVersion)
+    : m_editVersion(o.m_editVersion), m_transformVersion(o.m_transformVersion)
 {
   m_name = o.m_name;
   m_enabled = o.m_enabled;
@@ -46,7 +47,8 @@ LayerNodeData::LayerNodeData(const LayerNodeData &o)
   incObjectUseCount();
 }
 
-LayerNodeData::LayerNodeData(LayerNodeData &&o) : m_editVersion(o.m_editVersion)
+LayerNodeData::LayerNodeData(LayerNodeData &&o)
+    : m_editVersion(o.m_editVersion), m_transformVersion(o.m_transformVersion)
 {
   m_name = std::move(o.m_name);
   m_enabled = std::move(o.m_enabled);
@@ -250,7 +252,7 @@ void LayerNodeData::setEmpty()
 
 void LayerNodeData::setEnabled(bool e)
 {
-  noteEdit();
+  noteEdit(false);
   m_enabled = e;
 }
 
@@ -259,8 +261,21 @@ std::uint64_t LayerNodeData::editVersion() const
   return m_editVersion;
 }
 
-void LayerNodeData::noteEdit()
+std::uint64_t LayerNodeData::transformVersion() const
 {
+  return m_transformVersion;
+}
+
+void LayerNodeData::noteEdit(bool transformWrite)
+{
+  // One ordered clock across all payloads makes the latest event on a chain
+  // sufficient; unrelated writes never change a chain member's stamp.
+  static std::atomic<std::uint64_t> clock{0};
+  if (transformWrite) {
+    m_transformVersion = clock.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (m_transformVersion == 0)
+      std::terminate();
+  }
   // Never let an ancient token become current again on wraparound.
   if (++m_editVersion == 0)
     std::terminate();

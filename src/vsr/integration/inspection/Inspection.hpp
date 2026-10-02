@@ -457,6 +457,8 @@ class Inspector
     std::uint64_t aux{0};
     std::uint64_t phase{0};
     bool effective{true};
+    std::uint64_t structuralVersion{0};
+    std::uint64_t transformVersion{0};
   };
 
   // Owns its scratch reservation: released on completion, and otherwise when
@@ -520,6 +522,8 @@ class Inspector
         + (j.kind == "nodes"
                 ? detail::hex64(j.pos.aux) + detail::hex64(j.pos.phase)
                     + detail::hex64(j.pos.effective)
+                    + detail::hex64(j.pos.structuralVersion)
+                    + detail::hex64(j.pos.transformVersion)
                 : "");
     return payload + mac(payload);
   }
@@ -528,7 +532,7 @@ class Inspector
   {
     // Authenticate either supported carrier before checking its query binding:
     // a genuine cursor from another kind is stale, not malformed.
-    if (c.size() != 80 && c.size() != 128)
+    if (c.size() != 80 && c.size() != 160)
       return Outcome::INVALID_REQUEST;
     const auto payloadSize = c.size() - 16;
     for (char ch : c)
@@ -540,7 +544,7 @@ class Inspector
     const std::uint64_t rev = std::stoull(c.substr(32, 16), nullptr, 16);
     if (mac(binding(j, rev)) != c.substr(48, 16))
       return Outcome::CURSOR_STALE;
-    if (payloadSize != (j.kind == "nodes" ? 112u : 64u))
+    if (payloadSize != (j.kind == "nodes" ? 144u : 64u))
       return Outcome::INVALID_REQUEST;
     j.pos.pool = std::stoull(c.substr(0, 16), nullptr, 16);
     j.pos.index = std::stoull(c.substr(16, 16), nullptr, 16);
@@ -549,6 +553,8 @@ class Inspector
       j.pos.aux = std::stoull(c.substr(64, 16), nullptr, 16);
       j.pos.phase = std::stoull(c.substr(80, 16), nullptr, 16);
       j.pos.effective = std::stoull(c.substr(96, 16), nullptr, 16) != 0;
+      j.pos.structuralVersion = std::stoull(c.substr(112, 16), nullptr, 16);
+      j.pos.transformVersion = std::stoull(c.substr(128, 16), nullptr, 16);
     }
     j.started = true;
     return Outcome::OK;
@@ -972,14 +978,28 @@ class Inspector
       }
       j.pos.index = node.index() + 1;
       j.pos.effective = state.active && data.isEnabled();
-      j.pos.aux = node->isRoot() ? 0 : parent.index() + 1;
+      const auto dependencies = ids.beginNodeDependencies(ids.handleOf(node));
+      j.pos.structuralVersion = dependencies->structuralVersion;
+      j.pos.transformVersion = 0;
+      j.pos.aux = dependencies->ancestorSlot;
       j.pos.phase = j.pos.aux ? 1 : 3;
       return true;
     }
     if (j.pos.phase == 1) {
       auto ancestor = layer->at(j.pos.aux - 1);
       j.pos.effective = j.pos.effective && ancestor->value().isEnabled();
-      j.pos.aux = ancestor->isRoot() ? 0 : ancestor->parent().index() + 1;
+      identity::NodeDependencyWalk walk{ids.handleOf(node),
+          ids.handleOf(layer),
+          j.pos.aux,
+          j.pos.structuralVersion,
+          j.pos.transformVersion};
+      if (!ids.advanceNodeDependencies(walk)) {
+        exhausted = true;
+        return false;
+      }
+      j.pos.aux = walk.ancestorSlot;
+      j.pos.structuralVersion = walk.structuralVersion;
+      j.pos.transformVersion = walk.transformVersion;
       if (!j.pos.aux)
         j.pos.phase = 3;
       return true;
@@ -993,7 +1013,14 @@ class Inspector
         + ",\"effective_enabled\":" + (j.pos.effective ? "true" : "false")
         + ",\"node_edit_version\":"
         + detail::jsonString("ne:" + handle + ":"
-            + std::to_string(ids.nodeEditVersion(ids.handleOf(node))->version));
+            + std::to_string(ids.nodeEditVersion(ids.handleOf(node))->version))
+        + ",\"structural_version\":"
+        + detail::jsonString("ns:" + handle + ":" + layerHandle + ":"
+            + std::to_string(j.pos.structuralVersion))
+        + ",\"ancestry_version\":"
+        + detail::jsonString("na:" + handle + ":" + layerHandle + ":"
+            + std::to_string(j.pos.structuralVersion) + ":"
+            + std::to_string(j.pos.transformVersion));
     if (data.isTransform()) {
       item += ",\"local_matrix\":";
       // parameterValue already encodes matrices as complete row arrays and

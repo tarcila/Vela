@@ -113,8 +113,34 @@ that live node and the host launch/scene registration. It covers local transform
 and own-enabled writes, conservatively within the node. Even same-value writes
 and change-away/back advance it, independently of delegate publication. Rename,
 parent/sibling writes, other layers and layer activation do not advance the
-node's local token. No ancestry token, world transform or node-edit readiness
-is advertised yet.
+node's local token. Records also expose opaque `structural_version` and
+`ancestry_version` strings, to copy verbatim. Both bind the actual live node,
+layer membership and launch/registration. The structural token covers only
+creation/reparent history on the target and its parent chain; sibling insertion,
+erasure, reordering and state do not invalidate it. The ancestry token adds
+ancestor payload/transform write history (not the target's local content).
+Parent/grandparent transform change-back invalidates ancestry but not structure;
+ancestor enabled-only writes invalidate neither. World numeric transforms and
+node-edit readiness are not advertised yet.
+
+These are ordered event observations, not final-parent/value hashes or whole-layer
+epochs: each Forest creation/reparent event stamps only the affected node with
+that Forest's next event number. Taking the latest event on the current chain
+catches every reparent, including change-back: a new move event is later than
+all previously observed chain events. Transform/payload writes likewise use an
+ordered clock and update only the written payload. Construction/relocation keeps
+history; clone lifetimes/handles remain distinct. An ancestry token includes
+structure, so removing a formerly latest ancestor cannot resurrect a token.
+The existing one-ancestor-per-visit walk accumulates two integers; authenticated
+cursors retain them across work-limited pages. No recursive observation,
+per-ancestor retained identity, full snapshot or uncharged scratch is introduced.
+`SceneIdentity::beginNodeDependencies` / `advanceNodeDependencies` expose the
+same incremental check to headless callers. Each advance must be charged to the
+caller's work budget; only complete walks may be compared with `matchesStructure`
+or `matchesAncestry`. Callers must operate at safe points and abort/restart an
+in-progress walk if inspection revision changes between slices. An edit checker
+must resolve the target and build a fresh bounded walk, never compare two stored
+old walks as evidence of current state.
 
 Hosts must mutate and query on the safe-point thread. Normal Scene notifications
 advance revisions incrementally; no query-time hierarchy snapshot or fingerprint
@@ -138,6 +164,19 @@ Hosts must still publish the appropriate Scene layer signal after writes (one
 coalesced signal is sufficient), including renames, to keep cursors, render
 indices and UI current. Bypassing setters through raw-memory writes is unsupported
 and cannot maintain edit history, even if a later layer notification is sent.
+
+Structural mutation audit: Forest child insertion (including explicit-slot
+insertion) issues a fresh lifetime and creation event; `copy_subtree` uses that
+path for each clone; `move_subtree` stamps only the moved subtree root, preserving
+its identity and all descendants. Every descendant walk includes that root.
+Erase/subtree erase/clear retire descendants through real pool lifetime checks;
+Scene layer removal/replacement retires the layer domain. Root-preserving clear
+need not invalidate the surviving root's own parent-chain dependency. Raw Forest
+operations require the structure signal after mutation; Layer clear and Scene
+layer operations already publish. Existing Viewer/Lua/importer hierarchy paths
+use these same insert/copy/erase primitives. Cross-Forest relinking or raw pointer
+rewriting is not a supported layer-membership operation; copying into another
+layer creates fresh nodes owned by that layer.
 
 Representative mutation-path audit (source inspection, not interactive testing):
 - Viewer: `BaseViewport.cpp` gizmo and `ObjectEditor.cpp` SRT/reset use the

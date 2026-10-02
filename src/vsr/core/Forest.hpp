@@ -61,6 +61,13 @@ struct ForestNode
     return m_lifetime;
   }
 
+  // Latest creation/reparent event on this node, not sibling list changes.
+  // The Forest clock orders events so a max over a chain detects change-back.
+  std::uint64_t topologyVersion() const
+  {
+    return m_topologyVersion;
+  }
+
   Ref insert_first_child(T &&v);
   Ref insert_last_child(T &&v);
   Ref insert_last_child_at(size_t index, T &&v);
@@ -77,6 +84,7 @@ struct ForestNode
   friend bool operator==(const ForestNode<U> &a, const ForestNode<U> &b);
 
   std::uint64_t m_lifetime{0};
+  std::uint64_t m_topologyVersion{0};
   T m_value{};
   Ref m_prev;
   Ref m_children_begin;
@@ -218,6 +226,13 @@ struct Forest
   ObjectPool<ForestNode<T>> m_nodes;
   NodeRef m_root;
   std::uint64_t m_nextLifetime{1};
+  std::uint64_t m_topologyClock{0};
+  std::uint64_t nextTopologyVersion()
+  {
+    if (++m_topologyClock == 0)
+      std::terminate();
+    return m_topologyClock;
+  }
 };
 
 // Algorithms /////////////////////////////////////////////////////////////////
@@ -661,6 +676,7 @@ inline void Forest<T>::move_subtree(
     nextSibling->m_prev = prev;
 
   // Attach source to newParent as last child
+  source->m_topologyVersion = nextTopologyVersion();
   source->m_parent = newParent;
   source->m_prev = newParent->m_children_end;
   source->m_next = newParent->self();
@@ -809,6 +825,7 @@ template <typename T>
 inline typename Forest<T>::NodeRef Forest<T>::make_ForestNode(T &&v)
 {
   auto n = m_nodes.emplace(std::forward<T>(v), this);
+  n->m_topologyVersion = nextTopologyVersion();
   if (m_nextLifetime == 0)
     std::terminate();
   n->m_lifetime = m_nextLifetime++;
@@ -825,6 +842,7 @@ inline typename Forest<T>::NodeRef Forest<T>::make_ForestNode_at(
   auto n = m_nodes.emplace_at(index, std::forward<T>(v), this);
   if (!n)
     return {};
+  n->m_topologyVersion = nextTopologyVersion();
   if (m_nextLifetime == 0)
     std::terminate();
   n->m_lifetime = m_nextLifetime++;

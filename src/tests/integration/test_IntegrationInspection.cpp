@@ -149,6 +149,85 @@ const vsr::integration::mcp::json::Value &parameter(
 
 } // namespace
 
+SCENARIO("node dependencies distinguish structural and ancestor write history",
+    "[integration][node-dependency]")
+{
+  Fixture f(0);
+  auto *layer = f.scene.defaultLayer();
+  auto root = layer->root();
+  auto parent = root->insert_last_child(
+      vsr::scene::LayerNodeData(layer, vsr::math::IDENTITY_MAT4, "parent"));
+  auto target = parent->insert_last_child(
+      vsr::scene::LayerNodeData(layer, vsr::math::IDENTITY_MAT4, "target"));
+  PageArgs args;
+  args.kind = "nodes";
+  args.filters.name = "target";
+  auto observe = [&] {
+    auto result = page(f.inspect(args, f.nextId++));
+    REQUIRE(result.get("items")->a.size() == 1);
+    auto item = result.get("items")->a.at(0);
+    REQUIRE(item.get("structural_version"));
+    REQUIRE(item.get("ancestry_version"));
+    return item;
+  };
+  auto before = observe();
+  auto moved = vsr::math::IDENTITY_MAT4;
+  moved[3].x = 8.f;
+  parent->value().setAsTransform(moved);
+  parent->value().setAsTransform(vsr::math::IDENTITY_MAT4);
+  auto after = observe();
+  CHECK(after.get("ancestry_version")->s != before.get("ancestry_version")->s);
+  CHECK(after.get("structural_version")->s
+      == before.get("structural_version")->s);
+  CHECK(
+      after.get("node_edit_version")->s == before.get("node_edit_version")->s);
+  parent->value().setEnabled(false);
+  parent->value().setEnabled(true);
+  CHECK(
+      observe().get("ancestry_version")->s == after.get("ancestry_version")->s);
+  root->container()->move_subtree(target, root);
+  root->container()->move_subtree(target, parent);
+  auto reparented = observe();
+  CHECK(reparented.get("handle")->s == before.get("handle")->s);
+  CHECK(reparented.get("structural_version")->s
+      != after.get("structural_version")->s);
+  CHECK(reparented.get("ancestry_version")->s
+      != after.get("ancestry_version")->s);
+  auto sibling =
+      root->insert_last_child(vsr::scene::LayerNodeData(layer, "sibling"));
+  layer->erase(sibling);
+  CHECK(observe().get("structural_version")->s
+      == reparented.get("structural_version")->s);
+  CHECK(observe().get("ancestry_version")->s
+      == reparented.get("ancestry_version")->s);
+  // Ancestor reparenting affects descendants, not their local editable state.
+  auto otherParent =
+      root->insert_last_child(vsr::scene::LayerNodeData(layer, "other"));
+  root->container()->move_subtree(parent, otherParent);
+  root->container()->move_subtree(parent, root);
+  auto ancestorMoved = observe();
+  CHECK(ancestorMoved.get("structural_version")->s
+      != reparented.get("structural_version")->s);
+  CHECK(ancestorMoved.get("node_edit_version")->s
+      == before.get("node_edit_version")->s);
+  root->value().setAsTransform(moved);
+  root->value().setAsTransform(vsr::math::IDENTITY_MAT4);
+  auto grandparentChanged = observe();
+  CHECK(grandparentChanged.get("structural_version")->s
+      == ancestorMoved.get("structural_version")->s);
+  CHECK(grandparentChanged.get("ancestry_version")->s
+      != ancestorMoved.get("ancestry_version")->s);
+  otherParent->value().setAsTransform(moved);
+  otherParent->value().setEnabled(false);
+  parent->value().name() = "renamed";
+  auto *otherLayer = f.scene.addLayer("unrelated");
+  otherLayer->root()->value().setAsTransform(moved);
+  auto material = f.scene.createObject<vsr::scene::Material>("matte");
+  material->setParameter("opacity", 0.5f);
+  CHECK(observe().get("ancestry_version")->s
+      == grandparentChanged.get("ancestry_version")->s);
+}
+
 SCENARIO("node edit tokens remember intervening ordinary writes",
     "[integration][node-version]")
 {
@@ -688,10 +767,15 @@ SCENARIO("deep node ancestry and preorder continuations are bounded",
   std::size_t returned = 0;
   bool complete = false;
   std::string firstCursor;
+  std::string structure, ancestry;
   for (int i = 0; i < 40; ++i) {
     auto result = page(f.inspect(args, request++));
     CHECK(result.get("visited")->n <= 7);
     returned += result.get("items")->a.size();
+    if (!result.get("items")->a.empty()) {
+      structure = result.get("items")->a[0].get("structural_version")->s;
+      ancestry = result.get("items")->a[0].get("ancestry_version")->s;
+    }
     if (result.get("complete")->b) {
       complete = true;
       break;
@@ -702,6 +786,21 @@ SCENARIO("deep node ancestry and preorder continuations are bounded",
   }
   CHECK(complete);
   CHECK(returned == 1);
+  REQUIRE(!structure.empty());
+  REQUIRE(!ancestry.empty());
+  // Compare resumed construction to a fresh uninterrupted public query.
+  Inspector uninterrupted(f.integration, *f.authority, [&](SceneId id) {
+    return id == f.sceneId ? f.sceneIds.get() : nullptr;
+  });
+  PageArgs fresh;
+  fresh.kind = "nodes";
+  fresh.filters.name = "target";
+  f.submit(uninterrupted.makeInspection(f.creds.sessionId, f.sceneId, fresh),
+      request);
+  auto whole = page(f.drain(request++));
+  REQUIRE(whole.get("items")->a.size() == 1);
+  CHECK(whole.get("items")->a[0].get("structural_version")->s == structure);
+  CHECK(whole.get("items")->a[0].get("ancestry_version")->s == ancestry);
   args.cursor = firstCursor;
   args.filters.nodeKind = "empty";
   CHECK(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args).code

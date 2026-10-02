@@ -62,6 +62,8 @@ struct LayerNodeData
   // Copy/move construction preserves it for storage relocation; node lifetime
   // distinguishes clones. Assignments are writes to the destination.
   std::uint64_t editVersion() const;
+  // Globally ordered payload/transform history, excluding enabled-only writes.
+  std::uint64_t transformVersion() const;
 
   void setAsObject(Object *o);
   void setAsObject(anari::DataType type, size_t index);
@@ -93,7 +95,7 @@ struct LayerNodeData
   void clearInstanceParameters();
 
  private:
-  void noteEdit();
+  void noteEdit(bool transformWrite = true);
   void incObjectUseCount();
   void decObjectUseCount();
 
@@ -102,6 +104,7 @@ struct LayerNodeData
   std::string m_name;
   bool m_enabled{true};
   std::uint64_t m_editVersion{1};
+  std::uint64_t m_transformVersion{0};
   Any m_value;
   Any m_defaultValue;
   math::mat3 m_srt; // scale, azelrot, translation

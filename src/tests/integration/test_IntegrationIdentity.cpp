@@ -12,6 +12,73 @@
 using namespace vsr::integration::identity;
 using vsr::scene::Scene;
 
+SCENARIO("incremental node dependencies are bound to live domains and chains",
+    "[integration][node-dependency]")
+{
+  Scene scene;
+  IdentityAuthority authority;
+  SceneIdentity ids(authority, scene);
+  auto *layer = scene.defaultLayer();
+  auto parent = layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, vsr::math::IDENTITY_MAT4, "parent"));
+  auto node =
+      parent->insert_last_child(vsr::scene::LayerNodeData(layer, "target"));
+  auto handle = ids.handleOf(node);
+  auto observe = [&] {
+    auto walk = ids.beginNodeDependencies(handle);
+    REQUIRE(walk);
+    while (walk->ancestorSlot)
+      REQUIRE(ids.advanceNodeDependencies(*walk));
+    return *walk;
+  };
+  const auto before = observe();
+  CHECK(before.matchesStructure(observe()));
+  CHECK(before.matchesAncestry(observe()));
+  SECTION("ancestor change-back and enabled-only writes stay distinct")
+  {
+    parent->value().setEnabled(false);
+    CHECK(before.matchesAncestry(observe()));
+    parent->value().setAsTransform(vsr::math::IDENTITY_MAT4);
+    CHECK(before.matchesStructure(observe()));
+    CHECK_FALSE(before.matchesAncestry(observe()));
+  }
+  SECTION("clone and relocation do not alias dependencies")
+  {
+    auto clone = node->container()->copy_subtree(node, parent);
+    auto cloneWalk = ids.beginNodeDependencies(ids.handleOf(clone));
+    REQUIRE(cloneWalk);
+    while (cloneWalk->ancestorSlot)
+      REQUIRE(ids.advanceNodeDependencies(*cloneWalk));
+    CHECK_FALSE(before.matchesStructure(*cloneWalk));
+    node->container()->reserve(1024);
+    CHECK(before.matchesAncestry(observe()));
+  }
+  SECTION("wrong kinds and registrations cannot redirect")
+  {
+    auto wrong = handle;
+    wrong.domain = ids.handleOf(layer).domain;
+    CHECK_FALSE(ids.beginNodeDependencies(wrong));
+    SceneIdentity other(authority, scene);
+    CHECK_FALSE(other.beginNodeDependencies(handle));
+    IdentityAuthority launch;
+    SceneIdentity otherLaunch(launch, scene);
+    CHECK_FALSE(otherLaunch.beginNodeDependencies(handle));
+  }
+  SECTION("removal and recreation permanently retire the dependency target")
+  {
+    layer->erase(parent);
+    auto replacement = layer->root()->insert_last_child(
+        vsr::scene::LayerNodeData(layer, vsr::math::IDENTITY_MAT4, "parent"));
+    auto newNode = replacement->insert_last_child(
+        vsr::scene::LayerNodeData(layer, "target"));
+    CHECK_FALSE(ids.beginNodeDependencies(handle));
+    auto retired = before;
+    CHECK_FALSE(ids.advanceNodeDependencies(retired));
+    handle = ids.handleOf(newNode);
+    CHECK_FALSE(before.matchesStructure(observe()));
+  }
+}
+
 SCENARIO("node edit tokens bind live targets and authority domains",
     "[integration][node-version]")
 {
