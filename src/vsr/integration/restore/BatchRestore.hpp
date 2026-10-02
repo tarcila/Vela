@@ -503,11 +503,11 @@ inline RestoreResult RestoreService::commit(
   for (std::size_t i = 0; i < record->nodeChanges.size(); ++i) {
     auto v = record->nodeChanges[i].resulting;
     v.expected = *ident->nodeEditVersion(v.expected.node);
-    v.dependencies = dependencies[i];
-    v.dependencies.transformVersion = 0;
-    for (const auto &a : ancestors[i])
-      v.dependencies.transformVersion = std::max(
-          v.dependencies.transformVersion, a->value().transformVersion());
+    // Every restored ancestor is now final. Revisit the bounded validated
+    // chain without allocating, rather than returning pre-restore history.
+    v.dependencies = *ident->beginNodeDependencies(v.expected.node);
+    while (v.dependencies.ancestorSlot)
+      ident->advanceNodeDependencies(v.dependencies);
     res.nodeVersions.push_back(v);
   }
   res.committed = true;

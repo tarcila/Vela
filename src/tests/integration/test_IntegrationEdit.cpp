@@ -1587,6 +1587,293 @@ TEST_CASE("Node validation and preparation never partially commit",
   CHECK(f.edits->restorations().size() == 0);
 }
 
+TEST_CASE("Grouped SRT publishes final parent child dependencies and restores",
+    "[integration][node-edit][node-srt]")
+{
+  for (bool childFirst : {false, true}) {
+    Fixture f(true);
+    auto *l = f.scene.defaultLayer();
+    auto parent = l->root()->insert_last_child(
+        vsr::scene::LayerNodeData(l, vsr::math::IDENTITY_MAT4));
+    auto child = parent->insert_last_child(
+        vsr::scene::LayerNodeData(l, vsr::math::IDENTITY_MAT4));
+    f.scene.signalLayerStructureChanged(l);
+    auto rotation = f.nodeEntry(parent);
+    rotation.parameter = "rotation";
+    rotation.value = JsonValue::ofKind(JsonKind::OBJECT);
+    rotation.value.members = {{"azimuth", JsonValue::fromNumber(90)},
+        {"elevation", JsonValue::fromNumber(0)},
+        {"roll", JsonValue::fromNumber(0)}};
+    auto scale = f.nodeEntry(parent);
+    scale.parameter = "scale";
+    scale.value = JsonValue::numbers({2, 3, 4});
+    auto position = f.positionEntry(child, JsonValue::numbers({5, 6, 7}));
+    auto enabled = f.nodeEntry(child);
+    auto entries = childFirst
+        ? std::vector<EditEntry>{position, enabled, scale, rotation}
+        : std::vector<EditEntry>{rotation, scale, enabled, position};
+    f.recorder->layerSignals = 0;
+    f.recorder->onParameters = [&] {
+      const auto matrix = parent->value().getTransform();
+      CHECK(matrix[0][2] == Approx(-2).margin(1e-6));
+      CHECK(matrix[2][0] == Approx(4).margin(1e-6));
+      CHECK(child->value().getTransform()[3] == vsr::math::float4(5, 6, 7, 1));
+      CHECK_FALSE(child->value().isEnabled());
+    };
+    auto result = f.run(1, f.batch(entries));
+    REQUIRE(result.committed);
+    REQUIRE(result.nodeVersions.size() == 2);
+    CHECK(f.recorder->layerSignals == 1);
+    for (const auto &version : result.nodeVersions) {
+      CHECK(f.identity->isCurrent(version.expected));
+      auto live = *f.identity->beginNodeDependencies(version.expected.node);
+      while (live.ancestorSlot)
+        REQUIRE(f.identity->advanceNodeDependencies(live));
+      CHECK(live.matchesAncestry(version.dependencies));
+    }
+    f.recorder->onParameters = {};
+    restore::RestoreService restores(*f.engine, *f.edits);
+    restores.attachScene(f.sceneId, *f.identity);
+    auto admitted = restores.submitLocal({f.sceneId, *result.batchRef});
+    REQUIRE(admitted.code == Outcome::OK);
+    while (f.integration.service()) {
+    }
+    auto restored = restores.resultLocal(admitted.ref);
+    REQUIRE(restored->committed);
+    for (const auto &version : restored->nodeVersions) {
+      CHECK(f.identity->isCurrent(version.expected));
+      auto live = *f.identity->beginNodeDependencies(version.expected.node);
+      while (live.ancestorSlot)
+        REQUIRE(f.identity->advanceNodeDependencies(live));
+      CHECK(live.matchesAncestry(version.dependencies));
+    }
+    CHECK(parent->value().getTransform() == vsr::math::IDENTITY_MAT4);
+    CHECK(child->value().getTransform() == vsr::math::IDENTITY_MAT4);
+    CHECK(child->value().isEnabled());
+  }
+}
+
+TEST_CASE("Local rotation uses named degree angles and preserves translation",
+    "[integration][node-edit][node-srt]")
+{
+  Fixture f(true);
+  auto *l = f.scene.defaultLayer();
+  auto n = l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "rotate"));
+  auto original = vsr::math::IDENTITY_MAT4;
+  original[3] = {5.f, -6.f, 7.f, 1.f};
+  n->value().setAsTransform(original);
+  n->value().setCurrentValueAsDefault();
+  auto cached = n->value().getTransformSRT();
+  f.scene.signalLayerStructureChanged(l);
+  auto e = f.nodeEntry(n);
+  e.parameter = "rotation";
+  e.value = JsonValue::ofKind(JsonKind::OBJECT);
+  e.value.members = {{"azimuth", JsonValue::fromNumber(450)},
+      {"elevation", JsonValue::fromNumber(90)},
+      {"roll", JsonValue::fromNumber(90)}};
+  auto result = f.run(1, f.batch({e}));
+  REQUIRE(result.committed);
+  auto m = n->value().getTransform();
+  // Y(90) X(90) Z(90): columns (1,0,0), (0,0,1), (0,-1,0).
+  const vsr::math::float3 columns[] = {{1, 0, 0}, {0, 0, 1}, {0, -1, 0}};
+  for (int c = 0; c < 3; ++c)
+    for (int r = 0; r < 3; ++r)
+      CHECK(m[c][r] == Approx(columns[c][r]).margin(2e-6));
+  CHECK(m[3] == original[3]);
+  CHECK(n->value().getTransformSRT()[1] == vsr::math::float3(450, 90, 90));
+  restore::RestoreService restores(*f.engine, *f.edits);
+  restores.attachScene(f.sceneId, *f.identity);
+  auto adm = restores.submitLocal({f.sceneId, *result.batchRef});
+  REQUIRE(adm.code == Outcome::OK);
+  while (f.integration.service()) {
+  }
+  REQUIRE(restores.resultLocal(adm.ref)->committed);
+  auto restored = n->value().getTransform();
+  auto restoredSrt = n->value().getTransformSRT();
+  CHECK(std::memcmp(&restored, &original, sizeof(original)) == 0);
+  CHECK(std::memcmp(&restoredSrt, &cached, sizeof(cached)) == 0);
+  CHECK(n->value().isDefaultValue());
+}
+
+TEST_CASE("SRT groups are order independent with faithful signed zero scales",
+    "[integration][node-edit][node-srt]")
+{
+  std::vector<int> order{0, 1, 2, 3};
+  do {
+    Fixture f(true);
+    auto *l = f.scene.defaultLayer();
+    vsr::math::mat3 srt;
+    srt[0] = {-2, 0, 4};
+    srt[1] = {720, 0, 0};
+    srt[2] = {5, -6, 7};
+    auto n = l->root()->insert_last_child(vsr::scene::LayerNodeData(l, srt));
+    auto original = n->value().getTransform();
+    n->value().setCurrentValueAsDefault();
+    f.scene.signalLayerStructureChanged(l);
+    f.recorder->layerSignals = 0;
+    auto rotation = f.nodeEntry(n);
+    rotation.parameter = "rotation";
+    rotation.value = JsonValue::ofKind(JsonKind::OBJECT);
+    rotation.value.members = {{"azimuth", JsonValue::fromNumber(90)},
+        {"elevation", JsonValue::fromNumber(0)},
+        {"roll", JsonValue::fromNumber(0)}};
+    auto scale = f.nodeEntry(n);
+    scale.parameter = "scale";
+    scale.value = JsonValue::numbers({-3, 0, 2});
+    auto position = f.positionEntry(n, JsonValue::numbers({11, 12, 13}));
+    std::vector<EditEntry> fields{rotation, scale, position, f.nodeEntry(n)};
+    std::vector<EditEntry> entries;
+    for (auto i : order)
+      entries.push_back(fields[i]);
+    f.recorder->onParameters = [&] {
+      auto m = n->value().getTransform();
+      CHECK(m[0][2] == Approx(3).margin(1e-6));
+      CHECK(m[2][0] == Approx(2).margin(1e-6));
+      CHECK(m[3] == vsr::math::float4(11, 12, 13, 1));
+      CHECK_FALSE(n->value().isEnabled());
+    };
+    auto result = f.run(1, f.batch(entries));
+    REQUIRE(result.committed);
+    REQUIRE(result.nodeVersions.size() == 1);
+    CHECK(f.identity->isCurrent(result.nodeVersions[0].expected));
+    auto m = n->value().getTransform();
+    const vsr::math::float3 expected[] = {{0, 0, 3}, {0, 0, 0}, {2, 0, 0}};
+    for (int c = 0; c < 3; ++c)
+      for (int r = 0; r < 3; ++r)
+        CHECK(m[c][r] == Approx(expected[c][r]).margin(1e-6));
+    CHECK(n->value().getTransformSRT()[0] == vsr::math::float3(-3, 0, 2));
+    CHECK(f.recorder->layerSignals == 1);
+    CHECK(f.hookCalls == 1);
+    f.recorder->onParameters = {};
+    restore::RestoreService restores(*f.engine, *f.edits);
+    restores.attachScene(f.sceneId, *f.identity);
+    auto adm = restores.submitLocal({f.sceneId, *result.batchRef});
+    REQUIRE(adm.code == Outcome::OK);
+    while (f.integration.service()) {
+    }
+    REQUIRE(restores.resultLocal(adm.ref)->committed);
+    auto restored = n->value().getTransform();
+    auto restoredSrt = n->value().getTransformSRT();
+    CHECK(std::memcmp(&restored, &original, sizeof(original)) == 0);
+    CHECK(std::memcmp(&restoredSrt, &srt, sizeof(srt)) == 0);
+    CHECK(n->value().isDefaultValue());
+    CHECK(n->value().isEnabled());
+  } while (std::next_permutation(order.begin(), order.end()));
+}
+
+TEST_CASE("SRT rejects unfaithful caches and invalid values without any writes",
+    "[integration][node-edit][node-srt]")
+{
+  Fixture f(true);
+  auto *l = f.scene.defaultLayer();
+  auto n = l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "srt"));
+  auto matrix = vsr::math::IDENTITY_MAT4;
+  auto cache = n->value().getTransformSRT();
+  SECTION("shear")
+  {
+    matrix[1][0] = 0.2f;
+  }
+  SECTION("unfaithful reflection")
+  {
+    matrix[0][0] = -1;
+  }
+  SECTION("unfaithful degeneracy")
+  {
+    matrix[0][0] = 0;
+  }
+  SECTION("nonfinite cache")
+  {
+    cache[1][0] = std::numeric_limits<float>::infinity();
+  }
+  SECTION("out of tolerance")
+  {
+    matrix[0][0] += 2e-5f;
+  }
+  n->value().setTransformState(matrix, cache);
+  f.scene.signalLayerStructureChanged(l);
+  f.recorder->layerSignals = 0;
+  auto e = f.nodeEntry(n);
+  e.parameter = "scale";
+  e.value = JsonValue::numbers({1, 2, 3});
+  const auto version = e.nodeExpected;
+  auto result = f.run(1, f.batch({f.nodeEntry(n), e}));
+  CHECK(result.outcome == Outcome::INVALID_REQUEST);
+  CHECK_FALSE(result.committed);
+  CHECK_FALSE(result.batchRef);
+  CHECK(n->value().getTransform() == matrix);
+  CHECK(n->value().isEnabled());
+  CHECK(f.identity->isCurrent(version));
+  CHECK(f.hookCalls == 0);
+  CHECK(f.recorder->layerSignals == 0);
+  CHECK(f.edits->restorations().size() == 0);
+}
+
+TEST_CASE("SRT validates field shapes finite range and envelope exclusions",
+    "[integration][node-edit][node-srt]")
+{
+  Fixture f(true);
+  auto *l = f.scene.defaultLayer();
+  auto n = l->root()->insert_last_child(
+      vsr::scene::LayerNodeData(l, vsr::math::IDENTITY_MAT4));
+  f.scene.signalLayerStructureChanged(l);
+  auto e = f.nodeEntry(n);
+  e.parameter = "scale";
+  e.value = JsonValue::numbers({1, 2, 3});
+  SECTION("overflow")
+  {
+    e.value.elements[0] = JsonValue::fromNumber(1e100);
+  }
+  SECTION("infinity")
+  {
+    e.value.elements[0] =
+        JsonValue::fromNumber(std::numeric_limits<double>::infinity());
+  }
+  SECTION("NaN")
+  {
+    e.value.elements[0] =
+        JsonValue::fromNumber(std::numeric_limits<double>::quiet_NaN());
+  }
+  SECTION("wrong shape")
+  {
+    e.value = JsonValue::numbers({1, 2});
+  }
+  SECTION("rotation array")
+  {
+    e.parameter = "rotation";
+  }
+  SECTION("unknown named angle")
+  {
+    e.parameter = "rotation";
+    e.value = JsonValue::ofKind(JsonKind::OBJECT);
+    e.value.members = {{"azimuth", JsonValue::fromNumber(0)},
+        {"elevation", JsonValue::fromNumber(0)},
+        {"yaw", JsonValue::fromNumber(0)}};
+  }
+  auto result = f.run(1, f.batch({e}));
+  CHECK(result.outcome == Outcome::INVALID_REQUEST);
+  CHECK_FALSE(result.committed);
+  CHECK(f.identity->isCurrent(e.nodeExpected));
+  auto scale = f.nodeEntry(n);
+  scale.parameter = "scale";
+  scale.value = JsonValue::numbers({1, 2, 3});
+  auto transform = f.nodeEntry(n);
+  transform.parameter = "transform";
+  CHECK(f.submit(2, f.batch({scale, scale})).code == Outcome::INVALID_REQUEST);
+  CHECK(f.submit(3, f.batch({scale, transform})).code
+      == Outcome::INVALID_REQUEST);
+  CHECK(f.submit(4, f.batch({transform, scale})).code
+      == Outcome::INVALID_REQUEST);
+  auto rotation = scale;
+  rotation.parameter = "rotation";
+  CHECK(f.submit(5, f.batch({rotation, transform})).code
+      == Outcome::INVALID_REQUEST);
+  CHECK(f.submit(6, f.batch({transform, rotation})).code
+      == Outcome::INVALID_REQUEST);
+  rotation.nodeExpected.version++;
+  CHECK(
+      f.submit(7, f.batch({scale, rotation})).code == Outcome::INVALID_REQUEST);
+}
+
 TEST_CASE("Local position preserves exact linear and cached representation",
     "[integration][node-edit][node-position]")
 {
@@ -2237,6 +2524,112 @@ TEST_CASE("Viewer activity controls restore enabled nodes after disconnect",
   CHECK(restores.resultLocal(admission.ref)->committed);
   CHECK(node->value().isEnabled());
   CHECK_FALSE(restores.eligible(*result.batchRef));
+}
+
+TEST_CASE(
+    "Grouped parent and child SRT precede world conversion in either order",
+    "[integration][node-srt][node-world][mixed-edit]")
+{
+  for (bool reverse : {false, true}) {
+    Fixture f(true);
+    auto *layer = f.scene.defaultLayer();
+    auto parent = layer->root()->insert_last_child(
+        vsr::scene::LayerNodeData(layer, vsr::math::IDENTITY_MAT4, "parent"));
+    auto child = parent->insert_last_child(
+        vsr::scene::LayerNodeData(layer, vsr::math::IDENTITY_MAT4, "child"));
+    parent->value().setCurrentValueAsDefault();
+    child->value().setCurrentValueAsDefault();
+    const auto parentBefore = parent->value().getTransform();
+    const auto parentCache = parent->value().getTransformSRT();
+    const auto childBefore = child->value().getTransform();
+    const auto childCache = child->value().getTransformSRT();
+    f.scene.signalLayerStructureChanged(layer);
+    auto vector = [](double x, double y, double z) {
+      return JsonValue::array({JsonValue::fromNumber(x),
+          JsonValue::fromNumber(y),
+          JsonValue::fromNumber(z)});
+    };
+    auto rotation =
+        [&](vsr::scene::LayerNodeRef node, double azimuth, double elevation) {
+          auto e = f.nodeEntry(node);
+          e.parameter = "rotation";
+          e.value = JsonValue::ofKind(JsonKind::OBJECT);
+          e.value.members = {{"azimuth", JsonValue::fromNumber(azimuth)},
+              {"elevation", JsonValue::fromNumber(elevation)},
+              {"roll", JsonValue::fromNumber(0)}};
+          return e;
+        };
+    auto parentScale = f.positionEntry(parent, vector(2, 3, 4));
+    parentScale.parameter = "scale";
+    auto childScale = f.positionEntry(child, vector(5, 6, 7));
+    childScale.parameter = "scale";
+    auto world = f.positionEntry(child, vector(22, 26, 28));
+    world.space = "world";
+    world.hasAncestryVersion = true;
+    auto batch = f.batch({rotation(parent, 90, 0),
+        parentScale,
+        f.positionEntry(parent, vector(10, 20, 30)),
+        world,
+        rotation(child, 0, 90),
+        childScale,
+        f.nodeEntry(child),
+        f.entry(f.matte.data(), "opacity", JsonValue::fromNumber(0.5))});
+    if (reverse)
+      std::reverse(batch.edits.begin(), batch.edits.end());
+    const auto result = f.run(1, batch);
+    REQUIRE(result.outcome == Outcome::OK);
+    REQUIRE(result.committed);
+    REQUIRE(result.nodeVersions.size() == 2);
+    const auto matrix = child->value().getTransform();
+    CHECK(matrix[3].x == Approx(1).margin(2e-6));
+    CHECK(matrix[3].y == Approx(2).margin(2e-6));
+    CHECK(matrix[3].z == Approx(3).margin(2e-6));
+    auto expectedSRT = childCache;
+    expectedSRT[0] = {5, 6, 7};
+    expectedSRT[1] = {0, 90, 0};
+    const vsr::scene::LayerNodeData expected(nullptr, expectedSRT);
+    for (int col = 0; col < 3; ++col)
+      CHECK(matrix[col] == expected.getTransform()[col]);
+    for (const auto &version : result.nodeVersions) {
+      auto dependencies =
+          *f.identity->beginNodeDependencies(version.expected.node);
+      while (dependencies.ancestorSlot)
+        REQUIRE(f.identity->advanceNodeDependencies(dependencies));
+      CHECK(version.dependencies.matchesStructure(dependencies));
+      CHECK(version.dependencies.matchesAncestry(dependencies));
+      CHECK(f.identity->isCurrent(version.expected));
+    }
+    bool observedRestore = false;
+    f.recorder->onParameters = [&] {
+      observedRestore = true;
+      CHECK(parent->value().getTransform() == parentBefore);
+      CHECK(child->value().getTransform() == childBefore);
+      CHECK(child->value().isEnabled());
+      CHECK(f.matte->parameter("opacity")->value().get<float>() == 1.f);
+    };
+    restore::RestoreService restores(*f.engine, *f.edits);
+    restores.attachScene(f.sceneId, *f.identity);
+    auto ack = restores.submitLocal({f.sceneId, *result.batchRef});
+    REQUIRE(ack.code == Outcome::OK);
+    while (f.integration.service()) {
+    }
+    REQUIRE(restores.resultLocal(ack.ref)->outcome == Outcome::OK);
+    REQUIRE(restores.resultLocal(ack.ref)->committed);
+    CHECK(observedRestore);
+    const auto restoredParent = parent->value().getTransform();
+    const auto restoredParentCache = parent->value().getTransformSRT();
+    const auto restoredChild = child->value().getTransform();
+    const auto restoredChildCache = child->value().getTransformSRT();
+    CHECK(
+        std::memcmp(&restoredParent, &parentBefore, sizeof(parentBefore)) == 0);
+    CHECK(std::memcmp(&restoredParentCache, &parentCache, sizeof(parentCache))
+        == 0);
+    CHECK(std::memcmp(&restoredChild, &childBefore, sizeof(childBefore)) == 0);
+    CHECK(
+        std::memcmp(&restoredChildCache, &childCache, sizeof(childCache)) == 0);
+    CHECK(parent->value().isDefaultValue());
+    CHECK(child->value().isDefaultValue());
+  }
 }
 
 TEST_CASE("World origin conversion uses final ancestors and restores exactly",

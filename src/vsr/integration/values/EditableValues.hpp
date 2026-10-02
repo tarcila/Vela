@@ -81,6 +81,7 @@ enum class ValueError
   OUT_OF_DOMAIN, // includes exceeding the largest finite binary32
   UNSUPPORTED_NODE_KIND,
   NON_AFFINE,
+  UNFAITHFUL_SRT,
   SINGULAR_PARENT
 };
 

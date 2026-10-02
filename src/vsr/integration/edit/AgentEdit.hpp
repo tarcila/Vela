@@ -133,6 +133,8 @@ inline const char *valueErrorName(ValueError e)
     return "out_of_domain";
   case ValueError::UNSUPPORTED_NODE_KIND:
     return "unsupported_node_kind";
+  case ValueError::UNFAITHFUL_SRT:
+    return "unfaithful_srt";
   case ValueError::NON_AFFINE:
     return "non_affine";
   case ValueError::SINGULAR_PARENT:
@@ -202,7 +204,56 @@ inline std::string commitDetailJson(bool committed,
   return j;
 }
 
-// One bounded walk for the whole request; no retained ancestor snapshots.
+inline ValueError prepareSRTField(const scene::LayerNodeData &data,
+    const std::string &field,
+    const JsonValue &value,
+    core::math::mat3 &proposed)
+{
+  if (!data.isTransform())
+    return ValueError::UNSUPPORTED_NODE_KIND;
+  const auto cached = data.getTransformSRT();
+  for (int c = 0; c < 3; ++c)
+    for (int r = 0; r < 3; ++r)
+      if (!std::isfinite(cached[c][r]))
+        return ValueError::NON_FINITE;
+  const scene::LayerNodeData rebuilt(nullptr, cached);
+  const auto reconstruction = rebuilt.getTransform();
+  const auto original = data.getTransform();
+  for (int c = 0; c < 3; ++c)
+    for (int r = 0; r < 3; ++r) {
+      const double component = original[c][r];
+      if (!std::isfinite(component) || !std::isfinite(reconstruction[c][r])
+          || std::abs(component - double(reconstruction[c][r]))
+              > 1e-5 * std::max(1., std::abs(component)))
+        return ValueError::UNFAITHFUL_SRT;
+    }
+  const bool rotation = field == "rotation";
+  if (rotation ? value.kind != JsonKind::OBJECT || value.members.size() != 3
+               : value.kind != JsonKind::ARRAY || value.elements.size() != 3)
+    return ValueError::INCOMPATIBLE_TYPE;
+  const char *names[] = {"azimuth", "elevation", "roll"};
+  const double limit = std::numeric_limits<float>::max();
+  for (int i = 0; i < 3; ++i) {
+    const JsonValue *component = nullptr;
+    if (rotation) {
+      for (const auto &member : value.members)
+        if (member.first == names[i]) {
+          if (component)
+            return ValueError::INCOMPATIBLE_TYPE;
+          component = &member.second;
+        }
+      if (!component)
+        return ValueError::INCOMPATIBLE_TYPE;
+    } else
+      component = &value.elements[i];
+    const auto converted = convertScalar(*component, {-limit, limit});
+    if (!converted.ok())
+      return converted.error;
+    proposed[rotation ? 1 : 0][i] = converted.value;
+  }
+  return ValueError::NONE;
+}
+
 inline ValueError prepareMatrix(const JsonValue &value, core::math::mat4 &out)
 {
   if (value.kind != JsonKind::ARRAY || value.elements.size() != 4)
@@ -226,6 +277,7 @@ inline ValueError prepareMatrix(const JsonValue &value, core::math::mat4 &out)
   return ValueError::NONE;
 }
 
+// One bounded walk for the whole request; no retained ancestor snapshots.
 inline Outcome nodeDependencies(SceneIdentity &ids,
     const identity::NodeHandle &h,
     identity::NodeDependencyWalk &out,
@@ -611,7 +663,8 @@ inline bool EditService::validEnvelope(const EditBatch &batch)
           || e.nodeDependencies.ancestorSlot
           || !e.nodeDependencies.structuralVersion
           || (e.parameter != "enabled" && e.parameter != "position"
-              && e.parameter != "transform")
+              && e.parameter != "transform" && e.parameter != "rotation"
+              && e.parameter != "scale")
           || (e.space != "local"
               && (e.parameter != "position" || e.space != "world"
                   || !e.hasAncestryVersion))
@@ -622,10 +675,12 @@ inline bool EditService::validEnvelope(const EditBatch &batch)
       if (!inserted.second
           && inserted.first->second.version != e.nodeExpected.version)
         return false;
-      const auto exclusive =
-          e.parameter == "transform" ? "position" : "transform";
-      if (e.parameter != "enabled"
-          && seen.count({TargetKind::NODE, domain, serial, exclusive}))
+      if (e.parameter == "transform") {
+        for (const auto *field : {"position", "rotation", "scale"})
+          if (seen.count({TargetKind::NODE, domain, serial, field}))
+            return false;
+      } else if (e.parameter != "enabled"
+          && seen.count({TargetKind::NODE, domain, serial, "transform"}))
         return false;
     } else if (e.targetKind != TargetKind::OBJECT || !e.expected.object.valid())
       return false;
@@ -888,6 +943,7 @@ inline EditResult EditService::commit(
     bool changedEnabled{false};
     bool enabled{true};
     bool changedTransform{false};
+    bool changedSRT{false};
     core::math::mat4 matrix{core::math::IDENTITY_MAT4};
     core::math::mat3 srt{};
     std::vector<scene::LayerNodeRef> ancestors;
@@ -931,6 +987,10 @@ inline EditResult EditService::commit(
           if (it == nodes.end()) {
             nodes.push_back({node, &e, d});
             it = std::prev(nodes.end());
+            if (node->value().isTransform()) {
+              it->matrix = node->value().getTransform();
+              it->srt = node->value().getTransformSRT();
+            }
             it->ancestors = std::move(ancestors);
           }
           if (e.parameter == "enabled") {
@@ -963,8 +1023,6 @@ inline EditResult EditService::commit(
               return res;
             }
             it->changedTransform = true;
-            it->matrix = node->value().getTransform();
-            it->srt = node->value().getTransformSRT();
             it->matrix[3].x = position.x;
             it->matrix[3].y = position.y;
             it->matrix[3].z = position.z;
@@ -973,6 +1031,16 @@ inline EditResult EditService::commit(
               it->worldEntry = &e;
               it->worldIndex = index;
             }
+          } else if (e.parameter == "rotation" || e.parameter == "scale") {
+            res.valueError = detail::prepareSRTField(
+                node->value(), e.parameter, e.value, it->srt);
+            if (res.valueError != ValueError::NONE) {
+              res.outcome = Outcome::INVALID_REQUEST;
+              res.failedEntry = index;
+              return res;
+            }
+            it->changedTransform = true;
+            it->changedSRT = true;
           } else {
             if (!node->value().isTransform()) {
               res.outcome = Outcome::INVALID_REQUEST;
@@ -1021,6 +1089,24 @@ inline EditResult EditService::commit(
   if (stale) {
     res.outcome = Outcome::CONFLICT;
     return res;
+  }
+
+  // Finalize every grouped local linear state before world conversion, even
+  // when a child appears before its proposed parent in the request.
+  for (auto &p : nodes) {
+    if (!p.changedSRT)
+      continue;
+    const scene::LayerNodeData rebuilt(nullptr, p.srt);
+    const auto matrix = rebuilt.getTransform();
+    for (int c = 0; c < 3; ++c)
+      for (int r = 0; r < 3; ++r) {
+        if (!std::isfinite(matrix[c][r])) {
+          res.outcome = Outcome::INVALID_REQUEST;
+          res.valueError = ValueError::NON_FINITE;
+          return res;
+        }
+        p.matrix[c][r] = matrix[c][r];
+      }
   }
 
   // Resolve world requests parent-first, using complete proposed states.
@@ -1209,12 +1295,15 @@ inline EditResult EditService::commit(
   }
   for (auto &c : record.nodeChanges) {
     c.resulting.expected = *ident->nodeEditVersion(c.resulting.expected.node);
-    const auto &p = nodes[&c - record.nodeChanges.data()];
-    c.resulting.dependencies.transformVersion = 0;
-    for (const auto &a : p.ancestors)
-      c.resulting.dependencies.transformVersion =
-          std::max(c.resulting.dependencies.transformVersion,
-              a->value().transformVersion());
+    // Publish dependencies only after every node write. In particular a child
+    // must observe its parent's final transform history, in either entry order.
+    // This allocation-free walk revisits the already validated bounded chain;
+    // edits cannot change topology.
+    auto dependencies =
+        *ident->beginNodeDependencies(c.resulting.expected.node);
+    while (dependencies.ancestorSlot)
+      ident->advanceNodeDependencies(dependencies);
+    c.resulting.dependencies = dependencies;
     res.nodeVersions.push_back(c.resulting);
   }
   res.committed = true;

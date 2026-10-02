@@ -270,9 +270,9 @@ historical page rather than observing fresh state.
   edit grant. Discovery scene items advertise `node_edits_exposed`; existing
   object grants alone do not expose nodes. The integration-enabled viewer opts
   in. Supported fields are own `enabled` on any existing node kind and local
-  `position` or full local `transform` replacement on scalar-transform nodes.
-  None changes layer activation or stored default baselines. World positioning,
-  rotation, and scale conveniences are not exposed.
+  `position`, `rotation`, `scale`, or full local `transform` replacement on
+  scalar-transform nodes. None changes layer activation or stored default
+  baselines. World positioning is not exposed by these local-edit slices.
 - A node entry is `{target_kind: "node", handle, version, structural_version,
   parameter: "enabled", value: <Boolean>}`. Copy `handle`, `node_edit_version`
   (as `version`), and `structural_version` verbatim from node inspection.
@@ -306,7 +306,21 @@ historical page rather than observing fresh state.
   with `enabled` but not position/rotation/scale or another matrix entry.
   Restore preserves the exact prior matrix and cached SRT representation,
   including noncanonical angles and unfaithful caches, without replacing the
-  default baseline. Position/rotation/scale are not exposed by this slice.
+  default baseline.
+- Local `rotation` takes named degree components, for example
+  `{"azimuth":450,"elevation":90,"roll":90}`. VSR composes rotations about
+  Y, then X, then Z; supplied angles are retained, not wrapped. Local `scale`
+  takes three finite float32-representable components, including faithful zero
+  and signed values. Both require the existing cached SRT to reconstruct each
+  linear matrix component within `1e-5 * max(1, abs(component))`; non-finite
+  caches or unfaithful shear/reflection/degeneracy reject without repair.
+  Translation is preserved unless a position entry is supplied. Different
+  fields on a node share one expected version; prepare rotation/scale first,
+  translation second, and enabled independently, regardless of entry order.
+  All final node states are stored before notifications; result/journal versions
+  and ancestry tokens describe the state after every write. Restore recovers
+  exact prior matrix/cache/enabled state, never an approximate decomposition.
+  World rotation/scale and matrix replacement are unsupported.
 - `vsr_restore` has its own `operation_ref`, distinct from the target batch
   and from the original edit's provenance. It never selects a batch
   implicitly. Changing `target_batch_ref` under the same `request_id` is

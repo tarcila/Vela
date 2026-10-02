@@ -1630,6 +1630,135 @@ SCENARIO("MCP node enabled edit inspect restore uses only wire tokens",
   CHECK(node->value().isEnabled());
 }
 
+SCENARIO("MCP named rotation and signed scale replay and restore",
+    "[integration][node-mcp][node-srt]")
+{
+  Fixture f({}, true, true);
+  auto *l = f.scene.defaultLayer();
+  auto n = l->root()->insert_last_child(
+      vsr::scene::LayerNodeData(l, vsr::math::IDENTITY_MAT4, "wire-srt"));
+  n->value().setCurrentValueAsDefault();
+  f.scene.signalLayerStructureChanged(l);
+  auto s = f.attach();
+  const auto scene = "\"scene_id\":" + std::to_string(f.sceneId);
+  REQUIRE(
+      f.tool(s,
+           "vsr_inspect",
+           "{\"request_id\":1," + scene
+               + ",\"kind\":\"nodes\",\"name\":\"wire-srt\"}")
+          .errorCode()
+          .empty());
+  f.drain();
+  auto inspected = f.status(s, s.id, 1);
+  auto before = inspected.result()->get("items")->a[0];
+  const auto target = "\"target_kind\":\"node\",\"handle\":"
+      + json::quote(before.get("handle")->s)
+      + ",\"version\":" + json::quote(before.get("node_edit_version")->s)
+      + ",\"structural_version\":"
+      + json::quote(before.get("structural_version")->s);
+  auto args = "{\"request_id\":2," + scene + ",\"edits\":[{" + target
+      + ",\"parameter\":\"position\",\"value\":[11,12,13]},{" + target
+      + ",\"parameter\":\"rotation\",\"value\":{\"roll\":0,\"azimuth\":450,\"elevation\":0}},{"
+      + target + ",\"parameter\":\"scale\",\"value\":[-3,0,2]},{" + target
+      + ",\"parameter\":\"enabled\",\"value\":false}]}";
+  REQUIRE(f.tool(s, "vsr_edit", args).errorCode().empty());
+  f.drain();
+  auto done = f.status(s, s.id, 2);
+  REQUIRE(done.str("outcome") == "ok");
+  REQUIRE(done.result()->get("node_versions")->a.size() == 1);
+  auto m = n->value().getTransform();
+  CHECK(m[0][2] == Approx(3).margin(2e-6));
+  CHECK(m[2][0] == Approx(2).margin(2e-6));
+  CHECK(m[3] == vsr::math::float4(11, 12, 13, 1));
+  CHECK_FALSE(n->value().isEnabled());
+  CHECK(n->value().getTransformSRT()[1].x == 450);
+  CHECK(f.tool(s, "vsr_edit", args).flag("replayed"));
+  auto different = args;
+  different.replace(different.find("450"), 3, "450.0000001");
+  CHECK_FALSE(f.tool(s, "vsr_edit", different).errorCode().empty());
+  REQUIRE(f.restoreBatch(s, 3, *done.result()->get("batch_ref"))
+          .errorCode()
+          .empty());
+  f.drain();
+  CHECK(f.status(s, s.id, 3).str("outcome") == "ok");
+  CHECK(n->value().getTransform() == vsr::math::IDENTITY_MAT4);
+  CHECK(n->value().isDefaultValue());
+  CHECK(n->value().isEnabled());
+}
+
+SCENARIO(
+    "MCP local position and enabled group preserves exact matrix on restore",
+    "[integration][node-mcp][node-position]")
+{
+  Fixture f({}, true, true);
+  auto *layer = f.scene.defaultLayer();
+  auto node = layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, "wire-move"));
+  auto original = vsr::math::IDENTITY_MAT4;
+  original[0] = {-2.f, 1.f, 0.f, 0.f};
+  original[1] = {3.f, 4.f, 0.f, 0.f};
+  original[2] = {0.f, 0.f, 0.f, 0.f};
+  original[3] = {5.f, -6.f, 7.f, 1.f};
+  node->value().setAsTransform(original);
+  node->value().setCurrentValueAsDefault();
+  f.scene.signalLayerStructureChanged(layer);
+  auto s = f.attach();
+  const auto scene = "\"scene_id\":" + std::to_string(f.sceneId);
+  auto inspect = [&](std::uint64_t id) {
+    REQUIRE(
+        f.tool(s,
+             "vsr_inspect",
+             "{\"request_id\":" + std::to_string(id) + "," + scene
+                 + ",\"kind\":\"nodes\",\"name\":\"wire-move\"}")
+            .errorCode()
+            .empty());
+    f.drain();
+    auto result = f.status(s, s.id, id);
+    REQUIRE(result.str("outcome") == "ok");
+    REQUIRE(result.result()->get("items")->a.size() == 1);
+    return result.result()->get("items")->a[0];
+  };
+  auto before = inspect(1);
+  const auto target = "\"target_kind\":\"node\",\"handle\":"
+      + json::quote(before.get("handle")->s)
+      + ",\"version\":" + json::quote(before.get("node_edit_version")->s)
+      + ",\"structural_version\":"
+      + json::quote(before.get("structural_version")->s);
+  auto args = [&](const std::string &space) {
+    return "{\"request_id\":2," + scene + ",\"edits\":[{" + target
+        + ",\"parameter\":\"position\",\"value\":[11,-12,13]" + space + "},{"
+        + target + ",\"parameter\":\"enabled\",\"value\":false}]}";
+  };
+  CHECK(f.tool(s, "vsr_edit", args(",\"space\":\"world\"")).errorCode()
+      == "invalid_request");
+  REQUIRE(f.tool(s, "vsr_edit", args("")).errorCode().empty());
+  f.drain();
+  auto done = f.status(s, s.id, 2);
+  REQUIRE(done.str("outcome") == "ok");
+  REQUIRE(done.result()->get("batch_ref"));
+  CHECK(done.result()->get("node_versions")->a.size() == 1);
+  auto batch = *done.result()->get("batch_ref");
+  auto moved = inspect(3);
+  CHECK_FALSE(moved.get("enabled")->b);
+  const auto &rows = moved.get("local_matrix")->get("data")->a;
+  CHECK(rows[0].a[0].n == -2);
+  CHECK(rows[0].a[1].n == 3);
+  CHECK(rows[0].a[3].n == 11);
+  CHECK(rows[1].a[3].n == -12);
+  CHECK(rows[2].a[3].n == 13);
+  CHECK(rows[2].a[2].n == 0);
+  CHECK(f.tool(s, "vsr_edit", args(",\"space\":\"local\"")).flag("replayed"));
+  REQUIRE(f.restoreBatch(s, 4, batch).errorCode().empty());
+  f.drain();
+  REQUIRE(f.status(s, s.id, 4).str("outcome") == "ok");
+  auto restored = inspect(5);
+  CHECK(restored.get("enabled")->b);
+  CHECK(json::write(*restored.get("local_matrix"))
+      == json::write(*before.get("local_matrix")));
+  CHECK(node->value().getTransform() == original);
+  CHECK(node->value().isDefaultValue());
+}
+
 SCENARIO("MCP world position requires ancestry and restores exact node state",
     "[integration][node-mcp][node-position]")
 {
