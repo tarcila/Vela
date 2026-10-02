@@ -416,6 +416,44 @@ SCENARIO(
   CHECK(st.isError());
 }
 
+SCENARIO("MCP node queries parse filters and expose placement records",
+    "[integration][node-mcp]")
+{
+  Fixture f;
+  auto *layer = f.scene.defaultLayer();
+  layer->root()->insert_last_child(vsr::scene::LayerNodeData(layer, "wire"));
+  f.scene.signalLayerStructureChanged(layer);
+  auto s = f.attach();
+  const auto scene = "\"scene_id\":" + std::to_string(f.sceneId);
+  auto ack = f.tool(s,
+      "vsr_inspect",
+      "{\"request_id\":1," + scene
+          + ",\"kind\":\"nodes\",\"name\":\"wire\",\"node_kind\":\"empty\"}");
+  REQUIRE(ack.errorCode().empty());
+  f.drain();
+  auto result = f.status(s, s.id, 1);
+  REQUIRE(result.str("outcome") == "ok");
+  const auto &items = result.result()->get("items")->a;
+  REQUIRE(items.size() == 1);
+  CHECK(items[0].get("node_kind")->s == "empty");
+  CHECK(items[0].get("enabled")->b);
+  auto direct = f.tool(s,
+      "vsr_inspect",
+      "{\"request_id\":2," + scene + ",\"kind\":\"nodes\",\"handle\":"
+          + json::quote(items[0].get("handle")->s) + ",\"layer_handle\":"
+          + json::quote(items[0].get("layer_handle")->s) + ",\"parent_handle\":"
+          + json::quote(items[0].get("parent_handle")->s) + "}");
+  REQUIRE(direct.errorCode().empty());
+  f.drain();
+  CHECK(f.status(s, s.id, 2).result()->get("items")->a.size() == 1);
+  CHECK(f.tool(s,
+             "vsr_inspect",
+             "{\"request_id\":3," + scene
+                 + ",\"kind\":\"nodes\",\"node_kind\":17}")
+            .errorCode()
+      == "invalid_request");
+}
+
 SCENARIO("MCP layer queries expose live layer and root handles",
     "[integration][layer-mcp]")
 {
@@ -433,9 +471,10 @@ SCENARIO("MCP layer queries expose live layer and root handles",
                               ->get("kind")
                               ->get("enum")
                               ->a;
-      REQUIRE(kinds.size() == 2);
+      REQUIRE(kinds.size() == 3);
       CHECK(kinds[0].s == "objects");
       CHECK(kinds[1].s == "layers");
+      CHECK(kinds[2].s == "nodes");
       const auto *props = tool.get("inputSchema")->get("properties");
       CHECK(props->get("name")->get("maxLength")->n == 4096);
       CHECK(props->get("name_contains")->get("maxLength")->n == 4096);
@@ -477,7 +516,7 @@ SCENARIO("MCP layer queries expose live layer and root handles",
   CHECK(matched.result()->get("items")->a[0].get("root_handle")->s
       == items[0].get("root_handle")->s);
   for (const auto &bad :
-      {std::string("\"kind\":\"nodes\""),
+      {std::string("\"kind\":\"unsupported\""),
           std::string("\"kind\":17"),
           std::string("\"kind\":\"layers\",\"name\":17"),
           std::string("\"kind\":\"layers\",\"name_contains\":null"),
@@ -528,7 +567,7 @@ SCENARIO("MCP object filters and active paging limits are exposed",
   auto s = f.attach();
   const auto scene = "\"scene_id\":" + std::to_string(f.sceneId);
   for (const char *bad : {"\"page_size\":500",
-           "\"kind\":\"nodes\"",
+           "\"kind\":\"unsupported\"",
            "\"name\":1",
            "\"object_type\":\"ANARI_FLOAT32\"",
            "\"node_kind\":\"transform\"",

@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <optional>
 #include <random>
 #include <unordered_map>
@@ -192,6 +193,7 @@ class SceneIdentity
   LayerHandle handleOf(const scene::Layer *layer) const;
   scene::Layer *resolve(const LayerHandle &h) const;
   NodeHandle rootHandle(const scene::Layer *layer) const;
+  NodeHandle handleOf(scene::LayerNodeRef node) const;
   scene::LayerNodeRef resolve(const NodeHandle &h) const;
 
   // Parameter versions //
@@ -278,6 +280,16 @@ class SceneIdentity
   std::unordered_map<std::uint64_t, std::uint64_t> m_layerSerialOf;
   std::unordered_map<std::uint64_t, LayerEntry> m_layers;
   std::unordered_map<std::uint64_t, std::uint64_t> m_rootLayerOf;
+  struct NodeEntry
+  {
+    std::uint64_t layerSerial;
+    std::uint64_t lifetime;
+    std::size_t index;
+  };
+  // Forest creation stamps, not addresses or payloads, establish identity.
+  mutable std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint64_t>
+      m_nodeSerialOf;
+  mutable std::unordered_map<std::uint64_t, NodeEntry> m_nodes;
   Observer *m_observer{nullptr};
   std::size_t m_defragToken{0};
   std::uint64_t m_sceneRevision{1};
@@ -516,14 +528,45 @@ inline NodeHandle SceneIdentity::rootHandle(const scene::Layer *layer) const
   return {m_authority->launch(), m_nodeDomain, entry.rootSerial};
 }
 
+inline NodeHandle SceneIdentity::handleOf(scene::LayerNodeRef node) const
+{
+  if (!node)
+    return {};
+  const auto *layer = node->value().layer();
+  const auto layerHandle = handleOf(layer);
+  if (!layerHandle.valid() || layer->at(node.index()) != node)
+    return {};
+  if (node == layer->root())
+    return rootHandle(layer);
+  const auto key = std::make_pair(layerHandle.serial, node->lifetime());
+  auto it = m_nodeSerialOf.find(key);
+  if (it == m_nodeSerialOf.end()) {
+    const auto serial = m_authority->nextSerial();
+    it = m_nodeSerialOf.emplace(key, serial).first;
+    m_nodes.emplace(
+        serial, NodeEntry{layerHandle.serial, node->lifetime(), node.index()});
+  }
+  return {m_authority->launch(), m_nodeDomain, it->second};
+}
+
 inline scene::LayerNodeRef SceneIdentity::resolve(const NodeHandle &h) const
 {
   if (!h.valid() || h.launch != m_authority->launch()
       || h.domain != m_nodeDomain)
     return {};
   auto it = m_rootLayerOf.find(h.serial);
-  if (it == m_rootLayerOf.end())
-    return {};
+  if (it == m_rootLayerOf.end()) {
+    const auto n = m_nodes.find(h.serial);
+    if (n == m_nodes.end())
+      return {};
+    const auto layer = m_layers.find(n->second.layerSerial);
+    if (layer == m_layers.end())
+      return {};
+    auto node = layer->second.layer->at(n->second.index);
+    return node && node->lifetime() == n->second.lifetime
+        ? node
+        : scene::LayerNodeRef{};
+  }
   const auto &entry = m_layers.at(it->second);
   auto root = entry.layer->root();
   return root->lifetime() == entry.rootLifetime ? root : scene::LayerNodeRef{};

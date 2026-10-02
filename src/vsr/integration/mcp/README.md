@@ -67,12 +67,12 @@ block on a safe point.
 | Tool | Arguments | Capability | Slot / ID |
 |---|---|---|---|
 | `vsr_discover` | `request_id`, `page_size?`, `cursor?` | read | one scene slot, one request ID |
-| `vsr_inspect` | `request_id`, `scene_id`, `kind?`, `name?`, `name_contains?`, `handle?`, `object_type?`, `object_subtype?`, `page_size?`, `cursor?` | read on `scene_id` | one scene slot, one request ID |
+| `vsr_inspect` | `request_id`, `scene_id`, `kind?`, `name?`, `name_contains?`, `handle?`, `object_type?`, `object_subtype?`, `node_kind?`, `layer_handle?`, `parent_handle?`, `page_size?`, `cursor?` | read on `scene_id` | one scene slot, one request ID |
 | `vsr_operation_status` | `operation_ref` | current proof; read on every covered target for payload or foreign records | control gate, no ID |
 | `vsr_cancel` | `operation_ref` (own session only) | current proof | control gate, no ID |
 
-Inspection defaults to `kind: "objects"`; `kind: "layers"` is also supported.
-General `nodes` queries are not yet supported. Object filters intersect. `name` and
+Inspection defaults to `kind: "objects"`; `kind: "layers"` and `kind: "nodes"`
+are also supported. Object filters intersect. `name` and
 `object_subtype` compare exactly, `name_contains` is case-sensitive literal text
 (not regex/glob), `object_type` uses the advertised ANARI enum strings, and
 `handle` is the opaque object handle returned by inspection. Filter strings are
@@ -91,6 +91,24 @@ node handles have distinct host-issued domains and are not interchangeable.
 Removed/recreated layers, scene reset and SceneIdentity replacement retire old
 handles permanently. Clearing a layer's descendants preserves its genuine root
 and its handle, matching Forest's root-preserving semantics.
+
+Node queries support intersecting `name`, `name_contains`, node `handle`,
+`node_kind` (`empty`, `transform`, `object`, `transform_array`), `layer_handle`,
+and immediate `parent_handle` filters. They traverse layers in scene order and
+nodes in stable pre-order, including each layer root. Records contain
+`handle`, `layer_handle`, `parent_handle` (null for roots), `root`, bounded
+`name`, `node_kind`, `enabled`, and `effective_enabled` (layer and ancestry).
+Hidden placements remain readable. Scalar transforms expose a complete
+`local_matrix`; references expose `object` or `array` with type and handle or
+an explicit unavailable state. Arrays include metadata summaries only, never
+mapped contents or an arbitrary instance matrix. Parent handles resolve even
+outside a filtered page. Ancestry/climb work uses the shared visit/slice budget
+and cursors retain its bounded continuation state. Cursors bind all filters,
+kind, page policy and inspection revision; identical retries replay history.
+Forest creation stamps establish genuine node lifetime: erasure/recreation,
+ancestor removal and scene replacement cannot redirect handles. Subtree copies
+have distinct handles; moving a live subtree preserves them. No editable node
+version, ancestry token, world transform or node-edit readiness is advertised.
 
 Hosts must mutate and query on the safe-point thread. Normal Scene notifications
 advance revisions incrementally; no query-time hierarchy snapshot or fingerprint

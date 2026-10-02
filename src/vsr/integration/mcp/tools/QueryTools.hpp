@@ -39,7 +39,7 @@ inline std::string filterSchemaProps(const inspection::PageLimits &limits)
 {
   const std::string text = "{\"type\":\"string\",\"maxLength\":"
       + std::to_string(limits.displayString) + "}";
-  std::string props = "\"kind\":{\"type\":\"string\",\"enum\":[\"objects\",\"layers\"],"
+  std::string props = "\"kind\":{\"type\":\"string\",\"enum\":[\"objects\",\"layers\",\"nodes\"],"
                      "\"default\":\"objects\"},\"name\":"
       + text + ",\"name_contains\":" + text + ",\"object_subtype\":" + text
       + ",\"handle\":{\"type\":\"string\",\"pattern\":\"^[0-9a-f]{32}$\"},"
@@ -63,7 +63,9 @@ inline std::string filterSchemaProps(const inspection::PageLimits &limits)
     first = false;
     props += json::quote(anari::toString(type));
   }
-  return props + "]}";
+  return props + "]},\"node_kind\":{\"type\":\"string\",\"enum\":[\"empty\",\"transform\",\"object\",\"transform_array\"]},"
+      "\"layer_handle\":{\"type\":\"string\",\"pattern\":\"^[0-9a-f]{32}$\"},"
+      "\"parent_handle\":{\"type\":\"string\",\"pattern\":\"^[0-9a-f]{32}$\"}";
 }
 
 inline bool filterArgs(const json::Value &args, inspection::PageArgs &out)
@@ -73,9 +75,6 @@ inline bool filterArgs(const json::Value &args, inspection::PageArgs &out)
       return false;
     out.kind = kind->s;
   }
-  for (const char *key : {"node_kind", "layer_handle", "parent_handle"})
-    if (args.get(key))
-      return false;
   auto text = [&](const char *key, std::optional<std::string> &value) {
     const auto *v = args.get(key);
     if (!v)
@@ -89,7 +88,10 @@ inline bool filterArgs(const json::Value &args, inspection::PageArgs &out)
       && text("name_contains", out.filters.nameContains)
       && text("handle", out.filters.handle)
       && text("object_type", out.filters.objectType)
-      && text("object_subtype", out.filters.objectSubtype);
+      && text("object_subtype", out.filters.objectSubtype)
+      && text("node_kind", out.filters.nodeKind)
+      && text("layer_handle", out.filters.layerHandle)
+      && text("parent_handle", out.filters.parentHandle);
 }
 
 inline bool pageArgs(const json::Value &args, inspection::PageArgs &out)
@@ -106,7 +108,7 @@ inline void addQueryTools(std::vector<Tool> &tools, QueryDeps deps)
   const std::string paging = " Default page size "
       + std::to_string(limits.defaultItems) + ", maximum "
       + std::to_string(limits.maxItems)
-      + "; supported inspection kinds: objects, layers.";
+      + "; supported inspection kinds: objects, layers, nodes.";
   Tool discover;
   discover.name = "vsr_discover";
   discover.description =

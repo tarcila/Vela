@@ -149,6 +149,348 @@ const vsr::integration::mcp::json::Value &parameter(
 
 } // namespace
 
+SCENARIO("nodes expose placement observations through public inspection",
+    "[integration][node-inspection]")
+{
+  Fixture f(0);
+  auto *layer = f.scene.defaultLayer();
+  auto child = layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, "placement"));
+  child->value().setEnabled(false);
+  f.scene.signalLayerStructureChanged(layer);
+  PageArgs args;
+  args.kind = "nodes";
+  auto result = page(f.inspect(args, 1));
+  REQUIRE(result.get("items")->a.size() == 2);
+  const auto &root = result.get("items")->a[0];
+  const auto &node = result.get("items")->a[1];
+  CHECK(node.get("parent_handle")->s == root.get("handle")->s);
+  CHECK(node.get("node_kind")->s == "empty");
+  CHECK_FALSE(node.get("enabled")->b);
+  CHECK_FALSE(node.get("effective_enabled")->b);
+  args.filters.handle = node.get("handle")->s;
+  CHECK(page(f.inspect(args, 2)).get("items")->a.size() == 1);
+  layer->erase(child);
+  layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, "placement"));
+  f.scene.signalLayerStructureChanged(layer);
+  CHECK(f.inspect(args, 3).terminal == Outcome::CONFLICT);
+}
+
+SCENARIO("node kinds filters and inactive ancestry preserve local observations",
+    "[integration][node-inspection]")
+{
+  Fixture f(0);
+  auto *layer = f.scene.defaultLayer();
+  auto root = layer->root();
+  auto matrix = vsr::math::IDENTITY_MAT4;
+  matrix[0] = {1.f, 2.f, 3.f, 0.f};
+  matrix[1] = {4.f, 5.f, 6.f, 0.f};
+  matrix[2] = {7.f, 8.f, 9.f, 0.f};
+  matrix[3] = {10.f, 11.f, 12.f, 1.f};
+  auto transform = root->insert_last_child(
+      vsr::scene::LayerNodeData(layer, matrix, "duplicate"));
+  transform->value().setEnabled(false);
+  auto *surface = f.scene.createObject(ANARI_SURFACE, "default");
+  REQUIRE(surface);
+  auto placement = transform->insert_last_child(
+      vsr::scene::LayerNodeData(layer, surface, "duplicate"));
+  root->insert_last_child(
+      vsr::scene::LayerNodeData(layer, surface, "duplicate"));
+  auto array = f.scene.createArrayProxy(ANARI_FLOAT32_MAT4, 1000000);
+  root->insert_last_child(vsr::scene::LayerNodeData(layer, array, "array"));
+  auto missing =
+      root->insert_last_child(vsr::scene::LayerNodeData(layer, "missing"));
+  missing->value().setAsObject(ANARI_SURFACE, 99999);
+  auto *inactive = f.scene.addLayer("inactive");
+  f.scene.setLayerActive("inactive", false);
+  f.scene.signalLayerStructureChanged(layer);
+  PageArgs args;
+  args.kind = "nodes";
+  auto status = f.inspect(args, 1);
+  INFO(status.result);
+  auto all = page(status);
+  const auto &items = all.get("items")->a;
+  REQUIRE(items.size() == 7);
+  CHECK(items[0].get("root")->b);
+  CHECK(items[0].get("parent_handle")->type == mcp::json::Value::Type::NUL);
+  CHECK(items[1].get("local_matrix")->get("data")->a[0].a[1].n == 4);
+  CHECK(items[1].get("local_matrix")->get("data")->a[2].a[3].n == 12);
+  REQUIRE(items[2].get("object"));
+  REQUIRE(items[3].get("object"));
+  CHECK(items[2].get("object")->get("handle")->s
+      == items[3].get("object")->get("handle")->s);
+  CHECK(items[2].get("handle")->s != items[3].get("handle")->s);
+  CHECK_FALSE(items[2].get("effective_enabled")->b);
+  CHECK(items[3].get("effective_enabled")->b);
+  REQUIRE(items[4].get("node_kind")->s == "transform_array");
+  CHECK(items[4].get("array")->get("summary")->get("element_count")->n
+      == 1000000);
+  CHECK_FALSE(items[4].get("local_matrix"));
+  CHECK(items[5].get("object")->get("state")->s == "unavailable");
+  CHECK_FALSE(items[6].get("effective_enabled")->b);
+  args.filters.name = "duplicate";
+  args.filters.nameContains = "plic";
+  args.filters.nodeKind = "object";
+  args.filters.layerHandle = items[2].get("layer_handle")->s;
+  args.filters.parentHandle = items[1].get("handle")->s;
+  CHECK(page(f.inspect(args, 2)).get("items")->a.size() == 1);
+  args.filters.nameContains = "Plic";
+  CHECK(page(f.inspect(args, 3)).get("items")->a.empty());
+  args.filters = {};
+  args.filters.handle = items[2].get("parent_handle")->s;
+  CHECK(page(f.inspect(args, 4)).get("items")->a[0].get("node_kind")->s
+      == "transform");
+  for (auto bad : {"unsupported", "Object"}) {
+    args.filters.nodeKind = bad;
+    CHECK(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args).code
+        == Outcome::INVALID_REQUEST);
+  }
+  args.filters = {};
+  args.filters.handle = items[2].get("layer_handle")->s;
+  CHECK(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args).code
+      == Outcome::INVALID_REQUEST);
+  args.filters = {};
+  args.filters.parentHandle = "bad";
+  CHECK(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args).code
+      == Outcome::INVALID_REQUEST);
+  (void)placement;
+  (void)inactive;
+}
+
+SCENARIO("node handles follow real copy move and destruction lifetimes",
+    "[integration][node-inspection]")
+{
+  Fixture f(0);
+  auto *layer = f.scene.defaultLayer();
+  auto root = layer->root();
+  auto parent =
+      root->insert_last_child(vsr::scene::LayerNodeData(layer, "parent"));
+  auto node = root->insert_last_child(vsr::scene::LayerNodeData(layer, "same"));
+  PageArgs args;
+  args.kind = "nodes";
+  args.filters.name = "same";
+  auto original = page(f.inspect(args, 1));
+  auto handle = original.get("items")->a[0].get("handle")->s;
+  auto copy = root->container()->copy_subtree(node, root);
+  f.scene.signalLayerStructureChanged(layer);
+  auto copied = page(f.inspect(args, 2));
+  REQUIRE(copied.get("items")->a.size() == 2);
+  CHECK(copied.get("items")->a[0].get("handle")->s == handle);
+  CHECK(copied.get("items")->a[1].get("handle")->s != handle);
+  root->container()->move_subtree(node, parent);
+  f.scene.signalLayerStructureChanged(layer);
+  args.filters = {};
+  args.filters.handle = handle;
+  auto moved = page(f.inspect(args, 3));
+  CHECK(moved.get("items")->a[0].get("handle")->s == handle);
+  node->value().name() = "renamed";
+  node->value().setEnabled(false);
+  f.scene.signalLayerTransformChanged(layer);
+  CHECK(page(f.inspect(args, 4)).get("items")->a[0].get("handle")->s == handle);
+  layer->erase(parent);
+  f.scene.signalLayerStructureChanged(layer);
+  CHECK(f.inspect(args, 5).terminal == Outcome::CONFLICT);
+  args.filters.handle = copied.get("items")->a[1].get("handle")->s;
+  layer->clear();
+  CHECK(f.inspect(args, 6).terminal == Outcome::CONFLICT);
+  auto replacement =
+      root->insert_last_child(vsr::scene::LayerNodeData(layer, "same"));
+  args.filters = {};
+  args.filters.name = "same";
+  auto fresh = page(f.inspect(args, 7));
+  args.filters = {};
+  args.filters.handle = fresh.get("items")->a[0].get("handle")->s;
+  f.scene.removeAllLayers();
+  CHECK(f.inspect(args, 8).terminal == Outcome::CONFLICT);
+  layer = f.scene.addLayer("new");
+  layer->root()->insert_last_child(vsr::scene::LayerNodeData(layer, "same"));
+  args.filters = {};
+  args.filters.name = "same";
+  fresh = page(f.inspect(args, 9));
+  args.filters = {};
+  args.filters.handle = fresh.get("items")->a[0].get("handle")->s;
+  f.scene.removeAllObjects();
+  CHECK(f.inspect(args, 10).terminal == Outcome::CONFLICT);
+  layer = f.scene.addLayer("replacement");
+  layer->root()->insert_last_child(vsr::scene::LayerNodeData(layer, "same"));
+  args.filters = {};
+  args.filters.name = "same";
+  fresh = page(f.inspect(args, 11));
+  args.filters = {};
+  args.filters.handle = fresh.get("items")->a[0].get("handle")->s;
+  f.sceneIds = std::make_unique<identity::SceneIdentity>(f.ids, f.scene);
+  CHECK(f.inspect(args, 12).terminal == Outcome::CONFLICT);
+  (void)copy;
+  (void)replacement;
+}
+
+SCENARIO("node cursor policy replay and stale scopes never redirect",
+    "[integration][node-inspection]")
+{
+  Fixture f(0);
+  auto *layer = f.scene.defaultLayer();
+  auto parent = layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, "parent"));
+  parent->insert_last_child(vsr::scene::LayerNodeData(layer, "a"));
+  parent->insert_last_child(vsr::scene::LayerNodeData(layer, "b"));
+  PageArgs args;
+  args.kind = "nodes";
+  auto all = page(f.inspect(args, 1));
+  const auto &items = all.get("items")->a;
+  REQUIRE(items.size() == 4);
+  CHECK(items[2].get("name")->get("text")->s == "a");
+  CHECK(items[3].get("name")->get("text")->s == "b");
+  args.pageSize = 1;
+  auto original = f.inspect(args, 2);
+  auto first = page(original);
+  args.cursor = first.get("cursor")->s;
+  std::uint64_t request = 3;
+  for (int i = 0; i < 7; ++i) {
+    auto changed = args;
+    if (i == 0)
+      changed.filters.name = "parent";
+    if (i == 1)
+      changed.filters.nameContains = "a";
+    if (i == 2)
+      changed.filters.handle = items[1].get("handle")->s;
+    if (i == 3)
+      changed.filters.nodeKind = "empty";
+    if (i == 4)
+      changed.filters.layerHandle = items[1].get("layer_handle")->s;
+    if (i == 5)
+      changed.filters.parentHandle = items[1].get("handle")->s;
+    if (i == 6)
+      changed.pageSize = 2;
+    CHECK(
+        f.inspector->makeInspection(f.creds.sessionId, f.sceneId, changed).code
+        == Outcome::CURSOR_STALE);
+  }
+  auto changedKind = args;
+  changedKind.kind = "objects";
+  CHECK(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, changedKind)
+            .code
+      == Outcome::CURSOR_STALE);
+  auto next = page(f.inspect(args, request++));
+  CHECK(next.get("items")->a[0].get("handle")->s == items[1].get("handle")->s);
+  parent->value().setEnabled(false);
+  f.scene.signalLayerTransformChanged(layer);
+  CHECK(f.inspect(args, request++).terminal == Outcome::CURSOR_STALE);
+  args.cursor.clear();
+  auto replay = f.submit(
+      f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args), 2);
+  REQUIRE(replay.replayed);
+  CHECK(replay.status.result == original.result);
+  args.pageSize.reset();
+  args.filters.parentHandle = items[1].get("handle")->s;
+  layer->erase(parent);
+  layer->root()->insert_last_child(vsr::scene::LayerNodeData(layer, "parent"));
+  f.scene.signalLayerStructureChanged(layer);
+  CHECK(f.inspect(args, request++).terminal == Outcome::CONFLICT);
+  args.filters = {};
+  args.filters.layerHandle = items[1].get("layer_handle")->s;
+  f.scene.removeAllLayers();
+  CHECK(f.inspect(args, request++).terminal == Outcome::CONFLICT);
+}
+
+SCENARIO("node scans share budgets and release scratch on interruption",
+    "[integration][node-inspection]")
+{
+  PageLimits limits;
+  limits.sliceVisits = 1;
+  limits.visits = 3;
+  Fixture f(0, limits);
+  auto *layer = f.scene.defaultLayer();
+  for (int i = 0; i < 12; ++i)
+    layer->root()->insert_last_child(
+        vsr::scene::LayerNodeData(layer, "hidden"));
+  PageArgs args;
+  args.kind = "nodes";
+  args.filters.name = "absent";
+  auto result = page(f.inspect(args, 1));
+  CHECK(result.get("visited")->n <= 3);
+  CHECK(result.get("items")->a.empty());
+  CHECK_FALSE(result.get("complete")->b);
+  args.cursor = result.get("cursor")->s;
+  CHECK(page(f.inspect(args, 2)).get("items")->a.empty());
+  args.cursor.clear();
+  REQUIRE(
+      f.submit(
+           f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args), 3)
+          .code
+      == Outcome::OK);
+  f.integration.service();
+  REQUIRE(f.inspector->scratch().used() > 0);
+  SECTION("cancel")
+  {
+    f.engine->cancel(f.creds, {f.creds.sessionId, 3});
+    CHECK(f.drain(3).terminal == Outcome::CANCELLED);
+  }
+  SECTION("deadline")
+  {
+    f.now += 6;
+    CHECK(f.drain(3).terminal == Outcome::TIMEOUT);
+  }
+  SECTION("session end")
+  {
+    REQUIRE(f.authority->revokeSession());
+    while (f.integration.service() > 0) {
+    }
+  }
+  SECTION("read revoked")
+  {
+    f.authority->restrict(
+        session::Target::scene(f.sceneId), session::Capability::READ);
+    CHECK(f.drain(3).terminal == Outcome::FORBIDDEN);
+  }
+  CHECK(f.engine->slotsInUse() == 0);
+  CHECK(f.inspector->scratch().used() == 0);
+}
+
+SCENARIO("deep node ancestry and preorder continuations are bounded",
+    "[integration][node-inspection]")
+{
+  PageLimits limits;
+  limits.visits = 7;
+  limits.sliceVisits = 2;
+  Fixture f(0, limits);
+  auto *layer = f.scene.defaultLayer();
+  auto node = layer->root();
+  for (int i = 0; i < 24; ++i)
+    node = node->insert_last_child(vsr::scene::LayerNodeData(layer, "deep"));
+  node->value().name() = "target";
+  PageArgs args;
+  args.kind = "nodes";
+  args.filters.name = "target";
+  std::uint64_t request = 1;
+  std::size_t returned = 0;
+  bool complete = false;
+  std::string firstCursor;
+  for (int i = 0; i < 40; ++i) {
+    auto result = page(f.inspect(args, request++));
+    CHECK(result.get("visited")->n <= 7);
+    returned += result.get("items")->a.size();
+    if (result.get("complete")->b) {
+      complete = true;
+      break;
+    }
+    args.cursor = result.get("cursor")->s;
+    if (firstCursor.empty())
+      firstCursor = args.cursor;
+  }
+  CHECK(complete);
+  CHECK(returned == 1);
+  args.cursor = firstCursor;
+  args.filters.nodeKind = "empty";
+  CHECK(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args).code
+      == Outcome::CURSOR_STALE);
+  args.filters.nodeKind.reset();
+  node->value().setEnabled(false);
+  f.scene.signalLayerTransformChanged(layer);
+  CHECK(f.inspect(args, request++).terminal == Outcome::CURSOR_STALE);
+  CHECK(f.inspector->scratch().used() == 0);
+}
+
 SCENARIO("layers expose live roots and stored names in scene order",
     "[integration][layer-inspection]")
 {
@@ -893,7 +1235,7 @@ SCENARIO("object filter validation, handle lifetime and historical replay",
   CHECK(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args).code
       == Outcome::INVALID_REQUEST);
   args = {};
-  args.kind = "nodes";
+  args.kind = "unsupported";
   CHECK(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args).code
       == Outcome::INVALID_REQUEST);
   args = {};
@@ -1020,8 +1362,9 @@ SCENARIO("discovery lists readable targets with current capabilities",
   REQUIRE(a.code == Outcome::OK);
   auto s = f.drain(1);
   CHECK(s.result.find("\"kind\":\"scene\"") != std::string::npos);
-  CHECK(s.result.find("\"inspection\":{\"kinds\":[\"objects\",\"layers\"],"
-                      "\"default_page_size\":64,\"max_page_size\":256}")
+  CHECK(s.result.find(
+            "\"inspection\":{\"kinds\":[\"objects\",\"layers\",\"nodes\"],"
+            "\"default_page_size\":64,\"max_page_size\":256}")
       != std::string::npos);
   CHECK(s.result.find("\"edit\":true") != std::string::npos);
   const auto cursor = field(s.result, "cursor");

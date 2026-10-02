@@ -375,6 +375,9 @@ struct ObjectFilters
   std::optional<std::string> handle;
   std::optional<std::string> objectType;
   std::optional<std::string> objectSubtype;
+  std::optional<std::string> nodeKind;
+  std::optional<std::string> layerHandle;
+  std::optional<std::string> parentHandle;
 };
 
 struct PageArgs
@@ -449,6 +452,11 @@ class Inspector
   {
     std::uint64_t pool{0};
     std::uint64_t index{0};
+    // Nodes: index is slot+1 (zero starts at root); aux is the current
+    // ancestor/climb slot+1. Every ancestry and climb step is budgeted.
+    std::uint64_t aux{0};
+    std::uint64_t phase{0};
+    bool effective{true};
   };
 
   // Owns its scratch reservation: released on completion, and otherwise when
@@ -508,26 +516,40 @@ class Inspector
   {
     const std::string payload = detail::hex64(j.pos.pool)
         + detail::hex64(j.pos.index) + detail::hex64(j.revision)
-        + mac(binding(j, j.revision));
+        + mac(binding(j, j.revision))
+        + (j.kind == "nodes"
+                ? detail::hex64(j.pos.aux) + detail::hex64(j.pos.phase)
+                    + detail::hex64(j.pos.effective)
+                : "");
     return payload + mac(payload);
   }
 
   Outcome decodeCursor(const std::string &c, Job &j) const
   {
-    if (c.size() != 80)
+    // Authenticate either supported carrier before checking its query binding:
+    // a genuine cursor from another kind is stale, not malformed.
+    if (c.size() != 80 && c.size() != 128)
       return Outcome::INVALID_REQUEST;
+    const auto payloadSize = c.size() - 16;
     for (char ch : c)
       if (!std::isxdigit(std::uint8_t(ch)) || std::isupper(std::uint8_t(ch)))
         return Outcome::INVALID_REQUEST;
-    const std::string payload = c.substr(0, 64);
-    if (mac(payload) != c.substr(64))
+    const std::string payload = c.substr(0, payloadSize);
+    if (mac(payload) != c.substr(payloadSize))
       return Outcome::INVALID_REQUEST;
     const std::uint64_t rev = std::stoull(c.substr(32, 16), nullptr, 16);
     if (mac(binding(j, rev)) != c.substr(48, 16))
       return Outcome::CURSOR_STALE;
+    if (payloadSize != (j.kind == "nodes" ? 112u : 64u))
+      return Outcome::INVALID_REQUEST;
     j.pos.pool = std::stoull(c.substr(0, 16), nullptr, 16);
     j.pos.index = std::stoull(c.substr(16, 16), nullptr, 16);
     j.revision = rev;
+    if (j.kind == "nodes") {
+      j.pos.aux = std::stoull(c.substr(64, 16), nullptr, 16);
+      j.pos.phase = std::stoull(c.substr(80, 16), nullptr, 16);
+      j.pos.effective = std::stoull(c.substr(96, 16), nullptr, 16) != 0;
+    }
     j.started = true;
     return Outcome::OK;
   }
@@ -542,37 +564,54 @@ class Inspector
         + std::to_string(size) + ",\"name\":" + value(f.name)
         + ",\"name_contains\":" + value(f.nameContains) + ",\"handle\":"
         + value(f.handle) + ",\"object_type\":" + value(f.objectType)
-        + ",\"object_subtype\":" + value(f.objectSubtype) + "}";
+        + ",\"object_subtype\":" + value(f.objectSubtype) + ",\"node_kind\":"
+        + value(f.nodeKind) + ",\"layer_handle\":" + value(f.layerHandle)
+        + ",\"parent_handle\":" + value(f.parentHandle) + "}";
   }
 
   bool validFilters(Query q, const PageArgs &args) const
   {
-    if (args.kind != "objects" && args.kind != "layers")
+    if (args.kind != "objects" && args.kind != "layers" && args.kind != "nodes")
       return false;
     if (q == Query::DISCOVER && args.kind != "objects")
       return false;
     const auto &f = args.filters;
-    if (args.kind == "layers" && (f.objectType || f.objectSubtype))
+    if (args.kind != "objects" && (f.objectType || f.objectSubtype))
+      return false;
+    if (args.kind != "nodes" && (f.nodeKind || f.layerHandle || f.parentHandle))
+      return false;
+    if (f.nodeKind && *f.nodeKind != "empty" && *f.nodeKind != "transform"
+        && *f.nodeKind != "object" && *f.nodeKind != "transform_array")
       return false;
     for (const auto *s : {&f.name,
              &f.nameContains,
              &f.handle,
              &f.objectType,
-             &f.objectSubtype}) {
+             &f.objectSubtype,
+             &f.nodeKind,
+             &f.layerHandle,
+             &f.parentHandle}) {
       if (*s && (q == Query::DISCOVER || (*s)->size() > m_limits.displayString))
         return false;
     }
-    if (f.handle) {
-      if (f.handle->size() != 32)
+    for (const auto &filter :
+        {std::make_pair(&f.handle,
+             args.kind == "layers"      ? identity::HandleKind::LAYER
+                 : args.kind == "nodes" ? identity::HandleKind::NODE
+                                        : identity::HandleKind::OBJECT),
+            std::make_pair(&f.layerHandle, identity::HandleKind::LAYER),
+            std::make_pair(&f.parentHandle, identity::HandleKind::NODE)}) {
+      const auto &handle = *filter.first;
+      if (!handle)
+        continue;
+      if (handle->size() != 32)
         return false;
-      for (char c : *f.handle)
+      for (char c : *handle)
         if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
           return false;
-      const auto domain = std::stoull(f.handle->substr(0, 16), nullptr, 16);
+      const auto domain = std::stoull(handle->substr(0, 16), nullptr, 16);
       const auto kind = identity::IdentityAuthority::handleKind(domain);
-      if (kind
-          != (args.kind == "layers" ? identity::HandleKind::LAYER
-                                    : identity::HandleKind::OBJECT))
+      if (kind != filter.second)
         return false;
     }
     if (f.objectType) {
@@ -633,7 +672,7 @@ class Inspector
     job->target = target;
     job->maxItems = std::size_t(size);
     job->policy = filterPolicy(args, size);
-    if (q == Query::INSPECT && args.kind == "layers")
+    if (q == Query::INSPECT && args.kind != "objects")
       if (auto *ids = m_identities(target.id))
         job->identityBinding = layerIdentityBinding(*ids);
     // Charge retained query/filter state to the same global scratch budget as
@@ -644,7 +683,10 @@ class Inspector
              &job->filters.nameContains,
              &job->filters.handle,
              &job->filters.objectType,
-             &job->filters.objectSubtype})
+             &job->filters.objectSubtype,
+             &job->filters.nodeKind,
+             &job->filters.layerHandle,
+             &job->filters.parentHandle})
       if (*s)
         queryBytes += (*s)->size();
     if (!m_scratch->reserve(queryBytes)) {
@@ -755,7 +797,7 @@ class Inspector
         + ",\"capabilities\":" + capsJson(caps);
     if (!views)
       item +=
-          ",\"inspection\":{\"kinds\":[\"objects\",\"layers\"],\"default_page_size\":"
+          ",\"inspection\":{\"kinds\":[\"objects\",\"layers\",\"nodes\"],\"default_page_size\":"
           + std::to_string(m_limits.defaultItems)
           + ",\"max_page_size\":" + std::to_string(m_limits.maxItems) + "}";
     if (views && m_views)
@@ -864,6 +906,106 @@ class Inspector
     return true;
   }
 
+  template <typename Handle>
+  static std::string handleText(const Handle &h)
+  {
+    return detail::hex64(h.domain) + detail::hex64(h.serial);
+  }
+
+  bool nextNode(Job &j,
+      scene::Scene &scene,
+      identity::SceneIdentity &ids,
+      bool &tooLarge,
+      bool &exhausted)
+  {
+    if (j.pos.pool >= scene.numberOfLayers()) {
+      exhausted = true;
+      return false;
+    }
+    const auto &state = scene.layers().at_index(j.pos.pool).second;
+    auto *layer = state.ptr.get();
+    auto node = j.pos.index ? layer->at(j.pos.index - 1) : layer->root();
+    j.visited++;
+    auto advance = [&] {
+      if (!node->isLeaf()) {
+        j.pos.index = node->next().index() + 1;
+        j.pos.phase = 0;
+      } else {
+        j.pos.phase = 2;
+        j.pos.aux = node.index() + 1;
+      }
+    };
+    // Climb one edge at a time; even a deep final branch yields boundedly.
+    if (j.pos.phase == 2) {
+      auto current = layer->at(j.pos.aux - 1);
+      if (current->isRoot()) {
+        j.pos = {j.pos.pool + 1, 0};
+      } else if (current->sibling() != current->parent()) {
+        j.pos.index = current->sibling().index() + 1;
+        j.pos.phase = 0;
+      } else {
+        j.pos.aux = current->parent().index() + 1;
+      }
+      return true;
+    }
+    const auto &data = node->value();
+    const std::string kind = data.isTransform() ? "transform"
+        : anari::isArray(data.type())           ? "transform_array"
+        : data.isObject()                       ? "object"
+                                                : "empty";
+    const auto handle = handleText(ids.handleOf(node));
+    const auto layerHandle = handleText(ids.handleOf(layer));
+    const auto parent = node->parent();
+    const auto parentHandle =
+        node->isRoot() ? std::string{} : handleText(ids.handleOf(parent));
+    if (j.pos.phase == 0) {
+      const auto &f = j.filters;
+      if ((f.name && data.name() != *f.name)
+          || (f.nameContains
+              && data.name().find(*f.nameContains) == std::string::npos)
+          || (f.handle && handle != *f.handle)
+          || (f.nodeKind && kind != *f.nodeKind)
+          || (f.layerHandle && layerHandle != *f.layerHandle)
+          || (f.parentHandle && parentHandle != *f.parentHandle)) {
+        advance();
+        return true;
+      }
+      j.pos.index = node.index() + 1;
+      j.pos.effective = state.active && data.isEnabled();
+      j.pos.aux = node->isRoot() ? 0 : parent.index() + 1;
+      j.pos.phase = j.pos.aux ? 1 : 3;
+      return true;
+    }
+    if (j.pos.phase == 1) {
+      auto ancestor = layer->at(j.pos.aux - 1);
+      j.pos.effective = j.pos.effective && ancestor->value().isEnabled();
+      j.pos.aux = ancestor->isRoot() ? 0 : ancestor->parent().index() + 1;
+      if (!j.pos.aux)
+        j.pos.phase = 3;
+      return true;
+    }
+    std::string item = "{\"handle\":\"" + handle + "\",\"layer_handle\":\""
+        + layerHandle + "\",\"parent_handle\":"
+        + (node->isRoot() ? "null" : detail::jsonString(parentHandle))
+        + ",\"root\":" + (node->isRoot() ? "true" : "false") + ",\"name\":"
+        + display(data.name()) + ",\"node_kind\":" + detail::jsonString(kind)
+        + ",\"enabled\":" + (data.isEnabled() ? "true" : "false")
+        + ",\"effective_enabled\":" + (j.pos.effective ? "true" : "false");
+    if (data.isTransform()) {
+      item += ",\"local_matrix\":";
+      // parameterValue already encodes matrices as complete row arrays and
+      // tags non-finite components, without consulting the SRT cache.
+      item += detail::parameterValue(data.getValueRaw(), scene, ids, m_limits);
+    } else if (data.isObject()) {
+      item += kind == "transform_array" ? ",\"array\":" : ",\"object\":";
+      item += detail::parameterValue(data.getValueRaw(), scene, ids, m_limits);
+    }
+    if (!append(j, item + "}", tooLarge))
+      return false;
+    advance();
+    return true;
+  }
+
   bool nextInspection(Job &j,
       scene::Scene &scene,
       identity::SceneIdentity &ids,
@@ -962,7 +1104,8 @@ class Inspector
       ids = m_identities(j.target.id);
       if (!ids || ids->scene() != &ctx.scene)
         return done(Outcome::INVALID_REQUEST, "{\"error\":\"unsupported\"}");
-      if (j.kind == "layers" && j.identityBinding != layerIdentityBinding(*ids))
+      if (j.kind != "objects"
+          && j.identityBinding != layerIdentityBinding(*ids))
         return done(Outcome::CURSOR_STALE);
       // Name/metadata changes arrive incrementally via the scene's update
       // delegate; no per-slice O(objects) refresh.
@@ -985,6 +1128,9 @@ class Inspector
       if (j.kind == "layers") {
         if (!ids->resolve(identity::LayerHandle{launch, domain, serial}))
           return done(Outcome::CONFLICT);
+      } else if (j.kind == "nodes") {
+        if (!ids->resolve(identity::NodeHandle{launch, domain, serial}))
+          return done(Outcome::CONFLICT);
       } else {
         j.exactObject =
             ids->resolve(identity::ObjectHandle{launch, domain, serial});
@@ -993,6 +1139,21 @@ class Inspector
       }
     }
 
+    if (ids) {
+      const auto launch = ids->inspectionRevision().launch;
+      for (const auto &s : {j.filters.layerHandle, j.filters.parentHandle}) {
+        if (!s)
+          continue;
+        const auto domain = std::stoull(s->substr(0, 16), nullptr, 16);
+        const auto serial = std::stoull(s->substr(16, 16), nullptr, 16);
+        if (identity::IdentityAuthority::handleKind(domain)
+            == identity::HandleKind::LAYER) {
+          if (!ids->resolve(identity::LayerHandle{launch, domain, serial}))
+            return done(Outcome::CONFLICT);
+        } else if (!ids->resolve(identity::NodeHandle{launch, domain, serial}))
+          return done(Outcome::CONFLICT);
+      }
+    }
     std::size_t slice = 0;
     bool tooLarge = false, exhausted = false;
     while (slice < m_limits.sliceVisits) {
@@ -1005,6 +1166,8 @@ class Inspector
           ? nextDiscovery(j, tooLarge, exhausted)
           : j.kind == "layers"
           ? nextLayer(j, ctx.scene, *ids, tooLarge, exhausted)
+          : j.kind == "nodes"
+          ? nextNode(j, ctx.scene, *ids, tooLarge, exhausted)
           : nextInspection(j, ctx.scene, *ids, tooLarge, exhausted);
       if (tooLarge)
         return done(Outcome::ITEM_TOO_LARGE);
