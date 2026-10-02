@@ -459,6 +459,9 @@ class Inspector
     bool effective{true};
     std::uint64_t structuralVersion{0};
     std::uint64_t transformVersion{0};
+    // Fixed-size, authenticated continuation state; no parent stack.
+    core::math::mat4 world{core::math::IDENTITY_MAT4};
+    std::uint64_t worldIssue{0};
   };
 
   // Owns its scratch reservation: released on completion, and otherwise when
@@ -525,14 +528,25 @@ class Inspector
                     + detail::hex64(j.pos.structuralVersion)
                     + detail::hex64(j.pos.transformVersion)
                 : "");
-    return payload + mac(payload);
+    std::string carrier = payload;
+    if (j.kind == "nodes") {
+      carrier += detail::hex64(j.pos.worldIssue);
+      for (int column = 0; column < 4; ++column) {
+        for (int row = 0; row < 4; ++row) {
+          std::uint32_t bits;
+          std::memcpy(&bits, &j.pos.world[column][row], sizeof(bits));
+          carrier += detail::hex64(bits).substr(8);
+        }
+      }
+    }
+    return carrier + mac(carrier);
   }
 
   Outcome decodeCursor(const std::string &c, Job &j) const
   {
     // Authenticate either supported carrier before checking its query binding:
     // a genuine cursor from another kind is stale, not malformed.
-    if (c.size() != 80 && c.size() != 160)
+    if (c.size() != 80 && c.size() != 304)
       return Outcome::INVALID_REQUEST;
     const auto payloadSize = c.size() - 16;
     for (char ch : c)
@@ -544,7 +558,7 @@ class Inspector
     const std::uint64_t rev = std::stoull(c.substr(32, 16), nullptr, 16);
     if (mac(binding(j, rev)) != c.substr(48, 16))
       return Outcome::CURSOR_STALE;
-    if (payloadSize != (j.kind == "nodes" ? 144u : 64u))
+    if (payloadSize != (j.kind == "nodes" ? 288u : 64u))
       return Outcome::INVALID_REQUEST;
     j.pos.pool = std::stoull(c.substr(0, 16), nullptr, 16);
     j.pos.index = std::stoull(c.substr(16, 16), nullptr, 16);
@@ -555,6 +569,14 @@ class Inspector
       j.pos.effective = std::stoull(c.substr(96, 16), nullptr, 16) != 0;
       j.pos.structuralVersion = std::stoull(c.substr(112, 16), nullptr, 16);
       j.pos.transformVersion = std::stoull(c.substr(128, 16), nullptr, 16);
+      j.pos.worldIssue = std::stoull(c.substr(144, 16), nullptr, 16);
+      for (int column = 0; column < 4; ++column) {
+        for (int row = 0; row < 4; ++row) {
+          const std::uint32_t bits = std::stoul(
+              c.substr(160 + (column * 4 + row) * 8, 8), nullptr, 16);
+          std::memcpy(&j.pos.world[column][row], &bits, sizeof(bits));
+        }
+      }
     }
     j.started = true;
     return Outcome::OK;
@@ -684,7 +706,7 @@ class Inspector
     // Charge retained query/filter state to the same global scratch budget as
     // returned items, including no-match scans. Job owns release on every path.
     std::size_t queryBytes = job->policy.size() + job->sessionId.size()
-        + job->identityBinding.size();
+        + job->identityBinding.size() + sizeof(Position);
     for (const auto *s : {&job->filters.name,
              &job->filters.nameContains,
              &job->filters.handle,
@@ -918,6 +940,106 @@ class Inspector
     return detail::hex64(h.domain) + detail::hex64(h.serial);
   }
 
+  static std::uint64_t matrixIssue(const core::math::mat4 &matrix)
+  {
+    for (int column = 0; column < 4; ++column)
+      for (int row = 0; row < 4; ++row)
+        if (!std::isfinite(matrix[column][row]))
+          return 1;
+    return matrix[0][3] != 0 || matrix[1][3] != 0 || matrix[2][3] != 0
+            || matrix[3][3] != 1
+        ? 2
+        : 0;
+  }
+
+  static std::uint64_t transformIssue(const scene::LayerNodeData &data)
+  {
+    return data.isTransform()         ? matrixIssue(data.getTransform())
+        : anari::isArray(data.type()) ? 3
+                                      : 0;
+  }
+
+  static const char *issueReason(std::uint64_t issue)
+  {
+    return issue == 1 ? "non_finite_transform"
+        : issue == 2  ? "non_affine_transform"
+        : issue == 3  ? "transform_array_ancestry"
+                      : "world_transform_overflow";
+  }
+
+  static std::string unavailable(const char *reason)
+  {
+    return "{\"state\":\"unavailable\",\"reason\":" + detail::jsonString(reason)
+        + "}";
+  }
+
+  static std::string affordance(const char *reason)
+  {
+    return reason
+        ? "{\"available\":false,\"reason\":" + detail::jsonString(reason) + "}"
+        : "{\"available\":true}";
+  }
+
+  static std::string transformObservations(const scene::LayerNodeData &data)
+  {
+    const auto issue = transformIssue(data);
+    const char *reason = !data.isTransform() ? "not_scalar_transform"
+        : issue                              ? issueReason(issue)
+                                             : nullptr;
+    std::string result;
+    if (data.isTransform()) {
+      result += ",\"local_position\":";
+      const core::Any position(data.getTransform()[3].xyz());
+      result += reason ? unavailable(reason)
+                       : "{\"state\":\"available\",\"data\":"
+              + detail::numericData<float>(position) + "}";
+    }
+    const char *srtReason = reason;
+    const auto srt = data.getTransformSRT();
+    if (!srtReason) {
+      for (int column = 0; column < 3; ++column)
+        for (int row = 0; row < 3; ++row)
+          if (!std::isfinite(srt[column][row]))
+            srtReason = "non_finite_srt_cache";
+    }
+    if (!srtReason) {
+      // Exactly the node editor's degree-based Y then X then Z convention.
+      auto rotation = core::math::IDENTITY_MAT4;
+      const core::math::float3 axes[] = {{0, 1, 0}, {1, 0, 0}, {0, 0, 1}};
+      for (int i = 0; i < 3; ++i)
+        rotation = core::math::mul(rotation,
+            core::math::rotation_matrix(core::math::rotation_quat(
+                axes[i], core::math::radians(srt[1][i]))));
+      const auto rebuilt =
+          core::math::mul(rotation, core::math::scaling_matrix(srt[0]));
+      const auto original = data.getTransform();
+      for (int column = 0; column < 3; ++column) {
+        for (int row = 0; row < 3; ++row) {
+          const auto value = original[column][row];
+          if (!std::isfinite(rebuilt[column][row])
+              || std::abs(double(value) - double(rebuilt[column][row]))
+                  > 1e-5 * std::max(1., std::abs(double(value))))
+            srtReason = "unfaithful_srt_cache";
+        }
+      }
+    }
+    if (data.isTransform()) {
+      result += ",\"rotation\":";
+      result += srtReason ? unavailable(srtReason)
+                          : "{\"state\":\"available\",\"data\":"
+              + detail::numericData<float>(core::Any(srt[1])) + "}";
+      result += ",\"scale\":";
+      result += srtReason ? unavailable(srtReason)
+                          : "{\"state\":\"available\",\"data\":"
+              + detail::numericData<float>(core::Any(srt[0])) + "}";
+    }
+    return result + ",\"edit_affordances\":{\"enabled\":" + affordance(nullptr)
+        + ",\"matrix\":"
+        + affordance(data.isTransform() ? nullptr : "not_scalar_transform")
+        + ",\"position\":" + affordance(reason) + ",\"rotation\":"
+        + affordance(srtReason) + ",\"scale\":" + affordance(srtReason) + "}";
+  }
+
   bool nextNode(Job &j,
       scene::Scene &scene,
       identity::SceneIdentity &ids,
@@ -978,6 +1100,8 @@ class Inspector
       }
       j.pos.index = node.index() + 1;
       j.pos.effective = state.active && data.isEnabled();
+      j.pos.world = data.getTransform();
+      j.pos.worldIssue = transformIssue(data);
       const auto dependencies = ids.beginNodeDependencies(ids.handleOf(node));
       j.pos.structuralVersion = dependencies->structuralVersion;
       j.pos.transformVersion = 0;
@@ -988,6 +1112,15 @@ class Inspector
     if (j.pos.phase == 1) {
       auto ancestor = layer->at(j.pos.aux - 1);
       j.pos.effective = j.pos.effective && ancestor->value().isEnabled();
+      const auto issue = transformIssue(ancestor->value());
+      if (issue)
+        j.pos.worldIssue = issue;
+      if (!j.pos.worldIssue && ancestor->value().isTransform()) {
+        j.pos.world =
+            core::math::mul(ancestor->value().getTransform(), j.pos.world);
+        if (matrixIssue(j.pos.world))
+          j.pos.worldIssue = 4; // finite input matrices overflowed
+      }
       identity::NodeDependencyWalk walk{ids.handleOf(node),
           ids.handleOf(layer),
           j.pos.aux,
@@ -1030,6 +1163,11 @@ class Inspector
       item += kind == "transform_array" ? ",\"array\":" : ",\"object\":";
       item += detail::parameterValue(data.getValueRaw(), scene, ids, m_limits);
     }
+    item += ",\"world_matrix\":";
+    item += j.pos.worldIssue
+        ? unavailable(issueReason(j.pos.worldIssue))
+        : detail::parameterValue(core::Any(j.pos.world), scene, ids, m_limits);
+    item += transformObservations(data);
     if (!append(j, item + "}", tooLarge))
       return false;
     advance();

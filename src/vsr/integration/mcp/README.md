@@ -120,8 +120,31 @@ creation/reparent history on the target and its parent chain; sibling insertion,
 erasure, reordering and state do not invalidate it. The ancestry token adds
 ancestor payload/transform write history (not the target's local content).
 Parent/grandparent transform change-back invalidates ancestry but not structure;
-ancestor enabled-only writes invalidate neither. World numeric transforms and
-node-edit readiness are not advertised yet.
+ancestor enabled-only writes invalidate neither.
+
+Scalar transforms expose complete `local_matrix` and `local_position`;
+all node kinds expose `world_matrix` when their ancestry is valid. Matrices
+are four rows of four numbers with column-vector mathematics and translation
+in the last column. World composition is parent times local; non-transform
+nodes inherit their parents without acquiring transform storage. Non-finite
+local components retain typed `non_finite` tags (never substituted zeros).
+World observations instead carry `state: unavailable` and a reason for
+non-finite/non-affine transforms, array ancestry, or composition overflow;
+a singular finite affine matrix still has a valid world observation.
+
+`rotation` contains VSR degree-based azimuth (Y), elevation (X), roll (Z),
+composed Y then X then Z. `scale` and rotation are available only when the
+finite cached SRT reconstructs every linear component within
+`1e-5 * max(1, abs(component))`. Translation is observed directly, not repaired.
+Shear and unfaithful reflection/degeneracy expose `unfaithful_srt_cache`;
+faithfully cached zero/negative scale remains available. Euler values are not
+unique and no world SRT approximation is provided. `edit_affordances` reports
+representability with explicit availability/reasons, not permission or a
+promise that a node-write API exists. Scalar full-matrix replacement remains
+representable even when its current matrix is invalid. Empty/reference/array
+nodes do not advertise scalar matrix/position/rotation/scale conveniences.
+World accumulation uses constant-size cursor/scratch state and the same
+one-ancestor-per-visit budget as dependency observations.
 
 These are ordered event observations, not final-parent/value hashes or whole-layer
 epochs: each Forest creation/reparent event stamps only the affected node with

@@ -24,7 +24,9 @@
 // std
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -414,6 +416,70 @@ SCENARIO(
   st = f.status(s, s.id, 4);
   CHECK(st.str("outcome") == "cursor_stale");
   CHECK(st.isError());
+}
+
+SCENARIO("MCP node queries expose row matrices and transform affordances",
+    "[integration][node-transform-mcp]")
+{
+  Fixture f;
+  auto *layer = f.scene.defaultLayer();
+  auto parentMatrix = vsr::math::IDENTITY_MAT4;
+  parentMatrix[0].x = 2;
+  parentMatrix[1].x = 1;
+  parentMatrix[1].y = 3;
+  parentMatrix[2].z = 4;
+  parentMatrix[3] = {10, 20, 30, 1};
+  auto parent = layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, parentMatrix, "parent"));
+  auto local = vsr::math::IDENTITY_MAT4;
+  local[0].x = std::nextafter(1.f, 2.f);
+  local[3] = {5, 6, 7, 1};
+  parent->insert_last_child(vsr::scene::LayerNodeData(layer, local, "wire"));
+  auto invalid = vsr::math::IDENTITY_MAT4;
+  invalid[0].x = std::numeric_limits<float>::infinity();
+  layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, invalid, "invalid"));
+  vsr::math::mat3 signedSrt;
+  signedSrt[0] = {-2, 0, 4};
+  signedSrt[1] = {90, 0, 0};
+  signedSrt[2] = {11, 12, 13};
+  layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, signedSrt, "signed"));
+  f.scene.signalLayerStructureChanged(layer);
+  auto s = f.attach();
+  auto ack = f.tool(s,
+      "vsr_inspect",
+      "{\"request_id\":1,\"scene_id\":" + std::to_string(f.sceneId)
+          + ",\"kind\":\"nodes\"}");
+  REQUIRE(ack.errorCode().empty());
+  f.drain();
+  const auto status = f.status(s, s.id, 1);
+  REQUIRE(status.str("outcome") == "ok");
+  const auto &items = status.result()->get("items")->a;
+  REQUIRE(items.size() == 5);
+  REQUIRE(items[2].get("world_matrix"));
+  const auto &world = items[2].get("world_matrix")->get("data")->a;
+  CHECK(world[0].a[3].n == 26);
+  CHECK(world[1].a[3].n == 38);
+  CHECK(world[2].a[3].n == 58);
+  CHECK(items[2].get("local_matrix")->get("data")->a[0].a[0].n
+      == 1.00000011920928955078125);
+  CHECK(items[2].get("rotation")->get("state")->s == "available");
+  CHECK(items[1].get("rotation")->get("reason")->s == "unfaithful_srt_cache");
+  CHECK(items[1].get("edit_affordances")->get("matrix")->get("available")->b);
+  CHECK(
+      items[3].get("world_matrix")->get("reason")->s == "non_finite_transform");
+  const auto *component =
+      items[3].get("local_matrix")->get("data")->a[0].a[0].get("encoding");
+  REQUIRE(component);
+  CHECK(component->s == "non_finite");
+  CHECK(items[3].get("edit_affordances")->get("matrix")->get("available")->b);
+  CHECK(items[4].get("scale")->get("data")->a[0].n == -2);
+  CHECK(items[4].get("scale")->get("data")->a[1].n == 0);
+  CHECK(items[4].get("rotation")->get("data")->a[0].n == 90);
+  const auto &signedMatrix = items[4].get("local_matrix")->get("data")->a;
+  CHECK(std::abs(signedMatrix[0].a[2].n - 4) < 1e-5);
+  CHECK(std::abs(signedMatrix[2].a[0].n - 2) < 1e-5);
 }
 
 SCENARIO("MCP node queries parse filters and expose placement records",

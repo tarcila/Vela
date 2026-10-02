@@ -478,6 +478,158 @@ SCENARIO("nodes expose placement observations through public inspection",
   CHECK(f.inspect(args, 3).terminal == Outcome::CONFLICT);
 }
 
+SCENARIO("node queries derive scene transforms without losing local matrices",
+    "[integration][node-transforms]")
+{
+  Fixture f(0);
+  auto *layer = f.scene.defaultLayer();
+  auto parentMatrix = vsr::math::IDENTITY_MAT4;
+  // x' = 2x + y + 10, y' = 3y + 20, z' = 4z + 30.
+  parentMatrix[0].x = 2;
+  parentMatrix[1].x = 1;
+  parentMatrix[1].y = 3;
+  parentMatrix[2].z = 4;
+  parentMatrix[3] = {10, 20, 30, 1};
+  auto parent = layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, parentMatrix, "parent"));
+  auto local = vsr::math::IDENTITY_MAT4;
+  local[3] = {5, 6, 7, 1};
+  auto child = parent->insert_last_child(
+      vsr::scene::LayerNodeData(layer, local, "child"));
+  child->insert_last_child(vsr::scene::LayerNodeData(layer, "empty"));
+  f.scene.signalLayerStructureChanged(layer);
+  PageArgs args;
+  args.kind = "nodes";
+  const auto result = page(f.inspect(args, 1));
+  const auto &items = result.get("items")->a;
+  REQUIRE(items.size() == 4);
+  REQUIRE(items[2].get("world_matrix"));
+  const auto &world = items[2].get("world_matrix")->get("data")->a;
+  CHECK(world[0].a[3].n == 26);
+  CHECK(world[1].a[3].n == 38);
+  CHECK(world[2].a[3].n == 58);
+  CHECK(world[0].a[0].n == 2);
+  CHECK(world[0].a[1].n == 1);
+  CHECK(items[2].get("local_position")->get("data")->a[1].n == 6);
+  CHECK(items[3].get("world_matrix")->get("data")->a[0].a[3].n == 26);
+  CHECK_FALSE(
+      items[3].get("edit_affordances")->get("matrix")->get("available")->b);
+  CHECK(items[2].get("edit_affordances")->get("rotation")->get("available")->b);
+  CHECK_FALSE(
+      items[1].get("edit_affordances")->get("rotation")->get("available")->b);
+  CHECK(items[1].get("local_matrix")->get("data")->a[0].a[1].n == 1);
+}
+
+SCENARIO("node SRT affordances preserve signed degenerate and invalid state",
+    "[integration][node-transforms]")
+{
+  Fixture f(0);
+  auto *layer = f.scene.defaultLayer();
+  auto root = layer->root();
+  vsr::math::mat3 srt;
+  srt[0] = {-2, 0, 4};
+  srt[1] = {90, 0, 0};
+  srt[2] = {11, 12, 13};
+  auto signedNode =
+      root->insert_last_child(vsr::scene::LayerNodeData(layer, "signed"));
+  signedNode->value().setAsTransform(srt);
+  auto singular = vsr::math::IDENTITY_MAT4;
+  singular[0].x = 0;
+  root->insert_last_child(
+      vsr::scene::LayerNodeData(layer, singular, "singular"));
+  auto invalid = vsr::math::IDENTITY_MAT4;
+  invalid[0].x = std::numeric_limits<float>::infinity();
+  auto bad =
+      root->insert_last_child(vsr::scene::LayerNodeData(layer, invalid, "bad"));
+  bad->insert_last_child(vsr::scene::LayerNodeData(layer, "under_bad"));
+  auto projective = vsr::math::IDENTITY_MAT4;
+  projective[0][3] = .25f;
+  root->insert_last_child(
+      vsr::scene::LayerNodeData(layer, projective, "projective"));
+  auto array = f.scene.createArrayProxy(ANARI_FLOAT32_MAT4, 2);
+  auto instances = root->insert_last_child(
+      vsr::scene::LayerNodeData(layer, array, "instances"));
+  instances->insert_last_child(vsr::scene::LayerNodeData(layer, "under_array"));
+  f.scene.signalLayerStructureChanged(layer);
+  PageArgs args;
+  args.kind = "nodes";
+  const auto result = page(f.inspect(args, 1));
+  const auto &items = result.get("items")->a;
+  REQUIRE(items.size() == 8);
+  REQUIRE(items[1].get("rotation"));
+  CHECK(items[1].get("rotation")->get("data")->a[0].n == 90);
+  CHECK(items[1].get("scale")->get("data")->a[0].n == -2);
+  CHECK(items[1].get("scale")->get("data")->a[1].n == 0);
+  CHECK(items[1].get("edit_affordances")->get("scale")->get("available")->b);
+  const auto &matrix = items[1].get("local_matrix")->get("data")->a;
+  CHECK(std::abs(matrix[2].a[0].n - 2) < 1e-5);
+  CHECK(std::abs(matrix[0].a[2].n - 4) < 1e-5);
+  CHECK(matrix[1].a[1].n == 0);
+  CHECK(matrix[0].a[3].n == 11);
+  CHECK(items[2].get("world_matrix")->get("state")->s == "available");
+  CHECK(items[2].get("edit_affordances")->get("position")->get("available")->b);
+  CHECK(items[2].get("rotation")->get("state")->s == "available");
+  CHECK(items[2].get("scale")->get("data")->a[0].n == 0);
+  CHECK(items[2].get("local_matrix")->get("data")->a[0].a[0].n == 0);
+  for (int i : {3, 4})
+    CHECK(items[i].get("world_matrix")->get("reason")->s
+        == "non_finite_transform");
+  CHECK(items[3].get("local_matrix")->get("data")->a[0].a[0].get("encoding")->s
+      == "non_finite");
+  // Full replacement is still possible; observation does not grant permission.
+  CHECK(items[3].get("edit_affordances")->get("matrix")->get("available")->b);
+  CHECK_FALSE(
+      items[3].get("edit_affordances")->get("position")->get("available")->b);
+  CHECK(
+      items[5].get("world_matrix")->get("reason")->s == "non_affine_transform");
+  for (int i : {6, 7})
+    CHECK(items[i].get("world_matrix")->get("reason")->s
+        == "transform_array_ancestry");
+  CHECK_FALSE(items[6].get("local_matrix"));
+}
+
+SCENARIO("node world overflow and invalid components never fabricate data",
+    "[integration][node-transforms]")
+{
+  Fixture f(0);
+  auto *layer = f.scene.defaultLayer();
+  auto large = vsr::math::IDENTITY_MAT4;
+  large[0].x = std::numeric_limits<float>::max();
+  auto parent = layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, large, "large"));
+  auto doubled = vsr::math::IDENTITY_MAT4;
+  doubled[0].x = 2;
+  parent->insert_last_child(
+      vsr::scene::LayerNodeData(layer, doubled, "overflow"));
+  auto invalid = vsr::math::IDENTITY_MAT4;
+  invalid[1].y = std::numeric_limits<float>::quiet_NaN();
+  invalid[2].z = -std::numeric_limits<float>::infinity();
+  layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, invalid, "invalid"));
+  auto reflection = vsr::math::IDENTITY_MAT4;
+  reflection[0].x = -2;
+  layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, reflection, "reflection"));
+  f.scene.signalLayerStructureChanged(layer);
+  PageArgs args;
+  args.kind = "nodes";
+  const auto result = page(f.inspect(args, 1));
+  const auto &items = result.get("items")->a;
+  REQUIRE(items.size() == 5);
+  CHECK(items[1].get("world_matrix")->get("state")->s == "available");
+  CHECK(items[2].get("world_matrix")->get("reason")->s
+      == "world_transform_overflow");
+  CHECK_FALSE(items[2].get("world_matrix")->get("data"));
+  CHECK(items[2].get("local_matrix")->get("data")->a[0].a[0].n == 2);
+  const auto &invalidRows = items[3].get("local_matrix")->get("data")->a;
+  CHECK(invalidRows[1].a[1].get("data")->s == "nan");
+  CHECK(invalidRows[2].a[2].get("data")->s == "negative_infinity");
+  CHECK_FALSE(items[3].get("world_matrix")->get("data"));
+  CHECK(items[4].get("local_matrix")->get("data")->a[0].a[0].n == -2);
+  CHECK(items[4].get("world_matrix")->get("data")->a[0].a[0].n == -2);
+  CHECK(items[4].get("rotation")->get("reason")->s == "unfaithful_srt_cache");
+}
+
 SCENARIO("node kinds filters and inactive ancestry preserve local observations",
     "[integration][node-inspection]")
 {
@@ -757,8 +909,11 @@ SCENARIO("deep node ancestry and preorder continuations are bounded",
   Fixture f(0, limits);
   auto *layer = f.scene.defaultLayer();
   auto node = layer->root();
+  auto step = vsr::math::IDENTITY_MAT4;
+  step[3] = {1.25f, -2.f, 3.f, 1.f};
   for (int i = 0; i < 24; ++i)
-    node = node->insert_last_child(vsr::scene::LayerNodeData(layer, "deep"));
+    node =
+        node->insert_last_child(vsr::scene::LayerNodeData(layer, step, "deep"));
   node->value().name() = "target";
   PageArgs args;
   args.kind = "nodes";
@@ -775,6 +930,11 @@ SCENARIO("deep node ancestry and preorder continuations are bounded",
     if (!result.get("items")->a.empty()) {
       structure = result.get("items")->a[0].get("structural_version")->s;
       ancestry = result.get("items")->a[0].get("ancestry_version")->s;
+      const auto &world =
+          result.get("items")->a[0].get("world_matrix")->get("data")->a;
+      CHECK(world[0].a[3].n == 30);
+      CHECK(world[1].a[3].n == -48);
+      CHECK(world[2].a[3].n == 72);
     }
     if (result.get("complete")->b) {
       complete = true;
@@ -802,7 +962,7 @@ SCENARIO("deep node ancestry and preorder continuations are bounded",
   CHECK(whole.get("items")->a[0].get("structural_version")->s == structure);
   CHECK(whole.get("items")->a[0].get("ancestry_version")->s == ancestry);
   args.cursor = firstCursor;
-  args.filters.nodeKind = "empty";
+  args.filters.nodeKind = "transform";
   CHECK(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args).code
       == Outcome::CURSOR_STALE);
   args.filters.nodeKind.reset();
