@@ -990,7 +990,10 @@ class Inspector
         + ",\"root\":" + (node->isRoot() ? "true" : "false") + ",\"name\":"
         + display(data.name()) + ",\"node_kind\":" + detail::jsonString(kind)
         + ",\"enabled\":" + (data.isEnabled() ? "true" : "false")
-        + ",\"effective_enabled\":" + (j.pos.effective ? "true" : "false");
+        + ",\"effective_enabled\":" + (j.pos.effective ? "true" : "false")
+        + ",\"node_edit_version\":"
+        + detail::jsonString("ne:" + handle + ":"
+            + std::to_string(ids.nodeEditVersion(ids.handleOf(node))->version));
     if (data.isTransform()) {
       item += ",\"local_matrix\":";
       // parameterValue already encodes matrices as complete row arrays and

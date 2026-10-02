@@ -107,8 +107,14 @@ and cursors retain its bounded continuation state. Cursors bind all filters,
 kind, page policy and inspection revision; identical retries replay history.
 Forest creation stamps establish genuine node lifetime: erasure/recreation,
 ancestor removal and scene replacement cannot redirect handles. Subtree copies
-have distinct handles; moving a live subtree preserves them. No editable node
-version, ancestry token, world transform or node-edit readiness is advertised.
+have distinct handles; moving a live subtree preserves them. Every node record
+also exposes `node_edit_version`, an opaque string to copy verbatim, bound to
+that live node and the host launch/scene registration. It covers local transform
+and own-enabled writes, conservatively within the node. Even same-value writes
+and change-away/back advance it, independently of delegate publication. Rename,
+parent/sibling writes, other layers and layer activation do not advance the
+node's local token. No ancestry token, world transform or node-edit readiness
+is advertised yet.
 
 Hosts must mutate and query on the safe-point thread. Normal Scene notifications
 advance revisions incrementally; no query-time hierarchy snapshot or fingerprint
@@ -118,6 +124,36 @@ mutations, call `Scene::signalLayerStructureChanged(layer)` (or
 and `Layer::clear()` notify automatically. Unsupported raw mutation without the
 appropriate notification cannot maintain cursor/render correctness. These
 notifications do not regenerate unchanged lifetime handles.
+
+Use ordinary `LayerNodeData` setters (matrix/SRT, enabled, empty/object/array,
+`setValueRaw`), reset, or payload assignment for editable content. These maintain
+per-node write history without requiring an integration-specific setter. Copy
+construction preserves content/history but Forest assigns a distinct lifetime;
+storage relocation preserves live identity and history. Assignment advances the
+destination's history rather than importing the source's version. Moving out of
+live payload also advances the source's history. Transform setters preserve the
+stored default unless an explicit default is supplied; resetting uses that
+baseline, while changing baseline metadata alone is not a current-content edit.
+Hosts must still publish the appropriate Scene layer signal after writes (one
+coalesced signal is sufficient), including renames, to keep cursors, render
+indices and UI current. Bypassing setters through raw-memory writes is unsupported
+and cannot maintain edit history, even if a later layer notification is sent.
+
+Representative mutation-path audit (source inspection, not interactive testing):
+- Viewer: `BaseViewport.cpp` gizmo and `ObjectEditor.cpp` SRT/reset use the
+  tracked setters and transform signal; `LayerTree.cpp` uses `setEnabled`.
+- Lua: `LayerBindings.cpp` uses enabled/matrix/SRT/array setters. These payload
+  bindings do not publish automatically; scripts must use Scene's exposed
+  `signalLayerStructureChanged` / `signalLayerTransformChanged` bindings.
+- Animation: `TransformBinding.cpp` uses the matrix setter and transform signal;
+  `UsdInstancerFileBinding.cpp` replaces arrays through the tracked setter and
+  structure signal. Array-content edits are not scalar placement transforms.
+- Import: GLTF uses `Scene::insertChildTransformNode` (tracked construction and
+  automatic structure publication); layer deserialization uses SRT/raw-value
+  and enabled setters. Hosts must publish after deserializing into a live layer.
+Headless tests exercise these shared core mutators, assignment, default baselines,
+copy/move/relocation and coalesced publication; they do not claim execution of
+optional UI/Lua/USD front ends in the CPU-only build.
 
 Discovery scene items advertise `inspection.kinds`, `default_page_size`, and
 `max_page_size`. Both query schemas/descriptions use the host's active limits:

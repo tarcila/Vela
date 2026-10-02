@@ -111,6 +111,23 @@ struct NodeHandleTag;
 using LayerHandle = HierarchyHandle<LayerHandleTag>;
 using NodeHandle = HierarchyHandle<NodeHandleTag>;
 
+struct NodeEditVersionToken
+{
+  NodeHandle node;
+  std::uint64_t version{0};
+
+  friend bool operator==(
+      const NodeEditVersionToken &a, const NodeEditVersionToken &b)
+  {
+    return a.node == b.node && a.version == b.version;
+  }
+  friend bool operator!=(
+      const NodeEditVersionToken &a, const NodeEditVersionToken &b)
+  {
+    return !(a == b);
+  }
+};
+
 struct ParameterVersionToken
 {
   ObjectHandle object;
@@ -195,6 +212,12 @@ class SceneIdentity
   NodeHandle rootHandle(const scene::Layer *layer) const;
   NodeHandle handleOf(scene::LayerNodeRef node) const;
   scene::LayerNodeRef resolve(const NodeHandle &h) const;
+
+  // Local node editable versions; no query-time fingerprints or retained
+  // observations. Core history survives coalesced/absent notifications.
+  std::optional<NodeEditVersionToken> nodeEditVersion(
+      const NodeHandle &h) const;
+  bool isCurrent(const NodeEditVersionToken &t) const;
 
   // Parameter versions //
 
@@ -570,6 +593,21 @@ inline scene::LayerNodeRef SceneIdentity::resolve(const NodeHandle &h) const
   const auto &entry = m_layers.at(it->second);
   auto root = entry.layer->root();
   return root->lifetime() == entry.rootLifetime ? root : scene::LayerNodeRef{};
+}
+
+inline std::optional<NodeEditVersionToken> SceneIdentity::nodeEditVersion(
+    const NodeHandle &h) const
+{
+  auto node = resolve(h);
+  if (!node)
+    return {};
+  return NodeEditVersionToken{h, node->value().editVersion()};
+}
+
+inline bool SceneIdentity::isCurrent(const NodeEditVersionToken &t) const
+{
+  auto current = nodeEditVersion(t.node);
+  return current && *current == t;
 }
 
 inline ObjectHandle SceneIdentity::handleOf(const scene::Object *o) const

@@ -4,6 +4,8 @@
 #include "vsr/core/Logging.hpp"
 #include "vsr/scene/Layer.hpp"
 #include "vsr/scene/Scene.hpp"
+// std
+#include <exception>
 
 namespace vsr::scene {
 
@@ -32,6 +34,7 @@ LayerNodeData::LayerNodeData(Layer *layer, Object *o, const char *n)
 }
 
 LayerNodeData::LayerNodeData(const LayerNodeData &o)
+    : m_editVersion(o.m_editVersion)
 {
   m_name = o.m_name;
   m_enabled = o.m_enabled;
@@ -43,7 +46,7 @@ LayerNodeData::LayerNodeData(const LayerNodeData &o)
   incObjectUseCount();
 }
 
-LayerNodeData::LayerNodeData(LayerNodeData &&o)
+LayerNodeData::LayerNodeData(LayerNodeData &&o) : m_editVersion(o.m_editVersion)
 {
   m_name = std::move(o.m_name);
   m_enabled = std::move(o.m_enabled);
@@ -54,10 +57,14 @@ LayerNodeData::LayerNodeData(LayerNodeData &&o)
   m_layer = std::move(o.m_layer);
   o.m_layer = nullptr;
   o.m_value.reset();
+  o.noteEdit();
 }
 
 LayerNodeData &LayerNodeData::operator=(const LayerNodeData &o)
 {
+  noteEdit();
+  if (this == &o)
+    return *this;
   decObjectUseCount();
   m_name = o.m_name;
   m_enabled = o.m_enabled;
@@ -72,6 +79,9 @@ LayerNodeData &LayerNodeData::operator=(const LayerNodeData &o)
 
 LayerNodeData &LayerNodeData::operator=(LayerNodeData &&o)
 {
+  noteEdit();
+  if (this == &o)
+    return *this;
   decObjectUseCount();
   m_name = std::move(o.m_name);
   m_enabled = std::move(o.m_enabled);
@@ -82,6 +92,7 @@ LayerNodeData &LayerNodeData::operator=(LayerNodeData &&o)
   m_layer = std::move(o.m_layer);
   o.m_layer = nullptr;
   o.m_value.reset();
+  o.noteEdit();
   return *this;
 }
 
@@ -113,6 +124,7 @@ bool LayerNodeData::isDefaultValue() const
 void LayerNodeData::setToDefaultValue()
 {
   if (hasDefault()) {
+    noteEdit();
     m_value = m_defaultValue;
     if (isTransform())
       setAsTransform(getTransform()); // ensure srt matrix is up to date
@@ -164,6 +176,7 @@ void LayerNodeData::setAsObject(Object *o)
 
 void LayerNodeData::setAsObject(anari::DataType type, size_t index)
 {
+  noteEdit();
   decObjectUseCount();
   m_value = Any(type, index);
   incObjectUseCount();
@@ -171,6 +184,7 @@ void LayerNodeData::setAsObject(anari::DataType type, size_t index)
 
 void LayerNodeData::setAsTransform(const math::mat4 &m)
 {
+  noteEdit();
   decObjectUseCount();
   m_value = m;
   if (!hasDefault())
@@ -193,6 +207,7 @@ void LayerNodeData::setAsTransform(
 
 void LayerNodeData::setAsTransform(const math::mat3 &srt)
 {
+  noteEdit();
   decObjectUseCount();
   m_srt = srt;
   auto &sc = srt[0];
@@ -223,6 +238,7 @@ void LayerNodeData::setAsTransformArray(Array *a)
 
 void LayerNodeData::setEmpty()
 {
+  noteEdit();
   decObjectUseCount();
   m_value.reset();
   m_srt[0] = math::float3(1.f, 1.f, 1.f);
@@ -234,7 +250,20 @@ void LayerNodeData::setEmpty()
 
 void LayerNodeData::setEnabled(bool e)
 {
+  noteEdit();
   m_enabled = e;
+}
+
+std::uint64_t LayerNodeData::editVersion() const
+{
+  return m_editVersion;
+}
+
+void LayerNodeData::noteEdit()
+{
+  // Never let an ancient token become current again on wraparound.
+  if (++m_editVersion == 0)
+    std::terminate();
 }
 
 Object *LayerNodeData::getObject() const
@@ -289,6 +318,7 @@ Any LayerNodeData::getValueRaw() const
 
 void LayerNodeData::setValueRaw(const Any &v, bool ignoreObjectUsageCounts)
 {
+  noteEdit();
   if (!ignoreObjectUsageCounts)
     setEmpty();
   m_value = v;

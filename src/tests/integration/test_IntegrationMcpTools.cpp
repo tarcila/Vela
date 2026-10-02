@@ -421,7 +421,8 @@ SCENARIO("MCP node queries parse filters and expose placement records",
 {
   Fixture f;
   auto *layer = f.scene.defaultLayer();
-  layer->root()->insert_last_child(vsr::scene::LayerNodeData(layer, "wire"));
+  auto node = layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, "wire"));
   f.scene.signalLayerStructureChanged(layer);
   auto s = f.attach();
   const auto scene = "\"scene_id\":" + std::to_string(f.sceneId);
@@ -437,6 +438,9 @@ SCENARIO("MCP node queries parse filters and expose placement records",
   REQUIRE(items.size() == 1);
   CHECK(items[0].get("node_kind")->s == "empty");
   CHECK(items[0].get("enabled")->b);
+  REQUIRE(items[0].get("node_edit_version"));
+  const auto version = items[0].get("node_edit_version")->s;
+  CHECK(!version.empty());
   auto direct = f.tool(s,
       "vsr_inspect",
       "{\"request_id\":2," + scene + ",\"kind\":\"nodes\",\"handle\":"
@@ -445,7 +449,25 @@ SCENARIO("MCP node queries parse filters and expose placement records",
           + json::quote(items[0].get("parent_handle")->s) + "}");
   REQUIRE(direct.errorCode().empty());
   f.drain();
-  CHECK(f.status(s, s.id, 2).result()->get("items")->a.size() == 1);
+  const auto directResult = f.status(s, s.id, 2);
+  REQUIRE(directResult.result()->get("items")->a.size() == 1);
+  CHECK(directResult.result()->get("items")->a[0].get("node_edit_version")->s
+      == version);
+  node->value().setEnabled(false);
+  node->value().setEnabled(true);
+  f.scene.signalLayerStructureChanged(layer);
+  REQUIRE(
+      f.tool(s,
+           "vsr_inspect",
+           "{\"request_id\":4," + scene
+               + ",\"kind\":\"nodes\",\"name\":\"wire\"}")
+          .errorCode()
+          .empty());
+  f.drain();
+  const auto changed = f.status(s, s.id, 4);
+  REQUIRE(changed.result()->get("items")->a.size() == 1);
+  CHECK(changed.result()->get("items")->a[0].get("node_edit_version")->s
+      != version);
   CHECK(f.tool(s,
              "vsr_inspect",
              "{\"request_id\":3," + scene

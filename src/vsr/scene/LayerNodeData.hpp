@@ -58,6 +58,11 @@ struct LayerNodeData
   bool isEmpty() const;
   bool isEnabled() const;
 
+  // Local editable write history, independent of layer notifications and names.
+  // Copy/move construction preserves it for storage relocation; node lifetime
+  // distinguishes clones. Assignments are writes to the destination.
+  std::uint64_t editVersion() const;
+
   void setAsObject(Object *o);
   void setAsObject(anari::DataType type, size_t index);
   void setAsTransform(const math::mat4 &m);
@@ -88,6 +93,7 @@ struct LayerNodeData
   void clearInstanceParameters();
 
  private:
+  void noteEdit();
   void incObjectUseCount();
   void decObjectUseCount();
 
@@ -95,6 +101,7 @@ struct LayerNodeData
 
   std::string m_name;
   bool m_enabled{true};
+  std::uint64_t m_editVersion{1};
   Any m_value;
   Any m_defaultValue;
   math::mat3 m_srt; // scale, azelrot, translation

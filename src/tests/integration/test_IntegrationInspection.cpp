@@ -149,6 +149,228 @@ const vsr::integration::mcp::json::Value &parameter(
 
 } // namespace
 
+SCENARIO("node edit tokens remember intervening ordinary writes",
+    "[integration][node-version]")
+{
+  Fixture f(0);
+  auto *layer = f.scene.defaultLayer();
+  auto node = layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, vsr::math::IDENTITY_MAT4, "target"));
+  f.scene.signalLayerStructureChanged(layer);
+  PageArgs args;
+  args.kind = "nodes";
+  args.filters.name = "target";
+  auto token = [&] {
+    const auto result = page(f.inspect(args, f.nextId++));
+    const auto &items = result.get("items")->a;
+    REQUIRE(items.size() == 1);
+    const auto *version = items[0].get("node_edit_version");
+    REQUIRE(version);
+    REQUIRE(!version->s.empty());
+    return version->s;
+  };
+  const auto before = token();
+  auto moved = vsr::math::IDENTITY_MAT4;
+  moved[3].x = 7.f;
+  node->value().setAsTransform(moved);
+  node->value().setAsTransform(vsr::math::IDENTITY_MAT4);
+  // No publication between writes; one coalesced notification afterwards.
+  f.scene.signalLayerTransformChanged(layer);
+  const auto after = token();
+  CHECK(after != before);
+  CHECK(token() == after);
+  node->value().setEnabled(false);
+  node->value().setEnabled(true);
+  // History exists even before publication (fresh safe-point query).
+  CHECK(token() != after);
+}
+
+SCENARIO("ordinary payload writes and resets advance local edit tokens",
+    "[integration][node-version]")
+{
+  Fixture f(0);
+  auto *layer = f.scene.defaultLayer();
+  auto baseline = vsr::math::IDENTITY_MAT4;
+  baseline[3].y = 3.f;
+  auto node = layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, baseline, "target"));
+  f.scene.signalLayerStructureChanged(layer);
+  PageArgs args;
+  args.kind = "nodes";
+  args.filters.name = "target";
+  auto result = page(f.inspect(args, f.nextId++));
+  const auto &item = result.get("items")->a.at(0);
+  REQUIRE(item.get("node_edit_version"));
+  const auto before = item.get("node_edit_version")->s;
+  args.filters.name.reset();
+  args.filters.handle = item.get("handle")->s;
+  auto moved = baseline;
+  moved[3].x = 9.f;
+  auto &data = node->value();
+  SECTION("matrix with explicit default")
+  {
+    data.setAsTransform(moved, baseline);
+    data.setAsTransform(baseline);
+  }
+  SECTION("SRT write and restoration")
+  {
+    auto srt = data.getTransformSRT();
+    srt[2].x = 9.f;
+    data.setAsTransform(srt);
+    data.setAsTransform(baseline);
+  }
+  SECTION("reset preserves original default")
+  {
+    data.setAsTransform(moved);
+    data.setToDefaultValue();
+    CHECK(data.isDefaultValue());
+    CHECK(data.getTransform()[3].y == 3.f);
+    CHECK(data.getTransform()[3].x == 0.f);
+  }
+  SECTION("reset of already default is still a write")
+  {
+    data.setToDefaultValue();
+  }
+  SECTION("copy assignment does not import the source history")
+  {
+    const auto saved = data;
+    data.setAsTransform(moved);
+    data = saved;
+    CHECK(data.isDefaultValue());
+  }
+  SECTION("move assignment does not import the source history")
+  {
+    auto saved = data;
+    data.setAsTransform(moved);
+    data = std::move(saved);
+    CHECK(data.isDefaultValue());
+  }
+  SECTION("self copy assignment")
+  {
+    data = data;
+  }
+  SECTION("self move assignment")
+  {
+    auto &alias = data;
+    data = std::move(alias);
+  }
+  SECTION("empty and restoration")
+  {
+    data.setEmpty();
+    data.setAsTransform(baseline);
+  }
+  SECTION("object type change and restoration")
+  {
+    auto object = f.scene.createObject<vsr::scene::Material>("matte");
+    data.setAsObject(object.data());
+    data.setAsTransform(baseline);
+  }
+  SECTION("transform array type change and restoration")
+  {
+    auto array = f.scene.createArray(ANARI_FLOAT32_MAT4, 1);
+    data.setAsTransformArray(array.data());
+    data.setAsTransform(baseline);
+  }
+  SECTION("raw Any setter with usage counting")
+  {
+    data.setValueRaw(vsr::core::Any(moved));
+    data.setValueRaw(vsr::core::Any(baseline));
+  }
+  SECTION("raw Any setter without usage counting")
+  {
+    data.setValueRaw(vsr::core::Any(moved), true);
+    data.setValueRaw(vsr::core::Any(baseline), true);
+  }
+  f.scene.signalLayerTransformChanged(layer);
+  result = page(f.inspect(args, f.nextId++));
+  REQUIRE(result.get("items")->a.size() == 1);
+  CHECK(result.get("items")->a[0].get("node_edit_version")->s != before);
+}
+
+SCENARIO("node edit versions exclude unrelated writes and storage relocation",
+    "[integration][node-version]")
+{
+  Fixture f(0);
+  auto *layer = f.scene.defaultLayer();
+  auto parent = layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, vsr::math::IDENTITY_MAT4, "parent"));
+  auto node = parent->insert_last_child(
+      vsr::scene::LayerNodeData(layer, vsr::math::IDENTITY_MAT4, "target"));
+  f.scene.signalLayerStructureChanged(layer);
+  PageArgs args;
+  args.kind = "nodes";
+  args.filters.name = "target";
+  auto result = page(f.inspect(args, f.nextId++));
+  const auto &item = result.get("items")->a.at(0);
+  REQUIRE(item.get("node_edit_version"));
+  const auto before = item.get("node_edit_version")->s;
+  const auto handle = item.get("handle")->s;
+  args.filters.name.reset();
+  args.filters.handle = handle;
+  SECTION("rename also stales cursors")
+  {
+    PageArgs all;
+    all.kind = "nodes";
+    all.pageSize = 1;
+    auto first = page(f.inspect(all, f.nextId++));
+    REQUIRE(first.get("cursor"));
+    all.cursor = first.get("cursor")->s;
+    node->value().name() = "renamed";
+    f.scene.signalLayerStructureChanged(layer);
+    CHECK(f.inspect(all, f.nextId++).terminal == Outcome::CURSOR_STALE);
+  }
+  SECTION("parent and sibling change back")
+  {
+    auto moved = vsr::math::IDENTITY_MAT4;
+    moved[3].x = 9.f;
+    parent->value().setAsTransform(moved);
+    parent->value().setAsTransform(vsr::math::IDENTITY_MAT4);
+    parent->value().setEnabled(false);
+    parent->value().setEnabled(true);
+    auto sibling = parent->insert_last_child(vsr::scene::LayerNodeData(layer));
+    sibling->value().setEnabled(false);
+    f.scene.signalLayerStructureChanged(layer);
+  }
+  SECTION("other layer activation and object parameters")
+  {
+    auto *other = f.scene.addLayer("other");
+    other->root()->value().setEnabled(false);
+    f.scene.setLayerActive("default", false);
+    auto material = f.scene.createObject<vsr::scene::Material>("matte");
+    material->setParameter("opacity", 0.5f);
+    f.scene.signalLayerTransformChanged(other);
+  }
+  SECTION("baseline metadata is not current editable content")
+  {
+    node->value().setCurrentValueAsDefault();
+  }
+  SECTION("storage grows and reuses holes")
+  {
+    node->container()->reserve(layer->capacity() + 1000);
+    for (int i = 0; i < 30; ++i) {
+      auto temp = parent->insert_last_child(vsr::scene::LayerNodeData(layer));
+      temp->erase_self();
+    }
+    f.scene.signalLayerStructureChanged(layer);
+  }
+  SECTION("subtree move keeps local token and clone is distinct")
+  {
+    auto clone = node->container()->copy_subtree(node, layer->root());
+    const auto cloneHandle = f.sceneIds->handleOf(clone);
+    const auto originalHandle = f.sceneIds->handleOf(node);
+    REQUIRE(cloneHandle != originalHandle);
+    CHECK(f.sceneIds->nodeEditVersion(cloneHandle)
+        != f.sceneIds->nodeEditVersion(originalHandle));
+    node->container()->move_subtree(node, layer->root());
+    node->container()->move_subtree(node, parent);
+    f.scene.signalLayerStructureChanged(layer);
+  }
+  result = page(f.inspect(args, f.nextId++));
+  REQUIRE(result.get("items")->a.size() == 1);
+  CHECK(result.get("items")->a[0].get("handle")->s == handle);
+  CHECK(result.get("items")->a[0].get("node_edit_version")->s == before);
+}
+
 SCENARIO("nodes expose placement observations through public inspection",
     "[integration][node-inspection]")
 {

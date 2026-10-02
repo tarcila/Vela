@@ -12,6 +12,77 @@
 using namespace vsr::integration::identity;
 using vsr::scene::Scene;
 
+SCENARIO("node edit tokens bind live targets and authority domains",
+    "[integration][node-version]")
+{
+  Scene scene;
+  IdentityAuthority authority;
+  SceneIdentity ids(authority, scene);
+  auto *layer = scene.defaultLayer();
+  auto node = layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, vsr::math::IDENTITY_MAT4, "target"));
+  const auto handle = ids.handleOf(node);
+  const auto token = ids.nodeEditVersion(handle);
+  REQUIRE(token);
+  REQUIRE(ids.isCurrent(*token));
+  SECTION("every same-value enabled write is intervening")
+  {
+    node->value().setEnabled(true);
+    CHECK_FALSE(ids.isCurrent(*token));
+  }
+  SECTION("copy and move construction leave the original destination history")
+  {
+    auto copy = node->value();
+    auto moved = std::move(copy);
+    CHECK(ids.isCurrent(*token));
+    node->value() = std::move(moved);
+    CHECK_FALSE(ids.isCurrent(*token));
+  }
+  SECTION("moving out of live payload is an intervening source write")
+  {
+    auto moved = std::move(node->value());
+    CHECK_FALSE(ids.isCurrent(*token));
+    node->value() = std::move(moved);
+    CHECK_FALSE(ids.isCurrent(*token));
+  }
+  SECTION("erase and reuse never revives a token")
+  {
+    const auto oldIndex = node.index();
+    const auto oldLifetime = node->lifetime();
+    REQUIRE_FALSE(node->isRoot());
+    node->erase_self();
+    CHECK_FALSE(layer->at(oldIndex));
+    auto replacement = layer->root()->insert_last_child(
+        vsr::scene::LayerNodeData(layer, vsr::math::IDENTITY_MAT4, "target"));
+    CHECK(replacement->lifetime() != oldLifetime);
+    CHECK(ids.handleOf(replacement) != handle);
+    CHECK_FALSE(ids.nodeEditVersion(handle));
+    CHECK_FALSE(ids.isCurrent(*token));
+  }
+  SECTION("layer removal retires token")
+  {
+    scene.removeLayer("default");
+    CHECK_FALSE(ids.isCurrent(*token));
+  }
+  SECTION("scene reset retires token")
+  {
+    scene.removeAllObjects();
+    scene.removeAllLayers();
+    CHECK_FALSE(ids.isCurrent(*token));
+  }
+  SECTION("foreign registration and launch cannot validate token")
+  {
+    SceneIdentity registration(authority, scene);
+    IdentityAuthority otherAuthority;
+    SceneIdentity launch(otherAuthority, scene);
+    CHECK_FALSE(registration.isCurrent(*token));
+    CHECK_FALSE(launch.isCurrent(*token));
+    auto wrongKind = handle;
+    wrongKind.domain = ids.handleOf(layer).domain;
+    CHECK_FALSE(ids.nodeEditVersion(wrongKind));
+  }
+}
+
 SCENARIO("Handles never redirect to another object", "[integration]")
 {
   Scene scene;
