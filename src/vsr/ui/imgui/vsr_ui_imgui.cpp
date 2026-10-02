@@ -398,7 +398,11 @@ void buildUI_object(vsr::scene::Object &o,
 
   ImGui::Text("[%zu]: ", o.index());
   ImGui::SameLine();
-  ImGui::InputText("##name", &o.editableName());
+  // Edit a copy and commit through setName() so the metadata-change signal
+  // fires (inspection revision must track UI renames).
+  std::string name = o.name();
+  if (ImGui::InputText("##name", &name))
+    o.setName(name);
   ImGui::Separator();
 
   if (anari::isArray(o.type())) {

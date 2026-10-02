@@ -15,7 +15,10 @@ headless rendering, and scripting.
 | `vsrVolumeToNanoVDB` | Convert supported structured volume files to NanoVDB (`.vdb`) with optional quantization settings. | `./vsrVolumeToNanoVDB [options] <input_volume> <output.vdb>` |
 | `vsrLua` | Lua scripting and REPL tool for scene import, manipulation, and rendering workflows. | `./vsrLua <script.lua> [args...]`, `./vsrLua -e "<lua code>"`, `./vsrLua -i` |
 
-`vsrLua` is only built when `VSR_USE_LUA=ON`.
+| `vsrMcpProxy` | Trusted stdio MCP adapter that lets Pi attach to a running VSR application's loopback MCP endpoint. | `./vsrMcpProxy <descriptor.json>` or `VSR_MCP_DESCRIPTOR=<descriptor.json> ./vsrMcpProxy` |
+
+`vsrLua` is only built when `VSR_USE_LUA=ON`. `vsrMcpProxy` is only built when
+`VSR_USE_INTEGRATION_MCP=ON`.
 
 ## `obj2header`
 
@@ -174,3 +177,60 @@ Usage:
 ```
 
 In script mode, extra CLI arguments are passed to Lua in the `arg` table.
+
+## `vsrMcpProxy`
+
+A stdio MCP server that forwards to the loopback MCP endpoint published by a
+VSR application started with agent integration (for example
+`vsrViewer --agentIntegration`). Pi launches it as a stdio MCP server; the
+model sees only the application's tools.
+
+The proxy:
+
+- reads and validates the private launch descriptor (owner-private directory,
+  0600 file, strict schema) from its argument or `$VSR_MCP_DESCRIPTOR`;
+- attaches with the launch credential and keeps the session ID and secret in
+  memory only;
+- forwards each newline-delimited JSON-RPC message as one POST with the
+  `Authorization`, `VSR-Session-ID` and `VSR-Session-Proof` headers;
+- renews on its own timer at the cadence the server reports, whether or not
+  any messages flow;
+- after a lost session (revocation, expiry, reconnect), attaches again as a
+  new session and never reuses old authority;
+- detaches on stdin EOF, `SIGINT`, `SIGTERM` or `SIGHUP`.
+
+Every forwarded request is bounded. The connect deadline is 5 s, the overall
+response deadline is 30 s and the response cap is 16 MiB (headers and body).
+The proxy honours `Content-Length`. A request that breaches a limit fails
+locally: the stdio client gets a JSON-RPC error whose `error.data.code` is
+`timeout`, `response_too_large` or `unavailable`. Renewal and detach use the
+same limits, so shutdown never waits longer than those deadlines. If a lost
+session cannot be reattached, the request is answered locally with the
+attach's frozen code (for example `occupied`) and is not forwarded.
+
+Endpoint ownership (Linux): after a crash, a stale descriptor may name a port
+that another local account has since bound. Before sending the launch
+credential on each new TCP connection, the proxy looks up the connection in
+`/proc/net/tcp` or `/proc/net/tcp6` and checks that the listening peer socket
+belongs to the proxy's effective UID. If the owner differs, or the check cannot
+be made, the proxy sends nothing, prints a fixed diagnostic without the
+credential and exits with status 1.
+
+`vsr/*` methods sent by the stdio client are refused and never forwarded.
+Diagnostics on stderr are fixed strings. They never include credentials,
+secrets, headers or message bodies.
+
+Pi configuration (an explicit `--mcp-config` file, not a project
+`.mcp.json`):
+
+```json
+{"mcpServers": {"vsr": {
+  "command": "vsrMcpProxy",
+  "args": ["/run/user/1000/vsr/vsr-mcp-<launch_id>.json"]
+}}}
+```
+
+Start the application first. The proxy exits with status 1 when the descriptor
+is missing or unsafe, or when the attach fails, for example because another
+client already holds the session, or when the endpoint's listener is not
+owned by the current user.

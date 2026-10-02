@@ -176,4 +176,10 @@ void MultiUpdateDelegate::signalMetadataBatchUpdated(
     d->signalMetadataBatchUpdated(o, names);
 }
 
+void MultiUpdateDelegate::signalObjectMetadataChanged(const Object *o)
+{
+  for (auto &d : m_delegates)
+    d->signalObjectMetadataChanged(o);
+}
+
 } // namespace vsr::scene

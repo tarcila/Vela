@@ -75,6 +75,11 @@ option(VSR_NANOVDB_SKIP_INVALID_VOLUMES
 option(VSR_NANOVDB_USE_ZIP
   "Enable zlib so NanoVDB importer can read ZIP-compressed .nvdb files" ON)
 option(VSR_USE_LUA "Enable Lua scripting support" ON)
+option(VSR_USE_INTEGRATION
+  "Build the headless agent-integration library" ON)
+cmake_dependent_option(VSR_USE_INTEGRATION_MCP
+  "Build the embedded loopback MCP server for agent integration" OFF
+  "VSR_USE_INTEGRATION" OFF)
 
 if (APPLE)
   set(VSR_USE_CUDA OFF)

@@ -77,6 +77,11 @@ struct BaseUpdateDelegate
       const Object *o, const std::vector<std::string> &names)
   {}
 
+  // An object's name or metadata changed (not a parameter change). Delivered
+  // immediately, even inside a parameter batch. Optional hook: observers that
+  // do not report metadata need not handle it.
+  virtual void signalObjectMetadataChanged(const Object *) {}
+
   VSR_NOT_COPYABLE(BaseUpdateDelegate)
   VSR_DEFAULT_MOVEABLE(BaseUpdateDelegate)
 };
@@ -164,6 +169,7 @@ struct MultiUpdateDelegate : public BaseUpdateDelegate
   void signalMetadataUpdated(const Object *o, const char *name) override;
   void signalMetadataBatchUpdated(
       const Object *o, const std::vector<std::string> &names) override;
+  void signalObjectMetadataChanged(const Object *o) override;
 
  private:
   std::vector<std::unique_ptr<BaseUpdateDelegate>> m_delegates;

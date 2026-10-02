@@ -35,6 +35,12 @@ project_sources(PRIVATE
   vsr_ui_imgui.cpp
 )
 
+if(VSR_USE_INTEGRATION)
+  project_sources(PRIVATE windows/IntegrationActivity.cpp)
+  project_link_libraries(PUBLIC vsr_integration)
+  project_compile_definitions(PUBLIC VSR_USE_INTEGRATION)
+endif()
+
 if(VSR_USE_LUA)
   project_link_libraries(PRIVATE vsr_lua vela_ext_sol2)
   project_compile_definitions(PRIVATE VSR_USE_LUA)

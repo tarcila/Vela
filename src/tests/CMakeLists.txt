@@ -212,3 +212,7 @@ endif()
 if (TARGET vsr_scivis_studio_test_client_core AND TARGET vsr_scivis_studio_server_core)
   add_test(NAME vsr::StudioTestClient COMMAND ${PROJECT_NAME} "[StudioTestClient]")
 endif()
+
+if (VSR_USE_INTEGRATION)
+  add_subdirectory(integration)
+endif()

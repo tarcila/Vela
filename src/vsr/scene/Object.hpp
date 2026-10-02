@@ -91,7 +91,6 @@ struct Object : public ParameterObserver
   //// Metadata ////
 
   const std::string &name() const;
-  std::string &editableName();
   void setName(const char *n);
   void setName(const std::string &n);
 
@@ -180,8 +179,11 @@ struct Object : public ParameterObserver
   void decObjectUseCountParameter(const Parameter *p);
 
   void initMetadata() const;
-  // Signals the delegate that `name` changed, or collects it for the batch.
+  // Signals the keyed delegate or collects the key for the batch, and
+  // immediately notifies object-level metadata observers.
   void metadataChanged(std::string_view name);
+  // Bumps the metadata version and signals object-level observers on rename.
+  void objectMetadataChanged();
 
   Scene *m_scene{nullptr};
 

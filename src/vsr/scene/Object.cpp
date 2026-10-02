@@ -296,19 +296,17 @@ const std::string &Object::name() const
   return m_name;
 }
 
-std::string &Object::editableName()
-{
-  return m_name;
-}
-
 void Object::setName(const char *n)
 {
-  m_name = n;
+  setName(std::string(n ? n : ""));
 }
 
 void Object::setName(const std::string &n)
 {
+  if (m_name == n)
+    return;
   m_name = n;
+  objectMetadataChanged();
 }
 
 Any Object::getMetadataValue(std::string_view name) const
@@ -584,6 +582,8 @@ void Object::metadataChanged(std::string_view name)
     const std::string key(name);
     m_updateDelegate->signalMetadataUpdated(this, key.c_str());
   }
+  if (m_updateDelegate)
+    m_updateDelegate->signalObjectMetadataChanged(this);
 }
 
 void Object::parameterChanged(const Parameter *p, const Any &oldValue)
@@ -611,6 +611,13 @@ void Object::removeParameter(const Parameter *p)
 
   removeParameter(p->name());
   m_versions.parameter++;
+}
+
+void Object::objectMetadataChanged()
+{
+  m_versions.metadata++;
+  if (m_updateDelegate)
+    m_updateDelegate->signalObjectMetadataChanged(this);
 }
 
 BaseUpdateDelegate *Object::updateDelegate() const
