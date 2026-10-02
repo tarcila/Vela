@@ -1699,4 +1699,59 @@ SCENARIO(
   CHECK(node->value().isDefaultValue());
 }
 
+SCENARIO("MCP mixed edit and restore carry one batch and both version lists",
+    "[integration][mixed-edit][node-mcp]")
+{
+  Fixture f({}, true, true);
+  auto *layer = f.scene.defaultLayer();
+  auto node = layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, vsr::math::IDENTITY_MAT4, "mixed-wire"));
+  auto s = f.attach();
+  const auto object = f.firstTarget(s, 1);
+  const auto scene = "\"scene_id\":" + std::to_string(f.sceneId);
+  REQUIRE(
+      f.tool(s,
+           "vsr_inspect",
+           "{\"request_id\":2," + scene
+               + ",\"kind\":\"nodes\",\"name\":\"mixed-wire\"}")
+          .errorCode()
+          .empty());
+  f.drain();
+  auto inspected = f.status(s, s.id, 2);
+  REQUIRE(inspected.result());
+  REQUIRE(inspected.result()->get("items")->a.size() == 1);
+  const auto item = inspected.result()->get("items")->a[0];
+  const auto target = "\"target_kind\":\"node\",\"handle\":"
+      + json::quote(item.get("handle")->s)
+      + ",\"version\":" + json::quote(item.get("node_edit_version")->s)
+      + ",\"structural_version\":"
+      + json::quote(item.get("structural_version")->s);
+  const auto args = "{\"request_id\":3," + scene + ",\"edits\":[{" + object
+      + ",\"parameter\":\"opacity\",\"value\":0.5},{" + target
+      + ",\"parameter\":\"position\",\"value\":[4,5,6]}]}";
+  REQUIRE(f.tool(s, "vsr_edit", args).errorCode().empty());
+  f.drain();
+  auto done = f.status(s, s.id, 3);
+  REQUIRE(done.str("outcome") == "ok");
+  CHECK(done.flag("committed"));
+  REQUIRE(done.result());
+  CHECK(done.result()->get("versions")->a.size() == 1);
+  CHECK(done.result()->get("node_versions")->a.size() == 1);
+  REQUIRE(done.result()->get("batch_ref"));
+  const auto batch = *done.result()->get("batch_ref");
+  CHECK(f.opacity0() == 0.5f);
+  CHECK(node->value().getTransform()[3].xyz() == vsr::math::float3(4, 5, 6));
+  CHECK(f.tool(s, "vsr_edit", args).flag("replayed"));
+  REQUIRE(f.restoreBatch(s, 4, batch).errorCode().empty());
+  f.drain();
+  auto restored = f.status(s, s.id, 4);
+  REQUIRE(restored.str("outcome") == "ok");
+  CHECK(restored.flag("committed"));
+  CHECK(restored.result()->get("versions")->a.size() == 1);
+  CHECK(restored.result()->get("node_versions")->a.size() == 1);
+  CHECK(f.opacity0() == 1.f);
+  CHECK(node->value().getTransform() == vsr::math::IDENTITY_MAT4);
+  CHECK(f.restoreBatch(s, 4, batch).flag("replayed"));
+}
+
 #endif

@@ -204,6 +204,379 @@ bool isLowerHex32(const std::string &s)
 
 } // namespace
 
+TEST_CASE("Mixed batches commit and restore one complete scene adjustment",
+    "[integration][mixed-edit]")
+{
+  Fixture f(true);
+  auto *layer = f.scene.defaultLayer();
+  auto parent = layer->root()->insert_last_child(vsr::scene::LayerNodeData(
+      layer, vsr::core::math::IDENTITY_MAT4, "parent"));
+  auto a = parent->insert_last_child(vsr::scene::LayerNodeData(
+      layer, vsr::core::math::IDENTITY_MAT4, "matrix"));
+  auto b = parent->insert_last_child(vsr::scene::LayerNodeData(
+      layer, vsr::core::math::IDENTITY_MAT4, "position"));
+  auto original = vsr::core::math::IDENTITY_MAT4;
+  original[1].x = 3.f;
+  original[0].x = -2.f;
+  a->value().setAsTransform(original);
+  a->value().setCurrentValueAsDefault();
+  auto matrix = f.nodeEntry(a);
+  matrix.parameter = "transform";
+  matrix.value = JsonValue::array({JsonValue::numbers({2, 3, 0, 11}),
+      JsonValue::numbers({0, 4, 0, -12}),
+      JsonValue::numbers({0, 0, 5, 13}),
+      JsonValue::numbers({0, 0, 0, 1})});
+  auto batch =
+      f.batch({f.entry(f.matte.data(), "opacity", JsonValue::fromNumber(0.5)),
+          matrix,
+          f.positionEntry(b, JsonValue::numbers({7, 8, 9})),
+          f.nodeEntry(a),
+          f.entry(
+              f.matte.data(), "color", JsonValue::numbers({0.2, 0.3, 0.4}))});
+  const auto revision = f.identity->sceneRevision();
+  f.recorder->parameterSignals = f.recorder->layerSignals = 0;
+  f.recorder->onParameters = [&] {
+    CHECK(f.opacity() == 0.5f);
+    CHECK(*f.matte->parameterValueAs<float3>("color")
+        == float3(0.2f, 0.3f, 0.4f));
+    CHECK(a->value().getTransform()[3].xyz() == float3(11, -12, 13));
+    CHECK(b->value().getTransform()[3].xyz() == float3(7, 8, 9));
+    CHECK_FALSE(a->value().isEnabled());
+  };
+  auto r = f.run(1, batch);
+  REQUIRE(r.outcome == Outcome::OK);
+  REQUIRE(r.committed);
+  REQUIRE(r.batchRef);
+  REQUIRE(r.sceneRevision);
+  CHECK_FALSE(*r.sceneRevision == revision);
+  REQUIRE(r.versions.size() == 1);
+  REQUIRE(r.nodeVersions.size() == 2);
+  CHECK(f.identity->isCurrent(r.versions[0]));
+  for (const auto &v : r.nodeVersions)
+    CHECK(f.identity->isCurrent(v.expected));
+  CHECK(f.recorder->parameterSignals == 1);
+  CHECK(f.recorder->layerSignals == 1);
+  CHECK(f.hookCalls == 1);
+  CHECK(f.submit(1, batch).replayed);
+  CHECK(f.hookCalls == 1);
+  auto other = batch;
+  other.edits[0] = f.nodeEntry(b);
+  const auto different = f.submit(1, other);
+  CHECK_FALSE(different.replayed);
+  CHECK(different.code == Outcome::INVALID_REQUEST);
+
+  restore::RestoreService restores(*f.engine, *f.edits);
+  restores.attachScene(f.sceneId, *f.identity);
+  restores.setFaultInjector([] { return true; });
+  const auto parameterSignals = f.recorder->parameterSignals;
+  const auto layerSignals = f.recorder->layerSignals;
+  auto restore = restores.submitLocal({f.sceneId, *r.batchRef});
+  while (f.integration.service()) {
+  }
+  REQUIRE(restores.resultLocal(restore.ref));
+  CHECK(restores.resultLocal(restore.ref)->outcome == Outcome::BUSY);
+  CHECK(restores.eligible(*r.batchRef));
+  CHECK(f.identity->isCurrent(r.versions[0]));
+  for (const auto &v : r.nodeVersions)
+    CHECK(f.identity->isCurrent(v.expected));
+  CHECK(f.recorder->parameterSignals == parameterSignals);
+  CHECK(f.recorder->layerSignals == layerSignals);
+  CHECK(f.hookCalls == 1);
+  f.recorder->onParameters();
+
+  // Metadata, unedited parameters and defaults are not restored.
+  a->value().name() = "keep name";
+  f.light->setParameter("irradiance", 4.f);
+  auto parentMatrix = vsr::core::math::IDENTITY_MAT4;
+  parentMatrix[3].x = 100.f;
+  parent->value().setAsTransform(parentMatrix);
+  f.recorder->onParameters = [&] {
+    CHECK(f.opacity() == 1.f);
+    CHECK(*f.matte->parameterValueAs<float3>("color") == float3(1.f));
+    CHECK(a->value().getTransform() == original);
+    CHECK(b->value().getTransform() == vsr::core::math::IDENTITY_MAT4);
+    CHECK(a->value().isEnabled());
+  };
+  restores.setFaultInjector({});
+  f.authority->setAgentEditsDisabled(true);
+  f.authority->detach(f.creds);
+  restore = restores.submitLocal({f.sceneId, *r.batchRef});
+  while (f.integration.service()) {
+  }
+  auto restored = restores.resultLocal(restore.ref);
+  REQUIRE(restored);
+  REQUIRE(restored->committed);
+  CHECK(restored->versions.size() == 1);
+  CHECK(restored->nodeVersions.size() == 2);
+  CHECK_FALSE(restores.eligible(*r.batchRef));
+  CHECK(f.hookCalls == 2);
+  CHECK(a->value().name() == "keep name");
+  CHECK(a->value().isDefaultValue());
+  CHECK(f.irradiance() == 4.f);
+  CHECK(parent->value().getTransform() == parentMatrix);
+  restore = restores.submitLocal({f.sceneId, *r.batchRef});
+  while (f.integration.service()) {
+  }
+  CHECK(
+      restores.resultLocal(restore.ref)->outcome == Outcome::ALREADY_RESTORED);
+}
+
+TEST_CASE("One invalid mixed entry or preparation failure changes nothing",
+    "[integration][mixed-edit]")
+{
+  Fixture f(true);
+  auto *layer = f.scene.defaultLayer();
+  auto n = layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, vsr::core::math::IDENTITY_MAT4, "n"));
+  auto batch =
+      f.batch({f.entry(f.matte.data(), "opacity", JsonValue::fromNumber(0.5)),
+          f.positionEntry(n, JsonValue::numbers({4, 5, 6})),
+          f.nodeEntry(n)});
+  const auto objectVersion = batch.edits[0].expected;
+  const auto nodeVersion = batch.edits[1].nodeExpected;
+  const auto revision = f.identity->sceneRevision();
+  f.recorder->parameterSignals = f.recorder->layerSignals = 0;
+  SECTION("stale object")
+  {
+    ++batch.edits[0].expected.version;
+    CHECK(f.run(1, batch).outcome == Outcome::CONFLICT);
+  }
+  SECTION("stale node")
+  {
+    ++batch.edits[1].nodeExpected.version;
+    ++batch.edits[2].nodeExpected.version;
+    CHECK(f.run(1, batch).outcome == Outcome::CONFLICT);
+  }
+  SECTION("invalid node value")
+  {
+    batch.edits[1].value = JsonValue::numbers({4, 5});
+    CHECK(f.run(1, batch).outcome == Outcome::INVALID_REQUEST);
+  }
+  SECTION("invalid object value")
+  {
+    batch.edits[0].value = JsonValue::fromNumber(2);
+    CHECK(f.run(1, batch).outcome == Outcome::INVALID_REQUEST);
+  }
+  SECTION("object allowlist stays narrow")
+  {
+    batch.edits[0].parameter = "unsupported";
+    CHECK(f.run(1, batch).outcome == Outcome::INVALID_REQUEST);
+  }
+  SECTION("all preparation stages")
+  {
+    std::uint64_t id = 1;
+    for (auto stage : {FaultStage::PREPARE,
+             FaultStage::ALLOCATE,
+             FaultStage::RESERVE_RESTORATION}) {
+      f.edits->setFaultInjector([stage](FaultStage s) { return s == stage; });
+      auto r = f.run(id++, batch);
+      CHECK(r.outcome == Outcome::BUSY);
+      CHECK_FALSE(r.committed);
+      CHECK_FALSE(r.batchRef);
+      CHECK(f.identity->isCurrent(objectVersion));
+      CHECK(f.identity->isCurrent(nodeVersion));
+      CHECK(f.identity->sceneRevision() == revision);
+      CHECK(f.recorder->parameterSignals == 0);
+      CHECK(f.recorder->layerSignals == 0);
+    }
+  }
+  CHECK(f.opacity() == 1.f);
+  CHECK(n->value().getTransform() == vsr::core::math::IDENTITY_MAT4);
+  CHECK(n->value().isEnabled());
+  CHECK(f.identity->isCurrent(objectVersion));
+  CHECK(f.identity->isCurrent(nodeVersion));
+  CHECK(f.identity->sceneRevision() == revision);
+  CHECK(f.recorder->parameterSignals == 0);
+  CHECK(f.recorder->layerSignals == 0);
+  CHECK(f.hookCalls == 0);
+  CHECK(f.edits->restorations().size() == 0);
+}
+
+TEST_CASE(
+    "Mixed batches share entry and journal limits and permanent conflicts",
+    "[integration][mixed-edit]")
+{
+  Fixture f(true);
+  auto *layer = f.scene.defaultLayer();
+  std::vector<EditEntry> entries{
+      f.entry(f.matte.data(), "opacity", JsonValue::fromNumber(0.5))};
+  for (int i = 0; i < 63; ++i) {
+    auto n =
+        layer->root()->insert_last_child(vsr::scene::LayerNodeData(layer, "n"));
+    entries.push_back(f.nodeEntry(n));
+  }
+  auto oversized = entries;
+  oversized.push_back(
+      f.entry(f.light.data(), "irradiance", JsonValue::fromNumber(2)));
+  CHECK(f.submit(1, f.batch(oversized)).code == Outcome::INVALID_REQUEST);
+  auto r = f.run(1, f.batch(entries));
+  REQUIRE(r.committed);
+  REQUIRE(r.batchRef);
+  CHECK(r.versions.size() == 1);
+  CHECK(r.nodeVersions.size() == 63);
+  restore::RestoreService restores(*f.engine, *f.edits);
+  restores.attachScene(f.sceneId, *f.identity);
+  REQUIRE(restores.eligible(*r.batchRef));
+  SECTION("object change-back permanently conflicts the whole journal")
+  {
+    f.matte->setParameter("opacity", 0.25f);
+    f.matte->setParameter("opacity", 0.5f);
+  }
+  SECTION("node change-back permanently conflicts the whole journal")
+  {
+    auto n = layer->root()->next();
+    n->value().setEnabled(true);
+    n->value().setEnabled(false);
+  }
+  auto a = restores.submitLocal({f.sceneId, *r.batchRef});
+  while (f.integration.service()) {
+  }
+  REQUIRE(restores.resultLocal(a.ref));
+  CHECK(restores.resultLocal(a.ref)->outcome == Outcome::CONFLICT);
+  CHECK_FALSE(restores.resultLocal(a.ref)->committed);
+  CHECK(restores.conflicting(*r.batchRef));
+  CHECK_FALSE(restores.eligible(*r.batchRef));
+  CHECK(f.opacity() == 0.5f);
+  for (const auto &e : entries) {
+    if (e.targetKind == TargetKind::NODE)
+      CHECK_FALSE(
+          f.identity->resolve(e.nodeExpected.node)->value().isEnabled());
+  }
+  a = restores.submitLocal({f.sceneId, *r.batchRef});
+  while (f.integration.service()) {
+  }
+  CHECK(restores.resultLocal(a.ref)->outcome == Outcome::CONFLICT);
+}
+
+TEST_CASE("Mixed edits preserve exposure authority and honest synchronization",
+    "[integration][mixed-edit]")
+{
+  const bool exposed = GENERATE(false, true);
+  Fixture f(exposed);
+  auto *layer = f.scene.defaultLayer();
+  auto n =
+      layer->root()->insert_last_child(vsr::scene::LayerNodeData(layer, "n"));
+  auto batch =
+      f.batch({f.entry(f.matte.data(), "opacity", JsonValue::fromNumber(0.5)),
+          f.nodeEntry(n)});
+  if (!exposed) {
+    CHECK(f.run(1, batch).outcome == Outcome::FORBIDDEN);
+    CHECK(f.opacity() == 1.f);
+    CHECK(n->value().isEnabled());
+    CHECK(f.hookCalls == 0);
+    return;
+  }
+  SECTION("edit disabled between admission and execution")
+  {
+    REQUIRE(f.submit(1, batch).code == Outcome::OK);
+    f.authority->setAgentEditsDisabled(true);
+    while (f.integration.service()) {
+    }
+    const auto status = f.engine->status(f.creds, f.ref(1));
+    CHECK(status.terminal == Outcome::FORBIDDEN);
+    CHECK_FALSE(status.committed);
+    CHECK(f.opacity() == 1.f);
+    CHECK(n->value().isEnabled());
+  }
+  SECTION("disconnect before execution")
+  {
+    REQUIRE(f.submit(1, batch).code == Outcome::OK);
+    f.authority->detach(f.creds);
+    while (f.integration.service()) {
+    }
+    CHECK(f.opacity() == 1.f);
+    CHECK(n->value().isEnabled());
+    CHECK(f.hookCalls == 0);
+    CHECK(f.edits->restorations().size() == 0);
+  }
+  SECTION("local edit then newly attached session restore")
+  {
+    f.authority->setAgentEditsDisabled(true);
+    f.authority->detach(f.creds);
+    auto a = f.edits->submitLocal(batch);
+    REQUIRE(a.code == Outcome::OK);
+    while (f.integration.service()) {
+    }
+    auto r = f.edits->resultLocal(a.ref);
+    REQUIRE(r);
+    REQUIRE(r->committed);
+    REQUIRE(r->batchRef);
+    f.authority->setAgentEditsDisabled(false);
+    auto attached = f.authority->attach(f.authority->launchCredential());
+    REQUIRE(attached.code == session::Code::OK);
+    operations::Credentials credentials{f.authority->launchCredential(),
+        attached.sessionId,
+        attached.sessionSecret};
+    restore::RestoreService restores(*f.engine, *f.edits);
+    restores.attachScene(f.sceneId, *f.identity);
+    operations::OperationRef ref{attached.sessionId, 1};
+    REQUIRE(restores.submit(credentials, ref, {f.sceneId, *r->batchRef}).code
+        == Outcome::OK);
+    while (f.integration.service()) {
+    }
+    REQUIRE(restores.result(ref));
+    CHECK(restores.result(ref)->committed);
+    CHECK(f.opacity() == 1.f);
+    CHECK(n->value().isEnabled());
+    CHECK(
+        restores.submit(credentials, ref, {f.sceneId, *r->batchRef}).replayed);
+  }
+  SECTION("sync failure is committed and still restorable")
+  {
+    f.hook = [] { return false; };
+    auto r = f.run(1, batch);
+    REQUIRE(r.committed);
+    REQUIRE(r.batchRef);
+    CHECK(r.outcome == Outcome::APPLIED_WITH_SYNC_FAILURE);
+    CHECK(f.opacity() == 0.5f);
+    CHECK_FALSE(n->value().isEnabled());
+    restore::RestoreService restores(*f.engine, *f.edits);
+    restores.attachScene(f.sceneId, *f.identity);
+    REQUIRE(restores.eligible(*r.batchRef));
+    auto a = restores.submitLocal({f.sceneId, *r.batchRef});
+    while (f.integration.service()) {
+    }
+    REQUIRE(restores.resultLocal(a.ref));
+    CHECK(restores.resultLocal(a.ref)->committed);
+    CHECK(restores.resultLocal(a.ref)->outcome
+        == Outcome::APPLIED_WITH_SYNC_FAILURE);
+    CHECK_FALSE(restores.eligible(*r.batchRef));
+    CHECK(f.opacity() == 1.f);
+    CHECK(n->value().isEnabled());
+  }
+}
+
+TEST_CASE("Mixed journals use the shared bounded restoration store",
+    "[integration][mixed-edit]")
+{
+  Fixture f(true);
+  auto *layer = f.scene.defaultLayer();
+  auto n =
+      layer->root()->insert_last_child(vsr::scene::LayerNodeData(layer, "n"));
+  std::optional<BatchRef> first;
+  for (std::uint64_t id = 1; id <= 33; ++id) {
+    auto r = f.run(id,
+        f.batch({f.entry(f.matte.data(),
+                     "opacity",
+                     JsonValue::fromNumber(id % 2 ? 0.5 : 1)),
+            f.nodeEntry(n, id % 2 == 0)}));
+    REQUIRE(r.committed);
+    REQUIRE(r.batchRef);
+    if (!first)
+      first = r.batchRef;
+  }
+  restore::RestoreService restores(*f.engine, *f.edits);
+  restores.attachScene(f.sceneId, *f.identity);
+  CHECK_FALSE(restores.eligible(*first));
+  auto a = restores.submitLocal({f.sceneId, *first});
+  while (f.integration.service()) {
+  }
+  REQUIRE(restores.resultLocal(a.ref));
+  CHECK(restores.resultLocal(a.ref)->outcome == Outcome::OUTCOME_UNAVAILABLE);
+  CHECK(f.opacity() == 0.5f);
+  CHECK_FALSE(n->value().isEnabled());
+}
+
 SCENARIO("An Agent Edit Batch commits in full and publishes a Batch Reference",
     "[integration]")
 {
@@ -651,6 +1024,48 @@ Costs measureCosts()
 }
 
 } // namespace
+
+TEST_CASE("Mixed restoration payloads count against the shared activity budget",
+    "[integration][mixed-edit]")
+{
+  auto mixed = [](LoggedFixture &lf, std::uint64_t id) {
+    auto &f = lf.fx;
+    auto *layer = f.scene.defaultLayer();
+    auto n =
+        layer->root()->insert_last_child(vsr::scene::LayerNodeData(layer, "n"));
+    return f.run(id,
+        f.batch({f.entry(f.matte.data(), "opacity", JsonValue::fromNumber(0.5)),
+            f.nodeEntry(n)}));
+  };
+  LoggedFixture measured({}, true);
+  auto r = mixed(measured, 1);
+  REQUIRE(r.committed);
+  auto record = measured.log->get(1);
+  REQUIRE(record);
+  REQUIRE(record->batchRef);
+  CHECK(*record->batchRef == *r.batchRef);
+  CHECK(record->restorationBytes > 0);
+  CHECK(measured.log->usage().restorableBatches == 1);
+  const auto cost = activity::ActivityLog::cost(*record);
+  const auto resultBytes = record->result.size();
+  measured.holdActive();
+  const auto active = measured.log->usage().bytes - cost;
+
+  activity::Limits limits;
+  limits.bytes = active + cost - resultBytes - 1;
+  LoggedFixture constrained(limits, true);
+  constrained.holdActive();
+  r = mixed(constrained, 1);
+  CHECK(r.outcome == Outcome::BUSY);
+  CHECK_FALSE(r.committed);
+  CHECK_FALSE(r.batchRef);
+  CHECK(constrained.fx.opacity() == 1.f);
+  CHECK(
+      constrained.fx.scene.defaultLayer()->root()->next()->value().isEnabled());
+  CHECK(constrained.fx.hookCalls == 0);
+  CHECK(constrained.log->usage().restorableBatches == 0);
+  CHECK(constrained.log->usage().bytes <= limits.bytes);
+}
 
 SCENARIO("A committed edit is an eligible batch in the activity log",
     "[integration]")
