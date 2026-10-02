@@ -1780,6 +1780,204 @@ SCENARIO("sparse object filters retain bounded work and continuation",
   CHECK(f.inspector->scratch().used() == 0);
 }
 
+SCENARIO("stored name matching yields before a beyond-preview match",
+    "[integration][bounded-names]")
+{
+  PageLimits limits;
+  limits.sliceVisits = 1;
+  Fixture f(0, limits);
+  f.scene.removeAllLayers();
+  f.scene.addLayer(std::string(200000, 'a') + "needle");
+  PageArgs args;
+  args.kind = "layers";
+  args.filters.nameContains = "needle";
+  f.submit(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args), 1);
+  f.integration.service();
+  CHECK_FALSE(f.engine->status(f.creds, {f.creds.sessionId, 1}).terminal);
+  f.integration.service();
+  CHECK_FALSE(f.engine->status(f.creds, {f.creds.sessionId, 1}).terminal);
+  auto result = page(f.drain(1));
+  std::size_t found = result.get("items")->a.size();
+  for (int i = 0; !result.get("complete")->b && i < 32; ++i) {
+    args.cursor = result.get("cursor")->s;
+    result = page(f.inspect(args, 2 + i));
+    found += result.get("items")->a.size();
+  }
+  CHECK(result.get("complete")->b);
+  CHECK(found == 1);
+  CHECK(f.inspector->scratch().used() == 0);
+}
+
+SCENARIO("all query kinds resume linear literal matching on stored names",
+    "[integration][bounded-names]")
+{
+  const std::string kind = GENERATE("objects", "layers", "nodes");
+  PageLimits limits;
+  limits.nameWork = 257;
+  limits.sliceNameWork = 7;
+  Fixture f(0, limits);
+  f.scene.removeAllLayers();
+  const std::string name = std::string(8192, 'a') + "b";
+  if (kind == "objects")
+    f.scene.createObject<vsr::scene::Material>("matte")->setName(name.c_str());
+  else {
+    auto *layer = f.scene.addLayer(kind == "layers" ? name : "layer");
+    if (kind == "nodes") {
+      layer->root()->insert_last_child(
+          vsr::scene::LayerNodeData(layer, name.c_str()));
+      f.scene.signalLayerStructureChanged(layer);
+    }
+  }
+  PageArgs args;
+  args.kind = kind;
+  args.filters.nameContains = std::string(127, 'a') + "b";
+  std::size_t expected = 1;
+  SECTION("repeated prefix match beyond preview") {}
+  SECTION("repeated prefix no match")
+  {
+    args.filters.nameContains = std::string(127, 'a') + "c";
+    expected = 0;
+  }
+  SECTION("exact filter intersects, not preview matching")
+  {
+    args.filters.name = std::string(4096, 'a');
+    expected = 0;
+  }
+  SECTION("empty substring remains universal")
+  {
+    args.filters.nameContains = "";
+    PageArgs unfiltered;
+    unfiltered.kind = kind;
+    expected = page(f.inspect(unfiltered, 1)).get("items")->a.size();
+  }
+  std::size_t found = 0, work = 0;
+  bool complete = false;
+  std::string handle;
+  for (int i = 0; i < 100 && !complete; ++i) {
+    const auto result = page(f.inspect(args, 10 + i));
+    const auto comparisons = result.get("name_work")->n;
+    CHECK(comparisons <= 257);
+    work += comparisons;
+    found += result.get("items")->a.size();
+    if (!result.get("items")->a.empty())
+      handle = result.get("items")->a.back().get("handle")->s;
+    CHECK(f.inspector->scratch().used() == 0);
+    complete = result.get("complete")->b;
+    if (!complete) {
+      CHECK(result.get("stop")->s == "work");
+      args.cursor = result.get("cursor")->s;
+    }
+  }
+  CHECK(complete);
+  CHECK(found == expected);
+  // Other fixture objects/root names are also scanned, within 128 bytes.
+  CHECK(work <= 2 * (name.size() + 128));
+  if (expected == 1) {
+    args.cursor.clear();
+    args.filters.handle = handle;
+    std::size_t directFound = 0;
+    for (int i = 0; i < 100; ++i) {
+      auto result = page(f.inspect(args, 200 + i));
+      directFound += result.get("items")->a.size();
+      if (result.get("complete")->b)
+        break;
+      args.cursor = result.get("cursor")->s;
+    }
+    CHECK(directFound == 1);
+  }
+}
+
+SCENARIO("partial stored names respect interruption revision and replay",
+    "[integration][bounded-names]")
+{
+  const std::string kind = GENERATE("objects", "layers", "nodes");
+  PageLimits limits;
+  limits.nameWork = 31;
+  limits.sliceNameWork = 3;
+  Fixture f(0, limits);
+  f.scene.removeAllLayers();
+  const std::string name = std::string(8192, 'a') + "b";
+  if (kind == "objects")
+    f.scene.createObject<vsr::scene::Material>("matte")->setName(name.c_str());
+  else {
+    auto *layer = f.scene.addLayer(kind == "layers" ? name : "layer");
+    if (kind == "nodes") {
+      layer->root()->insert_last_child(
+          vsr::scene::LayerNodeData(layer, name.c_str()));
+      f.scene.signalLayerStructureChanged(layer);
+    }
+  }
+  PageArgs args;
+  args.kind = kind;
+  args.filters.nameContains = "ab";
+  auto firstStatus = f.inspect(args, 1);
+  auto first = page(firstStatus);
+  REQUIRE_FALSE(first.get("complete")->b);
+  CHECK(first.get("items")->a.empty());
+  args.cursor = first.get("cursor")->s;
+  SECTION("query substitution is stale")
+  {
+    args.filters.nameContains = "ac";
+    CHECK(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args).code
+        == Outcome::CURSOR_STALE);
+  }
+  SECTION("fresh revision stales progress but history replays")
+  {
+    f.scene.createObject<vsr::scene::Material>("matte")->setName("fresh");
+    CHECK(f.inspect(args, 2).terminal == Outcome::CURSOR_STALE);
+    args.cursor.clear();
+    CHECK(f.inspect(args, 1).result == firstStatus.result);
+    args.filters.nameContains = "fresh";
+    auto fresh = page(f.inspect(args, 3));
+    CHECK(fresh.get("revision")->s != first.get("revision")->s);
+  }
+  SECTION("cancel")
+  {
+    f.submit(
+        f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args), 2);
+    f.integration.service();
+    REQUIRE(f.inspector->scratch().used() > 0);
+    f.engine->cancel(f.creds, {f.creds.sessionId, 2});
+    CHECK(f.drain(2).terminal == Outcome::CANCELLED);
+  }
+  SECTION("deadline")
+  {
+    f.submit(
+        f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args), 2);
+    f.integration.service();
+    f.now += 6;
+    CHECK(f.drain(2).terminal == Outcome::TIMEOUT);
+  }
+  CHECK(f.inspector->scratch().used() == 0);
+}
+
+SCENARIO("exact name comparisons also resume in bounded slices",
+    "[integration][bounded-names]")
+{
+  PageLimits limits;
+  limits.nameWork = 5;
+  limits.sliceNameWork = 1;
+  Fixture f(0, limits);
+  f.scene.removeAllLayers();
+  f.scene.addLayer("abcdefghij");
+  PageArgs args;
+  args.kind = "layers";
+  args.filters.name = "abcdefghij";
+  args.filters.nameContains = "hij";
+  std::size_t found = 0, work = 0;
+  for (int i = 0; i < 10; ++i) {
+    auto result = page(f.inspect(args, i + 1));
+    CHECK(result.get("name_work")->n <= 5);
+    work += result.get("name_work")->n;
+    found += result.get("items")->a.size();
+    if (result.get("complete")->b)
+      break;
+    args.cursor = result.get("cursor")->s;
+  }
+  CHECK(found == 1);
+  CHECK(work == 20);
+}
+
 SCENARIO("pages yield in slices while keeping their slot", "[integration]")
 {
   Fixture f(1000);

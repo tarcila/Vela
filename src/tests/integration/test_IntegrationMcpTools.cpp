@@ -676,6 +676,10 @@ SCENARIO("MCP object filters and active paging limits are exposed",
     if (tool.get("name")->s == "vsr_inspect") {
       CHECK(props->get("kind")->get("enum")->a.at(0).s == "objects");
       CHECK(props->get("name")->get("maxLength")->n == 4096);
+      CHECK(tool.get("description")->s.find("65536 per operation")
+          != std::string::npos);
+      CHECK(tool.get("description")->s.find("4096 per safe-point slice")
+          != std::string::npos);
       REQUIRE(props->get("object_type")->get("enum"));
     }
   }

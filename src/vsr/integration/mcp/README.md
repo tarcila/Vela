@@ -80,6 +80,30 @@ bounded to 4096 UTF-8 bytes by default. Malformed or unsupported filters reject
 before admission; a stale exact handle returns `conflict`, and no matches return
 an empty complete page (or a marked work-budget continuation).
 
+All three kinds match the **real stored name**, including bytes beyond its
+preview. Host `PageLimits::nameWork` defaults to 65536 byte comparisons per
+operation and `sliceNameWork` to 4096 per safe point (both must be nonzero).
+Exact comparisons and substring fallback comparisons each cost one unit;
+`name_work` reports the page's comparisons, separately from `visited` candidate
+and hierarchy steps. Either work limit can stop a slice; operation exhaustion
+returns `stop: "work"` with a continuation, even with no items. A partly scanned
+candidate is not skipped or revisited from byte zero. Cursors authenticate the
+exact/substr phase, byte offset and matched-prefix length with the existing
+complete query and revision binding. Revision changes stale partial scans;
+retries of the same request still replay the historical result.
+
+Substring matching uses linear-time KMP, including adversarial repeated
+prefixes (at most twice the stored-name length in comparisons per substring
+scan). Admission builds its O(filter-byte-length) failure table using only the
+bounded input filter, never the stored name; the table's size_t entries, query
+strings and fixed cursor state are charged to shared inspection scratch.
+Tables are rebuilt at admission on continuation, bounded by the input-string
+limit, while the stored-name scan resumes. Exact length mismatch is constant
+work, empty substring matches without scanning, and combined filters intersect.
+No name snapshot or bulk name copy is retained. Cancellation/deadline/session
+termination release reservations just as for ordinary pages; scanning yields
+at each slice limit so the operation engine can check these terminal paths.
+
 Layer queries support intersecting exact `name`, literal case-sensitive
 `name_contains`, and exact layer `handle` filters (or unfiltered pages).
 Matching uses the real stored layer name, not its display preview or Scene

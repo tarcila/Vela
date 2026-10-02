@@ -147,7 +147,12 @@ inline void addQueryTools(std::vector<Tool> &tools, QueryDeps deps)
       "object_subtype filters intersect with literal, "
       "case-sensitive name_contains (not regex/glob). "
       "Filter strings are limited to "
-      + std::to_string(limits.displayString) + " UTF-8 bytes." + paging;
+      + std::to_string(limits.displayString)
+      + " UTF-8 bytes. Stored names are matched resumably, not against previews; "
+        "name_work counts byte comparisons (including substring fallback), with "
+      + std::to_string(limits.nameWork) + " per operation and "
+      + std::to_string(limits.sliceNameWork)
+      + " per safe-point slice. Work exhaustion returns a continuation." + paging;
   inspect.inputSchemaJson = std::string("{\"type\":\"object\",\"properties\":{")
       + requestIdSchema()
       + ",\"scene_id\":{\"type\":\"integer\",\"minimum\":0},"

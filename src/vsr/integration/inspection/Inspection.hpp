@@ -78,6 +78,9 @@ struct PageLimits
   std::size_t sliceVisits{256};
   std::size_t scratchBytes{8u << 20};
   double deadlineSeconds{5.0};
+  // Stored-name byte comparisons (including KMP fallback comparisons).
+  std::size_t nameWork{65536};
+  std::size_t sliceNameWork{4096};
 };
 
 // Global scratch accounting shared by all admitted discovery/inspection work.
@@ -462,6 +465,10 @@ class Inspector
     // Fixed-size, authenticated continuation state; no parent stack.
     core::math::mat4 world{core::math::IDENTITY_MAT4};
     std::uint64_t worldIssue{0};
+    // 0: unvisited, 1: exact, 2: substring, 3: matched.
+    std::uint64_t namePhase{0};
+    std::uint64_t nameOffset{0};
+    std::uint64_t nameMatched{0};
   };
 
   // Owns its scratch reservation: released on completion, and otherwise when
@@ -497,6 +504,9 @@ class Inspector
     bool started{false};
     std::uint64_t revision{0};
     std::size_t visited{0};
+    std::size_t nameWork{0};
+    std::size_t sliceNameWork{0};
+    std::vector<std::size_t> namePrefix;
     std::size_t returned{0};
     std::string items;
     std::size_t reserved{0};
@@ -539,6 +549,8 @@ class Inspector
         }
       }
     }
+    carrier += detail::hex64(j.pos.namePhase) + detail::hex64(j.pos.nameOffset)
+        + detail::hex64(j.pos.nameMatched);
     return carrier + mac(carrier);
   }
 
@@ -546,7 +558,7 @@ class Inspector
   {
     // Authenticate either supported carrier before checking its query binding:
     // a genuine cursor from another kind is stale, not malformed.
-    if (c.size() != 80 && c.size() != 304)
+    if (c.size() != 128 && c.size() != 352)
       return Outcome::INVALID_REQUEST;
     const auto payloadSize = c.size() - 16;
     for (char ch : c)
@@ -558,7 +570,7 @@ class Inspector
     const std::uint64_t rev = std::stoull(c.substr(32, 16), nullptr, 16);
     if (mac(binding(j, rev)) != c.substr(48, 16))
       return Outcome::CURSOR_STALE;
-    if (payloadSize != (j.kind == "nodes" ? 288u : 64u))
+    if (payloadSize != (j.kind == "nodes" ? 336u : 112u))
       return Outcome::INVALID_REQUEST;
     j.pos.pool = std::stoull(c.substr(0, 16), nullptr, 16);
     j.pos.index = std::stoull(c.substr(16, 16), nullptr, 16);
@@ -578,6 +590,10 @@ class Inspector
         }
       }
     }
+    const auto nameStart = payloadSize - 48;
+    j.pos.namePhase = std::stoull(c.substr(nameStart, 16), nullptr, 16);
+    j.pos.nameOffset = std::stoull(c.substr(nameStart + 16, 16), nullptr, 16);
+    j.pos.nameMatched = std::stoull(c.substr(nameStart + 32, 16), nullptr, 16);
     j.started = true;
     return Outcome::OK;
   }
@@ -687,7 +703,8 @@ class Inspector
   {
     Built b;
     const std::int64_t size = args.pageSize.value_or(m_limits.defaultItems);
-    if (size < 1 || size > m_limits.maxItems || !validFilters(q, args)) {
+    if (size < 1 || size > m_limits.maxItems || !validFilters(q, args)
+        || !m_limits.nameWork || !m_limits.sliceNameWork) {
       b.code = Outcome::INVALID_REQUEST;
       return b;
     }
@@ -717,11 +734,27 @@ class Inspector
              &job->filters.parentHandle})
       if (*s)
         queryBytes += (*s)->size();
+    const auto patternSize =
+        job->filters.nameContains ? job->filters.nameContains->size() : 0;
+    queryBytes += patternSize * sizeof(std::size_t);
     if (!m_scratch->reserve(queryBytes)) {
       b.code = Outcome::BUSY;
       return b;
     }
     job->reserved = queryBytes;
+    // Admission work is O(input bytes), bounded by displayString; no stored
+    // name is touched here. The linear KMP failure table is charged scratch.
+    job->namePrefix.resize(patternSize);
+    if (patternSize) {
+      const auto &pattern = *job->filters.nameContains;
+      for (std::size_t i = 1, matched = 0; i < patternSize; ++i) {
+        while (matched && pattern[i] != pattern[matched])
+          matched = job->namePrefix[matched - 1];
+        if (pattern[i] == pattern[matched])
+          ++matched;
+        job->namePrefix[i] = matched;
+      }
+    }
     if (!args.cursor.empty()) {
       b.code = decodeCursor(args.cursor, *job);
       if (b.code != Outcome::OK)
@@ -915,14 +948,18 @@ class Inspector
     }
     const auto &state = scene.layers().at_index(j.pos.index).second;
     const auto *layer = state.ptr.get();
-    j.visited++;
+    if (!j.pos.namePhase)
+      j.visited++;
     const auto h = ids.handleOf(layer);
     const auto handle = detail::hex64(h.domain) + detail::hex64(h.serial);
     const auto &f = j.filters;
-    if ((f.name && layer->name() != *f.name)
-        || (f.nameContains
-            && layer->name().find(*f.nameContains) == std::string::npos)
-        || (f.handle && handle != *f.handle)) {
+    const auto matches = (f.handle && handle != *f.handle)
+        ? std::optional<bool>(false)
+        : matchName(j, layer->name());
+    if (!matches)
+      return true;
+    if (!*matches) {
+      resetName(j.pos);
       j.pos.index++;
       return true;
     }
@@ -933,6 +970,7 @@ class Inspector
         + detail::hex64(root.domain) + detail::hex64(root.serial) + "\"}";
     if (!append(j, item, tooLarge))
       return false;
+    resetName(j.pos);
     j.pos.index++;
     return true;
   }
@@ -1056,8 +1094,10 @@ class Inspector
     const auto &state = scene.layers().at_index(j.pos.pool).second;
     auto *layer = state.ptr.get();
     auto node = j.pos.index ? layer->at(j.pos.index - 1) : layer->root();
-    j.visited++;
+    if (j.pos.phase || !j.pos.namePhase)
+      j.visited++;
     auto advance = [&] {
+      resetName(j.pos);
       if (!node->isLeaf()) {
         j.pos.index = node->next().index() + 1;
         j.pos.phase = 0;
@@ -1091,13 +1131,17 @@ class Inspector
         node->isRoot() ? std::string{} : handleText(ids.handleOf(parent));
     if (j.pos.phase == 0) {
       const auto &f = j.filters;
-      if ((f.name && data.name() != *f.name)
-          || (f.nameContains
-              && data.name().find(*f.nameContains) == std::string::npos)
-          || (f.handle && handle != *f.handle)
+      if ((f.handle && handle != *f.handle)
           || (f.nodeKind && kind != *f.nodeKind)
           || (f.layerHandle && layerHandle != *f.layerHandle)
           || (f.parentHandle && parentHandle != *f.parentHandle)) {
+        advance();
+        return true;
+      }
+      const auto matches = matchName(j, data.name());
+      if (!matches)
+        return true;
+      if (!*matches) {
         advance();
         return true;
       }
@@ -1191,10 +1235,12 @@ class Inspector
       j.pos = {j.pos.pool + 1, 0};
       return true;
     }
-    j.visited++;
+    if (!j.pos.namePhase)
+      j.visited++;
     auto *o = j.exactObject ? j.exactObject
                             : scene.getObject(kPools[j.pos.pool], j.pos.index);
     auto advance = [&] {
+      resetName(j.pos);
       if (j.exactObject)
         j.pos.pool = std::size(kPools);
       else
@@ -1207,12 +1253,16 @@ class Inspector
     const auto h = ids.handleOf(o);
     const auto handle = detail::hex64(h.domain) + detail::hex64(h.serial);
     const auto &f = j.filters;
-    if ((f.name && o->name() != *f.name)
-        || (f.nameContains
-            && o->name().find(*f.nameContains) == std::string::npos)
-        || (f.handle && handle != *f.handle)
+    if ((f.handle && handle != *f.handle)
         || (f.objectType && *f.objectType != anari::toString(o->type()))
         || (f.objectSubtype && *f.objectSubtype != o->subtype().str())) {
+      advance();
+      return true;
+    }
+    const auto matches = matchName(j, o->name());
+    if (!matches)
+      return true;
+    if (!*matches) {
       advance();
       return true;
     }
@@ -1257,6 +1307,65 @@ class Inspector
       return false;
     advance();
     return true;
+  }
+
+  // A pending result never advances the candidate. Each byte comparison,
+  // including fallback with an unchanged input offset, costs one work unit.
+  std::optional<bool> matchName(Job &j, const std::string &name)
+  {
+    auto &p = j.pos;
+    const auto &f = j.filters;
+    if (!p.namePhase)
+      p.namePhase = 1;
+    auto charge = [&] {
+      if (j.nameWork >= m_limits.nameWork
+          || j.sliceNameWork >= m_limits.sliceNameWork)
+        return false;
+      ++j.nameWork;
+      ++j.sliceNameWork;
+      return true;
+    };
+    if (p.namePhase == 1) {
+      if (f.name) {
+        if (name.size() != f.name->size())
+          return false;
+        while (p.nameOffset < name.size()) {
+          if (!charge())
+            return std::nullopt;
+          if (name[p.nameOffset] != (*f.name)[p.nameOffset])
+            return false;
+          ++p.nameOffset;
+        }
+      }
+      p.namePhase = 2;
+      p.nameOffset = 0;
+    }
+    if (p.namePhase == 2 && f.nameContains && !f.nameContains->empty()) {
+      const auto &pattern = *f.nameContains;
+      while (p.nameOffset < name.size()) {
+        if (!charge())
+          return std::nullopt;
+        if (name[p.nameOffset] == pattern[p.nameMatched]) {
+          ++p.nameOffset;
+          if (++p.nameMatched == pattern.size()) {
+            p.namePhase = 3;
+            return true;
+          }
+        } else if (p.nameMatched) {
+          p.nameMatched = j.namePrefix[p.nameMatched - 1];
+        } else {
+          ++p.nameOffset;
+        }
+      }
+      return false;
+    }
+    p.namePhase = 3;
+    return true;
+  }
+
+  static void resetName(Position &p)
+  {
+    p.namePhase = p.nameOffset = p.nameMatched = 0;
   }
 
   static std::string layerIdentityBinding(const identity::SceneIdentity &ids)
@@ -1326,9 +1435,11 @@ class Inspector
       }
     }
     std::size_t slice = 0;
+    j.sliceNameWork = 0;
     bool tooLarge = false, exhausted = false;
-    while (slice < m_limits.sliceVisits) {
-      if (j.visited >= m_limits.visits) {
+    while (slice < m_limits.sliceVisits
+        && j.sliceNameWork < m_limits.sliceNameWork) {
+      if (j.visited >= m_limits.visits || j.nameWork >= m_limits.nameWork) {
         j.stop = "work";
         break;
       }
@@ -1349,11 +1460,14 @@ class Inspector
       if (j.visited == before)
         slice++;
     }
+    if (!exhausted && !j.stop && j.nameWork >= m_limits.nameWork)
+      j.stop = "work";
     if (!exhausted && !j.stop)
       return Step{Step::Status::YIELD};
 
     std::string r = "{\"revision\":\"" + detail::hex64(j.revision)
         + "\",\"visited\":" + std::to_string(j.visited)
+        + ",\"name_work\":" + std::to_string(j.nameWork)
         + ",\"returned\":" + std::to_string(j.returned) + ",\"items\":["
         + j.items + "],\"complete\":" + (exhausted ? "true" : "false");
     if (ids)
