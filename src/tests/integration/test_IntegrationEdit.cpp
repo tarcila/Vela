@@ -792,6 +792,252 @@ SCENARIO("Canonical arguments carry the full content of every JSON kind",
   }
 }
 
+TEST_CASE("Full local matrix preserves affine state and restores cached SRT",
+    "[integration][node-edit][node-matrix]")
+{
+  Fixture f(true);
+  auto *layer = f.scene.addLayer("matrix");
+  auto n = layer->root()->insert_last_child(vsr::scene::LayerNodeData(
+      layer, vsr::core::math::IDENTITY_MAT4, "placement"));
+  // Keep an unnormalized angle cache that cannot be recovered by decomposition.
+  const vsr::core::math::mat3 srt{
+      {2.f, 3.f, 4.f}, {450.f, 0.f, 0.f}, {5.f, 6.f, 7.f}};
+  n->value().setAsTransform(srt);
+  SECTION("prior SRT angles are retained exactly") {}
+  SECTION("prior shear matrix is retained exactly")
+  {
+    auto shear = vsr::core::math::IDENTITY_MAT4;
+    shear[1].x = 2.5f;
+    shear[0].x = -3.f;
+    n->value().setAsTransform(shear);
+  }
+  SECTION("prior singular matrix and nonfinite decomposition cache")
+  {
+    auto singular = vsr::core::math::IDENTITY_MAT4;
+    singular[0].x = 0.f;
+    n->value().setAsTransform(singular);
+  }
+  const auto beforeSRT = n->value().getTransformSRT();
+  const auto before = n->value().getTransform();
+  f.scene.signalLayerStructureChanged(layer);
+  auto matrix = f.nodeEntry(n);
+  matrix.parameter = "transform";
+  matrix.value = JsonValue::array({JsonValue::numbers({-2, 3, 0, 11}),
+      JsonValue::numbers({0, 0, 0, 13}),
+      JsonValue::numbers({0, 1, 4, 17}),
+      JsonValue::numbers({0, 0, 0, 1})});
+  auto enabled = f.nodeEntry(n, false);
+  auto result = f.run(1, f.batch({matrix, enabled}));
+  REQUIRE(result.committed);
+  REQUIRE(result.batchRef);
+  CHECK(result.nodeVersions.size() == 1);
+  const auto after = n->value().getTransform();
+  CHECK(after[0].x == -2.f);
+  CHECK(after[1].x == 3.f);
+  CHECK(after[1].z == 1.f);
+  CHECK(after[3].x == 11.f);
+  CHECK(after[3].y == 13.f);
+  CHECK(after[3].z == 17.f);
+  CHECK_FALSE(n->value().isEnabled());
+  restore::RestoreService restores(*f.engine, *f.edits);
+  restores.attachScene(f.sceneId, *f.identity);
+  const auto admission = restores.submitLocal({f.sceneId, *result.batchRef});
+  REQUIRE(admission.code == Outcome::OK);
+  while (f.integration.service()) {
+  }
+  REQUIRE(restores.resultLocal(admission.ref)->committed);
+  const auto restored = n->value().getTransform();
+  const auto restoredSRT = n->value().getTransformSRT();
+  CHECK(std::memcmp(&restored, &before, sizeof(before)) == 0);
+  CHECK(std::memcmp(&restoredSRT, &beforeSRT, sizeof(beforeSRT)) == 0);
+  CHECK(n->value().isEnabled());
+  n->value().setToDefaultValue();
+  const auto baseline = n->value().getTransform();
+  CHECK(baseline[0].x == 1.f);
+  CHECK(baseline[3].x == 0.f);
+}
+
+TEST_CASE("Matrix rejection and preparation leave the whole batch unchanged",
+    "[integration][node-edit][node-matrix]")
+{
+  Fixture f(true);
+  auto *l = f.scene.addLayer("matrix-validation");
+  auto n = l->root()->insert_last_child(
+      vsr::scene::LayerNodeData(l, vsr::core::math::IDENTITY_MAT4, "n"));
+  f.scene.signalLayerStructureChanged(l);
+  auto e = f.nodeEntry(n);
+  e.parameter = "transform";
+  e.value = JsonValue::array({JsonValue::numbers({1, 2, 3, 4}),
+      JsonValue::numbers({0, 5, 6, 7}),
+      JsonValue::numbers({0, 0, -8, 9}),
+      JsonValue::numbers({0, 0, 0, 1})});
+  const auto version = e.nodeExpected;
+  const auto revision = f.identity->sceneRevision();
+  f.recorder->layerSignals = 0;
+  ValueError error = ValueError::NONE;
+  SECTION("projective tiny value cannot round to affine zero")
+  {
+    e.value.elements[3].elements[0] = JsonValue::fromNumber(1e-100);
+    error = ValueError::NON_AFFINE;
+  }
+  SECTION("projective near-one cannot round to affine one")
+  {
+    e.value.elements[3].elements[3] = JsonValue::fromNumber(1.0000000000000002);
+    error = ValueError::NON_AFFINE;
+  }
+  SECTION("overflow")
+  {
+    e.value.elements[0].elements[0] = JsonValue::fromNumber(1e100);
+    error = ValueError::OUT_OF_DOMAIN;
+  }
+  SECTION("nonfinite")
+  {
+    e.value.elements[0].elements[0] =
+        JsonValue::fromNumber(std::numeric_limits<double>::infinity());
+    error = ValueError::NON_FINITE;
+  }
+  SECTION("wrong shape")
+  {
+    e.value.elements[2].elements.pop_back();
+    error = ValueError::INCOMPATIBLE_TYPE;
+  }
+  SECTION("wrong scalar type")
+  {
+    e.value.elements[0].elements[0] = JsonValue::ofKind(JsonKind::BOOLEAN);
+    error = ValueError::INCOMPATIBLE_TYPE;
+  }
+  SECTION("wrong node kind")
+  {
+    n->value().setEmpty();
+    e = f.nodeEntry(n);
+    e.parameter = "transform";
+    e.value = JsonValue::numbers({1, 2, 3});
+    error = ValueError::UNSUPPORTED_NODE_KIND;
+  }
+  SECTION("all fallible preparation stages")
+  {
+    for (auto stage : {FaultStage::PREPARE,
+             FaultStage::ALLOCATE,
+             FaultStage::RESERVE_RESTORATION}) {
+      f.edits->setFaultInjector([stage](FaultStage s) { return s == stage; });
+      auto r = f.run(10 + static_cast<int>(stage), f.batch({e}));
+      CHECK(r.outcome == Outcome::BUSY);
+      CHECK_FALSE(r.committed);
+      CHECK_FALSE(r.batchRef);
+    }
+  }
+  SECTION("reserved convenience conflicts and duplicates")
+  {
+    for (auto field : {"position", "rotation", "scale", "transform"}) {
+      auto other = e;
+      other.parameter = field;
+      CHECK(f.submit(1, f.batch({e, other})).code == Outcome::INVALID_REQUEST);
+      CHECK(f.submit(2, f.batch({other, e})).code == Outcome::INVALID_REQUEST);
+    }
+  }
+  if (error != ValueError::NONE) {
+    auto r = f.run(1, f.batch({f.nodeEntry(n, false), e}));
+    CHECK(r.outcome == Outcome::INVALID_REQUEST);
+    CHECK(r.valueError == error);
+    CHECK(r.failedEntry == 1);
+    CHECK_FALSE(r.committed);
+    CHECK_FALSE(r.batchRef);
+  }
+  CHECK(n->value().isEnabled());
+  CHECK(f.recorder->layerSignals == 0);
+  CHECK(f.hookCalls == 0);
+  CHECK(f.edits->restorations().size() == 0);
+  if (error != ValueError::UNSUPPORTED_NODE_KIND) {
+    CHECK(f.identity->isCurrent(version));
+    CHECK(f.identity->sceneRevision() == revision);
+    CHECK(n->value().getTransform()[1].x == 0.f);
+  }
+}
+
+TEST_CASE(
+    "Matrix journals keep narrow conflicts and permanent restore outcomes",
+    "[integration][node-edit][node-matrix]")
+{
+  Fixture f(true);
+  auto *l = f.scene.addLayer("matrix-history");
+  auto parent = l->root()->insert_last_child(
+      vsr::scene::LayerNodeData(l, vsr::core::math::IDENTITY_MAT4, "parent"));
+  auto n = parent->insert_last_child(
+      vsr::scene::LayerNodeData(l, vsr::core::math::IDENTITY_MAT4, "n"));
+  auto sibling =
+      parent->insert_last_child(vsr::scene::LayerNodeData(l, "sibling"));
+  f.scene.signalLayerStructureChanged(l);
+  auto e = f.nodeEntry(n);
+  e.parameter = "transform";
+  e.value = JsonValue::array({JsonValue::numbers({-1, 2, 0, 5}),
+      JsonValue::numbers({0, 3, 0, 6}),
+      JsonValue::numbers({0, 0, 4, 7}),
+      JsonValue::numbers({0, 0, 0, 1})});
+  // A live parent's transform is not a local edit dependency.
+  auto translated = vsr::core::math::IDENTITY_MAT4;
+  translated[3].x = 100.f;
+  parent->value().setAsTransform(translated);
+  f.scene.signalLayerTransformChanged(l);
+  f.recorder->layerSignals = 0;
+  f.recorder->onParameters = [&] {
+    CHECK(n->value().getTransform()[3].x == 5.f);
+    CHECK_FALSE(sibling->value().isEnabled());
+  };
+  auto b = f.batch({e, f.nodeEntry(sibling, false)});
+  auto r = f.run(1, b);
+  REQUIRE(r.committed);
+  REQUIRE(r.batchRef);
+  CHECK(f.recorder->layerSignals == 1);
+  CHECK(f.submit(1, b).replayed);
+  restore::RestoreService restores(*f.engine, *f.edits);
+  restores.attachScene(f.sceneId, *f.identity);
+  f.recorder->onParameters = {};
+  bool conflict = false;
+  SECTION("unrelated metadata and ancestor transforms survive restoration")
+  {
+    n->value().name() = "renamed";
+    translated[3].x = 200.f;
+    parent->value().setAsTransform(translated);
+    f.scene.signalLayerTransformChanged(l);
+  }
+  SECTION("target transform change-back permanently conflicts")
+  {
+    const auto after = n->value().getTransform();
+    n->value().setAsTransform(vsr::core::math::IDENTITY_MAT4);
+    n->value().setAsTransform(after);
+    f.scene.signalLayerTransformChanged(l);
+    conflict = true;
+  }
+  SECTION("restore preparation failure retains eligibility")
+  {
+    restores.setFaultInjector([] { return true; });
+    auto failed = restores.submitLocal({f.sceneId, *r.batchRef});
+    REQUIRE(failed.code == Outcome::OK);
+    while (f.integration.service()) {
+    }
+    CHECK(restores.resultLocal(failed.ref)->outcome == Outcome::BUSY);
+    CHECK(restores.eligible(*r.batchRef));
+    CHECK(n->value().getTransform()[3].x == 5.f);
+    restores.setFaultInjector({});
+  }
+  auto restore = restores.submitLocal({f.sceneId, *r.batchRef});
+  REQUIRE(restore.code == Outcome::OK);
+  while (f.integration.service()) {
+  }
+  auto result = restores.resultLocal(restore.ref);
+  REQUIRE(result);
+  CHECK(result->outcome == (conflict ? Outcome::CONFLICT : Outcome::OK));
+  CHECK_FALSE(restores.eligible(*r.batchRef));
+  CHECK(n->value().getTransform()[3].x == (conflict ? 5.f : 0.f));
+  CHECK(sibling->value().isEnabled() == !conflict);
+  auto again = restores.submitLocal({f.sceneId, *r.batchRef});
+  REQUIRE(again.code == Outcome::OK);
+  while (f.integration.service()) {
+  }
+  CHECK(restores.resultLocal(again.ref)->outcome
+      == (conflict ? Outcome::CONFLICT : Outcome::ALREADY_RESTORED));
+}
+
 TEST_CASE("enabled nodes commit atomically and restore exactly",
     "[integration][node-edit]")
 {

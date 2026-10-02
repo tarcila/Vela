@@ -1500,6 +1500,67 @@ SCENARIO("MCP render maps sync_required and busy; resynchronize recovers",
   CHECK(f.engine->highWater(s.id) == hw);
 }
 
+SCENARIO("MCP full matrix uses row arrays and structured rejection",
+    "[integration][node-mcp][node-matrix]")
+{
+  Fixture f({}, true, true);
+  auto *layer = f.scene.defaultLayer();
+  auto node = layer->root()->insert_last_child(vsr::scene::LayerNodeData(
+      layer, vsr::core::math::IDENTITY_MAT4, "wire-matrix"));
+  f.scene.signalLayerStructureChanged(layer);
+  auto s = f.attach();
+  const auto scene = "\"scene_id\":" + std::to_string(f.sceneId);
+  REQUIRE(
+      f.tool(s,
+           "vsr_inspect",
+           "{\"request_id\":1," + scene
+               + ",\"kind\":\"nodes\",\"name\":\"wire-matrix\"}")
+          .errorCode()
+          .empty());
+  f.drain();
+  auto observed = f.status(s, s.id, 1);
+  REQUIRE(observed.str("outcome") == "ok");
+  auto item = observed.result()->get("items")->a[0];
+  auto args = [&](unsigned id, const std::string &matrix) {
+    return "{\"request_id\":" + std::to_string(id) + "," + scene
+        + ",\"edits\":[{\"target_kind\":\"node\",\"handle\":"
+        + json::quote(item.get("handle")->s)
+        + ",\"version\":" + json::quote(item.get("node_edit_version")->s)
+        + ",\"structural_version\":"
+        + json::quote(item.get("structural_version")->s)
+        + ",\"parameter\":\"transform\",\"value\":" + matrix + "}]}";
+  };
+  REQUIRE(
+      f.tool(s,
+           "vsr_edit",
+           args(2, "[[1,0,0,0],[0,1,0,0],[0,0,1,0],[1e-100,0,0,1]]"))
+          .errorCode()
+          .empty());
+  f.drain();
+  auto bad = f.status(s, s.id, 2);
+  CHECK(bad.str("outcome") == "invalid_request");
+  REQUIRE(bad.result()->get("value_error"));
+  CHECK(bad.result()->get("value_error")->s == "non_affine");
+  CHECK_FALSE(bad.result()->get("committed")->b);
+  REQUIRE(
+      f.tool(s,
+           "vsr_edit",
+           args(3, "[[-2,3,0,11],[0,0,0,13],[0,1,4,17],[0,0,0,1]]"))
+          .errorCode()
+          .empty());
+  f.drain();
+  auto done = f.status(s, s.id, 3);
+  REQUIRE(done.str("outcome") == "ok");
+  CHECK(node->value().getTransform()[1].x == 3.f);
+  CHECK(node->value().getTransform()[3].z == 17.f);
+  auto batch = *done.result()->get("batch_ref");
+  REQUIRE(f.restoreBatch(s, 4, batch).errorCode().empty());
+  f.drain();
+  CHECK(f.status(s, s.id, 4).str("outcome") == "ok");
+  CHECK(node->value().getTransform()[1].x == 0.f);
+  CHECK(node->value().getTransform()[3].z == 0.f);
+}
+
 SCENARIO("MCP node enabled edit inspect restore uses only wire tokens",
     "[integration][node-mcp][node-edit]")
 {

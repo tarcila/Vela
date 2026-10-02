@@ -129,6 +129,10 @@ inline const char *valueErrorName(ValueError e)
     return "non_finite";
   case ValueError::OUT_OF_DOMAIN:
     return "out_of_domain";
+  case ValueError::UNSUPPORTED_NODE_KIND:
+    return "unsupported_node_kind";
+  case ValueError::NON_AFFINE:
+    return "non_affine";
   case ValueError::NONE:
     break;
   }
@@ -195,6 +199,29 @@ inline std::string commitDetailJson(bool committed,
 }
 
 // One bounded walk for the whole request; no retained ancestor snapshots.
+inline ValueError prepareMatrix(const JsonValue &value, core::math::mat4 &out)
+{
+  if (value.kind != JsonKind::ARRAY || value.elements.size() != 4)
+    return ValueError::INCOMPATIBLE_TYPE;
+  for (std::size_t row = 0; row < 4; ++row) {
+    const auto &r = value.elements[row];
+    if (r.kind != JsonKind::ARRAY || r.elements.size() != 4)
+      return ValueError::INCOMPATIBLE_TYPE;
+    for (std::size_t col = 0; col < 4; ++col) {
+      const auto &v = r.elements[col];
+      const auto converted = convertScalar(v,
+          {-double(std::numeric_limits<float>::max()),
+              double(std::numeric_limits<float>::max())});
+      if (!converted.ok())
+        return converted.error;
+      if (row == 3 && v.number != (col == 3 ? 1.0 : 0.0))
+        return ValueError::NON_AFFINE;
+      out[col][row] = converted.value;
+    }
+  }
+  return ValueError::NONE;
+}
+
 inline Outcome nodeDependencies(SceneIdentity &ids,
     const identity::NodeHandle &h,
     identity::NodeDependencyWalk &out,
@@ -229,6 +256,10 @@ struct NodeChange
 {
   NodeVersion resulting;
   bool beforeEnabled{true};
+  bool changedEnabled{false};
+  bool changedTransform{false};
+  core::math::mat4 beforeMatrix{core::math::IDENTITY_MAT4};
+  core::math::mat3 beforeSRT{};
 };
 
 struct RestorationRecord
@@ -552,6 +583,9 @@ inline bool EditService::validEnvelope(const EditBatch &batch)
     return false;
   std::set<std::tuple<TargetKind, std::uint64_t, std::uint64_t, std::string>>
       seen;
+  std::map<std::pair<std::uint64_t, std::uint64_t>,
+      identity::NodeEditVersionToken>
+      expectedNodes;
   for (auto &e : batch.edits) {
     if (e.parameter.empty())
       return false;
@@ -566,8 +600,14 @@ inline bool EditService::validEnvelope(const EditBatch &batch)
           || e.nodeDependencies.node != e.nodeExpected.node
           || !e.nodeDependencies.layer.valid()
           || e.nodeDependencies.ancestorSlot
-          || !e.nodeDependencies.structuralVersion || e.parameter != "enabled"
-          || e.value.kind != JsonKind::BOOLEAN)
+          || !e.nodeDependencies.structuralVersion
+          || (e.parameter != "enabled" && e.parameter != "transform")
+          || (e.parameter == "enabled" && e.value.kind != JsonKind::BOOLEAN))
+        return false;
+      auto inserted =
+          expectedNodes.emplace(std::make_pair(domain, serial), e.nodeExpected);
+      if (!inserted.second
+          && inserted.first->second.version != e.nodeExpected.version)
         return false;
     } else if (e.targetKind != TargetKind::OBJECT || !e.expected.object.valid())
       return false;
@@ -823,6 +863,11 @@ inline EditResult EditService::commit(
     scene::LayerNodeRef node;
     const EditEntry *entry;
     identity::NodeDependencyWalk dependencies;
+    bool changedEnabled{false};
+    bool enabled{true};
+    bool changedTransform{false};
+    core::math::mat4 matrix{core::math::IDENTITY_MAT4};
+    core::math::mat3 srt{};
   };
   std::vector<PlannedNode> nodes;
   std::vector<const scene::Layer *> layers;
@@ -852,7 +897,36 @@ inline EditResult EditService::commit(
             || !d.matchesStructure(e.nodeDependencies))
           stale = true;
         else {
-          nodes.push_back({node, &e, d});
+          auto existing = std::find_if(
+              nodes.begin(), nodes.end(), [&](const PlannedNode &p) {
+                return p.entry->nodeExpected.node == e.nodeExpected.node;
+              });
+          if (existing == nodes.end()) {
+            nodes.push_back({node, &e, d});
+            existing = std::prev(nodes.end());
+          }
+          if (e.parameter == "enabled") {
+            existing->changedEnabled = true;
+            existing->enabled = e.value.boolean;
+          } else {
+            if (!node->value().isTransform()) {
+              res.outcome = Outcome::INVALID_REQUEST;
+              res.failedEntry = index;
+              res.valueError = ValueError::UNSUPPORTED_NODE_KIND;
+              return res;
+            }
+            res.valueError = detail::prepareMatrix(e.value, existing->matrix);
+            if (res.valueError != ValueError::NONE) {
+              res.outcome = Outcome::INVALID_REQUEST;
+              res.failedEntry = index;
+              return res;
+            }
+            // Decompose only the cache, never reconstruct the authoritative
+            // matrix.
+            scene::LayerNodeData prepared(nullptr, existing->matrix);
+            existing->srt = prepared.getTransformSRT();
+            existing->changedTransform = true;
+          }
           const auto *layer = node->value().layer();
           if (std::find(layers.begin(), layers.end(), layer) == layers.end())
             layers.push_back(layer);
@@ -899,9 +973,18 @@ inline EditResult EditService::commit(
     record.nodeChanges.reserve(nodes.size());
     res.nodeVersions.reserve(nodes.size());
     res.versions.reserve(plan.size());
-    for (auto &p : nodes)
-      record.nodeChanges.push_back({{p.entry->nodeExpected, p.dependencies},
-          p.node->value().isEnabled()});
+    for (auto &p : nodes) {
+      NodeChange c;
+      c.resulting = {p.entry->nodeExpected, p.dependencies};
+      c.beforeEnabled = p.node->value().isEnabled();
+      c.changedEnabled = p.changedEnabled;
+      c.changedTransform = p.changedTransform;
+      if (c.changedTransform) {
+        c.beforeMatrix = p.node->value().getTransform();
+        c.beforeSRT = p.node->value().getTransformSRT();
+      }
+      record.nodeChanges.push_back(c);
+    }
     record.changes.reserve(plan.size());
     objects.reserve(plan.size());
     for (auto &p : plan) {
@@ -948,8 +1031,12 @@ inline EditResult EditService::commit(
     p.object->setParameter(
         core::Token(p.entry->parameter), p.value.type(), p.value.data());
   }
-  for (auto &p : nodes)
-    p.node->value().setEnabled(p.entry->value.boolean);
+  for (auto &p : nodes) {
+    if (p.changedTransform)
+      p.node->value().setTransformState(p.matrix, p.srt);
+    if (p.changedEnabled)
+      p.node->value().setEnabled(p.enabled);
+  }
   for (auto *o : objects)
     o->endParameterBatch();
   for (const auto *layer : layers)

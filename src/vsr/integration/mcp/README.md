@@ -245,8 +245,9 @@ historical page rather than observing fresh state.
   (or `ContextSceneOptions::nodeEdits`) in addition to the session's scene
   edit grant. Discovery scene items advertise `node_edits_exposed`; existing
   object grants alone do not expose nodes. The integration-enabled viewer opts
-  in. This slice supports only the own `enabled` flag, on any existing node
-  kind; it does not change layer activation, payloads, or default transforms.
+  in. The own `enabled` flag is supported on any existing node kind. Scalar
+  transform nodes also support full local `transform` replacement; neither
+  operation changes layer activation or stored default baselines.
 - A node entry is `{target_kind: "node", handle, version, structural_version,
   parameter: "enabled", value: <Boolean>}`. Copy `handle`, `node_edit_version`
   (as `version`), and `structural_version` verbatim from node inspection.
@@ -258,6 +259,17 @@ historical page rather than observing fresh state.
   not. All entries share the existing 64-entry batch and authority limits.
   Preparation checks at most 4096 ancestor steps per batch; excess returns
   `busy` without mutation or lost restore eligibility.
+- A `transform` value is four rows of four finite binary64 numbers, using
+  column-vector mathematics and last-column translation. The last row must be
+  exactly `[0,0,0,1]` before binary32 rounding. Wrong shape/type, non-finite or
+  overflowing input, and projective rows reject unchanged with a structured
+  `value_error` and `failed_entry`; non-scalar nodes return
+  `unsupported_node_kind`. Singular, sheared and reflected affine matrices are
+  accepted without reconstruction or lossy repair. `transform` may combine
+  with `enabled` but not position/rotation/scale or another matrix entry.
+  Restore preserves the exact prior matrix and cached SRT representation,
+  including noncanonical angles and unfaithful caches, without replacing the
+  default baseline. Position/rotation/scale are not exposed by this slice.
 - `vsr_restore` has its own `operation_ref`, distinct from the target batch
   and from the original edit's provenance. It never selects a batch
   implicitly. Changing `target_batch_ref` under the same `request_id` is

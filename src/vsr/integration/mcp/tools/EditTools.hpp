@@ -206,7 +206,7 @@ inline void addEditTools(std::vector<Tool> &tools, EditDeps deps)
   Tool editTool;
   editTool.name = "vsr_edit";
   editTool.description =
-      "Atomically apply up to 64 object parameter or explicitly exposed node enabled edits to one scene; node entries require target_kind=node, opaque version and structural_version from inspection. Returns a "
+      "Atomically apply up to 64 object parameter or explicitly exposed node enabled/transform edits to one scene; transform replaces a scalar node's complete local affine matrix (four rows of four finite numbers, column-vector math, last-column translation, exact last row [0,0,0,1]). Shear, reflection and singular affine matrices are supported. Transform cannot combine with position/rotation/scale on the same node but may combine with Boolean enabled. Node entries require target_kind=node, opaque version and structural_version from inspection. Returns a "
       "batch_ref on commit.";
   editTool.inputSchemaJson = std::string("{\"type\":\"object\",\"properties\":{")
       + requestIdSchema()

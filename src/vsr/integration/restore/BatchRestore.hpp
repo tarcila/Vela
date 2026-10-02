@@ -462,8 +462,13 @@ inline RestoreResult RestoreService::commit(
         p.change->before.type(),
         p.change->before.data());
   }
-  for (std::size_t i = 0; i < nodes.size(); ++i)
-    nodes[i]->value().setEnabled(record->nodeChanges[i].beforeEnabled);
+  for (std::size_t i = 0; i < nodes.size(); ++i) {
+    const auto &c = record->nodeChanges[i];
+    if (c.changedTransform)
+      nodes[i]->value().setTransformState(c.beforeMatrix, c.beforeSRT);
+    if (c.changedEnabled)
+      nodes[i]->value().setEnabled(c.beforeEnabled);
+  }
   for (auto *o : objects)
     o->endParameterBatch();
   for (const auto *layer : layers)

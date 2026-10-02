@@ -233,6 +233,15 @@ void LayerNodeData::setAsTransform(const math::mat3 &srt)
     m_defaultValue = m_value;
 }
 
+void LayerNodeData::setTransformState(
+    const math::mat4 &matrix, const math::mat3 &srt)
+{
+  noteEdit();
+  decObjectUseCount();
+  m_value = matrix;
+  m_srt = srt;
+}
+
 void LayerNodeData::setAsTransformArray(Array *a)
 {
   setAsObject(a);

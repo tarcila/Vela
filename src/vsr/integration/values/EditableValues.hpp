@@ -78,7 +78,9 @@ enum class ValueError
   UNSUPPORTED_PARAMETER, // not on the edit surface for this object/subtype
   INCOMPATIBLE_TYPE, // wrong JSON kind/arity, or stored parameter type differs
   NON_FINITE,
-  OUT_OF_DOMAIN // includes exceeding the largest finite binary32
+  OUT_OF_DOMAIN, // includes exceeding the largest finite binary32
+  UNSUPPORTED_NODE_KIND,
+  NON_AFFINE
 };
 
 struct Domain
