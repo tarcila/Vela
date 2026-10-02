@@ -5,8 +5,10 @@
 #include "catch.hpp"
 // vsr
 #include "vsr/integration/inspection/Inspection.hpp"
+#include "vsr/integration/mcp/Json.hpp"
 #include "vsr/scene/Scene.hpp"
 // std
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -84,9 +86,7 @@ struct Fixture
     inspector = std::make_unique<Inspector>(
         integration,
         *authority,
-        [this](SceneId id) {
-          return id == sceneId ? sceneIds.get() : nullptr;
-        },
+        [this](SceneId id) { return id == sceneId ? sceneIds.get() : nullptr; },
         limits);
     attach();
   }
@@ -120,13 +120,261 @@ struct Fixture
 
   Status inspect(PageArgs args, std::uint64_t id)
   {
-    auto a = submit(inspector->makeInspection(creds.sessionId, sceneId, args), id);
+    auto a =
+        submit(inspector->makeInspection(creds.sessionId, sceneId, args), id);
     REQUIRE(a.code == Outcome::OK);
     return drain(id);
   }
 };
 
+vsr::integration::mcp::json::Value page(const Status &status)
+{
+  REQUIRE(status.terminal == Outcome::OK);
+  vsr::integration::mcp::json::Value parsed;
+  REQUIRE(vsr::integration::mcp::json::parse(status.result, parsed));
+  return parsed;
+}
+
+const vsr::integration::mcp::json::Value &parameter(
+    const vsr::integration::mcp::json::Value &item, const char *name)
+{
+  const auto *params = item.get("parameters");
+  REQUIRE(params);
+  for (const auto &p : params->a)
+    if (p.get("name")->s == name)
+      return p;
+  FAIL("missing parameter " << name);
+  return item;
+}
+
 } // namespace
+
+SCENARIO("ordinary read-only parameters retain ANARI types and stored values",
+    "[integration][typed-inspection]")
+{
+  Fixture f(0);
+  auto camera = f.scene.createObject<vsr::scene::Camera>("perspective");
+  camera->setParameter("observedBool", true);
+  const int32_t integer = -27;
+  camera->setParameter("observedInt", ANARI_INT32, &integer);
+  const double real = 1.2345678901234567;
+  camera->setParameter("observedDouble", ANARI_FLOAT64, &real);
+  camera->setParameter("observedString", "camera label");
+  camera->setParameter("embeddedNull", std::string("a\0b", 3));
+  const float vector[] = {1.25f, -2.5f, 3.75f};
+  camera->setParameter("observedVector", ANARI_FLOAT32_VEC3, vector);
+  const float matrix[] = {
+      1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15, 4, 8, 12, 16};
+  camera->setParameter("observedMatrix", ANARI_FLOAT32_MAT4, matrix);
+  auto result = page(f.inspect({}, 1));
+  const auto &item = result.get("items")->a.back();
+  auto value = [&](const char *name) -> const auto & {
+    const auto *v = parameter(item, name).get("value");
+    REQUIRE(v);
+    CHECK(v->get("state")->s == "available");
+    return *v;
+  };
+  CHECK(value("observedBool").get("data")->b);
+  CHECK(value("observedInt").get("type")->s == "ANARI_INT32");
+  CHECK(value("observedInt").get("data")->n == -27);
+  CHECK(value("observedDouble").get("data")->n == real);
+  CHECK(value("observedString").get("data")->s == "camera label");
+  CHECK(value("embeddedNull").get("data")->s == std::string("a\0b", 3));
+  const auto &components = value("observedVector").get("data")->a;
+  REQUIRE(components.size() == 3);
+  CHECK(components[0].n == 1.25);
+  CHECK(components[1].n == -2.5);
+  CHECK(components[2].n == 3.75);
+  const auto &rows = value("observedMatrix").get("data")->a;
+  REQUIRE(rows.size() == 4);
+  CHECK(rows[0].a[3].n == 4);
+  CHECK(rows[2].a[0].n == 9);
+  CHECK(rows[3].a[2].n == 15);
+  CHECK_FALSE(findEditableField(
+      camera->type(), camera->subtype(), vsr::core::Token("observedDouble")));
+}
+
+SCENARIO("large integers and non-finite components are lossless typed tags",
+    "[integration][typed-inspection]")
+{
+  Fixture f(0);
+  auto renderer = f.scene.createRenderer("helide", "default");
+  const int64_t integers[] = {-9007199254740991ll,
+      9007199254740992ll,
+      std::numeric_limits<int64_t>::min()};
+  renderer->setParameter("integers", ANARI_INT64_VEC3, integers);
+  const uint64_t largest = std::numeric_limits<uint64_t>::max();
+  renderer->setParameter("largest", ANARI_UINT64, &largest);
+  const float floats[] = {std::numeric_limits<float>::quiet_NaN(),
+      std::numeric_limits<float>::infinity(),
+      -std::numeric_limits<float>::infinity(),
+      -0.f};
+  renderer->setParameter("floats", ANARI_FLOAT32_VEC4, floats);
+  auto result = page(f.inspect({}, 1));
+  const auto &item = result.get("items")->a.back();
+  const auto &ints = parameter(item, "integers").get("value")->get("data")->a;
+  CHECK(ints[0].n == -9007199254740991.0);
+  CHECK(ints[1].get("encoding")->s == "decimal");
+  CHECK(ints[1].get("type")->s == "ANARI_INT64_VEC3");
+  CHECK(ints[1].get("data")->s == "9007199254740992");
+  CHECK(ints[2].get("data")->s == "-9223372036854775808");
+  CHECK(parameter(item, "largest").get("value")->get("data")->get("data")->s
+      == "18446744073709551615");
+  const auto &fs = parameter(item, "floats").get("value")->get("data")->a;
+  CHECK(fs[0].get("encoding")->s == "non_finite");
+  CHECK(fs[0].get("data")->s == "nan");
+  CHECK(fs[1].get("data")->s == "positive_infinity");
+  CHECK(fs[2].get("data")->s == "negative_infinity");
+  CHECK(std::signbit(fs[3].n));
+
+  auto matte = f.scene.createObject<vsr::scene::Material>("matte");
+  matte->setParameter("opacity", std::numeric_limits<float>::infinity());
+  // The legacy projection must also remain valid JSON, never fabricated zero.
+  auto legacy = page(f.inspect({}, 2));
+  REQUIRE(legacy.get("items"));
+  CHECK(f.inspector->scratch().used() == 0);
+}
+
+SCENARIO(
+    "object links distinguish valid null dangling and unmapped array summaries",
+    "[integration][typed-inspection]")
+{
+  Fixture f(0);
+  auto array = f.scene.createArrayProxy(ANARI_FLOAT32_VEC3, 7, 5);
+  auto material = f.scene.createObject<vsr::scene::Material>("physicallyBased");
+  const auto arrayIndex = array.index();
+  const auto materialIndex = material.index();
+  auto surface = f.scene.createSurface("links");
+  surface->setParameterObject("material", *material);
+  surface->setParameterObject("input", *array);
+  const size_t nullIndex = vsr::core::Any::INVALID_INDEX;
+  const size_t danglingIndex = 987654;
+  surface->addParameter("nullLink")
+      .setValue(vsr::core::Any(ANARI_GEOMETRY, nullIndex));
+  surface->addParameter("danglingLink")
+      .setValue(vsr::core::Any(ANARI_GEOMETRY, danglingIndex));
+  auto result = page(f.inspect({}, 1));
+  const auto &items = result.get("items")->a;
+  const auto &item =
+      items.at(1); // array then surface, before materials/cameras
+  const auto *link = parameter(item, "material").get("value");
+  REQUIRE(link);
+  CHECK(link->get("state")->s == "valid");
+  CHECK(link->get("type")->s == "ANARI_MATERIAL");
+  CHECK(link->get("handle")->s == items.at(3).get("handle")->s);
+  const auto *input = parameter(item, "input").get("value");
+  CHECK(input->get("handle")->s == items.at(0).get("handle")->s);
+  const auto *summary = input->get("summary");
+  REQUIRE(summary);
+  CHECK(summary->get("element_type")->s == "ANARI_FLOAT32_VEC3");
+  CHECK(summary->get("dimensionality")->n == 2);
+  CHECK(summary->get("dimensions")->a.at(0).n == 7);
+  CHECK(summary->get("dimensions")->a.at(1).n == 5);
+  CHECK(summary->get("element_count")->n == 35);
+  CHECK_FALSE(summary->get("data"));
+  CHECK(parameter(item, "nullLink").get("value")->get("state")->s == "null");
+  CHECK(parameter(item, "danglingLink").get("value")->get("state")->s
+      == "unavailable");
+  CHECK(parameter(item, "danglingLink").get("value")->get("reason")->s
+      == "dangling_reference");
+  CHECK(f.scene.getObject<vsr::scene::Array>(arrayIndex)->isProxy());
+  CHECK(f.scene.getObject<vsr::scene::Material>(materialIndex)->subtype()
+      == vsr::core::Token("physicallyBased"));
+}
+
+SCENARIO("optional representations are bounded with explicit reasons",
+    "[integration][typed-inspection]")
+{
+  PageLimits limits;
+  limits.displayString = 4;
+  Fixture f(0, limits);
+  auto camera = f.scene.createObject<vsr::scene::Camera>("perspective");
+  const std::string text = "ab\xe2\x82\xac" + std::string(1000000, 'x');
+  camera->setParameter("longText", text);
+  int sentinel = 42;
+  camera->setParameter("pointer", ANARI_VOID_POINTER, &sentinel);
+  auto result = page(f.inspect({}, 1));
+  const auto &item = result.get("items")->a.back();
+  const auto *preview = parameter(item, "longText").get("value");
+  REQUIRE(preview);
+  CHECK(preview->get("state")->s == "truncated");
+  CHECK(preview->get("reason")->s == "display_string_limit");
+  CHECK(preview->get("data")->s == "ab");
+  CHECK(result.get("items")->a.back().get("handle")->s.size() == 32);
+  const auto *unsupported = parameter(item, "pointer").get("value");
+  CHECK(unsupported->get("state")->s == "unavailable");
+  CHECK(unsupported->get("reason")->s == "unsupported_type");
+  CHECK_FALSE(unsupported->get("data"));
+  CHECK(f.inspector->scratch().used() == 0);
+
+  PageLimits small;
+  small.optionalBytes = 300;
+  Fixture g(0, small);
+  auto observed = g.scene.createObject<vsr::scene::Camera>("perspective");
+  observed->setParameter("hugeString", std::string(1000000, 'y'));
+  auto bounded = page(g.inspect({}, 1));
+  const auto &limited = bounded.get("items")->a.back();
+  CHECK(limited.get("parameters_truncated")->b);
+  CHECK(limited.get("parameters_reason")->s == "optional_byte_limit");
+  CHECK(limited.get("parameters_omitted")->n > 0);
+  CHECK(bounded.get("items")->a.back().get("type")->s == "ANARI_CAMERA");
+  CHECK(g.inspector->scratch().used() == 0);
+}
+
+SCENARIO("new observed values and relationships invalidate inspection cursors",
+    "[integration][typed-inspection]")
+{
+  Fixture f(3);
+  auto camera = f.scene.createObject<vsr::scene::Camera>("perspective");
+  camera->setParameter("observed", 1.f);
+  auto array = f.scene.createArrayProxy(ANARI_FLOAT32, 7);
+  camera->setParameterObject("input", *array);
+  const auto before = page(f.inspect({}, 1));
+  const auto oldVersion = before.get("items")->a.back().get("version")->n;
+  const auto first = page(f.inspect({1, ""}, 2));
+  const auto cursor = first.get("cursor")->s;
+  bool parameterChanged = true;
+
+  SECTION("non-editable change back still invalidates")
+  {
+    camera->setParameter("observed", 2.f);
+    camera->setParameter("observed", 1.f);
+  }
+  SECTION("parameter structure invalidates")
+  {
+    camera->removeParameter("observed");
+  }
+  SECTION("reference and summary changes invalidate")
+  {
+    auto other = f.scene.createArrayProxy(ANARI_UINT8, 4, 3, 2);
+    camera->setParameterObject("input", *other);
+    auto changed = page(f.inspect({}, 3));
+    const auto *summary = parameter(changed.get("items")->a.back(), "input")
+                              .get("value")
+                              ->get("summary");
+    CHECK(summary->get("element_type")->s == "ANARI_UINT8");
+    CHECK(summary->get("dimensionality")->n == 3);
+    CHECK(summary->get("element_count")->n == 24);
+  }
+  SECTION("referenced object lifetime invalidates")
+  {
+    parameterChanged = false;
+    f.scene.removeObject(array.data());
+    auto changed = page(f.inspect({}, 3));
+    const auto *value =
+        parameter(changed.get("items")->a.back(), "input").get("value");
+    CHECK(value->get("state")->s == "unavailable");
+    CHECK(value->get("reason")->s == "dangling_reference");
+  }
+  CHECK(f.inspect({1, cursor}, 4).terminal == Outcome::CURSOR_STALE);
+  auto after = page(f.inspect({}, 5));
+  CHECK(after.get("revision")->s != before.get("revision")->s);
+  const auto newVersion = after.get("items")->a.back().get("version")->n;
+  if (parameterChanged)
+    CHECK(newVersion > oldVersion);
+  else
+    CHECK(newVersion == oldVersion);
+}
 
 SCENARIO("page_size defaults, bounds and rejection", "[integration]")
 {
@@ -152,7 +400,8 @@ SCENARIO("page_size defaults, bounds and rejection", "[integration]")
   CHECK(field(s2.result, "returned") == "200");
 
   // Identical retry replays the retained page.
-  auto b = f.inspector->makeInspection(f.creds.sessionId, f.sceneId, {200, cursor});
+  auto b =
+      f.inspector->makeInspection(f.creds.sessionId, f.sceneId, {200, cursor});
   auto replay = f.submit(std::move(b), 2);
   REQUIRE(replay.replayed);
   CHECK(replay.status.result == s2.result);
@@ -168,7 +417,8 @@ SCENARIO("page_size defaults, bounds and rejection", "[integration]")
 SCENARIO("pages yield in slices while keeping their slot", "[integration]")
 {
   Fixture f(1000);
-  auto a = f.submit(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, {256, ""}), 1);
+  auto a = f.submit(
+      f.inspector->makeInspection(f.creds.sessionId, f.sceneId, {256, ""}), 1);
   REQUIRE(a.code == Outcome::OK);
   f.integration.service(); // one slice
   auto st = f.engine->status(f.creds, {f.creds.sessionId, 1});
@@ -188,7 +438,8 @@ SCENARIO("work limit and deadline", "[integration]")
   CHECK(std::stoi(field(s.result, "returned")) <= 100);
   CHECK(field(s.result, "visited") == "100");
 
-  auto a = f.submit(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, {}), 2);
+  auto a = f.submit(
+      f.inspector->makeInspection(f.creds.sessionId, f.sceneId, {}), 2);
   REQUIRE(a.code == Outcome::OK);
   f.now += 6.0;
   auto t = f.drain(2);
@@ -205,7 +456,8 @@ SCENARIO("cursors are stale on returned-field change and tamper-proof",
 
   std::string bad = cursor;
   bad[3] = bad[3] == 'a' ? 'b' : 'a';
-  CHECK(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, {10, bad}).code
+  CHECK(
+      f.inspector->makeInspection(f.creds.sessionId, f.sceneId, {10, bad}).code
       == Outcome::INVALID_REQUEST);
   CHECK(f.inspector->makeInspection("other", f.sceneId, {10, cursor}).code
       == Outcome::INVALID_REQUEST);
@@ -229,13 +481,13 @@ SCENARIO("discovery lists readable targets with current capabilities",
   const auto cursor = field(s.result, "cursor");
   REQUIRE(!cursor.empty());
 
-  f.authority->restrict(session::Target::scene(f.sceneId),
-      session::Capability::EDIT);
+  f.authority->restrict(
+      session::Target::scene(f.sceneId), session::Capability::EDIT);
   f.submit(f.inspector->makeDiscovery(f.creds.sessionId, {1, cursor}), 2);
   CHECK(*f.drain(2).terminal == Outcome::CURSOR_STALE);
 
-  f.authority->restrict(session::Target::view(f.viewId),
-      session::Capability::READ);
+  f.authority->restrict(
+      session::Target::view(f.viewId), session::Capability::READ);
   f.submit(f.inspector->makeDiscovery(f.creds.sessionId, {}), 3);
   auto all = f.drain(3);
   CHECK(field(all.result, "returned") == "1");
@@ -260,8 +512,8 @@ SCENARIO("optional text truncation is marked; oversize is item_too_large",
   CHECK(*g.inspect({}, 1).terminal == Outcome::ITEM_TOO_LARGE);
 }
 
-SCENARIO("inspection returns current values of editable parameters",
-    "[integration]")
+SCENARIO(
+    "inspection returns current values of editable parameters", "[integration]")
 {
   Fixture f(0);
   auto m = f.scene.createObject<vsr::scene::Material>("matte");
@@ -282,7 +534,7 @@ SCENARIO("inspection returns current values of editable parameters",
   // Only matte materials and directional lights carry values.
   std::size_t n = 0;
   for (auto p = s.result.find("\"values\""); p != std::string::npos;
-       p = s.result.find("\"values\"", p + 1))
+      p = s.result.find("\"values\"", p + 1))
     n++;
   CHECK(n == 3); // plus the scene's default matte material
 }
@@ -332,24 +584,24 @@ SCENARIO("discovery is admitted session-wide", "[integration]")
   GIVEN("only a non-first scene is readable")
   {
     Fixture f(1, {}, true);
-    f.authority->restrict(session::Target::scene(f.sceneId),
-        session::Capability::READ);
-    f.authority->restrict(session::Target::view(f.viewId),
-        session::Capability::READ);
+    f.authority->restrict(
+        session::Target::scene(f.sceneId), session::Capability::READ);
+    f.authority->restrict(
+        session::Target::view(f.viewId), session::Capability::READ);
     auto s = f.discover({}, 1);
     REQUIRE(*s.terminal == Outcome::OK);
     CHECK(field(s.result, "returned") == "1");
-    CHECK(s.result.find("\"kind\":\"scene\",\"id\":"
-                        + std::to_string(f.secondId))
+    CHECK(
+        s.result.find("\"kind\":\"scene\",\"id\":" + std::to_string(f.secondId))
         != std::string::npos);
   }
   GIVEN("no readable target")
   {
     Fixture f(1);
-    f.authority->restrict(session::Target::scene(f.sceneId),
-        session::Capability::READ);
-    f.authority->restrict(session::Target::view(f.viewId),
-        session::Capability::READ);
+    f.authority->restrict(
+        session::Target::scene(f.sceneId), session::Capability::READ);
+    f.authority->restrict(
+        session::Target::view(f.viewId), session::Capability::READ);
     auto s = f.discover({}, 1);
     REQUIRE(*s.terminal == Outcome::OK);
     CHECK(field(s.result, "returned") == "0");
@@ -358,8 +610,8 @@ SCENARIO("discovery is admitted session-wide", "[integration]")
   GIVEN("a page listing only the view, looked up from a later session")
   {
     Fixture f(1);
-    f.authority->restrict(session::Target::scene(f.sceneId),
-        session::Capability::READ);
+    f.authority->restrict(
+        session::Target::scene(f.sceneId), session::Capability::READ);
     auto s = f.discover({}, 1);
     REQUIRE(field(s.result, "returned") == "1");
     const OperationRef old{f.creds.sessionId, 1};
@@ -373,15 +625,15 @@ SCENARIO("discovery is admitted session-wide", "[integration]")
     }
     THEN("withdrawing read on the listed view denies the foreign lookup")
     {
-      f.authority->restrict(session::Target::view(f.viewId),
-          session::Capability::READ);
+      f.authority->restrict(
+          session::Target::view(f.viewId), session::Capability::READ);
       CHECK(f.engine->status(f.creds, old).code == Outcome::FORBIDDEN);
     }
   }
 }
 
-SCENARIO("scratch is released on every terminal path of a page",
-    "[integration]")
+SCENARIO(
+    "scratch is released on every terminal path of a page", "[integration]")
 {
   // Small slices so a partially built page holds scratch across safe points.
   PageLimits l;

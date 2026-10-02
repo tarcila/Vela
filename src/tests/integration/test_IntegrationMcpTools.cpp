@@ -175,8 +175,8 @@ struct Session
 
 std::string ref(const std::string &sid, std::uint64_t id)
 {
-  return "{\"session_id\":\"" + sid + "\",\"request_id\":"
-      + std::to_string(id) + "}";
+  return "{\"session_id\":\"" + sid + "\",\"request_id\":" + std::to_string(id)
+      + "}";
 }
 
 template <typename R>
@@ -234,9 +234,7 @@ struct Fixture
     inspector = std::make_unique<inspection::Inspector>(
         integration,
         *authority,
-        [this](SceneId id) {
-          return id == sceneId ? sceneIds.get() : nullptr;
-        },
+        [this](SceneId id) { return id == sceneId ? sceneIds.get() : nullptr; },
         limits);
     REQUIRE(descriptor::openDirectory(tmp.path, {}, dir).ok());
     edits = std::make_unique<edit::EditService>(
@@ -294,7 +292,8 @@ struct Fixture
 
   Reply status(const Session &s, const std::string &sid, std::uint64_t id)
   {
-    return tool(s, "vsr_operation_status", "{\"operation_ref\":" + ref(sid, id) + "}");
+    return tool(
+        s, "vsr_operation_status", "{\"operation_ref\":" + ref(sid, id) + "}");
   }
 
   // First inspected object as {"handle":…,"version":…} JSON members.
@@ -321,17 +320,17 @@ struct Fixture
         "vsr_edit",
         "{\"request_id\":" + std::to_string(id) + ",\"scene_id\":"
             + std::to_string(sceneId) + ",\"edits\":[{" + target
-            + ",\"parameter\":\"opacity\",\"value\":"
-            + std::to_string(value) + "}]}");
+            + ",\"parameter\":\"opacity\",\"value\":" + std::to_string(value)
+            + "}]}");
   }
 
   Reply restoreBatch(const Session &s, std::uint64_t id, const json::Value &b)
   {
     return tool(s,
         "vsr_restore",
-        "{\"request_id\":" + std::to_string(id) + ",\"scene_id\":"
-            + std::to_string(sceneId) + ",\"target_batch_ref\":"
-            + json::write(b) + "}");
+        "{\"request_id\":" + std::to_string(id)
+            + ",\"scene_id\":" + std::to_string(sceneId)
+            + ",\"target_batch_ref\":" + json::write(b) + "}");
   }
 
   float opacity0()
@@ -345,16 +344,14 @@ struct Fixture
 
 } // namespace
 
-SCENARIO("MCP discovery and inspection tools page over loopback",
-    "[integration]")
+SCENARIO(
+    "MCP discovery and inspection tools page over loopback", "[integration]")
 {
   Fixture f;
   auto list = f.rpc("tools/list", "{}");
   const std::string listBody = json::write(list.json);
-  for (const char *name : {"vsr_discover",
-           "vsr_inspect",
-           "vsr_operation_status",
-           "vsr_cancel"})
+  for (const char *name :
+      {"vsr_discover", "vsr_inspect", "vsr_operation_status", "vsr_cancel"})
     REQUIRE(listBody.find(name) != std::string::npos);
 
   auto s = f.attach();
@@ -419,8 +416,48 @@ SCENARIO("MCP discovery and inspection tools page over loopback",
   CHECK(st.isError());
 }
 
-SCENARIO("MCP query tools map envelope and capability rejections",
-    "[integration]")
+SCENARIO("MCP inspection carries typed values without granting writes",
+    "[integration][typed-inspection]")
+{
+  Fixture f;
+  auto camera = f.scene.createObject<vsr::scene::Camera>("perspective");
+  const uint64_t integer = 18446744073709551615ull;
+  camera->setParameter("observed", ANARI_UINT64, &integer);
+  auto array = f.scene.createArrayProxy(ANARI_FLOAT32, 8);
+  camera->setParameterObject("input", *array);
+  auto s = f.attach();
+  f.tool(s,
+      "vsr_inspect",
+      "{\"request_id\":1,\"scene_id\":" + std::to_string(f.sceneId) + "}");
+  f.drain();
+  auto st = f.status(s, s.id, 1);
+  REQUIRE(st.str("outcome") == "ok");
+  const auto &items = st.result()->get("items")->a;
+  const auto &params = items.back().get("parameters")->a;
+  bool observed = false, linked = false;
+  for (const auto &p : params) {
+    if (p.get("name")->s == "observed") {
+      const auto *v = p.get("value");
+      CHECK(v->get("type")->s == "ANARI_UINT64");
+      CHECK(v->get("data")->get("encoding")->s == "decimal");
+      CHECK(v->get("data")->get("data")->s == "18446744073709551615");
+      observed = true;
+    }
+    if (p.get("name")->s == "input") {
+      CHECK(p.get("value")->get("handle")->s == items.front().get("handle")->s);
+      CHECK(p.get("value")->get("summary")->get("element_count")->n == 8);
+      linked = true;
+    }
+  }
+  CHECK(observed);
+  CHECK(linked);
+  CHECK(f.scene.getObject<vsr::scene::Array>(array.index())->isProxy());
+  CHECK(!f.authority->effectiveCapabilities(session::Target::scene(f.sceneId))
+          .edit);
+}
+
+SCENARIO(
+    "MCP query tools map envelope and capability rejections", "[integration]")
 {
   Fixture f;
   auto s = f.attach();
@@ -459,8 +496,7 @@ SCENARIO("MCP query tools map envelope and capability rejections",
   CHECK(g.status(gs, gs.id, 1).str("outcome") == "item_too_large");
 }
 
-SCENARIO("MCP lookup and cancel by qualified operation_ref",
-    "[integration]")
+SCENARIO("MCP lookup and cancel by qualified operation_ref", "[integration]")
 {
   Fixture f;
   auto s = f.attach();
@@ -468,8 +504,7 @@ SCENARIO("MCP lookup and cancel by qualified operation_ref",
   CHECK(f.status(s, s.id, 5).errorCode() == "unknown");
   f.tool(s, "vsr_discover", "{\"request_id\":5}");
   CHECK(f.status(s, s.id, 4).errorCode() == "outcome_unavailable");
-  CHECK(f.tool(s, "vsr_operation_status", "{\"operation_ref\":{}}")
-            .errorCode()
+  CHECK(f.tool(s, "vsr_operation_status", "{\"operation_ref\":{}}").errorCode()
       == "invalid_request");
 
   // Cancel queued work: terminal cancelled, never started.
@@ -494,8 +529,8 @@ SCENARIO("MCP lookup and cancel by qualified operation_ref",
       session::Target::scene(f.sceneId), session::Capability::READ);
 }
 
-SCENARIO("MCP lookup across sessions keeps kind and read gates",
-    "[integration]")
+SCENARIO(
+    "MCP lookup across sessions keeps kind and read gates", "[integration]")
 {
   Fixture f;
   auto s1 = f.attach();
@@ -653,13 +688,13 @@ SCENARIO("MCP edit and restore map conflict, sync failure and envelopes",
   // Envelope errors reject before admission and consume no ID.
   const auto hw = f.engine->highWater(s.id);
   const std::string scene = std::to_string(f.sceneId);
-  for (const std::string bad : {
-           "{\"request_id\":9,\"scene_id\":" + scene + ",\"edits\":[]}",
-           "{\"request_id\":9,\"scene_id\":" + scene
-               + ",\"edits\":[{\"handle\":\"zz\",\"version\":1,"
-                 "\"parameter\":\"opacity\",\"value\":1}]}",
-           "{\"request_id\":9,\"edits\":[{" + target
-               + ",\"parameter\":\"opacity\",\"value\":1}]}"})
+  for (const std::string bad :
+      {"{\"request_id\":9,\"scene_id\":" + scene + ",\"edits\":[]}",
+          "{\"request_id\":9,\"scene_id\":" + scene
+              + ",\"edits\":[{\"handle\":\"zz\",\"version\":1,"
+                "\"parameter\":\"opacity\",\"value\":1}]}",
+          "{\"request_id\":9,\"edits\":[{" + target
+              + ",\"parameter\":\"opacity\",\"value\":1}]}"})
     CHECK(f.tool(s, "vsr_edit", bad).errorCode() == "invalid_request");
   CHECK(f.tool(s,
              "vsr_restore",
@@ -858,7 +893,8 @@ struct RenderFixture
     sphere->setParameterObject("vertex.position", *pos);
     sphere->setParameter("radius", 1.f);
     auto mat = scene.createObject<Material>(tokens::material::matte);
-    scene.insertChildObjectNode(root, scene.createSurface("sphere", sphere, mat));
+    scene.insertChildObjectNode(
+        root, scene.createSurface("sphere", sphere, mat));
     auto light = scene.createObject<Light>(tokens::light::directional);
     scene.insertChildObjectNode(root, light);
     camera = scene.createObject<Camera>(tokens::camera::perspective);
@@ -908,9 +944,8 @@ struct RenderFixture
         integration, *authority, [this](SceneId id) {
           return id == sceneId ? identity.get() : nullptr;
         });
-    inspector->setViewRevisions([this](ViewId id) {
-      return id == viewId ? tracker.get() : nullptr;
-    });
+    inspector->setViewRevisions(
+        [this](ViewId id) { return id == viewId ? tracker.get() : nullptr; });
 
     REQUIRE(descriptor::openDirectory(tmp.path, {}, dir).ok());
     mcp::Config cfg;
@@ -990,11 +1025,9 @@ SCENARIO("MCP render returns PNG image content at view-owned dimensions",
   auto s = f.attach();
 
   // A request dimension override is an envelope error: nothing admitted.
-  CHECK(f.tool(s, "vsr_render", f.renderArgs(1, ",\"width\":8"))
-            .errorCode()
+  CHECK(f.tool(s, "vsr_render", f.renderArgs(1, ",\"width\":8")).errorCode()
       == "invalid_request");
-  CHECK(f.tool(s, "vsr_render", f.renderArgs(1, ",\"height\":8"))
-            .errorCode()
+  CHECK(f.tool(s, "vsr_render", f.renderArgs(1, ",\"height\":8")).errorCode()
       == "invalid_request");
   CHECK(f.tool(s,
              "vsr_render",
@@ -1050,8 +1083,8 @@ SCENARIO("MCP render returns PNG image content at view-owned dimensions",
       == "invalid_request");
 }
 
-SCENARIO("MCP discover, inspect, render using only wire tokens",
-    "[integration]")
+SCENARIO(
+    "MCP discover, inspect, render using only wire tokens", "[integration]")
 {
   // Addendum 04 §8: an agent forms its first render request from wire data
   // alone; no host-side token lookup happens in this scenario.
@@ -1084,8 +1117,8 @@ SCENARIO("MCP discover, inspect, render using only wire tokens",
   f.tool(s,
       "vsr_render",
       "{\"request_id\":3,\"view_id\":" + std::to_string(std::int64_t(viewId))
-          + ",\"scene_revision\":\"" + sceneRevision
-          + "\",\"view_revision\":\"" + viewRevision + "\"}");
+          + ",\"scene_revision\":\"" + sceneRevision + "\",\"view_revision\":\""
+          + viewRevision + "\"}");
   auto done = f.run(s, "vsr_render_image", 3);
   REQUIRE(done.str("outcome") == "ok");
   CHECK(done.result()->get("scene_revision")->s == sceneRevision);

@@ -10,6 +10,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <string_view>
 
 namespace vsr::core {
 
@@ -64,6 +65,7 @@ struct Any
   size_t getAsObjectIndex() const; // when storing object indices only
 
   std::string getString() const;
+  std::string_view getStringView() const;
   const char *getCStr() const;
   void reserveString(size_t size);
   void resizeString(size_t size);
@@ -348,6 +350,12 @@ inline T Any::storageAs() const
 inline std::string Any::getString() const
 {
   return type() == ANARI_STRING ? m_string : "";
+}
+
+inline std::string_view Any::getStringView() const
+{
+  return type() == ANARI_STRING ? std::string_view(m_string)
+                                : std::string_view();
 }
 
 inline const char *Any::getCStr() const

@@ -13,13 +13,17 @@
 // std
 #include <atomic>
 #include <cctype>
+#include <charconv>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <random>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace vsr::integration::inspection {
@@ -44,6 +48,13 @@ namespace vsr::integration::inspection {
  * Inspection items carry "values" for the §8 editable parameters of matte
  * materials and directional lights (addendum 04): numbers are the binary64 of
  * the stored float32; direction is [azimuth, elevation] in degrees.
+ *
+ * Each parameter also carries a declared-ANARI-type "value" with an explicit
+ * state: available (data), valid (object handle), null, truncated (preview),
+ * or unavailable (reason). Integer components outside JSON's safe interval use
+ * decimal-string tags; non-finite float components use non_finite tags. Array
+ * links/items carry metadata summaries only, never bulk contents. These read
+ * representations do not change the editable parameter allowlist.
  *
  * Discovery is session-wide: it needs no capability on any one target, lists
  * only readable targets, and its record covers exactly the listed targets.
@@ -105,18 +116,27 @@ inline std::uint64_t rotl(std::uint64_t x, int b)
 }
 
 // SipHash-2-4 keyed MAC.
-inline std::uint64_t siphash(
-    const std::uint64_t key[2], const std::string &msg)
+inline std::uint64_t siphash(const std::uint64_t key[2], const std::string &msg)
 {
   std::uint64_t v0 = 0x736f6d6570736575ull ^ key[0];
   std::uint64_t v1 = 0x646f72616e646f6dull ^ key[1];
   std::uint64_t v2 = 0x6c7967656e657261ull ^ key[0];
   std::uint64_t v3 = 0x7465646279746573ull ^ key[1];
   auto round = [&] {
-    v0 += v1; v1 = rotl(v1, 13); v1 ^= v0; v0 = rotl(v0, 32);
-    v2 += v3; v3 = rotl(v3, 16); v3 ^= v2;
-    v0 += v3; v3 = rotl(v3, 21); v3 ^= v0;
-    v2 += v1; v1 = rotl(v1, 17); v1 ^= v2; v2 = rotl(v2, 32);
+    v0 += v1;
+    v1 = rotl(v1, 13);
+    v1 ^= v0;
+    v0 = rotl(v0, 32);
+    v2 += v3;
+    v3 = rotl(v3, 16);
+    v3 ^= v2;
+    v0 += v3;
+    v3 = rotl(v3, 21);
+    v3 ^= v0;
+    v2 += v1;
+    v1 = rotl(v1, 17);
+    v1 ^= v2;
+    v2 = rotl(v2, 32);
   };
   const std::size_t n = msg.size();
   std::size_t i = 0;
@@ -124,17 +144,22 @@ inline std::uint64_t siphash(
     std::uint64_t m;
     std::memcpy(&m, msg.data() + i, 8);
     v3 ^= m;
-    round(); round();
+    round();
+    round();
     v0 ^= m;
   }
   std::uint64_t b = std::uint64_t(n) << 56;
   for (std::size_t j = 0; i + j < n; j++)
     b |= std::uint64_t(std::uint8_t(msg[i + j])) << (8 * j);
   v3 ^= b;
-  round(); round();
+  round();
+  round();
   v0 ^= b;
   v2 ^= 0xff;
-  round(); round(); round(); round();
+  round();
+  round();
+  round();
+  round();
   return v0 ^ v1 ^ v2 ^ v3;
 }
 
@@ -174,12 +199,165 @@ inline std::string jsonString(const std::string &s)
 }
 
 // Truncate at a UTF-8 boundary without scanning past the limit.
-inline std::string truncateUtf8(const std::string &s, std::size_t limit)
+inline std::string truncateUtf8(std::string_view s, std::size_t limit)
 {
   std::size_t n = limit;
   while (n > 0 && (std::uint8_t(s[n]) & 0xC0) == 0x80)
     n--;
-  return s.substr(0, n);
+  return std::string(s.substr(0, n));
+}
+
+// Numeric reads use memcpy: Any's byte storage need not be aligned for T.
+template <typename T>
+inline std::string numericComponent(const core::Any &value, std::size_t index)
+{
+  T component;
+  std::memcpy(&component,
+      static_cast<const unsigned char *>(value.data()) + index * sizeof(T),
+      sizeof(T));
+  if constexpr (std::is_floating_point_v<T>) {
+    if (!std::isfinite(component))
+      return "{\"type\":" + jsonString(anari::toString(value.type()))
+          + ",\"encoding\":\"non_finite\",\"data\":"
+          + jsonString(std::isnan(component) ? "nan"
+                  : component > 0            ? "positive_infinity"
+                                             : "negative_infinity")
+          + "}";
+    char buffer[64];
+    const auto result = std::to_chars(buffer,
+        buffer + sizeof(buffer),
+        double(component),
+        std::chars_format::general,
+        std::numeric_limits<double>::max_digits10);
+    return std::string(buffer, result.ptr);
+  } else {
+    constexpr std::uint64_t SAFE_INTEGER = 9007199254740991ull;
+    const auto decimal = std::to_string(component);
+    bool safe;
+    if constexpr (std::is_signed_v<T>)
+      safe = component >= -std::int64_t(SAFE_INTEGER)
+          && component <= std::int64_t(SAFE_INTEGER);
+    else
+      safe = component <= SAFE_INTEGER;
+    return safe ? decimal
+                : "{\"type\":" + jsonString(anari::toString(value.type()))
+            + ",\"encoding\":\"decimal\",\"data\":" + jsonString(decimal) + "}";
+  }
+}
+
+template <typename T>
+inline std::string numericData(
+    const core::Any &value, std::size_t rows = 0, std::size_t columns = 0)
+{
+  const auto count = anari::componentsOf(value.type());
+  if (count == 1)
+    return numericComponent<T>(value, 0);
+  std::string result = "[";
+  if (rows) {
+    for (std::size_t row = 0; row < rows; ++row) {
+      result += row ? ",[" : "[";
+      for (std::size_t column = 0; column < columns; ++column)
+        result += (column ? "," : "")
+            + numericComponent<T>(value, column * rows + row);
+      result += "]";
+    }
+  } else {
+    for (std::size_t i = 0; i < count; ++i)
+      result += (i ? "," : "") + numericComponent<T>(value, i);
+  }
+  return result + "]";
+}
+
+inline std::string summaryInteger(std::size_t value)
+{
+  const std::uint64_t count = value;
+  const core::Any integer(ANARI_UINT64, &count);
+  return numericComponent<std::uint64_t>(integer, 0);
+}
+
+inline std::string arraySummary(const scene::Array &array)
+{
+  const auto rank = array.type() == ANARI_ARRAY1D ? 1u
+      : array.type() == ANARI_ARRAY2D             ? 2u
+                                                  : 3u;
+  std::string dimensions = "[";
+  std::size_t count = 1;
+  bool overflow = false;
+  for (std::size_t i = 0; i < rank; ++i) {
+    const auto dimension = array.dim(i);
+    dimensions += (i ? "," : "") + summaryInteger(dimension);
+    if (dimension
+        && count > std::numeric_limits<std::size_t>::max() / dimension)
+      overflow = true;
+    else if (!overflow)
+      count *= dimension;
+  }
+  return "{\"element_type\":" + jsonString(anari::toString(array.elementType()))
+      + ",\"dimensionality\":" + std::to_string(rank)
+      + ",\"dimensions\":" + dimensions + "],\"element_count\":"
+      + (overflow ? "{\"state\":\"unavailable\",\"reason\":\"count_overflow\"}"
+                  : summaryInteger(count))
+      + "}";
+}
+
+inline std::string parameterValue(const core::Any &value,
+    scene::Scene &scene,
+    identity::SceneIdentity &ids,
+    const PageLimits &limits)
+{
+  const auto type = value.type();
+  const auto prefix = "{\"type\":" + jsonString(anari::toString(type));
+  if (value.holdsObject()) {
+    if (value.getAsObjectIndex() == core::Any::INVALID_INDEX)
+      return prefix + ",\"state\":\"null\"}";
+    const auto *object = scene.getObject(value);
+    const auto handle = ids.handleOf(object);
+    if (!handle.valid())
+      return prefix
+          + ",\"state\":\"unavailable\",\"reason\":\"dangling_reference\"}";
+    std::string result = prefix + ",\"state\":\"valid\",\"handle\":\""
+        + hex64(handle.domain) + hex64(handle.serial) + "\"";
+    if (const auto *array = dynamic_cast<const scene::Array *>(object))
+      result += ",\"summary\":" + arraySummary(*array);
+    return result + "}";
+  }
+  std::string data;
+  if (type == ANARI_BOOL)
+    data = value.get<bool>() ? "true" : "false";
+  else if (type == ANARI_STRING) {
+    const auto text = value.getStringView();
+    const auto stringLimit =
+        std::min(limits.displayString, limits.optionalBytes);
+    if (text.size() > stringLimit)
+      return prefix + ",\"state\":\"truncated\",\"reason\":"
+          + jsonString(limits.displayString <= limits.optionalBytes
+                  ? "display_string_limit"
+                  : "optional_byte_limit")
+          + ",\"data\":" + jsonString(truncateUtf8(text, stringLimit)) + "}";
+    data = jsonString(std::string(text));
+  }
+#define VSR_INSPECT_NUMERIC(BASE, CPP)                                         \
+  else if (type == BASE || type == BASE##_VEC2 || type == BASE##_VEC3          \
+      || type == BASE##_VEC4) data = numericData<CPP>(value)
+  VSR_INSPECT_NUMERIC(ANARI_INT8, std::int8_t);
+  VSR_INSPECT_NUMERIC(ANARI_UINT8, std::uint8_t);
+  VSR_INSPECT_NUMERIC(ANARI_INT16, std::int16_t);
+  VSR_INSPECT_NUMERIC(ANARI_UINT16, std::uint16_t);
+  VSR_INSPECT_NUMERIC(ANARI_INT32, std::int32_t);
+  VSR_INSPECT_NUMERIC(ANARI_UINT32, std::uint32_t);
+  VSR_INSPECT_NUMERIC(ANARI_INT64, std::int64_t);
+  VSR_INSPECT_NUMERIC(ANARI_UINT64, std::uint64_t);
+  VSR_INSPECT_NUMERIC(ANARI_FLOAT32, float);
+  VSR_INSPECT_NUMERIC(ANARI_FLOAT64, double);
+#undef VSR_INSPECT_NUMERIC
+  else if (type == ANARI_FLOAT32_MAT2) data = numericData<float>(value, 2, 2);
+  else if (type == ANARI_FLOAT32_MAT3) data = numericData<float>(value, 3, 3);
+  else if (type == ANARI_FLOAT32_MAT4) data = numericData<float>(value, 4, 4);
+  else if (type == ANARI_FLOAT32_MAT2x3) data = numericData<float>(value, 2, 3);
+  else if (type == ANARI_FLOAT32_MAT3x4) data = numericData<float>(value, 3, 4);
+  return data.empty()
+      ? prefix + ",\"state\":\"unavailable\",\"reason\":\"unsupported_type\"}"
+      : prefix + ",\"state\":\"available\",\"data\":" + data + "}";
 }
 
 } // namespace detail
@@ -305,8 +483,8 @@ class Inspector
   std::string binding(const Job &j, std::uint64_t revision) const
   {
     return std::to_string(int(j.query)) + ":" + j.sessionId + ":"
-        + std::to_string(int(j.target.kind)) + ":"
-        + std::to_string(j.target.id) + ":" + std::to_string(revision);
+        + std::to_string(int(j.target.kind)) + ":" + std::to_string(j.target.id)
+        + ":" + std::to_string(revision);
   }
 
   std::string encodeCursor(const Job &j) const
@@ -475,8 +653,8 @@ class Inspector
       j.pos.index++;
       return true;
     }
-    std::string item = std::string("{\"kind\":\"")
-        + (views ? "view" : "scene") + "\",\"id\":" + std::to_string(i)
+    std::string item = std::string("{\"kind\":\"") + (views ? "view" : "scene")
+        + "\",\"id\":" + std::to_string(i)
         + ",\"capabilities\":" + capsJson(caps);
     if (views && m_views)
       if (auto *tracker = m_views(i))
@@ -505,24 +683,27 @@ class Inspector
   {
     auto &db = s.objectDB();
     switch (p) {
-    case 0: return db.array.capacity();
-    case 1: return db.surface.capacity();
-    case 2: return db.geometry.capacity();
-    case 3: return db.material.capacity();
-    case 4: return db.sampler.capacity();
-    case 5: return db.volume.capacity();
-    case 6: return db.field.capacity();
-    case 7: return db.light.capacity();
-    case 8: return db.camera.capacity();
-    default: return db.renderer.capacity();
+    case 0:
+      return db.array.capacity();
+    case 1:
+      return db.surface.capacity();
+    case 2:
+      return db.geometry.capacity();
+    case 3:
+      return db.material.capacity();
+    case 4:
+      return db.sampler.capacity();
+    case 5:
+      return db.volume.capacity();
+    case 6:
+      return db.field.capacity();
+    case 7:
+      return db.light.capacity();
+    case 8:
+      return db.camera.capacity();
+    default:
+      return db.renderer.capacity();
     }
-  }
-
-  static std::string number(float v)
-  {
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "%.17g", double(v));
-    return buf;
   }
 
   // Current values of the §8 editable parameters, or empty when none apply.
@@ -535,15 +716,14 @@ class Inspector
       const auto *p = o.parameter(Token(f.parameter));
       if (!p || p->value().type() != f.storedType)
         continue;
-      const auto *v = static_cast<const float *>(p->value().data());
       std::string e = "[";
       for (std::size_t c = 0; c < f.components; c++)
-        e += (c ? "," : "") + number(v[c]);
+        e += (c ? "," : "") + detail::numericComponent<float>(p->value(), c);
       e += "]";
       if (f.components == 1)
-        e = number(v[0]);
-      out += (out.empty() ? "" : ",") + detail::jsonString(f.parameter) + ":"
-          + e;
+        e = detail::numericComponent<float>(p->value(), 0);
+      out +=
+          (out.empty() ? "" : ",") + detail::jsonString(f.parameter) + ":" + e;
     }
     return out;
   }
@@ -571,30 +751,41 @@ class Inspector
     const auto h = ids.handleOf(o);
     const auto v = ids.parameterVersion(h);
     std::string item = "{\"handle\":\"" + detail::hex64(h.domain)
-        + detail::hex64(h.serial) + "\",\"type\":"
-        + detail::jsonString(anari::toString(o->type())) + ",\"subtype\":"
-        + detail::jsonString(o->subtype().str()) + ",\"version\":"
-        + std::to_string(v ? v->version : 0) + ",\"name\":";
+        + detail::hex64(h.serial)
+        + "\",\"type\":" + detail::jsonString(anari::toString(o->type()))
+        + ",\"subtype\":" + detail::jsonString(o->subtype().str())
+        + ",\"version\":" + std::to_string(v ? v->version : 0) + ",\"name\":";
     std::string name = display(o->name());
     std::string params = ",\"parameters\":[";
     bool paramsTruncated = false;
+    std::size_t represented = 0;
     for (std::size_t p = 0; p < o->numParameters(); p++) {
       const auto &par = o->parameterAt(p);
-      std::string e = std::string(p ? "," : "") + "{\"name\":"
-          + detail::jsonString(par.name().str()) + ",\"type\":"
-          + detail::jsonString(anari::toString(par.value().type())) + "}";
+      std::string e = std::string(p ? "," : "")
+          + "{\"name\":" + detail::jsonString(par.name().str()) + ",\"type\":"
+          + detail::jsonString(anari::toString(par.value().type()))
+          + ",\"value\":"
+          + detail::parameterValue(par.value(), scene, ids, m_limits) + "}";
       if (params.size() + e.size() > m_limits.optionalBytes) {
         paramsTruncated = true;
         break;
       }
       params += e;
+      represented++;
     }
     params += "],\"parameters_truncated\":";
     params += paramsTruncated ? "true" : "false";
+    if (paramsTruncated)
+      params +=
+          ",\"parameters_reason\":\"optional_byte_limit\",\"parameters_omitted\":"
+          + std::to_string(o->numParameters() - represented);
     const auto vals = editableValues(*o);
     if (!vals.empty())
       params += ",\"values\":{" + vals + "}";
-    item += name + params + "}";
+    item += name + params;
+    if (const auto *array = dynamic_cast<const scene::Array *>(o))
+      item += ",\"summary\":" + detail::arraySummary(*array);
+    item += "}";
     if (!append(j, item, tooLarge))
       return false;
     j.pos.index++;
