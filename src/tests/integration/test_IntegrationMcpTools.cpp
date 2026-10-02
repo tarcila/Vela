@@ -416,6 +416,90 @@ SCENARIO(
   CHECK(st.isError());
 }
 
+SCENARIO("MCP layer queries expose live layer and root handles",
+    "[integration][layer-mcp]")
+{
+  Fixture f;
+  f.scene.removeAllLayers();
+  auto *layer = f.scene.addLayer("wire-key");
+  layer->editableName() = "wire-name";
+  f.scene.signalLayerStructureChanged(layer);
+  f.scene.setLayerActive("wire-key", false);
+  auto list = f.rpc("tools/list", "{}");
+  for (const auto &tool : list.json.get("result")->get("tools")->a) {
+    if (tool.get("name")->s == "vsr_inspect") {
+      const auto &kinds = tool.get("inputSchema")
+                              ->get("properties")
+                              ->get("kind")
+                              ->get("enum")
+                              ->a;
+      REQUIRE(kinds.size() == 2);
+      CHECK(kinds[0].s == "objects");
+      CHECK(kinds[1].s == "layers");
+      const auto *props = tool.get("inputSchema")->get("properties");
+      CHECK(props->get("name")->get("maxLength")->n == 4096);
+      CHECK(props->get("name_contains")->get("maxLength")->n == 4096);
+      CHECK(props->get("page_size")->get("maximum")->n == 256);
+      CHECK(tool.get("description")->s.find("Layer filters: exact stored name")
+          != std::string::npos);
+    }
+  }
+  auto s = f.attach();
+  const auto scene = "\"scene_id\":" + std::to_string(f.sceneId);
+  auto ack = f.tool(
+      s, "vsr_inspect", "{\"request_id\":1," + scene + ",\"kind\":\"layers\"}");
+  REQUIRE(ack.errorCode().empty());
+  f.drain();
+  auto result = f.status(s, s.id, 1);
+  REQUIRE(result.str("outcome") == "ok");
+  const auto &items = result.result()->get("items")->a;
+  REQUIRE(items.size() == 1);
+  CHECK(items[0].get("name")->get("text")->s == "wire-name");
+  CHECK_FALSE(items[0].get("active")->b);
+  CHECK(items[0].get("root_handle")->s != items[0].get("handle")->s);
+  auto direct = f.tool(s,
+      "vsr_inspect",
+      "{\"request_id\":2," + scene + ",\"kind\":\"layers\",\"handle\":"
+          + json::quote(items[0].get("handle")->s) + "}");
+  REQUIRE(direct.errorCode().empty());
+  f.drain();
+  CHECK(f.status(s, s.id, 2).str("outcome") == "ok");
+  auto filtered = f.tool(s,
+      "vsr_inspect",
+      "{\"request_id\":4," + scene
+          + ",\"kind\":\"layers\",\"name\":\"wire-name\",\"name_contains\":\"wire\",\"handle\":"
+          + json::quote(items[0].get("handle")->s) + "}");
+  REQUIRE(filtered.errorCode().empty());
+  f.drain();
+  const auto matched = f.status(s, s.id, 4);
+  REQUIRE(matched.str("outcome") == "ok");
+  REQUIRE(matched.result()->get("items")->a.size() == 1);
+  CHECK(matched.result()->get("items")->a[0].get("root_handle")->s
+      == items[0].get("root_handle")->s);
+  for (const auto &bad :
+      {std::string("\"kind\":\"nodes\""),
+          std::string("\"kind\":17"),
+          std::string("\"kind\":\"layers\",\"name\":17"),
+          std::string("\"kind\":\"layers\",\"name_contains\":null"),
+          std::string("\"kind\":\"layers\",\"object_subtype\":\"matte\""),
+          std::string("\"kind\":\"layers\",\"node_kind\":\"empty\""),
+          std::string("\"kind\":\"layers\",\"layer_handle\":\"bad\""),
+          std::string("\"kind\":\"layers\",\"parent_handle\":\"bad\""),
+          std::string("\"kind\":\"layers\",\"page_size\":500"),
+          std::string("\"kind\":\"layers\",\"name\":")
+              + json::quote(std::string(4097, 'x')),
+          std::string("\"kind\":\"layers\",\"object_type\":\"ANARI_MATERIAL\""),
+          std::string("\"kind\":\"layers\",\"handle\":12"),
+          std::string("\"kind\":\"layers\",\"handle\":\"bad\""),
+          std::string("\"kind\":\"layers\",\"handle\":")
+              + json::quote(items[0].get("root_handle")->s)}) {
+    CHECK(
+        f.tool(s, "vsr_inspect", "{\"request_id\":3," + scene + "," + bad + "}")
+            .errorCode()
+        == "invalid_request");
+  }
+}
+
 SCENARIO("MCP object filters and active paging limits are exposed",
     "[integration][object-filters]")
 {

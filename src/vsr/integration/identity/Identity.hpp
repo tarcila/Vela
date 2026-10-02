@@ -77,6 +77,39 @@ struct ObjectHandle
   }
 };
 
+enum class HandleKind : std::uint64_t
+{
+  OTHER = 0,
+  OBJECT = 1,
+  LAYER = 2,
+  NODE = 3
+};
+
+// Distinct C++ types and wire domains; core lifetime stamps are never exposed.
+template <typename Tag>
+struct HierarchyHandle
+{
+  LaunchStamp launch;
+  std::uint64_t domain{0};
+  std::uint64_t serial{0};
+  bool valid() const
+  {
+    return serial != 0;
+  }
+  friend bool operator==(const HierarchyHandle &a, const HierarchyHandle &b)
+  {
+    return a.launch == b.launch && a.domain == b.domain && a.serial == b.serial;
+  }
+  friend bool operator!=(const HierarchyHandle &a, const HierarchyHandle &b)
+  {
+    return !(a == b);
+  }
+};
+struct LayerHandleTag;
+struct NodeHandleTag;
+using LayerHandle = HierarchyHandle<LayerHandleTag>;
+using NodeHandle = HierarchyHandle<NodeHandleTag>;
+
 struct ParameterVersionToken
 {
   ObjectHandle object;
@@ -126,7 +159,11 @@ class IdentityAuthority
 
   const LaunchStamp &launch() const;
   // Unique within this authority; never 0, never reused.
-  std::uint64_t nextDomain();
+  std::uint64_t nextDomain(HandleKind kind = HandleKind::OTHER);
+  static HandleKind handleKind(std::uint64_t domain)
+  {
+    return HandleKind(domain & 3);
+  }
   std::uint64_t nextSerial();
 
  private:
@@ -151,6 +188,11 @@ class SceneIdentity
   ObjectHandle handleOf(const scene::Object *o) const;
   // nullptr for foreign, removed, replaced or earlier-launch handles.
   scene::Object *resolve(const ObjectHandle &h) const;
+
+  LayerHandle handleOf(const scene::Layer *layer) const;
+  scene::Layer *resolve(const LayerHandle &h) const;
+  NodeHandle rootHandle(const scene::Layer *layer) const;
+  scene::LayerNodeRef resolve(const NodeHandle &h) const;
 
   // Parameter versions //
 
@@ -200,6 +242,16 @@ class SceneIdentity
     std::size_t metadataFingerprint{0};
   };
 
+  struct LayerEntry
+  {
+    scene::Layer *layer{nullptr};
+    std::uint64_t lifetime{0};
+    std::uint64_t rootLifetime{0};
+    std::uint64_t rootSerial{0};
+  };
+  void trackLayer(const scene::Layer *layer);
+  void untrackLayer(const scene::Layer *layer);
+
   class Observer;
   friend class Observer;
 
@@ -221,6 +273,11 @@ class SceneIdentity
   IdentityAuthority *m_authority{nullptr};
   scene::Scene *m_scene{nullptr};
   std::uint64_t m_domain{0};
+  std::uint64_t m_layerDomain{0};
+  std::uint64_t m_nodeDomain{0};
+  std::unordered_map<std::uint64_t, std::uint64_t> m_layerSerialOf;
+  std::unordered_map<std::uint64_t, LayerEntry> m_layers;
+  std::unordered_map<std::uint64_t, std::uint64_t> m_rootLayerOf;
   Observer *m_observer{nullptr};
   std::size_t m_defragToken{0};
   std::uint64_t m_sceneRevision{1};
@@ -282,9 +339,11 @@ inline const LaunchStamp &IdentityAuthority::launch() const
   return m_launch;
 }
 
-inline std::uint64_t IdentityAuthority::nextDomain()
+inline std::uint64_t IdentityAuthority::nextDomain(HandleKind kind)
 {
-  return m_nextDomain++;
+  if (m_nextDomain > (UINT64_MAX >> 2))
+    std::terminate();
+  return (m_nextDomain++ << 2) | std::uint64_t(kind);
 }
 
 inline std::uint64_t IdentityAuthority::nextSerial()
@@ -333,8 +392,9 @@ class SceneIdentity::Observer : public scene::BaseUpdateDelegate
   {
     m_owner->untrackAll();
   }
-  void signalLayerAdded(const scene::Layer *) override
+  void signalLayerAdded(const scene::Layer *layer) override
   {
+    m_owner->trackLayer(layer);
     m_owner->sceneContentChanged();
   }
   void signalLayerStructureUpdated(const scene::Layer *) override
@@ -345,8 +405,9 @@ class SceneIdentity::Observer : public scene::BaseUpdateDelegate
   {
     m_owner->sceneContentChanged();
   }
-  void signalLayerRemoved(const scene::Layer *) override
+  void signalLayerRemoved(const scene::Layer *layer) override
   {
+    m_owner->untrackLayer(layer);
     m_owner->sceneContentChanged();
   }
   void signalActiveLayersChanged() override
@@ -372,9 +433,15 @@ class SceneIdentity::Observer : public scene::BaseUpdateDelegate
 
 inline SceneIdentity::SceneIdentity(
     IdentityAuthority &authority, scene::Scene &scene)
-    : m_authority(&authority), m_scene(&scene), m_domain(authority.nextDomain())
+    : m_authority(&authority),
+      m_scene(&scene),
+      m_domain(authority.nextDomain(HandleKind::OBJECT)),
+      m_layerDomain(authority.nextDomain(HandleKind::LAYER)),
+      m_nodeDomain(authority.nextDomain(HandleKind::NODE))
 {
   trackExisting();
+  for (const auto &entry : scene.layers())
+    trackLayer(entry.second.ptr.get());
   m_observer = scene.updateDelegate().emplace<Observer>(this);
   m_defragToken = scene.addDefragCallback(
       [this](const scene::IndexRemapper &r) { remap(r); });
@@ -389,6 +456,77 @@ inline SceneIdentity::~SceneIdentity()
 inline scene::Scene *SceneIdentity::scene() const
 {
   return m_scene;
+}
+
+inline void SceneIdentity::trackLayer(const scene::Layer *layer)
+{
+  if (!layer || m_layerSerialOf.count(layer->lifetime()))
+    return;
+  const auto serial = m_authority->nextSerial();
+  const auto rootSerial = m_authority->nextSerial();
+  m_layerSerialOf.emplace(layer->lifetime(), serial);
+  m_layers.emplace(serial,
+      LayerEntry{const_cast<scene::Layer *>(layer),
+          layer->lifetime(),
+          layer->root()->lifetime(),
+          rootSerial});
+  m_rootLayerOf.emplace(rootSerial, serial);
+}
+
+inline void SceneIdentity::untrackLayer(const scene::Layer *layer)
+{
+  auto it = m_layerSerialOf.find(layer->lifetime());
+  if (it == m_layerSerialOf.end())
+    return;
+  m_rootLayerOf.erase(m_layers.at(it->second).rootSerial);
+  m_layers.erase(it->second);
+  m_layerSerialOf.erase(it);
+}
+
+inline LayerHandle SceneIdentity::handleOf(const scene::Layer *layer) const
+{
+  if (!layer || layer->scene() != m_scene)
+    return {};
+  auto it = m_layerSerialOf.find(layer->lifetime());
+  if (it == m_layerSerialOf.end())
+    return {};
+  return {m_authority->launch(), m_layerDomain, it->second};
+}
+
+inline scene::Layer *SceneIdentity::resolve(const LayerHandle &h) const
+{
+  if (!h.valid() || h.launch != m_authority->launch()
+      || h.domain != m_layerDomain)
+    return nullptr;
+  auto it = m_layers.find(h.serial);
+  if (it == m_layers.end()
+      || it->second.layer->lifetime() != it->second.lifetime)
+    return nullptr;
+  return it->second.layer;
+}
+
+inline NodeHandle SceneIdentity::rootHandle(const scene::Layer *layer) const
+{
+  const auto h = handleOf(layer);
+  if (!h.valid())
+    return {};
+  const auto &entry = m_layers.at(h.serial);
+  if (layer->root()->lifetime() != entry.rootLifetime)
+    return {};
+  return {m_authority->launch(), m_nodeDomain, entry.rootSerial};
+}
+
+inline scene::LayerNodeRef SceneIdentity::resolve(const NodeHandle &h) const
+{
+  if (!h.valid() || h.launch != m_authority->launch()
+      || h.domain != m_nodeDomain)
+    return {};
+  auto it = m_rootLayerOf.find(h.serial);
+  if (it == m_rootLayerOf.end())
+    return {};
+  const auto &entry = m_layers.at(it->second);
+  auto root = entry.layer->root();
+  return root->lifetime() == entry.rootLifetime ? root : scene::LayerNodeRef{};
 }
 
 inline ObjectHandle SceneIdentity::handleOf(const scene::Object *o) const

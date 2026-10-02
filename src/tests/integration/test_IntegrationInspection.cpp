@@ -149,6 +149,396 @@ const vsr::integration::mcp::json::Value &parameter(
 
 } // namespace
 
+SCENARIO("layers expose live roots and stored names in scene order",
+    "[integration][layer-inspection]")
+{
+  Fixture f(0);
+  f.scene.removeAllLayers();
+  auto *first = f.scene.addLayer("first-key");
+  auto *second = f.scene.addLayer("second-key");
+  first->editableName() = "duplicate";
+  second->editableName() = "duplicate";
+  f.scene.signalLayerStructureChanged(first);
+  f.scene.signalLayerStructureChanged(second);
+  f.scene.setLayerActive("second-key", false);
+  PageArgs args;
+  args.kind = "layers";
+  auto result = page(f.inspect(args, 1));
+  const auto &items = result.get("items")->a;
+  REQUIRE(items.size() == 2);
+  CHECK(items[0].get("name")->get("text")->s == "duplicate");
+  CHECK(items[1].get("name")->get("text")->s == "duplicate");
+  CHECK(items[0].get("active")->b);
+  CHECK_FALSE(items[1].get("active")->b);
+  CHECK(items[0].get("handle")->s != items[1].get("handle")->s);
+  CHECK(items[0].get("root_handle")->s != items[1].get("root_handle")->s);
+  CHECK(items[0].get("handle")->s != items[0].get("root_handle")->s);
+  args.filters.handle = items[1].get("handle")->s;
+  auto direct = page(f.inspect(args, 2));
+  REQUIRE(direct.get("items")->a.size() == 1);
+  CHECK(direct.get("items")->a[0].get("handle")->s == *args.filters.handle);
+  CHECK(direct.get("visited")->n == 2);
+}
+
+SCENARIO("layer name filters intersect on stored literal names",
+    "[integration][layer-inspection][layer-filters]")
+{
+  Fixture f(0);
+  f.scene.removeAllLayers();
+  for (const auto &key : {"first-key", "second-key", "Queen.*"}) {
+    auto *layer = f.scene.addLayer(key);
+    layer->editableName() =
+        std::string(key) == "Queen.*" ? "queen.*" : "Queen.*";
+    f.scene.signalLayerStructureChanged(layer);
+  }
+  PageArgs args;
+  args.kind = "layers";
+  args.filters.name = "Queen.*";
+  auto exact = page(f.inspect(args, 1));
+  REQUIRE(exact.get("items")->a.size() == 2);
+  const auto handle = exact.get("items")->a[1].get("handle")->s;
+  args.filters.nameContains = ".*";
+  args.filters.handle = handle;
+  auto direct = page(f.inspect(args, 2));
+  REQUIRE(direct.get("items")->a.size() == 1);
+  CHECK(direct.get("items")->a[0].get("handle")->s == handle);
+  args.filters.name = "queen.*";
+  CHECK(page(f.inspect(args, 3)).get("items")->a.empty());
+  args.filters.handle.reset();
+  args.filters.name.reset();
+  args.filters.nameContains = "Queen";
+  CHECK(page(f.inspect(args, 4)).get("items")->a.size() == 2);
+  args.filters.nameContains = "Q*";
+  auto empty = page(f.inspect(args, 5));
+  CHECK(empty.get("items")->a.empty());
+  CHECK(empty.get("complete")->b);
+  args.filters.nameContains.reset();
+  args.filters.name = "first-key";
+  CHECK(page(f.inspect(args, 6)).get("items")->a.empty());
+  CHECK(f.inspector->scratch().used() == 0);
+}
+
+SCENARIO("filtered layer cursors bind every filter and replay historical pages",
+    "[integration][layer-inspection][layer-filters]")
+{
+  Fixture f(0);
+  f.scene.removeAllLayers();
+  for (const auto &key : {"one", "two", "three"}) {
+    auto *layer = f.scene.addLayer(key);
+    layer->editableName() = "duplicate";
+    f.scene.signalLayerStructureChanged(layer);
+  }
+  PageArgs args;
+  args.kind = "layers";
+  args.pageSize = 1;
+  args.filters.name = "duplicate";
+  args.filters.nameContains = "lic";
+  const auto historical = f.inspect(args, 1);
+  args.cursor = page(historical).get("cursor")->s;
+  for (int i = 0; i < 4; i++) {
+    auto changed = args;
+    if (i == 0)
+      changed.filters.name.reset();
+    else if (i == 1)
+      changed.filters.nameContains = "dup";
+    else if (i == 2)
+      changed.pageSize = 2;
+    else
+      changed.kind = "objects";
+    CHECK(
+        f.inspector->makeInspection(f.creds.sessionId, f.sceneId, changed).code
+        == Outcome::CURSOR_STALE);
+  }
+  REQUIRE(page(f.inspect(args, 2)).get("items")->a.size() == 1);
+  auto *layer = f.scene.layers().at_index(0).second.ptr.get();
+  layer->editableName() = "changed";
+  f.scene.signalLayerStructureChanged(layer);
+  CHECK(f.inspect(args, 3).terminal == Outcome::CURSOR_STALE);
+  args.cursor.clear();
+  CHECK(f.inspect(args, 1).result == historical.result);
+  CHECK(f.inspector->scratch().used() == 0);
+}
+
+SCENARIO(
+    "sparse layer filters yield bounded pages and release terminal scratch",
+    "[integration][layer-inspection][layer-filters]")
+{
+  PageLimits limits;
+  limits.visits = 3;
+  limits.sliceVisits = 1;
+  Fixture f(0, limits);
+  f.scene.removeAllLayers();
+  for (int i = 0; i < 8; i++)
+    f.scene.addLayer(i == 7 ? "needle" : "hay" + std::to_string(i));
+  PageArgs args;
+  args.kind = "layers";
+  args.filters.nameContains = "needle";
+  f.submit(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args), 1);
+  f.integration.service();
+  CHECK_FALSE(f.engine->status(f.creds, {f.creds.sessionId, 1}).terminal);
+  auto first = page(f.drain(1));
+  CHECK(first.get("visited")->n == 3);
+  CHECK(first.get("items")->a.empty());
+  CHECK(first.get("stop")->s == "work");
+  auto scan = [&](PageArgs query, std::uint64_t id) {
+    std::size_t returned = 0;
+    for (int pages = 0; pages < 4; pages++) {
+      auto result = page(f.inspect(query, id++));
+      CHECK(result.get("visited")->n <= 3);
+      returned += result.get("items")->a.size();
+      CHECK(f.inspector->scratch().used() == 0);
+      if (result.get("complete")->b)
+        return returned;
+      query.cursor = result.get("cursor")->s;
+    }
+    FAIL("bounded scan did not terminate");
+    return returned;
+  };
+  args.cursor = first.get("cursor")->s;
+  CHECK(scan(args, 2) == 1);
+  args.cursor.clear();
+  args.filters.nameContains = "absent";
+  CHECK(scan(args, 10) == 0);
+  f.submit(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args), 20);
+  f.integration.service();
+  REQUIRE(f.inspector->scratch().used() > 0);
+  SECTION("cancel")
+  {
+    f.engine->cancel(f.creds, {f.creds.sessionId, 20});
+    CHECK(f.drain(20).terminal == Outcome::CANCELLED);
+  }
+  SECTION("deadline")
+  {
+    f.now += 6;
+    CHECK(f.drain(20).terminal == Outcome::TIMEOUT);
+  }
+  SECTION("session ended")
+  {
+    REQUIRE(f.authority->revokeSession());
+    while (f.integration.service() > 0) {
+    }
+  }
+  CHECK(f.engine->slotsInUse() == 0);
+  CHECK(f.inspector->scratch().used() == 0);
+}
+
+SCENARIO("layer name policy rejects invalid queries without widening access",
+    "[integration][layer-inspection][layer-filters]")
+{
+  Fixture f(0);
+  PageArgs args;
+  args.kind = "layers";
+  args.filters.name = std::string(4097, 'x');
+  CHECK(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args).code
+      == Outcome::INVALID_REQUEST);
+  args.filters.name = "default";
+  args.filters.objectSubtype = "matte";
+  CHECK(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args).code
+      == Outcome::INVALID_REQUEST);
+  args.filters.objectSubtype.reset();
+  f.authority->restrict(
+      session::Target::scene(f.sceneId), session::Capability::READ);
+  auto denied = f.engine->submit(f.creds,
+      {f.creds.sessionId, 1},
+      f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args).request);
+  CHECK(denied.code == Outcome::FORBIDDEN);
+  CHECK(f.inspector->scratch().used() == 0);
+}
+
+SCENARIO("layer filters use stored names while sharing representation budgets",
+    "[integration][layer-inspection][layer-filters]")
+{
+  PageLimits limits;
+  SECTION("display previews do not become names")
+  {
+    limits.displayString = 4;
+    Fixture f(0, limits);
+    f.scene.removeAllLayers();
+    f.scene.addLayer("abcd-suffix");
+    PageArgs args;
+    args.kind = "layers";
+    args.filters.name = "abcd";
+    CHECK(page(f.inspect(args, 1)).get("items")->a.empty());
+    args.filters.name.reset();
+    args.filters.nameContains = "fix";
+    auto matched = page(f.inspect(args, 2));
+    REQUIRE(matched.get("items")->a.size() == 1);
+    CHECK(matched.get("items")->a[0].get("name")->get("text")->s == "abcd");
+    CHECK(f.inspector->scratch().used() == 0);
+  }
+  SECTION("filters consume shared scratch even without matches")
+  {
+    limits.scratchBytes = 128;
+    Fixture f(0, limits);
+    PageArgs args;
+    args.kind = "layers";
+    args.filters.name = std::string(4096, 'x');
+    CHECK(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args).code
+        == Outcome::BUSY);
+    CHECK(f.inspector->scratch().used() == 0);
+  }
+  SECTION("page byte limits preserve filtered continuation")
+  {
+    limits.pageBytes = 750;
+    Fixture f(0, limits);
+    f.scene.removeAllLayers();
+    f.scene.addLayer("one");
+    f.scene.addLayer("two");
+    PageArgs args;
+    args.kind = "layers";
+    args.filters.nameContains = "o";
+    auto first = page(f.inspect(args, 1));
+    REQUIRE(first.get("items")->a.size() == 1);
+    CHECK(first.get("stop")->s == "byte");
+    args.cursor = first.get("cursor")->s;
+    auto next = page(f.inspect(args, 2));
+    REQUIRE(next.get("items")->a.size() == 1);
+    CHECK(next.get("items")->a[0].get("name")->get("text")->s == "two");
+    CHECK(next.get("complete")->b);
+    CHECK(f.inspector->scratch().used() == 0);
+  }
+  SECTION("oversize layer items release scratch")
+  {
+    limits.itemBytes = 32;
+    Fixture f(0, limits);
+    f.scene.addLayer("oversize");
+    PageArgs args;
+    args.kind = "layers";
+    args.filters.nameContains = "";
+    CHECK(f.inspect(args, 1).terminal == Outcome::ITEM_TOO_LARGE);
+    CHECK(f.inspector->scratch().used() == 0);
+  }
+  SECTION("stale handles conflict even when names cannot match")
+  {
+    Fixture f(0, limits);
+    f.scene.removeAllLayers();
+    f.scene.addLayer("old");
+    PageArgs args;
+    args.kind = "layers";
+    args.filters.handle =
+        page(f.inspect(args, 1)).get("items")->a[0].get("handle")->s;
+    f.scene.removeLayer("old");
+    f.scene.addLayer("old");
+    args.filters.name = "absent";
+    CHECK(f.inspect(args, 2).terminal == Outcome::CONFLICT);
+    CHECK(f.inspector->scratch().used() == 0);
+  }
+}
+
+SCENARIO("layer and root lifetimes survive notifications but never removal",
+    "[integration][layer-inspection]")
+{
+  Fixture f(0);
+  f.scene.removeAllLayers();
+  auto *layer = f.scene.addLayer("live");
+  PageArgs args;
+  args.kind = "layers";
+  auto original = page(f.inspect(args, 1));
+  const auto handle = original.get("items")->a[0].get("handle")->s;
+  const auto root = original.get("items")->a[0].get("root_handle")->s;
+  f.scene.insertChildTransformNode(layer->root(), vsr::math::IDENTITY_MAT4);
+  auto beforeClear = page(f.inspect(args, 2));
+  layer->clear();
+  REQUIRE(layer->size() == 1);
+  REQUIRE(layer->root());
+  auto cleared = page(f.inspect(args, 3));
+  CHECK(
+      cleared.get("scene_revision")->s != beforeClear.get("scene_revision")->s);
+  CHECK(cleared.get("items")->a[0].get("handle")->s == handle);
+  CHECK(cleared.get("items")->a[0].get("root_handle")->s == root);
+  f.scene.signalLayerStructureChanged(layer);
+  f.scene.signalLayerTransformChanged(layer);
+  f.scene.setLayerActive("live", false);
+  layer->editableName() = "renamed";
+  f.scene.signalLayerStructureChanged(layer);
+  auto changed = page(f.inspect(args, 4));
+  CHECK(changed.get("items")->a[0].get("handle")->s == handle);
+  CHECK(changed.get("items")->a[0].get("root_handle")->s == root);
+  // Even a retained shared_ptr must not make a removed layer live in the scene.
+  auto retained = f.scene.layers().at_index(0).second.ptr;
+  f.scene.removeLayer("live");
+  f.scene.addLayer("live");
+  auto recreated = page(f.inspect(args, 5));
+  CHECK(recreated.get("items")->a[0].get("handle")->s != handle);
+  CHECK(recreated.get("items")->a[0].get("root_handle")->s != root);
+  args.filters.handle = handle;
+  CHECK(f.inspect(args, 6).terminal == Outcome::CONFLICT);
+  auto replay = f.submit(f.inspector->makeInspection(f.creds.sessionId,
+                             f.sceneId,
+                             PageArgs{std::nullopt, {}, {}, "layers"}),
+      1);
+  REQUIRE(replay.replayed);
+  CHECK(replay.status.result
+      == f.engine->status(f.creds, {f.creds.sessionId, 1}).result);
+  args.filters.handle = recreated.get("items")->a[0].get("handle")->s;
+  f.scene.removeAllObjects();
+  f.scene.addLayer("live");
+  CHECK(f.inspect(args, 7).terminal == Outcome::CONFLICT);
+}
+
+SCENARIO("layer cursors bind identity and every supported policy",
+    "[integration][layer-inspection]")
+{
+  Fixture f(0);
+  f.scene.removeAllLayers();
+  auto *layer = f.scene.addLayer("one");
+  f.scene.addLayer("two");
+  f.sceneIds = std::make_unique<identity::SceneIdentity>(f.ids, f.scene);
+  PageArgs args;
+  args.kind = "layers";
+  args.pageSize = 1;
+  auto first = page(f.inspect(args, 1));
+  args.cursor = first.get("cursor")->s;
+  auto continuation = page(f.inspect(args, 2));
+  REQUIRE(continuation.get("items")->a.size() == 1);
+  CHECK(continuation.get("items")->a[0].get("name")->get("text")->s == "two");
+  auto substituted = args;
+  substituted.kind = "objects";
+  CHECK(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, substituted)
+            .code
+      == Outcome::CURSOR_STALE);
+  substituted = args;
+  substituted.pageSize = 2;
+  CHECK(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, substituted)
+            .code
+      == Outcome::CURSOR_STALE);
+  substituted = args;
+  substituted.filters.handle = first.get("items")->a[0].get("handle")->s;
+  CHECK(f.inspector->makeInspection(f.creds.sessionId, f.sceneId, substituted)
+            .code
+      == Outcome::CURSOR_STALE);
+  SECTION("identity replacement with the same revision count")
+  {
+    f.sceneIds = std::make_unique<identity::SceneIdentity>(f.ids, f.scene);
+    auto built =
+        f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args);
+    CHECK(built.code == Outcome::CURSOR_STALE);
+  }
+  SECTION("notifying mutations")
+  {
+    layer->editableName() = "renamed";
+    f.scene.signalLayerStructureChanged(layer);
+    CHECK(f.inspect(args, 3).terminal == Outcome::CURSOR_STALE);
+  }
+  SECTION("root-preserving clear")
+  {
+    layer->clear();
+    CHECK(f.inspect(args, 3).terminal == Outcome::CURSOR_STALE);
+  }
+  SECTION("activation change-back")
+  {
+    f.scene.setLayerActive("one", false);
+    f.scene.setLayerActive("one", true);
+    CHECK(f.inspect(args, 3).terminal == Outcome::CURSOR_STALE);
+  }
+  SECTION("membership change-back")
+  {
+    f.scene.removeLayer("two");
+    f.scene.addLayer("two");
+    CHECK(f.inspect(args, 3).terminal == Outcome::CURSOR_STALE);
+  }
+}
+
 SCENARIO("ordinary read-only parameters retain ANARI types and stored values",
     "[integration][typed-inspection]")
 {
@@ -630,7 +1020,7 @@ SCENARIO("discovery lists readable targets with current capabilities",
   REQUIRE(a.code == Outcome::OK);
   auto s = f.drain(1);
   CHECK(s.result.find("\"kind\":\"scene\"") != std::string::npos);
-  CHECK(s.result.find("\"inspection\":{\"kinds\":[\"objects\"],"
+  CHECK(s.result.find("\"inspection\":{\"kinds\":[\"objects\",\"layers\"],"
                       "\"default_page_size\":64,\"max_page_size\":256}")
       != std::string::npos);
   CHECK(s.result.find("\"edit\":true") != std::string::npos);

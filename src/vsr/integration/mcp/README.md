@@ -71,14 +71,35 @@ block on a safe point.
 | `vsr_operation_status` | `operation_ref` | current proof; read on every covered target for payload or foreign records | control gate, no ID |
 | `vsr_cancel` | `operation_ref` (own session only) | current proof | control gate, no ID |
 
-Object inspection defaults to `kind: "objects"` (currently the only supported
-mode); these are scene objects, not layer nodes. Filters intersect. `name` and
+Inspection defaults to `kind: "objects"`; `kind: "layers"` is also supported.
+General `nodes` queries are not yet supported. Object filters intersect. `name` and
 `object_subtype` compare exactly, `name_contains` is case-sensitive literal text
 (not regex/glob), `object_type` uses the advertised ANARI enum strings, and
 `handle` is the opaque object handle returned by inspection. Filter strings are
 bounded to 4096 UTF-8 bytes by default. Malformed or unsupported filters reject
 before admission; a stale exact handle returns `conflict`, and no matches return
 an empty complete page (or a marked work-budget continuation).
+
+Layer queries support intersecting exact `name`, literal case-sensitive
+`name_contains`, and exact layer `handle` filters (or unfiltered pages).
+Matching uses the real stored layer name, not its display preview or Scene
+LayerMap key; duplicate names are legal and no matches succeed empty.
+Object/node-only filters reject for layers. Each item has
+`handle`, `name` (the bounded display of the stored Layer name, not its map key),
+`active`, and `root_handle`. Inactive layers remain readable. Object, layer and
+node handles have distinct host-issued domains and are not interchangeable.
+Removed/recreated layers, scene reset and SceneIdentity replacement retire old
+handles permanently. Clearing a layer's descendants preserves its genuine root
+and its handle, matching Forest's root-preserving semantics.
+
+Hosts must mutate and query on the safe-point thread. Normal Scene notifications
+advance revisions incrementally; no query-time hierarchy snapshot or fingerprint
+scan is used. After changing `Layer::editableName()` or using raw Forest/node
+mutations, call `Scene::signalLayerStructureChanged(layer)` (or
+`signalLayerTransformChanged` for transforms). Scene layer membership/activation
+and `Layer::clear()` notify automatically. Unsupported raw mutation without the
+appropriate notification cannot maintain cursor/render correctness. These
+notifications do not regenerate unchanged lifetime handles.
 
 Discovery scene items advertise `inspection.kinds`, `default_page_size`, and
 `max_page_size`. Both query schemas/descriptions use the host's active limits:

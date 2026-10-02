@@ -34,6 +34,12 @@ struct Layer final
 
   Scene *scene() const;
 
+  // Process-local creation stamp, never reused. Not an external handle.
+  std::uint64_t lifetime() const
+  {
+    return m_lifetime;
+  }
+
   const std::string &name() const;
   std::string &editableName();
 
@@ -63,6 +69,7 @@ struct Layer final
       ConstVisitorExitFunction &&onNodeExit) const;
 
  private:
+  const std::uint64_t m_lifetime;
   Scene *m_scene{nullptr};
   std::string m_name;
   Forest<LayerNodeData> m_tree{{this, math::IDENTITY_MAT4, "root"}};

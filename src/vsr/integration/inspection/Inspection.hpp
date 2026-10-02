@@ -472,8 +472,10 @@ class Inspector
 
     std::shared_ptr<ScratchPool> pool;
     Query query;
+    std::string kind;
     ObjectFilters filters;
     std::string policy;
+    std::string identityBinding;
     scene::Object *exactObject{nullptr}; // resolved only at the safe point
     std::string sessionId;
     Target target;
@@ -498,7 +500,8 @@ class Inspector
   {
     return std::to_string(int(j.query)) + ":" + j.sessionId + ":"
         + std::to_string(int(j.target.kind)) + ":" + std::to_string(j.target.id)
-        + ":" + std::to_string(revision) + ":" + j.policy;
+        + ":" + std::to_string(revision) + ":" + j.policy + ":"
+        + j.identityBinding;
   }
 
   std::string encodeCursor(const Job &j) const
@@ -544,9 +547,13 @@ class Inspector
 
   bool validFilters(Query q, const PageArgs &args) const
   {
-    if (args.kind != "objects")
+    if (args.kind != "objects" && args.kind != "layers")
+      return false;
+    if (q == Query::DISCOVER && args.kind != "objects")
       return false;
     const auto &f = args.filters;
+    if (args.kind == "layers" && (f.objectType || f.objectSubtype))
+      return false;
     for (const auto *s : {&f.name,
              &f.nameContains,
              &f.handle,
@@ -561,6 +568,12 @@ class Inspector
       for (char c : *f.handle)
         if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
           return false;
+      const auto domain = std::stoull(f.handle->substr(0, 16), nullptr, 16);
+      const auto kind = identity::IdentityAuthority::handleKind(domain);
+      if (kind
+          != (args.kind == "layers" ? identity::HandleKind::LAYER
+                                    : identity::HandleKind::OBJECT))
+        return false;
     }
     if (f.objectType) {
       bool supported = false;
@@ -614,14 +627,19 @@ class Inspector
     auto job = std::make_shared<Job>();
     job->pool = m_scratch;
     job->query = q;
+    job->kind = args.kind;
     job->filters = args.filters;
     job->sessionId = sessionId;
     job->target = target;
     job->maxItems = std::size_t(size);
     job->policy = filterPolicy(args, size);
+    if (q == Query::INSPECT && args.kind == "layers")
+      if (auto *ids = m_identities(target.id))
+        job->identityBinding = layerIdentityBinding(*ids);
     // Charge retained query/filter state to the same global scratch budget as
     // returned items, including no-match scans. Job owns release on every path.
-    std::size_t queryBytes = job->policy.size() + job->sessionId.size();
+    std::size_t queryBytes = job->policy.size() + job->sessionId.size()
+        + job->identityBinding.size();
     for (const auto *s : {&job->filters.name,
              &job->filters.nameContains,
              &job->filters.handle,
@@ -736,7 +754,8 @@ class Inspector
         + "\",\"id\":" + std::to_string(i)
         + ",\"capabilities\":" + capsJson(caps);
     if (!views)
-      item += ",\"inspection\":{\"kinds\":[\"objects\"],\"default_page_size\":"
+      item +=
+          ",\"inspection\":{\"kinds\":[\"objects\",\"layers\"],\"default_page_size\":"
           + std::to_string(m_limits.defaultItems)
           + ",\"max_page_size\":" + std::to_string(m_limits.maxItems) + "}";
     if (views && m_views)
@@ -809,6 +828,40 @@ class Inspector
           (out.empty() ? "" : ",") + detail::jsonString(f.parameter) + ":" + e;
     }
     return out;
+  }
+
+  bool nextLayer(Job &j,
+      scene::Scene &scene,
+      identity::SceneIdentity &ids,
+      bool &tooLarge,
+      bool &exhausted)
+  {
+    if (j.pos.index >= scene.numberOfLayers()) {
+      exhausted = true;
+      return false;
+    }
+    const auto &state = scene.layers().at_index(j.pos.index).second;
+    const auto *layer = state.ptr.get();
+    j.visited++;
+    const auto h = ids.handleOf(layer);
+    const auto handle = detail::hex64(h.domain) + detail::hex64(h.serial);
+    const auto &f = j.filters;
+    if ((f.name && layer->name() != *f.name)
+        || (f.nameContains
+            && layer->name().find(*f.nameContains) == std::string::npos)
+        || (f.handle && handle != *f.handle)) {
+      j.pos.index++;
+      return true;
+    }
+    const auto root = ids.rootHandle(layer);
+    const std::string item = "{\"handle\":\"" + handle
+        + "\",\"name\":" + display(layer->name()) + ",\"active\":"
+        + (state.active ? "true" : "false") + ",\"root_handle\":\""
+        + detail::hex64(root.domain) + detail::hex64(root.serial) + "\"}";
+    if (!append(j, item, tooLarge))
+      return false;
+    j.pos.index++;
+    return true;
   }
 
   bool nextInspection(Job &j,
@@ -893,6 +946,13 @@ class Inspector
     return true;
   }
 
+  static std::string layerIdentityBinding(const identity::SceneIdentity &ids)
+  {
+    const auto r = ids.inspectionRevision();
+    return detail::hex64(r.launch.activation) + detail::hex64(r.launch.nonce)
+        + detail::hex64(r.domain);
+  }
+
   Step run(Job &j, StepContext &ctx)
   {
     if (ctx.abandoned)
@@ -902,6 +962,8 @@ class Inspector
       ids = m_identities(j.target.id);
       if (!ids || ids->scene() != &ctx.scene)
         return done(Outcome::INVALID_REQUEST, "{\"error\":\"unsupported\"}");
+      if (j.kind == "layers" && j.identityBinding != layerIdentityBinding(*ids))
+        return done(Outcome::CURSOR_STALE);
       // Name/metadata changes arrive incrementally via the scene's update
       // delegate; no per-slice O(objects) refresh.
     }
@@ -917,12 +979,18 @@ class Inspector
 
     if (ids && j.filters.handle) {
       const auto &s = *j.filters.handle;
-      identity::ObjectHandle h{ids->inspectionRevision().launch,
-          std::stoull(s.substr(0, 16), nullptr, 16),
-          std::stoull(s.substr(16, 16), nullptr, 16)};
-      j.exactObject = ids->resolve(h);
-      if (!j.exactObject)
-        return done(Outcome::CONFLICT);
+      const auto launch = ids->inspectionRevision().launch;
+      const auto domain = std::stoull(s.substr(0, 16), nullptr, 16);
+      const auto serial = std::stoull(s.substr(16, 16), nullptr, 16);
+      if (j.kind == "layers") {
+        if (!ids->resolve(identity::LayerHandle{launch, domain, serial}))
+          return done(Outcome::CONFLICT);
+      } else {
+        j.exactObject =
+            ids->resolve(identity::ObjectHandle{launch, domain, serial});
+        if (!j.exactObject)
+          return done(Outcome::CONFLICT);
+      }
     }
 
     std::size_t slice = 0;
@@ -935,6 +1003,8 @@ class Inspector
       const std::size_t before = j.visited;
       const bool more = j.query == Query::DISCOVER
           ? nextDiscovery(j, tooLarge, exhausted)
+          : j.kind == "layers"
+          ? nextLayer(j, ctx.scene, *ids, tooLarge, exhausted)
           : nextInspection(j, ctx.scene, *ids, tooLarge, exhausted);
       if (tooLarge)
         return done(Outcome::ITEM_TOO_LARGE);

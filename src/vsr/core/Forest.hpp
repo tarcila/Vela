@@ -6,6 +6,8 @@
 #include "vsr/core/ObjectPool.hpp"
 #include "vsr/core/TypeMacros.hpp"
 // std
+#include <cstdint>
+#include <exception>
 #include <functional>
 #include <utility>
 
@@ -52,6 +54,13 @@ struct ForestNode
 
   size_t index() const;
 
+  // Creation stamp within this Forest, independent of pool slot reuse.
+  // Storage relocation and move_subtree preserve it; copies get a new stamp.
+  std::uint64_t lifetime() const
+  {
+    return m_lifetime;
+  }
+
   Ref insert_first_child(T &&v);
   Ref insert_last_child(T &&v);
   Ref insert_last_child_at(size_t index, T &&v);
@@ -67,6 +76,7 @@ struct ForestNode
   template <typename U>
   friend bool operator==(const ForestNode<U> &a, const ForestNode<U> &b);
 
+  std::uint64_t m_lifetime{0};
   T m_value{};
   Ref m_prev;
   Ref m_children_begin;
@@ -207,6 +217,7 @@ struct Forest
 
   ObjectPool<ForestNode<T>> m_nodes;
   NodeRef m_root;
+  std::uint64_t m_nextLifetime{1};
 };
 
 // Algorithms /////////////////////////////////////////////////////////////////
@@ -798,6 +809,9 @@ template <typename T>
 inline typename Forest<T>::NodeRef Forest<T>::make_ForestNode(T &&v)
 {
   auto n = m_nodes.emplace(std::forward<T>(v), this);
+  if (m_nextLifetime == 0)
+    std::terminate();
+  n->m_lifetime = m_nextLifetime++;
   n->m_self = n;
   n->m_children_end = n;
   n->m_children_begin = n;
@@ -811,6 +825,9 @@ inline typename Forest<T>::NodeRef Forest<T>::make_ForestNode_at(
   auto n = m_nodes.emplace_at(index, std::forward<T>(v), this);
   if (!n)
     return {};
+  if (m_nextLifetime == 0)
+    std::terminate();
+  n->m_lifetime = m_nextLifetime++;
   n->m_self = n;
   n->m_children_end = n;
   n->m_children_begin = n;

@@ -39,7 +39,7 @@ inline std::string filterSchemaProps(const inspection::PageLimits &limits)
 {
   const std::string text = "{\"type\":\"string\",\"maxLength\":"
       + std::to_string(limits.displayString) + "}";
-  std::string props = "\"kind\":{\"type\":\"string\",\"enum\":[\"objects\"],"
+  std::string props = "\"kind\":{\"type\":\"string\",\"enum\":[\"objects\",\"layers\"],"
                      "\"default\":\"objects\"},\"name\":"
       + text + ",\"name_contains\":" + text + ",\"object_subtype\":" + text
       + ",\"handle\":{\"type\":\"string\",\"pattern\":\"^[0-9a-f]{32}$\"},"
@@ -106,7 +106,7 @@ inline void addQueryTools(std::vector<Tool> &tools, QueryDeps deps)
   const std::string paging = " Default page size "
       + std::to_string(limits.defaultItems) + ", maximum "
       + std::to_string(limits.maxItems)
-      + "; supported inspection kind: objects.";
+      + "; supported inspection kinds: objects, layers.";
   Tool discover;
   discover.name = "vsr_discover";
   discover.description =
@@ -131,8 +131,11 @@ inline void addQueryTools(std::vector<Tool> &tools, QueryDeps deps)
   Tool inspect;
   inspect.name = "vsr_inspect";
   inspect.description =
-      "Page through scene objects and parameters, not layer nodes. "
-      "Optional exact name, handle, ANARI object_type and "
+      "Page through scene objects/parameters (default) or layers with live "
+      "root handles. Layer filters: exact stored name, exact layer handle, "
+      "and literal case-sensitive name_contains intersect. Object/node-only "
+      "filters reject for layers; general nodes are unsupported. Object filters: "
+      "optional exact name, handle, ANARI object_type and "
       "object_subtype filters intersect with literal, "
       "case-sensitive name_contains (not regex/glob). "
       "Filter strings are limited to "

@@ -4,11 +4,25 @@
 #include "vsr/scene/Layer.hpp"
 #include "vsr/core/Logging.hpp"
 #include "vsr/scene/Scene.hpp"
+// std
+#include <atomic>
+#include <exception>
 
 namespace vsr::scene {
 
+namespace {
+std::uint64_t nextLayerLifetime()
+{
+  static std::atomic<std::uint64_t> next{1};
+  const auto stamp = next.fetch_add(1, std::memory_order_relaxed);
+  if (!stamp)
+    std::terminate();
+  return stamp;
+}
+} // namespace
+
 Layer::Layer(Scene *scene, std::string name)
-    : m_scene(scene), m_name(std::move(name))
+    : m_lifetime(nextLayerLifetime()), m_scene(scene), m_name(std::move(name))
 {}
 
 Layer::~Layer() = default;
@@ -61,6 +75,8 @@ void Layer::erase(LayerNodeRef obj)
 void Layer::clear()
 {
   m_tree.clear();
+  if (m_scene)
+    m_scene->signalLayerStructureChanged(this);
 }
 
 bool Layer::isAncestorOf(
