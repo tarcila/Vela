@@ -80,7 +80,8 @@ enum class ValueError
   NON_FINITE,
   OUT_OF_DOMAIN, // includes exceeding the largest finite binary32
   UNSUPPORTED_NODE_KIND,
-  NON_AFFINE
+  NON_AFFINE,
+  SINGULAR_PARENT
 };
 
 struct Domain

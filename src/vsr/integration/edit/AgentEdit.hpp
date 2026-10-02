@@ -81,7 +81,8 @@ struct EditEntry
   TargetKind targetKind{TargetKind::OBJECT};
   identity::NodeEditVersionToken nodeExpected;
   identity::NodeDependencyWalk nodeDependencies;
-  std::string space{"local"}; // position only; world is not yet supported
+  std::string space{"local"}; // position only
+  bool hasAncestryVersion{false};
 };
 
 struct EditBatch
@@ -134,6 +135,8 @@ inline const char *valueErrorName(ValueError e)
     return "unsupported_node_kind";
   case ValueError::NON_AFFINE:
     return "non_affine";
+  case ValueError::SINGULAR_PARENT:
+    return "singular_parent";
   case ValueError::NONE:
     break;
   }
@@ -226,7 +229,8 @@ inline ValueError prepareMatrix(const JsonValue &value, core::math::mat4 &out)
 inline Outcome nodeDependencies(SceneIdentity &ids,
     const identity::NodeHandle &h,
     identity::NodeDependencyWalk &out,
-    std::size_t &remaining)
+    std::size_t &remaining,
+    std::vector<scene::LayerNodeRef> *ancestors = nullptr)
 {
   auto walk = ids.beginNodeDependencies(h);
   if (!walk)
@@ -235,6 +239,9 @@ inline Outcome nodeDependencies(SceneIdentity &ids,
     if (!remaining)
       return Outcome::BUSY;
     --remaining;
+    if (ancestors)
+      ancestors->push_back(
+          ids.resolve(walk->layer)->at(walk->ancestorSlot - 1));
     if (!ids.advanceNodeDependencies(*walk))
       return Outcome::CONFLICT;
   }
@@ -259,6 +266,7 @@ struct NodeChange
   bool beforeEnabled{true};
   bool changedEnabled{false};
   bool changedTransform{false};
+  bool requiresAncestry{false};
   core::math::mat4 beforeMatrix{core::math::IDENTITY_MAT4};
   core::math::mat3 beforeSRT{};
 };
@@ -604,7 +612,9 @@ inline bool EditService::validEnvelope(const EditBatch &batch)
           || !e.nodeDependencies.structuralVersion
           || (e.parameter != "enabled" && e.parameter != "position"
               && e.parameter != "transform")
-          || e.space != "local"
+          || (e.space != "local"
+              && (e.parameter != "position" || e.space != "world"
+                  || !e.hasAncestryVersion))
           || (e.parameter == "enabled" && e.value.kind != JsonKind::BOOLEAN))
         return false;
       auto inserted =
@@ -707,7 +717,9 @@ inline std::string EditService::canonicalArguments(const EditBatch &batch)
           + std::to_string(e.nodeExpected.version) + ":"
           + std::to_string(d.layer.domain) + "/"
           + std::to_string(d.layer.serial) + "/"
-          + std::to_string(d.structuralVersion) + ":" + e.parameter + "=";
+          + std::to_string(d.structuralVersion) + ":"
+          + (e.space == "world" ? std::to_string(d.transformVersion) : "") + ":"
+          + e.parameter + "=";
       if (e.parameter == "position")
         detail::appendText(s, e.space);
       detail::appendValue(s, e.value);
@@ -878,6 +890,10 @@ inline EditResult EditService::commit(
     bool changedTransform{false};
     core::math::mat4 matrix{core::math::IDENTITY_MAT4};
     core::math::mat3 srt{};
+    std::vector<scene::LayerNodeRef> ancestors;
+    const EditEntry *worldEntry{nullptr};
+    std::size_t worldIndex{0};
+    bool worldPrepared{false};
   };
   std::vector<PlannedNode> nodes;
   std::vector<const scene::Layer *> layers;
@@ -896,15 +912,17 @@ inline EditResult EditService::commit(
           return res;
         }
         identity::NodeDependencyWalk d;
-        const auto status =
-            detail::nodeDependencies(*ident, e.nodeExpected.node, d, remaining);
+        std::vector<scene::LayerNodeRef> ancestors;
+        const auto status = detail::nodeDependencies(
+            *ident, e.nodeExpected.node, d, remaining, &ancestors);
         if (status == Outcome::BUSY) {
           res.outcome = status;
           return res;
         }
         auto node = ident->resolve(e.nodeExpected.node);
         if (status != Outcome::OK || !ident->isCurrent(e.nodeExpected)
-            || !d.matchesStructure(e.nodeDependencies))
+            || !d.matchesStructure(e.nodeDependencies)
+            || (e.space == "world" && !d.matchesAncestry(e.nodeDependencies)))
           stale = true;
         else {
           auto it = std::find_if(nodes.begin(),
@@ -913,6 +931,7 @@ inline EditResult EditService::commit(
           if (it == nodes.end()) {
             nodes.push_back({node, &e, d});
             it = std::prev(nodes.end());
+            it->ancestors = std::move(ancestors);
           }
           if (e.parameter == "enabled") {
             it->changedEnabled = true;
@@ -950,6 +969,10 @@ inline EditResult EditService::commit(
             it->matrix[3].y = position.y;
             it->matrix[3].z = position.z;
             it->srt[2] = position;
+            if (e.space == "world") {
+              it->worldEntry = &e;
+              it->worldIndex = index;
+            }
           } else {
             if (!node->value().isTransform()) {
               res.outcome = Outcome::INVALID_REQUEST;
@@ -1000,6 +1023,99 @@ inline EditResult EditService::commit(
     return res;
   }
 
+  // Resolve world requests parent-first, using complete proposed states.
+  // Saved chains are bounded by the same 4096-step preparation budget.
+  auto prepareWorld = [&](auto &&self, PlannedNode &p) -> ValueError {
+    if (!p.worldEntry || p.worldPrepared)
+      return ValueError::NONE;
+    double parent[4][4]{};
+    for (int i = 0; i < 4; ++i)
+      parent[i][i] = 1;
+    for (auto a = p.ancestors.rbegin(); a != p.ancestors.rend(); ++a) {
+      auto proposed = std::find_if(nodes.begin(),
+          nodes.end(),
+          [&](const PlannedNode &n) { return n.node == *a; });
+      if (proposed != nodes.end()) {
+        auto error = self(self, *proposed);
+        if (error != ValueError::NONE)
+          return error;
+      }
+      const auto &data = (*a)->value();
+      if (anari::isArray(data.type()))
+        return ValueError::UNSUPPORTED_NODE_KIND;
+      if (!data.isTransform())
+        continue;
+      const auto matrix = proposed != nodes.end() && proposed->changedTransform
+          ? proposed->matrix
+          : data.getTransform();
+      double product[4][4]{};
+      for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < 4; ++col) {
+          if (!std::isfinite(matrix[col][row]))
+            return ValueError::NON_FINITE;
+          if (row == 3 && matrix[col][row] != (col == 3 ? 1.f : 0.f))
+            return ValueError::NON_AFFINE;
+          for (int k = 0; k < 4; ++k)
+            product[row][col] += parent[row][k] * double(matrix[col][k]);
+          if (!std::isfinite(product[row][col]))
+            return ValueError::NON_FINITE;
+          if (std::abs(product[row][col]) > std::numeric_limits<float>::max())
+            return ValueError::OUT_OF_DOMAIN;
+        }
+      }
+      std::memcpy(parent, product, sizeof(parent));
+    }
+    // Pivoted elimination solves the affine point conversion; no repair or
+    // pseudoinverse is permitted. Keep binary64 request coordinates here.
+    double system[3][4];
+    for (int row = 0; row < 3; ++row) {
+      for (int col = 0; col < 3; ++col)
+        system[row][col] = parent[row][col];
+      system[row][3] =
+          p.worldEntry->value.elements[row].number - parent[row][3];
+    }
+    for (int col = 0; col < 3; ++col) {
+      int pivot = col;
+      for (int row = col + 1; row < 3; ++row)
+        if (std::abs(system[row][col]) > std::abs(system[pivot][col]))
+          pivot = row;
+      if (system[pivot][col] == 0)
+        return ValueError::SINGULAR_PARENT;
+      for (int k = 0; k < 4; ++k)
+        std::swap(system[col][k], system[pivot][k]);
+      const double divisor = system[col][col];
+      for (int k = col; k < 4; ++k)
+        system[col][k] /= divisor;
+      for (int row = 0; row < 3; ++row) {
+        if (row == col)
+          continue;
+        const double factor = system[row][col];
+        for (int k = col; k < 4; ++k)
+          system[row][k] -= factor * system[col][k];
+      }
+    }
+    const double limit = std::numeric_limits<float>::max();
+    for (int row = 0; row < 3; ++row) {
+      auto value =
+          convertScalar(JsonValue::fromNumber(system[row][3]), {-limit, limit});
+      if (!value.ok())
+        return value.error;
+      p.matrix[3][row] = value.value;
+      p.srt[2][row] = value.value;
+    }
+    p.worldPrepared = true;
+    return ValueError::NONE;
+  };
+  for (auto &p : nodes) {
+    auto error = prepareWorld(prepareWorld, p);
+    if (error != ValueError::NONE) {
+      res.outcome = Outcome::INVALID_REQUEST;
+      res.failedEntry = p.worldIndex;
+      res.valueError = error;
+      return res;
+    }
+  }
+
   // 2. Prepare allocations, Batch Reference and restoration storage. //
 
   RestorationRecord record;
@@ -1021,6 +1137,7 @@ inline EditResult EditService::commit(
       c.beforeEnabled = p.node->value().isEnabled();
       c.changedEnabled = p.changedEnabled;
       c.changedTransform = p.changedTransform;
+      c.requiresAncestry = p.worldEntry != nullptr;
       if (c.changedTransform) {
         c.beforeMatrix = p.node->value().getTransform();
         c.beforeSRT = p.node->value().getTransformSRT();
@@ -1092,6 +1209,12 @@ inline EditResult EditService::commit(
   }
   for (auto &c : record.nodeChanges) {
     c.resulting.expected = *ident->nodeEditVersion(c.resulting.expected.node);
+    const auto &p = nodes[&c - record.nodeChanges.data()];
+    c.resulting.dependencies.transformVersion = 0;
+    for (const auto &a : p.ancestors)
+      c.resulting.dependencies.transformVersion =
+          std::max(c.resulting.dependencies.transformVersion,
+              a->value().transformVersion());
     res.nodeVersions.push_back(c.resulting);
   }
   res.committed = true;

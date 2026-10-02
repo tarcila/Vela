@@ -386,7 +386,9 @@ inline RestoreResult RestoreService::commit(
 
   std::size_t remaining = 4096;
   std::vector<identity::NodeDependencyWalk> dependencies;
+  std::vector<std::vector<scene::LayerNodeRef>> ancestors;
   try {
+    ancestors.resize(record->nodeChanges.size());
     dependencies.reserve(record->nodeChanges.size());
   } catch (const std::bad_alloc &) {
     res.outcome = Outcome::BUSY;
@@ -394,14 +396,25 @@ inline RestoreResult RestoreService::commit(
   }
   for (const auto &c : record->nodeChanges) {
     identity::NodeDependencyWalk current;
-    auto status = edit::detail::nodeDependencies(
-        *ident, c.resulting.expected.node, current, remaining);
+    Outcome status;
+    try {
+      status = edit::detail::nodeDependencies(*ident,
+          c.resulting.expected.node,
+          current,
+          remaining,
+          &ancestors[dependencies.size()]);
+    } catch (const std::bad_alloc &) {
+      res.outcome = Outcome::BUSY;
+      return res;
+    }
     if (status == Outcome::BUSY) {
       res.outcome = status;
       return res;
     }
     if (status != Outcome::OK || !ident->isCurrent(c.resulting.expected)
-        || !current.matchesStructure(c.resulting.dependencies)) {
+        || !current.matchesStructure(c.resulting.dependencies)
+        || (c.requiresAncestry
+            && !current.matchesAncestry(c.resulting.dependencies))) {
       markConflicting(request.targetBatchRef, ctx);
       res.outcome = Outcome::CONFLICT;
       return res;
@@ -491,6 +504,10 @@ inline RestoreResult RestoreService::commit(
     auto v = record->nodeChanges[i].resulting;
     v.expected = *ident->nodeEditVersion(v.expected.node);
     v.dependencies = dependencies[i];
+    v.dependencies.transformVersion = 0;
+    for (const auto &a : ancestors[i])
+      v.dependencies.transformVersion = std::max(
+          v.dependencies.transformVersion, a->value().transformVersion());
     res.nodeVersions.push_back(v);
   }
   res.committed = true;

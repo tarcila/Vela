@@ -1630,14 +1630,20 @@ SCENARIO("MCP node enabled edit inspect restore uses only wire tokens",
   CHECK(node->value().isEnabled());
 }
 
-SCENARIO(
-    "MCP local position and enabled group preserves exact matrix on restore",
+SCENARIO("MCP world position requires ancestry and restores exact node state",
     "[integration][node-mcp][node-position]")
 {
   Fixture f({}, true, true);
   auto *layer = f.scene.defaultLayer();
-  auto node = layer->root()->insert_last_child(
-      vsr::scene::LayerNodeData(layer, "wire-move"));
+  auto parent = layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, "wire-parent"));
+  auto parentMatrix = vsr::math::IDENTITY_MAT4;
+  parentMatrix[0] = {0, 2, 0, 0};
+  parentMatrix[1] = {-3, 0, 0, 0};
+  parentMatrix[3] = {2, 3, 4, 1};
+  parent->value().setAsTransform(parentMatrix);
+  auto node =
+      parent->insert_last_child(vsr::scene::LayerNodeData(layer, "wire-move"));
   auto original = vsr::math::IDENTITY_MAT4;
   original[0] = {-2.f, 1.f, 0.f, 0.f};
   original[1] = {3.f, 4.f, 0.f, 0.f};
@@ -1670,12 +1676,19 @@ SCENARIO(
       + json::quote(before.get("structural_version")->s);
   auto args = [&](const std::string &space) {
     return "{\"request_id\":2," + scene + ",\"edits\":[{" + target
-        + ",\"parameter\":\"position\",\"value\":[11,-12,13]" + space + "},{"
+        + ",\"parameter\":\"position\",\"value\":[13,-9,17]" + space + "},{"
         + target + ",\"parameter\":\"enabled\",\"value\":false}]}";
   };
   CHECK(f.tool(s, "vsr_edit", args(",\"space\":\"world\"")).errorCode()
       == "invalid_request");
-  REQUIRE(f.tool(s, "vsr_edit", args("")).errorCode().empty());
+  CHECK(f.tool(s,
+             "vsr_edit",
+             args(",\"space\":\"world\",\"ancestry_version\":\"bad\""))
+            .errorCode()
+      == "invalid_request");
+  const auto worldArgs = args(",\"space\":\"world\",\"ancestry_version\":"
+      + json::quote(before.get("ancestry_version")->s));
+  REQUIRE(f.tool(s, "vsr_edit", worldArgs).errorCode().empty());
   f.drain();
   auto done = f.status(s, s.id, 2);
   REQUIRE(done.str("outcome") == "ok");
@@ -1687,11 +1700,13 @@ SCENARIO(
   const auto &rows = moved.get("local_matrix")->get("data")->a;
   CHECK(rows[0].a[0].n == -2);
   CHECK(rows[0].a[1].n == 3);
-  CHECK(rows[0].a[3].n == 11);
-  CHECK(rows[1].a[3].n == -12);
+  CHECK(rows[0].a[3].n == -6);
+  CHECK(std::abs(rows[1].a[3].n + 11. / 3) < 1e-6);
   CHECK(rows[2].a[3].n == 13);
   CHECK(rows[2].a[2].n == 0);
-  CHECK(f.tool(s, "vsr_edit", args(",\"space\":\"local\"")).flag("replayed"));
+  CHECK(f.tool(s, "vsr_edit", worldArgs).flag("replayed"));
+  CHECK(f.tool(s, "vsr_edit", args(",\"space\":\"local\"")).errorCode()
+      == "request_id_conflict");
   REQUIRE(f.restoreBatch(s, 4, batch).errorCode().empty());
   f.drain();
   REQUIRE(f.status(s, s.id, 4).str("outcome") == "ok");
@@ -1756,6 +1771,93 @@ SCENARIO("MCP mixed edit and restore carry one batch and both version lists",
   CHECK(f.opacity0() == 1.f);
   CHECK(node->value().getTransform() == vsr::math::IDENTITY_MAT4);
   CHECK(f.restoreBatch(s, 4, batch).flag("replayed"));
+}
+
+SCENARIO(
+    "MCP world parent child permutations restore and reject stale ancestry",
+    "[integration][node-mcp][node-world]")
+{
+  for (bool reverse : {false, true}) {
+    Fixture f({}, true, true);
+    auto *l = f.scene.defaultLayer();
+    auto grand =
+        l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "g"));
+    auto parent = grand->insert_last_child(vsr::scene::LayerNodeData(l, "p"));
+    auto child = parent->insert_last_child(vsr::scene::LayerNodeData(l, "c"));
+    auto matrix = vsr::math::IDENTITY_MAT4;
+    matrix[0] = {0, 2, 0, 0};
+    matrix[1] = {-3, 0, 0, 0};
+    matrix[3] = {10, 20, 30, 1};
+    grand->value().setAsTransform(matrix);
+    parent->value().setAsTransform(vsr::math::IDENTITY_MAT4);
+    child->value().setAsTransform(vsr::math::IDENTITY_MAT4);
+    f.scene.signalLayerStructureChanged(l);
+    auto s = f.attach();
+    const auto scene = "\"scene_id\":" + std::to_string(f.sceneId);
+    std::uint64_t id = 0;
+    auto inspect = [&](const std::string &name) {
+      ++id;
+      REQUIRE(
+          f.tool(s,
+               "vsr_inspect",
+               "{\"request_id\":" + std::to_string(id) + "," + scene
+                   + ",\"kind\":\"nodes\",\"name\":" + json::quote(name) + "}")
+              .errorCode()
+              .empty());
+      f.drain();
+      auto result = f.status(s, s.id, id);
+      REQUIRE(result.str("outcome") == "ok");
+      REQUIRE(result.result()->get("items")->a.size() == 1);
+      return result.result()->get("items")->a[0];
+    };
+    auto entry =
+        [&](const json::Value &n, const std::string &value, bool world) {
+          return "{\"target_kind\":\"node\",\"handle\":"
+              + json::quote(n.get("handle")->s)
+              + ",\"version\":" + json::quote(n.get("node_edit_version")->s)
+              + ",\"structural_version\":"
+              + json::quote(n.get("structural_version")->s)
+              + ",\"parameter\":\"position\",\"value\":" + value
+              + (world ? ",\"space\":\"world\",\"ancestry_version\":"
+                          + json::quote(n.get("ancestry_version")->s)
+                       : "")
+              + "}";
+        };
+    const auto p = entry(inspect("p"), "[1,2,3]", false);
+    const auto c = entry(inspect("c"), "[-8,30,39]", true);
+    auto edit = [&](const std::string &entries) {
+      ++id;
+      REQUIRE(
+          f.tool(s,
+               "vsr_edit",
+               "{\"request_id\":" + std::to_string(id) + "," + scene
+                   + ",\"edits\":[" + entries + "]}")
+              .errorCode()
+              .empty());
+      f.drain();
+      return f.status(s, s.id, id);
+    };
+    auto done = edit(reverse ? c + "," + p : p + "," + c);
+    REQUIRE(done.str("outcome") == "ok");
+    CHECK(child->value().getTransform()[3] == vsr::math::float4(4, 4, 6, 1));
+    const auto batch = *done.result()->get("batch_ref");
+    REQUIRE(f.restoreBatch(s, ++id, batch).errorCode().empty());
+    f.drain();
+    REQUIRE(f.status(s, s.id, id).str("outcome") == "ok");
+    CHECK(parent->value().getTransform() == vsr::math::IDENTITY_MAT4);
+    CHECK(child->value().getTransform() == vsr::math::IDENTITY_MAT4);
+    const auto stale = entry(inspect("c"), "[-8,30,39]", true);
+    grand->value().setAsTransform(vsr::math::IDENTITY_MAT4);
+    grand->value().setAsTransform(matrix);
+    f.scene.signalLayerStructureChanged(l);
+    CHECK(edit(stale).str("outcome") == "conflict");
+    matrix[0] = {0, 0, 0, 0};
+    grand->value().setAsTransform(matrix);
+    f.scene.signalLayerStructureChanged(l);
+    CHECK(edit(entry(inspect("c"), "[-8,30,39]", true)).str("outcome")
+        == "invalid_request");
+    CHECK(child->value().getTransform() == vsr::math::IDENTITY_MAT4);
+  }
 }
 
 #endif

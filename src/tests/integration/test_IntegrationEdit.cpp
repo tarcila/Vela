@@ -2239,6 +2239,231 @@ TEST_CASE("Viewer activity controls restore enabled nodes after disconnect",
   CHECK_FALSE(restores.eligible(*result.batchRef));
 }
 
+TEST_CASE("World origin conversion uses final ancestors and restores exactly",
+    "[integration][node-world]")
+{
+  for (int mode : {0, 1, 2})
+    for (bool reverse : {false, true})
+      for (bool laterChange : {false, true}) {
+        Fixture f(true);
+        auto *l = f.scene.defaultLayer();
+        auto grand =
+            l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "grand"));
+        auto parent =
+            grand->insert_last_child(vsr::scene::LayerNodeData(l, "parent"));
+        auto child =
+            parent->insert_last_child(vsr::scene::LayerNodeData(l, "child"));
+        auto g = vsr::math::IDENTITY_MAT4;
+        g[0] = {0, 2, 0, 0};
+        g[1] = {-3, 0, 0, 0};
+        g[3] = {10, 20, 30, 1};
+        grand->value().setAsTransform(g);
+        parent->value().setAsTransform(vsr::math::IDENTITY_MAT4);
+        auto original = vsr::math::IDENTITY_MAT4;
+        original[1].x = 0.5f;
+        original[3] = {7, 8, 9, 1};
+        child->value().setAsTransform(original);
+        child->value().setCurrentValueAsDefault();
+        const auto cache = child->value().getTransformSRT();
+        f.scene.signalLayerStructureChanged(l);
+        auto p = f.positionEntry(parent,
+            JsonValue::array({JsonValue::fromNumber(1),
+                JsonValue::fromNumber(2),
+                JsonValue::fromNumber(3)}));
+        auto c = f.positionEntry(child,
+            JsonValue::array({JsonValue::fromNumber(-8),
+                JsonValue::fromNumber(30),
+                JsonValue::fromNumber(39)}));
+        c.space = "world";
+        c.hasAncestryVersion = true;
+        if (mode == 1) {
+          p.parameter = "transform";
+          p.value =
+              JsonValue::array({JsonValue::array({JsonValue::fromNumber(2),
+                                    JsonValue::fromNumber(0),
+                                    JsonValue::fromNumber(0),
+                                    JsonValue::fromNumber(1)}),
+                  JsonValue::array({JsonValue::fromNumber(0),
+                      JsonValue::fromNumber(4),
+                      JsonValue::fromNumber(0),
+                      JsonValue::fromNumber(2)}),
+                  JsonValue::array({JsonValue::fromNumber(0),
+                      JsonValue::fromNumber(0),
+                      JsonValue::fromNumber(3),
+                      JsonValue::fromNumber(3)}),
+                  JsonValue::array({JsonValue::fromNumber(0),
+                      JsonValue::fromNumber(0),
+                      JsonValue::fromNumber(0),
+                      JsonValue::fromNumber(1)})});
+        } else if (mode == 2) {
+          p.space = "world";
+          p.hasAncestryVersion = true;
+          p.value = JsonValue::array({JsonValue::fromNumber(4),
+              JsonValue::fromNumber(22),
+              JsonValue::fromNumber(33)});
+        }
+        auto batch = reverse ? f.batch({c, p}) : f.batch({p, c});
+        auto r = f.run(1, batch);
+        REQUIRE(r.outcome == Outcome::OK);
+        REQUIRE(r.committed);
+        CHECK(child->value().getTransform()[3]
+            == (mode == 1 ? vsr::math::float4(2, 1, 2, 1)
+                          : vsr::math::float4(4, 4, 6, 1)));
+        for (int col = 0; col < 3; ++col)
+          CHECK(child->value().getTransform()[col] == original[col]);
+        CHECK(f.hookCalls == 1);
+        if (laterChange) {
+          const auto finalParent = parent->value().getTransform();
+          parent->value().setAsTransform(vsr::math::IDENTITY_MAT4);
+          parent->value().setAsTransform(finalParent);
+          f.scene.signalLayerStructureChanged(l);
+        }
+        restore::RestoreService restores(*f.engine, *f.edits);
+        restores.attachScene(f.sceneId, *f.identity);
+        auto ack = restores.submitLocal({f.sceneId, *r.batchRef});
+        REQUIRE(ack.code == Outcome::OK);
+        while (f.integration.service()) {
+        }
+        if (laterChange) {
+          CHECK(restores.resultLocal(ack.ref)->outcome == Outcome::CONFLICT);
+          CHECK_FALSE(restores.resultLocal(ack.ref)->committed);
+          continue;
+        }
+        REQUIRE(restores.resultLocal(ack.ref)->committed);
+        auto restored = child->value().getTransform();
+        auto restoredCache = child->value().getTransformSRT();
+        CHECK(std::memcmp(&restored, &original, sizeof(original)) == 0);
+        CHECK(std::memcmp(&restoredCache, &cache, sizeof(cache)) == 0);
+        CHECK(child->value().isDefaultValue());
+        CHECK(parent->value().getTransform() == vsr::math::IDENTITY_MAT4);
+      }
+}
+
+TEST_CASE("World conversion accepts invertible shear reflection and tiny scale",
+    "[integration][node-world]")
+{
+  for (bool tiny : {false, true}) {
+    Fixture f(true);
+    auto *l = f.scene.defaultLayer();
+    auto parent =
+        l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "p"));
+    auto child = parent->insert_last_child(vsr::scene::LayerNodeData(l, "c"));
+    auto matrix = vsr::math::IDENTITY_MAT4;
+    matrix[0].x = tiny ? 1e-20f : -2.f;
+    matrix[1].x = tiny ? 0.f : 3.f;
+    matrix[1].y = 4.f;
+    matrix[3] = {0, 2, 3, 1};
+    parent->value().setAsTransform(matrix);
+    child->value().setAsTransform(vsr::math::IDENTITY_MAT4);
+    f.scene.signalLayerStructureChanged(l);
+    auto e = f.positionEntry(child,
+        JsonValue::array(
+            {JsonValue::fromNumber(tiny ? double(matrix[0].x) * 2 : 5),
+                JsonValue::fromNumber(14),
+                JsonValue::fromNumber(7)}));
+    e.space = "world";
+    e.hasAncestryVersion = true;
+    auto result = f.run(1, f.batch({e}));
+    REQUIRE(result.outcome == Outcome::OK);
+    CHECK(child->value().getTransform()[3] == vsr::math::float4(2, 3, 4, 1));
+  }
+}
+
+TEST_CASE("World position rejects invalid final parents without partial writes",
+    "[integration][node-world]")
+{
+  for (int mode : {0, 1, 2, 3}) {
+    Fixture f(true);
+    auto *l = f.scene.defaultLayer();
+    auto parent =
+        l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "p"));
+    auto child = parent->insert_last_child(vsr::scene::LayerNodeData(l, "c"));
+    auto matrix = vsr::math::IDENTITY_MAT4;
+    if (mode == 0)
+      matrix[0].x = 0;
+    if (mode == 1)
+      matrix[0].x = std::numeric_limits<float>::denorm_min();
+    if (mode == 2)
+      matrix[0].x = std::numeric_limits<float>::infinity();
+    if (mode == 3)
+      matrix[0].w = 1;
+    parent->value().setAsTransform(matrix);
+    child->value().setAsTransform(vsr::math::IDENTITY_MAT4);
+    f.scene.signalLayerStructureChanged(l);
+    auto e = f.positionEntry(child,
+        JsonValue::array({JsonValue::fromNumber(1),
+            JsonValue::fromNumber(2),
+            JsonValue::fromNumber(3)}));
+    e.space = "world";
+    e.hasAncestryVersion = true;
+    auto result = f.run(1, f.batch({f.nodeEntry(parent, false), e}));
+    CHECK(result.outcome == Outcome::INVALID_REQUEST);
+    CHECK_FALSE(result.committed);
+    CHECK_FALSE(result.batchRef);
+    CHECK(result.valueError
+        == (mode == 0       ? ValueError::SINGULAR_PARENT
+                : mode == 1 ? ValueError::OUT_OF_DOMAIN
+                : mode == 2 ? ValueError::NON_FINITE
+                            : ValueError::NON_AFFINE));
+    CHECK(parent->value().isEnabled());
+    CHECK(child->value().getTransform() == vsr::math::IDENTITY_MAT4);
+    CHECK(f.hookCalls == 0);
+  }
+}
+
+TEST_CASE("World ancestry change-back conflicts but local restore stays narrow",
+    "[integration][node-world]")
+{
+  for (bool world : {false, true}) {
+    Fixture f(true);
+    auto *l = f.scene.defaultLayer();
+    auto parent =
+        l->root()->insert_last_child(vsr::scene::LayerNodeData(l, "p"));
+    auto child = parent->insert_last_child(vsr::scene::LayerNodeData(l, "c"));
+    parent->value().setAsTransform(vsr::math::IDENTITY_MAT4);
+    child->value().setAsTransform(vsr::math::IDENTITY_MAT4);
+    f.scene.signalLayerStructureChanged(l);
+    auto entry = [&] {
+      auto e = f.positionEntry(child,
+          JsonValue::array({JsonValue::fromNumber(1),
+              JsonValue::fromNumber(2),
+              JsonValue::fromNumber(3)}));
+      e.space = world ? "world" : "local";
+      e.hasAncestryVersion = world;
+      return e;
+    };
+    auto stale = entry();
+    auto changeBack = [&] {
+      auto m = vsr::math::IDENTITY_MAT4;
+      m[3].x = 20;
+      parent->value().setAsTransform(m);
+      parent->value().setAsTransform(vsr::math::IDENTITY_MAT4);
+      f.scene.signalLayerStructureChanged(l);
+    };
+    changeBack();
+    auto result = f.run(1, f.batch({stale}));
+    CHECK(result.outcome == (world ? Outcome::CONFLICT : Outcome::OK));
+    result = f.run(2, f.batch({entry()}));
+    REQUIRE(result.committed);
+    changeBack();
+    restore::RestoreService restores(*f.engine, *f.edits);
+    restores.attachScene(f.sceneId, *f.identity);
+    auto ack = restores.submitLocal({f.sceneId, *result.batchRef});
+    REQUIRE(ack.code == Outcome::OK);
+    while (f.integration.service()) {
+    }
+    auto restored = restores.resultLocal(ack.ref);
+    CHECK(restored->outcome == (world ? Outcome::CONFLICT : Outcome::OK));
+    CHECK(restored->committed == !world);
+    if (world) {
+      auto retry = restores.submitLocal({f.sceneId, *result.batchRef});
+      while (f.integration.service()) {
+      }
+      CHECK(restores.resultLocal(retry.ref)->outcome == Outcome::CONFLICT);
+    }
+  }
+}
+
 TEST_CASE("Deep node preparation fails boundedly without mutation",
     "[integration][node-edit]")
 {

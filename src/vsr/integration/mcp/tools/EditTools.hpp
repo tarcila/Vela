@@ -158,7 +158,8 @@ inline std::optional<edit::EditBatch> editBatchArg(
         return {};
       const auto *space = e.get("space");
       if (space) {
-        if (param->s != "position" || !space->isString() || space->s != "local")
+        if (param->s != "position" || !space->isString()
+            || (space->s != "local" && space->s != "world"))
           return {};
         entry.space = space->s;
       }
@@ -166,6 +167,21 @@ inline std::optional<edit::EditBatch> editBatchArg(
       entry.nodeExpected = {{launch, handle->domain, handle->serial}, *nv};
       entry.nodeDependencies = {
           entry.nodeExpected.node, {launch, lh->domain, lh->serial}, 0, *ds, 0};
+      if (entry.space == "world") {
+        const auto *ancestry = e.get("ancestry_version");
+        const auto ap = "na:" + e.get("handle")->s + ":" + lv.s + ":"
+            + std::to_string(*ds) + ":";
+        if (!ancestry || !ancestry->isString()
+            || ancestry->s.compare(0, ap.size(), ap))
+          return {};
+        const auto tail = ancestry->s.substr(ap.size());
+        auto av =
+            tail == "0" ? std::optional<std::uint64_t>(0) : tokenNumber(tail);
+        if (!av)
+          return {};
+        entry.nodeDependencies.transformVersion = *av;
+        entry.hasAncestryVersion = true;
+      }
     } else {
       if (!optionalIntArg(e, "version", version) || !version || *version < 0)
         return {};
@@ -211,7 +227,7 @@ inline void addEditTools(std::vector<Tool> &tools, EditDeps deps)
   Tool editTool;
   editTool.name = "vsr_edit";
   editTool.description =
-      "Atomically apply up to 64 object parameter or explicitly exposed node enabled/local position/transform edits to one scene; position is three finite float32-representable numbers, space defaults to local, and only scalar-transform nodes accept position or transform (no world, rotation or scale edits). Transform replaces a scalar node's complete local affine matrix (four rows of four finite numbers, column-vector math, last-column translation, exact last row [0,0,0,1]). Shear, reflection and singular affine matrices are supported. Transform cannot combine with position/rotation/scale on the same node but may combine with Boolean enabled. Node entries require target_kind=node, opaque version and structural_version from inspection. Returns a "
+      "Atomically apply up to 64 object parameter or explicitly exposed node enabled/local or world position/transform edits to one scene; position is three finite float32-representable numbers, space defaults to local, and only scalar-transform nodes accept position or transform (no world rotation, scale or matrix edits). World position means the node's local origin, requires ancestry_version from inspection, and converts through finite invertible proposed final ancestors; singular parents reject without fallback. Transform replaces a scalar node's complete local affine matrix (four rows of four finite numbers, column-vector math, last-column translation, exact last row [0,0,0,1]). Shear, reflection and singular affine matrices are supported. Transform cannot combine with position/rotation/scale on the same node but may combine with Boolean enabled. Node entries require target_kind=node, opaque version and structural_version from inspection. Returns a "
       "batch_ref on commit.";
   editTool.inputSchemaJson = std::string("{\"type\":\"object\",\"properties\":{")
       + requestIdSchema()
@@ -221,7 +237,8 @@ inline void addEditTools(std::vector<Tool> &tools, EditDeps deps)
         "\"handle\":{\"type\":\"string\"},"
         "\"target_kind\":{\"enum\":[\"object\",\"node\"]},"
         "\"structural_version\":{\"type\":\"string\"},"
-        "\"space\":{\"enum\":[\"local\"]},"
+        "\"ancestry_version\":{\"type\":\"string\"},"
+        "\"space\":{\"enum\":[\"local\",\"world\"]},"
         "\"version\":{\"type\":[\"integer\",\"string\"]},"
         "\"parameter\":{\"type\":\"string\"},\"value\":{}},"
         "\"required\":[\"handle\",\"version\",\"parameter\",\"value\"]}}},"

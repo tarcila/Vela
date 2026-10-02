@@ -129,6 +129,29 @@ The tools are `vsr_discover`, `vsr_inspect`, `vsr_operation_status`,
 `vsr_resynchronize`. See the [carrier and tool contract](../src/vsr/integration/mcp/README.md)
 for argument schemas, revision tokens, and stable outcome codes.
 
+### Editing a placement's world position
+
+Scene objects own parameters; layer nodes place those objects. To move a
+placement, inspect `kind: "nodes"` and use its `handle`, `node_edit_version`,
+`structural_version`, and `ancestry_version`. The scene must explicitly expose
+node edits. A `vsr_edit` node entry uses `target_kind: "node"`, those tokens
+(`version` carries `node_edit_version`), `parameter: "position"`, a three-number
+`value`, and `space: "world"`. Omitting `space` means local coordinates.
+
+World position is the location of the node's **local origin**, not its bounds or
+geometric center. Conversion uses the proposed final ancestor matrices, so
+parent/child entry order does not change the result. Only translation changes;
+shear/reflection in the node's linear part is preserved. Parents must be finite,
+affine and invertible, and the converted local point must fit float32. Singular
+parents reject without repair or fallback. World rotation, scale and matrix
+replacement are not supported.
+
+Reinspect after ancestor transform writes, including change-back: stale world
+ancestry conflicts, while unrelated sibling edits do not. Restore validates the
+batch's post-commit ancestry, so a parent/child batch is immediately restorable;
+a subsequent ancestor transform write prevents restoration, even if changed
+back. Restore is conditional and one-way, not general undo.
+
 ### 4. Disconnect and reconnect
 
 Exit Pi to detach the proxy and release the controller session; it logs
