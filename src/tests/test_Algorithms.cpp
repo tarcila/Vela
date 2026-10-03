@@ -13,7 +13,13 @@
 #include "vsr/algorithms/cpu/outputTransform.hpp"
 #include "vsr/algorithms/cpu/toneMap.hpp"
 #include "vsr/algorithms/cpu/visualizeAOV.hpp"
+#ifdef VSR_ALGORITHMS_HAS_CUDA
+#include "vsr/algorithms/cuda/clearBuffers.hpp"
+#include "vsr/algorithms/cuda/convertColorBuffer.hpp"
+#include "vsr/algorithms/cuda/toneMap.hpp"
+#endif
 // vsr_core
+#include "vsr/core/TypeMacros.hpp"
 #include "vsr/core/VSRMath.hpp"
 // helium
 #include <helium/helium_math.h>
@@ -61,6 +67,66 @@ uint32_t shadePixel(uint32_t c)
   return helium::cvt_color_to_uint32(c_out);
 }
 
+#ifdef VSR_ALGORITHMS_HAS_CUDA
+
+struct DeviceBuffer
+{
+  explicit DeviceBuffer(size_t bytes);
+  ~DeviceBuffer();
+  VSR_NOT_COPYABLE(DeviceBuffer)
+  VSR_NOT_MOVEABLE(DeviceBuffer)
+
+  void *data{nullptr};
+};
+
+DeviceBuffer::DeviceBuffer(size_t bytes)
+{
+  REQUIRE(cudaMalloc(&data, bytes) == cudaSuccess);
+}
+
+DeviceBuffer::~DeviceBuffer()
+{
+  CHECK(cudaFree(data) == cudaSuccess);
+}
+
+struct DeviceStream
+{
+  DeviceStream();
+  ~DeviceStream();
+  VSR_NOT_COPYABLE(DeviceStream)
+  VSR_NOT_MOVEABLE(DeviceStream)
+
+  cudaStream_t stream{nullptr};
+};
+
+DeviceStream::DeviceStream()
+{
+  REQUIRE(
+      cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess);
+}
+
+DeviceStream::~DeviceStream()
+{
+  CHECK(cudaStreamDestroy(stream) == cudaSuccess);
+}
+
+void requireCudaDevice()
+{
+  int count = 0;
+  const auto status = cudaGetDeviceCount(&count);
+  INFO(cudaGetErrorString(status));
+  REQUIRE(status == cudaSuccess);
+  REQUIRE(count > 0);
+  cudaDeviceProp properties{};
+  int device = 0;
+  REQUIRE(cudaGetDevice(&device) == cudaSuccess);
+  REQUIRE(cudaGetDeviceProperties(&properties, device) == cudaSuccess);
+  INFO("CUDA device: " << properties.name);
+  REQUIRE(properties.major > 0);
+}
+
+#endif
+
 } // namespace
 
 SCENARIO("Host buffer helpers apply fills and float-to-byte conversion",
@@ -96,6 +162,142 @@ SCENARIO("Host buffer helpers apply fills and float-to-byte conversion",
     }
   }
 }
+
+#ifdef VSR_ALGORITHMS_HAS_CUDA
+
+TEST_CASE("CUDA buffer helpers match CPU results on device memory",
+    "[Algorithms][CUDA]")
+{
+  requireCudaDevice();
+  DeviceStream explicitStream;
+  // An odd size crosses launch boundaries and exercises the final tail.
+  constexpr uint32_t COUNT = 1027;
+  DeviceBuffer floatBuffer(COUNT * sizeof(float));
+  DeviceBuffer uintBuffer(COUNT * sizeof(uint32_t));
+  DeviceBuffer byteBuffer(COUNT * sizeof(uint8_t));
+  auto *floats = static_cast<float *>(floatBuffer.data);
+  auto *uints = static_cast<uint32_t *>(uintBuffer.data);
+  auto *bytes = static_cast<uint8_t *>(byteBuffer.data);
+  cudaPointerAttributes attributes{};
+  REQUIRE(cudaPointerGetAttributes(&attributes, floats) == cudaSuccess);
+  REQUIRE(attributes.type == cudaMemoryTypeDevice);
+
+  for (const bool useExplicitStream : {false, true}) {
+    const auto stream = useExplicitStream ? explicitStream.stream : nullptr;
+    CAPTURE(useExplicitStream);
+    REQUIRE(cudaMemsetAsync(floats, 0, COUNT * sizeof(float), stream)
+        == cudaSuccess);
+    REQUIRE(cudaMemsetAsync(uints, 0, COUNT * sizeof(uint32_t), stream)
+        == cudaSuccess);
+    if (useExplicitStream) {
+      vsr::algorithms::cuda::fill(stream, floats, COUNT, 3.5f);
+      vsr::algorithms::cuda::fill(stream, uints, COUNT, 0xDEADBEEFu);
+    } else {
+      vsr::algorithms::cuda::fill(floats, COUNT, 3.5f);
+      vsr::algorithms::cuda::fill(uints, COUNT, 0xDEADBEEFu);
+    }
+    REQUIRE(cudaGetLastError() == cudaSuccess);
+    REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+    std::vector<float> actualFloats(COUNT), expectedFloats(COUNT);
+    std::vector<uint32_t> actualUints(COUNT), expectedUints(COUNT);
+    REQUIRE(cudaMemcpy(actualFloats.data(),
+                floats,
+                COUNT * sizeof(float),
+                cudaMemcpyDeviceToHost)
+        == cudaSuccess);
+    REQUIRE(cudaMemcpy(actualUints.data(),
+                uints,
+                COUNT * sizeof(uint32_t),
+                cudaMemcpyDeviceToHost)
+        == cudaSuccess);
+    cpu::fill(expectedFloats.data(), COUNT, 3.5f);
+    cpu::fill(expectedUints.data(), COUNT, 0xDEADBEEFu);
+    REQUIRE(actualFloats == expectedFloats);
+    REQUIRE(actualUints == expectedUints);
+
+    const std::array<float, 7> values{-1.f, 0.f, 0.25f, 0.5f, 0.75f, 1.f, 2.f};
+    for (size_t i = 0; i < COUNT; ++i)
+      actualFloats[i] = values[i % values.size()];
+    REQUIRE(cudaMemcpyAsync(floats,
+                actualFloats.data(),
+                COUNT * sizeof(float),
+                cudaMemcpyHostToDevice,
+                stream)
+        == cudaSuccess);
+    REQUIRE(cudaMemsetAsync(bytes, 42, COUNT, stream) == cudaSuccess);
+    if (useExplicitStream)
+      vsr::algorithms::cuda::convertFloatToUint8(stream, floats, bytes, COUNT);
+    else
+      vsr::algorithms::cuda::convertFloatToUint8(floats, bytes, COUNT);
+    REQUIRE(cudaGetLastError() == cudaSuccess);
+    REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+    std::vector<uint8_t> actualBytes(COUNT), expectedBytes(COUNT);
+    REQUIRE(cudaMemcpy(actualBytes.data(), bytes, COUNT, cudaMemcpyDeviceToHost)
+        == cudaSuccess);
+    cpu::convertFloatToUint8(actualFloats.data(), expectedBytes.data(), COUNT);
+    REQUIRE(actualBytes == expectedBytes);
+  }
+}
+
+TEST_CASE("CUDA tone mapping matches CPU curves and preserves alpha",
+    "[Algorithms][CUDA]")
+{
+  requireCudaDevice();
+  DeviceStream explicitStream;
+  constexpr uint32_t COUNT = 1027;
+  std::vector<float> input(COUNT * 4);
+  for (size_t i = 0; i < COUNT; ++i) {
+    input[i * 4] = float(i % 17) * 0.125f - 0.5f;
+    input[i * 4 + 1] = float(i % 23) * 0.25f;
+    input[i * 4 + 2] = float(i % 31) * 2.f;
+    input[i * 4 + 3] = float(i % 11) * 0.1f;
+  }
+  DeviceBuffer buffer(input.size() * sizeof(float));
+  auto *deviceColor = static_cast<float *>(buffer.data);
+  using Operator = vsr::algorithms::ToneMapOperator;
+  for (const bool useExplicitStream : {false, true}) {
+    const auto stream = useExplicitStream ? explicitStream.stream : nullptr;
+    for (const auto op : {Operator::NONE,
+             Operator::REINHARD,
+             Operator::ACES,
+             Operator::HABLE,
+             Operator::KHRONOS_PBR_NEUTRAL,
+             Operator::AGX}) {
+      CAPTURE(useExplicitStream, int(op));
+      auto expected = input;
+      auto actual = input;
+      cpu::toneMap(expected.data(), COUNT, 1.25f, op);
+      REQUIRE(cudaMemcpyAsync(deviceColor,
+                  input.data(),
+                  input.size() * sizeof(float),
+                  cudaMemcpyHostToDevice,
+                  stream)
+          == cudaSuccess);
+      if (useExplicitStream)
+        vsr::algorithms::cuda::toneMap(stream, deviceColor, COUNT, 1.25f, op);
+      else
+        vsr::algorithms::cuda::toneMap(deviceColor, COUNT, 1.25f, op);
+      REQUIRE(cudaGetLastError() == cudaSuccess);
+      REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+      REQUIRE(cudaMemcpy(actual.data(),
+                  deviceColor,
+                  actual.size() * sizeof(float),
+                  cudaMemcpyDeviceToHost)
+          == cudaSuccess);
+      REQUIRE(actual != input);
+      for (size_t i = 0; i < actual.size(); ++i) {
+        CAPTURE(i);
+        REQUIRE(std::isfinite(actual[i]));
+        if (i % 4 == 3)
+          REQUIRE(actual[i] == input[i]);
+        else
+          REQUIRE(actual[i] == Approx(expected[i]).margin(2e-5));
+      }
+    }
+  }
+}
+
+#endif
 
 SCENARIO(
     "Host auto exposure computes the exact mean log luminance", "[Algorithms]")

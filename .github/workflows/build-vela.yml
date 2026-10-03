@@ -59,6 +59,9 @@ jobs:
       working-directory: ${{ github.workspace }}/build
       run: ctest -C ${{ matrix.config }} --output-on-failure
 
+  # GitHub-hosted runners provide the toolkit, not a guaranteed GPU.
+  # This job is compile-only; device parity/sanitizer execution requires
+  # a GPU-capable host as documented in docs/cuda-validation.md.
   build-cuda:
     runs-on: ${{ matrix.runs-on }}
     strategy:
