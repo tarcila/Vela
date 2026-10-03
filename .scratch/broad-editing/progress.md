@@ -138,3 +138,25 @@ configurations. CUDA is not automatically claimed as tested.
   workspaces are cleaned after their completed commits land; integration
   workspace/bookmark broad-editing remains for testing. Original pi-integration
   user config/screenshot are untouched. No PR, issue publication, or push.
+
+## Post-delivery reliability request
+
+The user requested CUDA verification and strongest unattended reliability
+before the camera/capture follow-on. Reliability merge6520efdf leaves the main
+build CUDA-enabled. Full parallel68/68 and204 repeat executions pass, actual
+GPU98,792assertions execute, Compute Sanitizer memcheck is clean, and the
+worker's other device diagnostics/profiling are retained as separate evidence.
+
+ASan/UBSan/float-cast-overflow/leak-ON verification found and fixed the JSON
+number cast-order UB; added bounded seeded affine/numeric regressions and fixed
+an invalid test optional dereference. The parallel remote orbit mismatch was
+reproduced through phased delivery and corrected in the test's owning-thread
+snapshot/full-pose settlement, not by changing production following logic or
+relaxing tolerance. See ../reliability-verification/SUMMARY.md and the committed
+orbit diagnosis for exact proof and remaining limits.
+
+The next camera/capture proposal is a draft under ../camera-capture/. It keeps
+interactive view state unchanged, uses qualified capture-owned resources and
+truthful device/quality/memory provenance, and leaves persistent camera writes
+and server file authority outside the recommended first increment. No new
+capture implementation is claimed or approved by this reliability record.
