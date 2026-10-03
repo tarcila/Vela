@@ -16,8 +16,11 @@
 #include "vsr/scene/Scene.hpp"
 #include "vsr/ui/imgui/windows/IntegrationActivityModel.h"
 // std
+#include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
+#include <random>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -2350,7 +2353,10 @@ TEST_CASE(
     f.authority->setAgentEditsDisabled(true);
     while (f.integration.service()) {
     }
-    CHECK_FALSE(f.edits->result(f.ref(1))->committed);
+    const auto status = f.engine->status(f.creds, f.ref(1));
+    CHECK(status.terminal == Outcome::FORBIDDEN);
+    CHECK_FALSE(status.committed);
+    CHECK_FALSE(f.edits->result(f.ref(1)));
     CHECK(a->value().isEnabled());
   }
   SECTION("disconnect before safe point")
@@ -3013,6 +3019,251 @@ TEST_CASE("Fools Mate discovers moves verifies and restores one live scene",
   drain();
   CHECK(f.edits->result(f.ref(id))->outcome == operations::Outcome::CONFLICT);
   board.unchanged(true);
+}
+
+TEST_CASE(
+    "Every matrix component rejects nonfinite and binary64 overflow atomically",
+    "[integration][reliability-numeric][mixed-edit][node-matrix]")
+{
+  Fixture f(true);
+  auto *layer = f.scene.defaultLayer();
+  auto node = layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, vsr::math::IDENTITY_MAT4, "numeric"));
+  node->value().setCurrentValueAsDefault();
+  const auto cache = node->value().getTransformSRT();
+  const auto version = f.nodeEntry(node).nodeExpected;
+  const auto objectVersion = f.version(f.matte.data());
+  const auto revision = f.identity->sceneRevision();
+  const double invalid[] = {std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity(),
+      -std::numeric_limits<double>::infinity(),
+      std::nextafter(double(std::numeric_limits<float>::max()),
+          std::numeric_limits<double>::infinity())};
+  std::uint64_t id = 1;
+  for (int row = 0; row < 4; ++row)
+    for (int col = 0; col < 4; ++col)
+      for (int kind = 0; kind < 4; ++kind) {
+        INFO("row=" << row << " col=" << col << " kind=" << kind);
+        auto matrix = f.nodeEntry(node);
+        matrix.parameter = "transform";
+        matrix.value = JsonValue::array({JsonValue::numbers({1, 0, 0, 2}),
+            JsonValue::numbers({0, 1, 0, 3}),
+            JsonValue::numbers({0, 0, 1, 5}),
+            JsonValue::numbers({0, 0, 0, 1})});
+        matrix.value.elements[row].elements[col] =
+            JsonValue::fromNumber(invalid[kind]);
+        const auto result = f.run(id++,
+            f.batch(
+                {f.entry(f.matte.data(), "opacity", JsonValue::fromNumber(0.5)),
+                    f.nodeEntry(node, false),
+                    matrix}));
+        CHECK(result.outcome == Outcome::INVALID_REQUEST);
+        CHECK(result.valueError
+            == (kind == 3 ? ValueError::OUT_OF_DOMAIN
+                          : ValueError::NON_FINITE));
+        CHECK(result.failedEntry == 2);
+        CHECK_FALSE(result.committed);
+        CHECK_FALSE(result.batchRef);
+        CHECK(f.opacity() == 1.f);
+        CHECK(node->value().isEnabled());
+        CHECK(node->value().getTransform() == vsr::math::IDENTITY_MAT4);
+        const auto afterCache = node->value().getTransformSRT();
+        CHECK(std::memcmp(&afterCache, &cache, sizeof(cache)) == 0);
+        CHECK(node->value().isDefaultValue());
+        CHECK(f.identity->isCurrent(version));
+        CHECK(f.identity->isCurrent(objectVersion));
+        CHECK(f.identity->sceneRevision() == revision);
+        CHECK(f.hookCalls == 0);
+        CHECK(f.edits->restorations().size() == 0);
+      }
+}
+
+TEST_CASE(
+    "Seeded dyadic affine groups restore exactly and reject stale batches",
+    "[integration][reliability-property][node-world][mixed-edit]")
+{
+  constexpr std::uint32_t SEED = 0x042a2e7b;
+  std::mt19937 random(SEED);
+  auto dyadic = [&] { return (int(random() % 33) - 16) / 4.; };
+  auto scale = [&] {
+    const double powers[] = {-4, -2, -0.5, 0.5, 2, 4};
+    return powers[random() % 6];
+  };
+  for (int iteration = 0; iteration < 48; ++iteration) {
+    INFO("seed=" << SEED << " iteration=" << iteration);
+    Fixture f(true);
+    auto *layer = f.scene.defaultLayer();
+    auto grand = layer->root()->insert_last_child(
+        vsr::scene::LayerNodeData(layer, vsr::math::IDENTITY_MAT4, "grand"));
+    auto parent = grand->insert_last_child(
+        vsr::scene::LayerNodeData(layer, vsr::math::IDENTITY_MAT4, "parent"));
+    auto child = parent->insert_last_child(
+        vsr::scene::LayerNodeData(layer, vsr::math::IDENTITY_MAT4, "child"));
+    auto sibling = grand->insert_last_child(
+        vsr::scene::LayerNodeData(layer, vsr::math::IDENTITY_MAT4, "sibling"));
+    const double gx = scale(), gy = scale(), gz = scale();
+    const double gh = dyadic(), gtX = dyadic(), gtY = dyadic(), gtZ = dyadic();
+    const bool turn = iteration % 2;
+    auto g = vsr::math::IDENTITY_MAT4;
+    g[0] =
+        turn ? vsr::math::float4(0, gy, 0, 0) : vsr::math::float4(gx, 0, 0, 0);
+    g[1] = turn ? vsr::math::float4(-gx, 0, 0, 0)
+                : vsr::math::float4(gh, gy, 0, 0);
+    g[2].z = gz;
+    g[3] = {float(gtX), float(gtY), float(gtZ), 1};
+    grand->value().setAsTransform(g);
+
+    // Independent forward equations, not inversion, matrix multiplication,
+    // decomposition or any implementation transform helper.
+    auto world = [&](double x, double y, double z) {
+      return JsonValue::numbers({gtX + (turn ? -gx * y : gx * x + gh * y),
+          gtY + gy * (turn ? x : y),
+          gtZ + gz * z});
+    };
+    const int mode = iteration % 3;
+    auto beforeParent = vsr::math::IDENTITY_MAT4;
+    beforeParent[1].x = mode == 0 ? 0.75f : 0.f;
+    beforeParent[3] = {-0.f, 2, -3, 1};
+    parent->value().setAsTransform(beforeParent);
+    auto beforeChild = vsr::math::IDENTITY_MAT4;
+    beforeChild[0].x = iteration % 4 == 0 ? 0.f : -2.f;
+    beforeChild[1].x = 1.25f;
+    beforeChild[3] = {3, -0.f, 5, 1};
+    child->value().setAsTransform(beforeChild);
+    child->value().setEnabled(iteration % 3 != 0);
+    if (iteration % 2 == 0) {
+      parent->value().setCurrentValueAsDefault();
+      child->value().setCurrentValueAsDefault();
+    }
+    const auto parentCache = parent->value().getTransformSRT();
+    const auto childCache = child->value().getTransformSRT();
+    const bool beforeEnabled = child->value().isEnabled();
+    const bool parentWasDefault = parent->value().isDefaultValue();
+    const bool childWasDefault = child->value().isDefaultValue();
+    f.scene.signalLayerStructureChanged(layer);
+
+    const double px = scale(), py = scale(), pz = scale();
+    const double ph = mode == 0 ? dyadic() : 0;
+    const double pk = mode == 0 ? dyadic() : 0;
+    const double pj = mode == 0 ? dyadic() : 0;
+    const double tx = dyadic(), ty = dyadic(), tz = dyadic();
+    const double cx = dyadic(), cy = dyadic(), cz = dyadic();
+    auto p = f.nodeEntry(parent);
+    p.parameter = "transform";
+    p.value = JsonValue::array({JsonValue::numbers({px, ph, pk, tx}),
+        JsonValue::numbers({0, py, pj, ty}),
+        JsonValue::numbers({0, 0, pz, tz}),
+        JsonValue::numbers({0, 0, 0, 1})});
+    auto c = f.positionEntry(child,
+        world(tx + px * cx + ph * cy + pk * cz,
+            ty + py * cy + pj * cz,
+            tz + pz * cz));
+    c.space = "world";
+    c.hasAncestryVersion = true;
+    auto batch = f.batch({p,
+        c,
+        f.nodeEntry(child, !beforeEnabled),
+        f.entry(f.matte.data(), "opacity", JsonValue::fromNumber(0.25)),
+        f.entry(f.light.data(), "irradiance", JsonValue::fromNumber(2))});
+    if (mode != 0) {
+      batch.edits[0].parameter = "scale";
+      batch.edits[0].value = JsonValue::numbers({px, py, pz});
+      auto position = f.positionEntry(parent,
+          mode == 2 ? world(tx, ty, tz) : JsonValue::numbers({tx, ty, tz}));
+      position.space = mode == 2 ? "world" : "local";
+      position.hasAncestryVersion = mode == 2;
+      batch.edits.push_back(position);
+    }
+    // Fisher-Yates with the engine's raw output keeps permutations portable.
+    for (std::size_t n = batch.edits.size(); n > 1; --n)
+      std::swap(batch.edits[n - 1], batch.edits[random() % n]);
+    EditResult result;
+    if (iteration % 2) {
+      const auto admitted = f.edits->submitLocal(batch);
+      REQUIRE(admitted.code == Outcome::OK);
+      for (int step = 0; f.integration.service() > 0; ++step)
+        REQUIRE(step < 1000);
+      REQUIRE(f.edits->resultLocal(admitted.ref));
+      result = *f.edits->resultLocal(admitted.ref);
+    } else
+      result = f.run(1, batch);
+    REQUIRE(result.outcome == Outcome::OK);
+    REQUIRE(result.committed);
+    REQUIRE(result.batchRef);
+    CHECK(result.nodeVersions.size() == 2);
+    CHECK(result.versions.size() == 2);
+    const auto finalParent = parent->value().getTransform();
+    CHECK(finalParent[0] == vsr::math::float4(px, 0, 0, 0));
+    CHECK(finalParent[1] == vsr::math::float4(ph, py, 0, 0));
+    CHECK(finalParent[2] == vsr::math::float4(pk, pj, pz, 0));
+    CHECK(finalParent[3] == vsr::math::float4(tx, ty, tz, 1));
+    const auto after = child->value().getTransform();
+    CHECK(after[3] == vsr::math::float4(cx, cy, cz, 1));
+    for (int col = 0; col < 3; ++col)
+      CHECK(after[col] == beforeChild[col]);
+    CHECK(child->value().isEnabled() == !beforeEnabled);
+    CHECK(f.opacity() == 0.25f);
+    CHECK(f.irradiance() == 2.f);
+
+    const auto revision = f.identity->sceneRevision();
+    const auto rejected = f.run(2, batch);
+    CHECK(rejected.outcome == Outcome::CONFLICT);
+    CHECK_FALSE(rejected.committed);
+    CHECK_FALSE(rejected.batchRef);
+    CHECK(f.identity->sceneRevision() == revision);
+    CHECK(child->value().getTransform() == after);
+    CHECK(f.opacity() == 0.25f);
+    CHECK(f.irradiance() == 2.f);
+    CHECK(f.hookCalls == 1);
+    CHECK(f.edits->restorations().size() == 1);
+    for (const auto &v : result.nodeVersions)
+      CHECK(f.identity->isCurrent(v.expected));
+    for (const auto &v : result.versions)
+      CHECK(f.identity->isCurrent(v));
+
+    // Later unrelated host edits must survive conditional restoration.
+    auto unrelated = vsr::math::IDENTITY_MAT4;
+    unrelated[3] = {17, 19, 23, 1};
+    sibling->value().setAsTransform(unrelated);
+    child->value().name() = "keep rename";
+    f.scene.signalLayerStructureChanged(layer);
+    restore::RestoreService restores(*f.engine, *f.edits);
+    restores.attachScene(f.sceneId, *f.identity);
+    const auto ack = restores.submitLocal({f.sceneId, *result.batchRef});
+    REQUIRE(ack.code == Outcome::OK);
+    for (int step = 0; f.integration.service() > 0; ++step)
+      REQUIRE(step < 1000);
+    REQUIRE(restores.resultLocal(ack.ref));
+    REQUIRE(restores.resultLocal(ack.ref)->outcome == Outcome::OK);
+    REQUIRE(restores.resultLocal(ack.ref)->committed);
+    const auto restoredParent = parent->value().getTransform();
+    const auto restoredChild = child->value().getTransform();
+    const auto restoredParentCache = parent->value().getTransformSRT();
+    const auto restoredChildCache = child->value().getTransformSRT();
+    CHECK(
+        std::memcmp(&restoredParent, &beforeParent, sizeof(beforeParent)) == 0);
+    CHECK(std::memcmp(&restoredChild, &beforeChild, sizeof(beforeChild)) == 0);
+    CHECK(std::memcmp(&restoredParentCache, &parentCache, sizeof(parentCache))
+        == 0);
+    CHECK(
+        std::memcmp(&restoredChildCache, &childCache, sizeof(childCache)) == 0);
+    CHECK(child->value().isEnabled() == beforeEnabled);
+    CHECK(parent->value().isDefaultValue() == parentWasDefault);
+    CHECK(child->value().isDefaultValue() == childWasDefault);
+    CHECK(child->value().name() == "keep rename");
+    CHECK(sibling->value().getTransform() == unrelated);
+    CHECK(grand->value().getTransform() == g);
+    CHECK(f.opacity() == 1.f);
+    CHECK(f.irradiance() == 1.f);
+    CHECK(f.hookCalls == 2);
+    CHECK_FALSE(restores.eligible(*result.batchRef));
+    parent->value().setToDefaultValue();
+    child->value().setToDefaultValue();
+    CHECK(parent->value().getTransform()
+        == (iteration % 2 == 0 ? beforeParent : vsr::math::IDENTITY_MAT4));
+    CHECK(child->value().getTransform()
+        == (iteration % 2 == 0 ? beforeChild : vsr::math::IDENTITY_MAT4));
+  }
 }
 
 TEST_CASE("Deep node preparation fails boundedly without mutation",

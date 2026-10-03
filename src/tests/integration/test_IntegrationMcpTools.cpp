@@ -28,6 +28,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <limits>
 #include <memory>
@@ -1991,6 +1992,121 @@ SCENARIO(
         == "invalid_request");
     CHECK(child->value().getTransform() == vsr::math::IDENTITY_MAT4);
   }
+}
+
+SCENARIO("MCP echoes finite numeric RPC identifiers without integer overflow",
+    "[integration][reliability-numeric][rpc-numeric]")
+{
+  Fixture f;
+  const std::pair<const char *, double> ids[] = {{"1e40", 1e40},
+      {"-1e40", -1e40},
+      {"9223372036854775808", 9223372036854775808.},
+      {"-9223372036854777856", -9223372036854777856.},
+      {"1e308", 1e308},
+      {"-1e308", -1e308}};
+  for (const auto &[text, expected] : ids) {
+    INFO(text);
+    const auto reply = post(f.server->port(),
+        {"Host: " + f.server->authority(),
+            "Authorization: Bearer " + f.authority->launchCredential()},
+        std::string("{\"jsonrpc\":\"2.0\",\"id\":") + text
+            + ",\"method\":\"ping\"}");
+    CHECK(reply.status == 200);
+    REQUIRE(reply.json.get("id"));
+    REQUIRE(reply.json.get("id")->isNumber());
+    CHECK(reply.json.get("id")->n == expected);
+    CHECK(reply.json.get("result"));
+  }
+}
+
+SCENARIO("MCP malformed numeric edits never consume valid state",
+    "[integration][node-mcp][reliability-numeric]")
+{
+  Fixture f({}, true, true);
+  auto *layer = f.scene.defaultLayer();
+  auto node = layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, vsr::math::IDENTITY_MAT4, "numeric"));
+  node->value().setCurrentValueAsDefault();
+  const auto beforeCache = node->value().getTransformSRT();
+  auto s = f.attach();
+  const auto scene = "\"scene_id\":" + std::to_string(f.sceneId);
+  REQUIRE(
+      f.tool(s,
+           "vsr_inspect",
+           "{\"request_id\":1," + scene
+               + ",\"kind\":\"nodes\",\"name\":\"numeric\"}")
+          .errorCode()
+          .empty());
+  f.drain();
+  const auto observed = f.status(s, s.id, 1);
+  REQUIRE(observed.result());
+  REQUIRE(observed.result()->get("items")->a.size() == 1);
+  const auto item = observed.result()->get("items")->a[0];
+  const auto target = "\"target_kind\":\"node\",\"handle\":"
+      + json::quote(item.get("handle")->s)
+      + ",\"version\":" + json::quote(item.get("node_edit_version")->s)
+      + ",\"structural_version\":"
+      + json::quote(item.get("structural_version")->s);
+  std::uint64_t id = 2;
+  auto args = [&](const std::string &value) {
+    return "{\"request_id\":" + std::to_string(id) + "," + scene
+        + ",\"edits\":[{" + target
+        + ",\"parameter\":\"enabled\",\"value\":false},{" + target
+        + ",\"parameter\":\"position\",\"value\":" + value + "}]}";
+  };
+  const auto version = *f.sceneIds->nodeEditVersion(f.sceneIds->handleOf(node));
+  const auto revision = f.sceneIds->sceneRevision();
+  for (const std::string value : {"[1e309,0,0]",
+           "[NaN,0,0]",
+           "[Infinity,0,0]",
+           "[01,0,0]",
+           "[1.,0,0]",
+           "[1e,0,0]"}) {
+    INFO(value);
+    const auto rejected = f.tool(s, "vsr_edit", args(value));
+    REQUIRE(rejected.json.get("error"));
+    REQUIRE(rejected.json.get("error")->get("code"));
+    CHECK(rejected.json.get("error")->get("code")->n == -32700);
+    CHECK(f.status(s, s.id, id).errorCode() == "unknown");
+  }
+  for (const std::string value : {"null",
+           "true",
+           "\"1\"",
+           "[1,2]",
+           "[1,2,3,4]",
+           "[1e40,0,0]",
+           "[{\"encoding\":\"non_finite\",\"value\":\"nan\"},0,0]"}) {
+    INFO(value);
+    const auto accepted = f.tool(s, "vsr_edit", args(value));
+    REQUIRE(accepted.errorCode().empty());
+    f.drain();
+    const auto rejected = f.status(s, s.id, id++);
+    CHECK(rejected.str("outcome") == "invalid_request");
+    CHECK_FALSE(rejected.flag("committed"));
+    CHECK(node->value().isEnabled());
+    CHECK(node->value().getTransform() == vsr::math::IDENTITY_MAT4);
+    CHECK(f.sceneIds->isCurrent(version));
+    CHECK(f.sceneIds->sceneRevision() == revision);
+    CHECK(f.edits->restorations().size() == 0);
+  }
+  REQUIRE(f.tool(s, "vsr_edit", args("[-0,0.5,-0.25]")).errorCode().empty());
+  f.drain();
+  const auto done = f.status(s, s.id, id++);
+  REQUIRE(done.str("outcome") == "ok");
+  REQUIRE(done.result()->get("batch_ref"));
+  CHECK_FALSE(node->value().isEnabled());
+  CHECK(node->value().getTransform()[3].x == 0.f);
+  CHECK(node->value().getTransform()[3].y == 0.5f);
+  CHECK(node->value().getTransform()[3].z == -0.25f);
+  REQUIRE(f.restoreBatch(s, id, *done.result()->get("batch_ref"))
+          .errorCode()
+          .empty());
+  f.drain();
+  CHECK(f.status(s, s.id, id).str("outcome") == "ok");
+  CHECK(node->value().isEnabled());
+  CHECK(node->value().isDefaultValue());
+  const auto restoredCache = node->value().getTransformSRT();
+  CHECK(std::memcmp(&restoredCache, &beforeCache, sizeof(beforeCache)) == 0);
 }
 
 SCENARIO("Fools Mate repeats through loopback MCP and host safe points",

@@ -381,8 +381,8 @@ inline std::string write(const Value &v)
     return v.b ? "true" : "false";
   case Value::Type::NUMBER: {
     char buf[32];
-    if (v.n == static_cast<double>(static_cast<long long>(v.n))
-        && v.n > -9007199254740992.0 && v.n < 9007199254740992.0)
+    if (v.n > -9007199254740992.0 && v.n < 9007199254740992.0
+        && v.n == static_cast<double>(static_cast<long long>(v.n)))
       std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(v.n));
     else
       std::snprintf(buf, sizeof(buf), "%.17g", v.n);
