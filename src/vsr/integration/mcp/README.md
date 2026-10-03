@@ -256,9 +256,13 @@ historical page rather than observing fresh state.
 
 ## Tools (ticket 104)
 
+See the [live placement guide](../../../../docs/live-placement-editing.md) for
+filter/cursor flow, complete node entry examples, conditional dependency fields,
+write boundaries, and viewer Restore controls.
+
 | Tool | Arguments | Capability | Slot / ID |
 |---|---|---|---|
-| `vsr_edit` | `request_id`, `scene_id`, `edits: [{handle, version, parameter, value}]` (1–64) | edit on `scene_id` | one scene slot, one request ID |
+| `vsr_edit` | `request_id`, `scene_id`, `edits: [{target_kind?, handle, version, structural_version?, ancestry_version?, space?, parameter, value}]` (1–64 combined) | edit on `scene_id` | one scene slot, one request ID |
 | `vsr_restore` | `request_id`, `scene_id`, `target_batch_ref: {launch_id, batch_id}` | edit on `scene_id` | one scene slot, one request ID |
 
 - `handle` and `version` are copied verbatim from a `vsr_inspect` item
@@ -272,7 +276,11 @@ historical page rather than observing fresh state.
   in. Supported fields are own `enabled` on any existing node kind and local
   `position`, `rotation`, `scale`, or full local `transform` replacement on
   scalar-transform nodes. None changes layer activation or stored default
-  baselines. World positioning is not exposed by these local-edit slices.
+  baselines. World origin positioning additionally requires `space: "world"`
+  and `ancestry_version` copied verbatim from inspection. Conversion uses the
+  proposed final parent world matrix, which must be finite affine and invertible;
+  singular parents reject without fallback. Ancestor transform change-back
+  conflicts with world edits/restoration but not local-space edits.
 - A node entry is `{target_kind: "node", handle, version, structural_version,
   parameter: "enabled", value: <Boolean>}`. Copy `handle`, `node_edit_version`
   (as `version`), and `structural_version` verbatim from node inspection.

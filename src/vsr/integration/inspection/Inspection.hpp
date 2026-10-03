@@ -451,6 +451,16 @@ class Inspector
   }
 
  private:
+  // Explicit values preserve the authenticated cursor's uint64 carrier.
+  enum class TransformIssue : std::uint64_t
+  {
+    NONE = 0,
+    NON_FINITE = 1,
+    NON_AFFINE = 2,
+    ARRAY_ANCESTRY = 3,
+    WORLD_OVERFLOW = 4
+  };
+
   struct Position
   {
     std::uint64_t pool{0};
@@ -464,7 +474,7 @@ class Inspector
     std::uint64_t transformVersion{0};
     // Fixed-size, authenticated continuation state; no parent stack.
     core::math::mat4 world{core::math::IDENTITY_MAT4};
-    std::uint64_t worldIssue{0};
+    TransformIssue worldIssue{TransformIssue::NONE};
     // 0: unvisited, 1: exact, 2: substring, 3: matched.
     std::uint64_t namePhase{0};
     std::uint64_t nameOffset{0};
@@ -540,7 +550,7 @@ class Inspector
                 : "");
     std::string carrier = payload;
     if (j.kind == "nodes") {
-      carrier += detail::hex64(j.pos.worldIssue);
+      carrier += detail::hex64(std::uint64_t(j.pos.worldIssue));
       for (int column = 0; column < 4; ++column) {
         for (int row = 0; row < 4; ++row) {
           std::uint32_t bits;
@@ -581,7 +591,8 @@ class Inspector
       j.pos.effective = std::stoull(c.substr(96, 16), nullptr, 16) != 0;
       j.pos.structuralVersion = std::stoull(c.substr(112, 16), nullptr, 16);
       j.pos.transformVersion = std::stoull(c.substr(128, 16), nullptr, 16);
-      j.pos.worldIssue = std::stoull(c.substr(144, 16), nullptr, 16);
+      j.pos.worldIssue =
+          TransformIssue(std::stoull(c.substr(144, 16), nullptr, 16));
       for (int column = 0; column < 4; ++column) {
         for (int row = 0; row < 4; ++row) {
           const std::uint32_t bits = std::stoul(
@@ -981,32 +992,9 @@ class Inspector
     return detail::hex64(h.domain) + detail::hex64(h.serial);
   }
 
-  static std::uint64_t matrixIssue(const core::math::mat4 &matrix)
-  {
-    for (int column = 0; column < 4; ++column)
-      for (int row = 0; row < 4; ++row)
-        if (!std::isfinite(matrix[column][row]))
-          return 1;
-    return matrix[0][3] != 0 || matrix[1][3] != 0 || matrix[2][3] != 0
-            || matrix[3][3] != 1
-        ? 2
-        : 0;
-  }
-
-  static std::uint64_t transformIssue(const scene::LayerNodeData &data)
-  {
-    return data.isTransform()         ? matrixIssue(data.getTransform())
-        : anari::isArray(data.type()) ? 3
-                                      : 0;
-  }
-
-  static const char *issueReason(std::uint64_t issue)
-  {
-    return issue == 1 ? "non_finite_transform"
-        : issue == 2  ? "non_affine_transform"
-        : issue == 3  ? "transform_array_ancestry"
-                      : "world_transform_overflow";
-  }
+  static TransformIssue matrixIssue(const core::math::mat4 &matrix);
+  static TransformIssue transformIssue(const scene::LayerNodeData &data);
+  static const char *issueReason(TransformIssue issue);
 
   static std::string unavailable(const char *reason)
   {
@@ -1025,7 +1013,7 @@ class Inspector
   {
     const auto issue = transformIssue(data);
     const char *reason = !data.isTransform() ? "not_scalar_transform"
-        : issue                              ? issueReason(issue)
+        : issue != TransformIssue::NONE      ? issueReason(issue)
                                              : nullptr;
     std::string result;
     if (data.isTransform()) {
@@ -1160,13 +1148,14 @@ class Inspector
       auto ancestor = layer->at(j.pos.aux - 1);
       j.pos.effective = j.pos.effective && ancestor->value().isEnabled();
       const auto issue = transformIssue(ancestor->value());
-      if (issue)
+      if (issue != TransformIssue::NONE)
         j.pos.worldIssue = issue;
-      if (!j.pos.worldIssue && ancestor->value().isTransform()) {
+      if (j.pos.worldIssue == TransformIssue::NONE
+          && ancestor->value().isTransform()) {
         j.pos.world =
             core::math::mul(ancestor->value().getTransform(), j.pos.world);
-        if (matrixIssue(j.pos.world))
-          j.pos.worldIssue = 4; // finite input matrices overflowed
+        if (matrixIssue(j.pos.world) != TransformIssue::NONE)
+          j.pos.worldIssue = TransformIssue::WORLD_OVERFLOW;
       }
       identity::NodeDependencyWalk walk{ids.handleOf(node),
           ids.handleOf(layer),
@@ -1211,7 +1200,7 @@ class Inspector
       item += detail::parameterValue(data.getValueRaw(), scene, ids, m_limits);
     }
     item += ",\"world_matrix\":";
-    item += j.pos.worldIssue
+    item += j.pos.worldIssue != TransformIssue::NONE
         ? unavailable(issueReason(j.pos.worldIssue))
         : detail::parameterValue(core::Any(j.pos.world), scene, ids, m_limits);
     item += transformObservations(data);
@@ -1487,5 +1476,36 @@ class Inspector
   std::shared_ptr<ScratchPool> m_scratch;
   std::uint64_t m_key[2]{};
 };
+
+// Inlined definitions ////////////////////////////////////////////////////////
+
+inline Inspector::TransformIssue Inspector::matrixIssue(
+    const core::math::mat4 &matrix)
+{
+  for (int column = 0; column < 4; ++column)
+    for (int row = 0; row < 4; ++row)
+      if (!std::isfinite(matrix[column][row]))
+        return TransformIssue::NON_FINITE;
+  return matrix[0][3] != 0 || matrix[1][3] != 0 || matrix[2][3] != 0
+          || matrix[3][3] != 1
+      ? TransformIssue::NON_AFFINE
+      : TransformIssue::NONE;
+}
+
+inline Inspector::TransformIssue Inspector::transformIssue(
+    const scene::LayerNodeData &data)
+{
+  return data.isTransform()         ? matrixIssue(data.getTransform())
+      : anari::isArray(data.type()) ? TransformIssue::ARRAY_ANCESTRY
+                                    : TransformIssue::NONE;
+}
+
+inline const char *Inspector::issueReason(TransformIssue issue)
+{
+  return issue == TransformIssue::NON_FINITE    ? "non_finite_transform"
+      : issue == TransformIssue::NON_AFFINE     ? "non_affine_transform"
+      : issue == TransformIssue::ARRAY_ANCESTRY ? "transform_array_ancestry"
+                                                : "world_transform_overflow";
+}
 
 } // namespace vsr::integration::inspection

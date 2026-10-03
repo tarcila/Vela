@@ -337,6 +337,12 @@ class SceneIdentity
     std::size_t index;
   };
   // Forest creation stamps, not addresses or payloads, establish identity.
+  // This lazy registry retains every issued (layer, node lifetime) pair for
+  // the SceneIdentity lifetime, including removed nodes: cardinality follows
+  // scene size and churn, not a bounded page or batch. Each handleOf() needs
+  // a lookup during budgeted traversal. FlatMap's linear lookup would make
+  // each visit scan that growing history; std::map bounds lookup/insertion
+  // to O(log N) without a rehash spike. No ordered traversal is required.
   mutable std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint64_t>
       m_nodeSerialOf;
   mutable std::unordered_map<std::uint64_t, NodeEntry> m_nodes;

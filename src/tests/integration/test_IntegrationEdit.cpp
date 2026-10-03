@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // catch
+#include "ChessFixture.hpp"
 #include "catch.hpp"
+#include "vsr/integration/context/ContextAdapter.hpp"
+#include "vsr/integration/inspection/Inspection.hpp"
+#include "vsr/integration/mcp/Json.hpp"
 // vsr
 #include "vsr/integration/Integration.hpp"
 #include "vsr/integration/activity/Activity.hpp"
@@ -2855,6 +2859,160 @@ TEST_CASE("World ancestry change-back conflicts but local restore stays narrow",
       CHECK(restores.resultLocal(retry.ref)->outcome == Outcome::CONFLICT);
     }
   }
+}
+
+TEST_CASE("Fools Mate discovers moves verifies and restores one live scene",
+    "[integration][chess]")
+{
+  Fixture f(true);
+  chess::Fixture board(f.scene);
+  context::ViewerExecutionHook safePoint(f.integration);
+  auto drain = [&] {
+    for (int i = 0; i < 10000; ++i)
+      if (safePoint() == 0)
+        return;
+    FAIL("headless safe point did not become idle");
+  };
+  inspection::Inspector inspector(
+      f.integration, *f.authority, [&](SceneId) { return f.identity.get(); });
+  restore::RestoreService restores(*f.engine, *f.edits);
+  restores.attachScene(f.sceneId, *f.identity);
+  activity::ActivityLog log;
+  activity::EngineActivitySink sink(log, f.integration);
+  f.engine->setActivitySink(&sink);
+  struct ResetSink
+  {
+    operations::OperationEngine &engine;
+    ~ResetSink()
+    {
+      engine.setActivitySink(nullptr);
+    }
+  } reset{*f.engine};
+  std::uint64_t id = 100;
+  auto inspect = [&](const char *name) {
+    inspection::PageArgs args;
+    args.kind = "nodes";
+    args.filters.name = name;
+    auto built = inspector.makeInspection(f.sessionId, f.sceneId, args);
+    REQUIRE(built.code == operations::Outcome::OK);
+    const auto ref = f.ref(++id);
+    REQUIRE(f.engine->submit(f.creds, ref, std::move(built.request)).code
+        == operations::Outcome::OK);
+    drain();
+    auto status = f.engine->status(f.creds, ref);
+    REQUIRE(status.terminal == operations::Outcome::OK);
+    mcp::json::Value result;
+    REQUIRE(mcp::json::parse(status.result, result));
+    REQUIRE(result.get("items")->a.size() == 1);
+    return result.get("items")->a[0];
+  };
+  std::vector<EditEntry> entries;
+  for (const auto &move : chess::MOVES) {
+    auto item = inspect(move.name);
+    vsr::scene::LayerNodeRef target;
+    for (auto node : board.pieces)
+      if (node->value().name() == move.name)
+        target = node;
+    REQUIRE(target);
+    auto e = f.positionEntry(target,
+        JsonValue::numbers({move.world[0], move.world[1], move.world[2]}));
+    CHECK(item.get("name")->get("text")->s == move.name);
+    CHECK_FALSE(item.get("handle")->s.empty());
+    e.space = "world";
+    e.hasAncestryVersion = true;
+    entries.push_back(e);
+  }
+  const auto whiteObject = f.version(board.surfaces[0].data());
+  const auto blackObject = f.version(board.surfaces[1].data());
+  const auto matteObject = f.version(f.matte.data());
+  const auto lightObject = f.version(f.light.data());
+  const auto stale = entries;
+  const auto editId = ++id;
+  REQUIRE(f.submit(editId, f.batch(entries)).code == operations::Outcome::OK);
+  CHECK_FALSE(f.edits->result(f.ref(editId)));
+  board.unchanged(true); // admission is not mutation
+  drain();
+  auto edited = f.edits->result(f.ref(editId));
+  REQUIRE(edited);
+  REQUIRE(edited->outcome == operations::Outcome::OK);
+  REQUIRE(edited->committed);
+  REQUIRE(edited->batchRef);
+  CHECK(f.hookCalls == 1);
+  for (const auto &move : chess::MOVES) {
+    auto item = inspect(move.name);
+    REQUIRE(item.get("world_matrix"));
+    REQUIRE(item.get("world_matrix")->get("data"));
+    REQUIRE(item.get("world_matrix")->get("data")->a.size() == 4);
+    REQUIRE(item.get("local_position"));
+    REQUIRE(item.get("local_position")->get("data"));
+    REQUIRE(item.get("local_position")->get("data")->a.size() == 3);
+    for (int axis = 0; axis < 3; ++axis) {
+      REQUIRE(item.get("world_matrix")->get("data")->a[axis].a.size() == 4);
+      CHECK(item.get("world_matrix")->get("data")->a[axis].a[3].n
+          == move.world[axis]);
+      CHECK(item.get("local_position")->get("data")->a[axis].n
+          == move.local[axis]);
+    }
+  }
+  board.unchanged(false);
+  auto rejected = f.submit(++id, f.batch(stale));
+  REQUIRE(rejected.code == operations::Outcome::OK);
+  drain();
+  CHECK(f.edits->result(f.ref(id))->outcome == operations::Outcome::CONFLICT);
+  bool unrelatedEdit = false;
+  SECTION("All other 28 placements remain exactly unchanged") {}
+  SECTION("Restoration preserves a later unrelated sibling edit")
+  {
+    REQUIRE(f.submit(++id, f.batch({f.nodeEntry(board.pieces[0], false)})).code
+        == operations::Outcome::OK);
+    drain();
+    REQUIRE(f.edits->result(f.ref(id))->committed);
+    board.original[0].setEnabled(false);
+    unrelatedEdit = true;
+  }
+  REQUIRE(
+      restores.submit(f.creds, f.ref(++id), {f.sceneId, *edited->batchRef}).code
+      == operations::Outcome::OK);
+  drain();
+  REQUIRE(restores.result(f.ref(id))->outcome == operations::Outcome::OK);
+  board.unchanged(true);
+  CHECK(f.hookCalls == (unrelatedEdit ? 3 : 2));
+  CHECK(f.version(board.surfaces[0].data()) == whiteObject);
+  CHECK(f.version(board.surfaces[1].data()) == blackObject);
+  CHECK(f.version(f.matte.data()) == matteObject);
+  CHECK(f.version(f.light.data()) == lightObject);
+  bool sawEdit = false;
+  bool sawRestore = false;
+  for (const auto &record : log.snapshot()) {
+    REQUIRE_FALSE(record.entry.active);
+    if (record.entry.ref && record.entry.ref->sessionId == f.sessionId
+        && record.entry.ref->requestId == editId) {
+      CHECK(record.entry.terminal == operations::Outcome::OK);
+      CHECK(record.entry.committed);
+      sawEdit = true;
+    }
+    if (record.entry.kind == activity::OperationKind::RESTORE) {
+      CHECK(record.entry.terminal == operations::Outcome::OK);
+      CHECK(record.entry.committed);
+      sawRestore = true;
+    }
+  }
+  CHECK(sawEdit);
+  CHECK(sawRestore);
+  // Host change-back invalidates the freshly observed world dependency.
+  auto e = f.positionEntry(board.pieces[13], JsonValue::numbers({1, 2, 3}));
+  e.space = "world";
+  e.hasAncestryVersion = true;
+  auto parent = board.board->value().getTransform();
+  auto changed = parent;
+  changed[3].x += 1;
+  board.board->value().setAsTransform(changed);
+  board.board->value().setAsTransform(parent);
+  f.scene.signalLayerStructureChanged(f.scene.defaultLayer());
+  REQUIRE(f.submit(++id, f.batch({e})).code == operations::Outcome::OK);
+  drain();
+  CHECK(f.edits->result(f.ref(id))->outcome == operations::Outcome::CONFLICT);
+  board.unchanged(true);
 }
 
 TEST_CASE("Deep node preparation fails boundedly without mutation",

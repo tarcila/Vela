@@ -277,6 +277,40 @@ inline ValueError prepareMatrix(const JsonValue &value, core::math::mat4 &out)
   return ValueError::NONE;
 }
 
+inline ValueError preparePositionField(const scene::LayerNodeData &data,
+    const JsonValue &value,
+    core::math::float3 &position)
+{
+  if (!data.isTransform())
+    return ValueError::UNSUPPORTED_NODE_KIND;
+  if (value.kind != JsonKind::ARRAY || value.elements.size() != 3)
+    return ValueError::INCOMPATIBLE_TYPE;
+  const double limit = std::numeric_limits<float>::max();
+  for (int c = 0; c < 3; ++c) {
+    const auto component = convertScalar(value.elements[c], {-limit, limit});
+    if (!component.ok())
+      return component.error;
+    position[c] = component.value;
+  }
+  return ValueError::NONE;
+}
+
+inline ValueError prepareTransformField(const scene::LayerNodeData &data,
+    const JsonValue &value,
+    core::math::mat4 &matrix,
+    core::math::mat3 &srt)
+{
+  if (!data.isTransform())
+    return ValueError::UNSUPPORTED_NODE_KIND;
+  const auto error = prepareMatrix(value, matrix);
+  if (error != ValueError::NONE)
+    return error;
+  // Decompose only the cache, never reconstruct the authoritative matrix.
+  const scene::LayerNodeData prepared(nullptr, matrix);
+  srt = prepared.getTransformSRT();
+  return ValueError::NONE;
+}
+
 // One bounded walk for the whole request; no retained ancestor snapshots.
 inline Outcome nodeDependencies(SceneIdentity &ids,
     const identity::NodeHandle &h,
@@ -963,6 +997,8 @@ inline EditResult EditService::commit(
     plan.reserve(batch.edits.size());
     for (auto &e : batch.edits) {
       if (e.targetKind == TargetKind::NODE) {
+        // Envelope validation checks shape; live exposure/authority may
+        // change after admission and must still reject before any mutation.
         if (!m_integration.nodeEditsExposed(batch.scene)) {
           res.outcome = Outcome::FORBIDDEN;
           return res;
@@ -997,25 +1033,9 @@ inline EditResult EditService::commit(
             it->changedEnabled = true;
             it->enabled = e.value.boolean;
           } else if (e.parameter == "position") {
-            ValueError error = ValueError::NONE;
             core::math::float3 position;
-            if (!node->value().isTransform())
-              error = ValueError::UNSUPPORTED_NODE_KIND;
-            else if (e.value.kind != JsonKind::ARRAY
-                || e.value.elements.size() != 3)
-              error = ValueError::INCOMPATIBLE_TYPE;
-            else {
-              const double limit = std::numeric_limits<float>::max();
-              for (int c = 0; c < 3; ++c) {
-                auto component =
-                    convertScalar(e.value.elements[c], {-limit, limit});
-                if (!component.ok()) {
-                  error = component.error;
-                  break;
-                }
-                position[c] = component.value;
-              }
-            }
+            const auto error =
+                detail::preparePositionField(node->value(), e.value, position);
             if (error != ValueError::NONE) {
               res.outcome = Outcome::INVALID_REQUEST;
               res.failedEntry = index;
@@ -1042,22 +1062,13 @@ inline EditResult EditService::commit(
             it->changedTransform = true;
             it->changedSRT = true;
           } else {
-            if (!node->value().isTransform()) {
-              res.outcome = Outcome::INVALID_REQUEST;
-              res.failedEntry = index;
-              res.valueError = ValueError::UNSUPPORTED_NODE_KIND;
-              return res;
-            }
-            res.valueError = detail::prepareMatrix(e.value, it->matrix);
+            res.valueError = detail::prepareTransformField(
+                node->value(), e.value, it->matrix, it->srt);
             if (res.valueError != ValueError::NONE) {
               res.outcome = Outcome::INVALID_REQUEST;
               res.failedEntry = index;
               return res;
             }
-            // Decompose only the cache, never reconstruct the authoritative
-            // matrix.
-            scene::LayerNodeData prepared(nullptr, it->matrix);
-            it->srt = prepared.getTransformSRT();
             it->changedTransform = true;
           }
           const auto *layer = node->value().layer();

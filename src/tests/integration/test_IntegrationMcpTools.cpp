@@ -9,7 +9,9 @@
 #if defined(VSR_USE_INTEGRATION_MCP) && defined(__linux__)
 
 // catch
+#include "ChessFixture.hpp"
 #include "catch.hpp"
+#include "vsr/integration/context/ContextAdapter.hpp"
 // vsr
 #include "vsr/integration/Integration.hpp"
 #include "vsr/integration/mcp/McpServer.hpp"
@@ -26,8 +28,10 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <iomanip>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 // posix
@@ -1987,6 +1991,141 @@ SCENARIO(
         == "invalid_request");
     CHECK(child->value().getTransform() == vsr::math::IDENTITY_MAT4);
   }
+}
+
+SCENARIO("Fools Mate repeats through loopback MCP and host safe points",
+    "[integration][MCPchess][node-mcp]")
+{
+  Fixture f({}, true, true);
+  chess::Fixture board(f.scene);
+  context::ViewerExecutionHook safePoint(f.integration);
+  auto session = f.attach();
+  std::uint64_t id = 100;
+  auto wait = [&](std::uint64_t request) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (int tries = 0; tries < 1000; ++tries) {
+      REQUIRE(std::chrono::steady_clock::now() < deadline);
+      safePoint();
+      auto result = f.status(session, session.id, request);
+      if (!result.str("outcome").empty())
+        return result;
+    }
+    FAIL("MCP operation did not finish within bounded host polling");
+    return Reply{};
+  };
+  REQUIRE(
+      f.tool(session,
+           "vsr_discover",
+           "{\"request_id\":" + std::to_string(++id) + "}")
+          .errorCode()
+          .empty());
+  auto discovered = wait(id);
+  REQUIRE(discovered.str("outcome") == "ok");
+  REQUIRE(discovered.result());
+  REQUIRE(discovered.result()->get("items"));
+  REQUIRE(discovered.result()->get("items")->a.size() == 1);
+  const auto &sceneItem = discovered.result()->get("items")->a[0];
+  REQUIRE(sceneItem.get("kind")->s == "scene");
+  REQUIRE(sceneItem.get("id"));
+  const auto scene = "\"scene_id\":"
+      + std::to_string(static_cast<SceneId>(sceneItem.get("id")->n));
+  auto inspect = [&](const char *name) {
+    const auto request = ++id;
+    REQUIRE(
+        f.tool(session,
+             "vsr_inspect",
+             "{\"request_id\":" + std::to_string(request) + "," + scene
+                 + ",\"kind\":\"nodes\",\"name\":" + json::quote(name) + "}")
+            .errorCode()
+            .empty());
+    auto done = wait(request);
+    REQUIRE(done.str("outcome") == "ok");
+    REQUIRE(done.result()->get("items")->a.size() == 1);
+    return done.result()->get("items")->a[0];
+  };
+  const auto parentBefore = inspect("board");
+  std::vector<json::Value> before;
+  std::string entries;
+  for (const auto &move : chess::MOVES) {
+    auto item = inspect(move.name);
+    REQUIRE(item.get("name")->get("text")->s == move.name);
+    REQUIRE(item.get("parent_handle")->s == parentBefore.get("handle")->s);
+    before.push_back(item);
+    if (!entries.empty())
+      entries += ",";
+    std::ostringstream destination;
+    destination << std::setprecision(17) << '[' << move.world[0] << ','
+                << move.world[1] << ',' << move.world[2] << ']';
+    entries += "{\"target_kind\":\"node\",\"handle\":"
+        + json::quote(item.get("handle")->s)
+        + ",\"version\":" + json::quote(item.get("node_edit_version")->s)
+        + ",\"structural_version\":"
+        + json::quote(item.get("structural_version")->s)
+        + ",\"ancestry_version\":"
+        + json::quote(item.get("ancestry_version")->s)
+        + ",\"space\":\"world\",\"parameter\":\"position\",\"value\":"
+        + destination.str() + "}";
+  }
+  auto submit = [&](const std::string &edits) {
+    const auto request = ++id;
+    auto accepted = f.tool(session,
+        "vsr_edit",
+        "{\"request_id\":" + std::to_string(request) + "," + scene
+            + ",\"edits\":[" + edits + "]}");
+    REQUIRE(accepted.errorCode().empty());
+    CHECK(accepted.str("state") == "pending");
+    CHECK(accepted.str("progress") == "queued");
+    CHECK_FALSE(accepted.flag("committed"));
+    return request;
+  };
+  const auto editId = submit(entries);
+  board.unchanged(true); // listener admission never mutates the scene
+  auto done = wait(editId);
+  REQUIRE(done.str("outcome") == "ok");
+  REQUIRE(done.flag("committed"));
+  REQUIRE(done.result()->get("batch_ref"));
+  const auto batch = *done.result()->get("batch_ref");
+  for (const auto &move : chess::MOVES) {
+    auto item = inspect(move.name);
+    REQUIRE(item.get("world_matrix"));
+    REQUIRE(item.get("world_matrix")->get("data"));
+    REQUIRE(item.get("world_matrix")->get("data")->a.size() == 4);
+    REQUIRE(item.get("local_position"));
+    REQUIRE(item.get("local_position")->get("data"));
+    REQUIRE(item.get("local_position")->get("data")->a.size() == 3);
+    for (int axis = 0; axis < 3; ++axis) {
+      REQUIRE(item.get("world_matrix")->get("data")->a[axis].a.size() == 4);
+      CHECK(item.get("world_matrix")->get("data")->a[axis].a[3].n
+          == move.world[axis]);
+      CHECK(item.get("local_position")->get("data")->a[axis].n
+          == move.local[axis]);
+    }
+  }
+  board.unchanged(false);
+  CHECK(wait(submit(entries)).str("outcome") == "conflict");
+  auto restore = [&] {
+    return f.tool(session,
+        "vsr_restore",
+        "{\"request_id\":" + std::to_string(++id) + "," + scene
+            + ",\"target_batch_ref\":" + json::write(batch) + "}");
+  };
+  REQUIRE(restore().errorCode().empty());
+  auto restored = wait(id);
+  REQUIRE(restored.str("outcome") == "ok");
+  REQUIRE(restored.flag("committed"));
+  for (std::size_t i = 0; i < chess::MOVES.size(); ++i) {
+    auto item = inspect(chess::MOVES[i].name);
+    for (const char *field :
+        {"local_matrix", "enabled", "name", "node_kind", "parent_handle"})
+      CHECK(
+          json::write(*item.get(field)) == json::write(*before[i].get(field)));
+  }
+  auto parentAfter = inspect("board");
+  CHECK(json::write(parentAfter) == json::write(parentBefore));
+  board.unchanged(true);
+  REQUIRE(restore().errorCode().empty());
+  CHECK(wait(id).str("outcome") != "ok"); // one-way, never redo
 }
 
 #endif

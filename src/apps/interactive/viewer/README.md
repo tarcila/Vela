@@ -35,6 +35,7 @@ CLI parsing is split into two layers:
 
 | Option | Description |
 | --- | --- |
+| `--agentIntegration` | Explicitly expose authenticated agent tools, including existing-node edits; requires an integration/MCP-enabled build. | 
 | `--noDefaultLayout` | Do not apply built-in ImGui dock layout at startup. |
 | `--noDefaultRenderer` | Do not auto-select a default renderer in the viewport. |
 | `--secondaryView <library>` / `-sv <library>` | Enable secondary viewport and set its ANARI library. |
@@ -120,6 +121,21 @@ Start secondary viewport on another ANARI library:
 ```bash
 ./vsrViewer -sv visgl -gltf scene.gltf
 ```
+
+## Live agent placement editing
+
+With `--agentIntegration`, **Agent Activity** shows the private descriptor path,
+operation outcomes, batch references, and conditional restoration eligibility.
+Use `vsrMcpProxy` to connect a trusted client; do not paste descriptor contents
+or credentials into a prompt. Scene objects own parameters, while layer nodes
+address individual placements; readable parameters are not automatically writable.
+
+See the [live placement guide](../../../../docs/live-placement-editing.md) for
+filtered/paged inspection, copying `node_edit_version` into `version`, required
+structural/world ancestry tokens, local/world origin moves, VSR degree rotations,
+full affine matrices, conflicts, and exact one-way Restore. The guide also lists
+the unchanged material/light allowlist and deferred tools. Inspecting a stored
+scene camera does not change the viewport or agent capture camera.
 
 ## User Color Maps
 

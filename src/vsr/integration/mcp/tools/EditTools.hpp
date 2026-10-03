@@ -227,6 +227,7 @@ inline void addEditTools(std::vector<Tool> &tools, EditDeps deps)
   Tool editTool;
   editTool.name = "vsr_edit";
   editTool.description =
+      "Copy node_edit_version into version and structural_version verbatim for every node entry; world position additionally requires ancestry_version. Object entries keep integer versions and the existing matte color/opacity and directional light color/direction/irradiance allowlist; readable parameters are not automatically writable. Stored camera parameters do not control the viewport or agent capture camera. "
       "World position means the node's local origin, requires ancestry_version from inspection, and converts through finite invertible proposed final ancestors; singular parents reject without fallback. "
       "Atomically apply up to 64 object parameter or explicitly exposed node enabled/local or world position/local rotation/scale/transform edits to one scene. Position and scale are three finite float32-representable numbers. Rotation is an object with named azimuth/elevation/roll degree components, composed about Y then X then Z as in VSR; supplied angles are retained, not wrapped. Rotation/scale require a faithful current cached SRT reconstruction (per-linear-component tolerance 1e-5 times max(1,abs(component))); no shear repair. Signed and zero scales are supported when faithful. Space defaults to local; no world rotation/scale/matrix edits. Only scalar-transform nodes accept transform fields. Different fields group deterministically with one expected version; repeated fields reject. Transform replaces a scalar node's complete local affine matrix (four rows of four finite numbers, column-vector math, last-column translation, exact last row [0,0,0,1]). Shear, reflection and singular affine matrices are supported. Transform cannot combine with position/rotation/scale on the same node but may combine with Boolean enabled. Node entries require target_kind=node, opaque version and structural_version from inspection. Returns a "
       "batch_ref on commit.";
@@ -258,7 +259,7 @@ inline void addEditTools(std::vector<Tool> &tools, EditDeps deps)
   Tool restoreTool;
   restoreTool.name = "vsr_restore";
   restoreTool.description =
-      "One-way restore of the batch named by target_batch_ref.";
+      "Conditionally restore the exact prior changed state of the batch named by target_batch_ref, not a whole layer. Later target or required ancestor writes conflict, including change-back; unrelated edits and reset defaults survive. Success consumes eligibility without redo; restore conflicts permanently consume eligibility. Sync failure can still mean committed: inspect committed independently of outcome.";
   restoreTool.inputSchemaJson =
       std::string("{\"type\":\"object\",\"properties\":{") + requestIdSchema()
       + ",\"scene_id\":{\"type\":\"integer\",\"minimum\":0},"

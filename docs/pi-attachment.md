@@ -131,6 +131,12 @@ for argument schemas, revision tokens, and stable outcome codes.
 
 ### Editing a placement's world position
 
+For complete local/world examples, filters and bounded cursor flow, node versus
+object identity, typed/unavailable values, and Restore controls, see the
+[live placement guide](live-placement-editing.md). Its edit examples explicitly
+map inspection's `node_edit_version` to the entry's `version` and explain when
+`structural_version` and `ancestry_version` are required.
+
 Scene objects own parameters; layer nodes place those objects. To move a
 placement, inspect `kind: "nodes"` and use its `handle`, `node_edit_version`,
 `structural_version`, and `ancestry_version`. The scene must explicitly expose

@@ -520,6 +520,67 @@ SCENARIO("node queries derive scene transforms without losing local matrices",
   CHECK(items[1].get("local_matrix")->get("data")->a[0].a[1].n == 1);
 }
 
+SCENARIO("node transform reasons survive authenticated work continuations",
+    "[integration][node-transforms][layer-inspection]")
+{
+  PageLimits limits;
+  limits.visits = 1;
+  limits.sliceVisits = 1;
+  Fixture f(0, limits);
+  auto *layer = f.scene.defaultLayer();
+  auto root = layer->root();
+  auto add = [&](vsr::math::mat4 matrix, const char *name) {
+    return root->insert_last_child(
+        vsr::scene::LayerNodeData(layer, matrix, name));
+  };
+  add(vsr::math::IDENTITY_MAT4, "valid");
+  auto nonFinite = vsr::math::IDENTITY_MAT4;
+  nonFinite[0].x = std::numeric_limits<float>::infinity();
+  add(nonFinite, "nonfinite");
+  auto nonAffine = vsr::math::IDENTITY_MAT4;
+  nonAffine[0][3] = .25f;
+  add(nonAffine, "nonaffine");
+  auto array = f.scene.createArrayProxy(ANARI_FLOAT32_MAT4, 2);
+  root->insert_last_child(vsr::scene::LayerNodeData(layer, array, "array"));
+  auto large = vsr::math::IDENTITY_MAT4;
+  large[0].x = std::numeric_limits<float>::max();
+  auto parent = add(large, "large");
+  auto doubled = vsr::math::IDENTITY_MAT4;
+  doubled[0].x = 2;
+  parent->insert_last_child(
+      vsr::scene::LayerNodeData(layer, doubled, "overflow"));
+  f.scene.signalLayerStructureChanged(layer);
+  PageArgs args;
+  args.kind = "nodes";
+  std::vector<std::string> reasons;
+  bool complete = false;
+  for (std::uint64_t id = 1; id <= 100 && !complete; ++id) {
+    const auto result = page(f.inspect(args, id));
+    for (const auto &item : result.get("items")->a) {
+      const auto *world = item.get("world_matrix");
+      REQUIRE(world);
+      reasons.push_back(world->get("state")->s == "available"
+              ? "available"
+              : world->get("reason")->s);
+    }
+    complete = result.get("complete")->b;
+    if (!complete) {
+      REQUIRE(result.get("cursor"));
+      args.cursor = result.get("cursor")->s;
+    }
+  }
+  REQUIRE(complete);
+  CHECK(reasons
+      == std::vector<std::string>{"available",
+          "available",
+          "non_finite_transform",
+          "non_affine_transform",
+          "transform_array_ancestry",
+          "available",
+          "world_transform_overflow"});
+  CHECK(f.inspector->scratch().used() == 0);
+}
+
 SCENARIO("node SRT affordances preserve signed degenerate and invalid state",
     "[integration][node-transforms]")
 {

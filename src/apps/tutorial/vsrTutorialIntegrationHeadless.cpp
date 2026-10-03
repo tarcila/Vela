@@ -26,6 +26,7 @@
 #include "vsr/integration/identity/Identity.hpp"
 #include "vsr/integration/inspection/Inspection.hpp"
 #include "vsr/integration/render/RevisionRender.hpp"
+#include "vsr/integration/restore/BatchRestore.hpp"
 #ifdef VSR_USE_INTEGRATION_MCP
 #include "vsr/integration/descriptor/LaunchDescriptor.hpp"
 #include "vsr/integration/mcp/McpServer.hpp"
@@ -369,8 +370,8 @@ int main(int argc, const char *argv[])
   host->edits = std::make_unique<vi::edit::EditService>(
       integration, *host->engine, host->authority->launchId());
   host->edits->attachScene(*sceneId, *host->identity);
-  host->restores =
-      std::make_unique<vi::restore::RestoreService>(*host->engine, *host->edits);
+  host->restores = std::make_unique<vi::restore::RestoreService>(
+      *host->engine, *host->edits);
   host->restores->attachScene(*sceneId, *host->identity);
   host->sync = std::make_unique<vi::sync::SyncService>(
       integration, *host->engine, host->edits->syncStates());
@@ -390,9 +391,8 @@ int main(int argc, const char *argv[])
   auto *tracker = host->tracker.get();
   host->inspector = std::make_unique<vi::inspection::Inspector>(integration,
       *host->authority,
-      [identity, sid = *sceneId](vi::SceneId id) {
-        return id == sid ? identity : nullptr;
-      });
+      [identity, sid = *sceneId](
+          vi::SceneId id) { return id == sid ? identity : nullptr; });
   host->inspector->setViewRevisions([tracker, vid = *viewId](vi::ViewId id) {
     return id == vid ? tracker : nullptr;
   });
@@ -413,11 +413,8 @@ int main(int argc, const char *argv[])
     std::fprintf(stderr, "runtime directory: %s\n", st.reason.c_str());
     return 1;
   }
-  if (auto st = vi::mcp::McpServer::start(cfg,
-          *host->authority,
-          *host->engine,
-          host->runtimeDir,
-          host->mcp);
+  if (auto st = vi::mcp::McpServer::start(
+          cfg, *host->authority, *host->engine, host->runtimeDir, host->mcp);
       !st.ok()) {
     std::fprintf(stderr, "MCP listener: %s\n", st.reason.c_str());
     return 1;
@@ -425,8 +422,8 @@ int main(int argc, const char *argv[])
   // stdout carries only the descriptor path.
   std::printf("%s\n", host->mcp->published().path().c_str());
 #else
-  std::fprintf(stderr,
-      "integration active without MCP: no listener, no descriptor\n");
+  std::fprintf(
+      stderr, "integration active without MCP: no listener, no descriptor\n");
 #endif
   std::fflush(stdout);
 
