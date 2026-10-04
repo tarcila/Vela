@@ -1,0 +1,6 @@
+00c0cc2f95ead52127941f095e6a9f3e1f37d08d3432d6e3a1efec1d39385092  .scratch/viewport-integration/archives/viewport-bindings.tar.zst
+1bda4b211aba5d36cfc21eb87a05fa0742411abeb4be71ecb1041e7cac024328  .scratch/viewport-integration/archives/viewport-cpu-frame.tar.zst
+2383d5510ee52c50db2bbac5d013c233ce0be3b77f099284b3c22c983bf6cda6  .scratch/viewport-integration/archives/viewport-gpu-frame.tar.zst
+5dd51438db4cccdbf0793e33a17c38d0e9019ed07b48a2f63c3fe8a87d04b531  .scratch/viewport-integration/archives/viewport-requests.tar.zst
+d344e6ec6a86413ec74bf5cce56376cc4cb4f4dc2db7b36812ee734074a9885e  .scratch/viewport-integration/archives/viewport-translation-commit.tar.zst
+f23dd1a74ba4956b4f3413110fe4849c2b0b4550a6c0b6445dfbb85f3a941638  .scratch/viewport-integration/archives/viewport-translation-preview.tar.zst

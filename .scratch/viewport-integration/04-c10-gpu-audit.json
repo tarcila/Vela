@@ -1,0 +1,124 @@
+{
+  "reports": {
+    "on": {
+      "positiveActivityCounts": {
+        "NVTX_EVENTS": 5024,
+        "CUPTI_ACTIVITY_KIND_RUNTIME": 97237,
+        "CUDA_GPU_MEMORY_USAGE_EVENTS": 1628,
+        "CUDA_UM_CPU_PAGE_FAULT_EVENTS": 177769,
+        "CUDA_UM_GPU_PAGE_FAULT_EVENTS": 3252,
+        "CUPTI_ACTIVITY_KIND_KERNEL": 17596,
+        "CUPTI_ACTIVITY_KIND_MEMCPY": 353174
+      },
+      "positiveNormalManagedAllocationCalls": {
+        "cudaMallocManaged_v6000": 104
+      },
+      "normalCopiesAndMigrations": [
+        {
+          "kind": "Host-to-Device",
+          "bytes": 107294084,
+          "count": 3435
+        },
+        {
+          "kind": "Device-to-Host",
+          "bytes": 11828,
+          "count": 2954
+        },
+        {
+          "kind": "Device-to-Device",
+          "bytes": 5294072560,
+          "count": 4558
+        },
+        {
+          "kind": "Unified Host-to-Device",
+          "bytes": 1008517120,
+          "count": 163347
+        },
+        {
+          "kind": "Unified Device-to-Host",
+          "bytes": 1026084864,
+          "count": 178880
+        }
+      ],
+      "observationMarkers": {
+        "04.observation.start": {
+          "ranges": 227,
+          "maxMs": 0.739688,
+          "ownerCudaApis": 0,
+          "processCpuManagedFaults": 0,
+          "processGpuAllocations": 0,
+          "concurrentGpuFaults": 0
+        },
+        "04.observation.acquire": {
+          "ranges": 215,
+          "maxMs": 4.189002,
+          "ownerCudaApis": 0,
+          "processCpuManagedFaults": 0,
+          "processGpuAllocations": 0,
+          "concurrentGpuFaults": 0
+        },
+        "04.observation.present": {
+          "ranges": 217,
+          "maxMs": 1.245218,
+          "ownerCudaApis": 0,
+          "processCpuManagedFaults": 0,
+          "processGpuAllocations": 0,
+          "concurrentGpuFaults": 0
+        }
+      }
+    },
+    "off": {
+      "positiveActivityCounts": {
+        "NVTX_EVENTS": 4632,
+        "CUPTI_ACTIVITY_KIND_RUNTIME": 97928,
+        "CUDA_GPU_MEMORY_USAGE_EVENTS": 1636,
+        "CUDA_UM_CPU_PAGE_FAULT_EVENTS": 177924,
+        "CUDA_UM_GPU_PAGE_FAULT_EVENTS": 3282,
+        "CUPTI_ACTIVITY_KIND_KERNEL": 17752,
+        "CUPTI_ACTIVITY_KIND_MEMCPY": 354698
+      },
+      "positiveNormalManagedAllocationCalls": {
+        "cudaMallocManaged_v6000": 104
+      },
+      "normalCopiesAndMigrations": [
+        {
+          "kind": "Host-to-Device",
+          "bytes": 107301188,
+          "count": 3459
+        },
+        {
+          "kind": "Device-to-Host",
+          "bytes": 11932,
+          "count": 2980
+        },
+        {
+          "kind": "Device-to-Device",
+          "bytes": 5346041856,
+          "count": 4600
+        },
+        {
+          "kind": "Unified Host-to-Device",
+          "bytes": 1017339904,
+          "count": 164609
+        },
+        {
+          "kind": "Unified Device-to-Host",
+          "bytes": 1034907648,
+          "count": 179050
+        }
+      ],
+      "observationMarkers": {
+        "04.observation.start": {
+          "ranges": 229,
+          "maxMs": 0.003947,
+          "ownerCudaApis": 0,
+          "processCpuManagedFaults": 0,
+          "processGpuAllocations": 0,
+          "concurrentGpuFaults": 0
+        }
+      }
+    }
+  },
+  "conclusion": "At actual maximum-two-view callbacks, no observation-owner CUDA runtime entry, managed CPU fault or GPU allocation. Normal rendering has positive CUDA/managed allocation/synchronization/migration activity in both configurations.",
+  "limits": "Temporal process GPU-fault overlap is disclosed, not attributed to observation. Normal frame counts/timing differ. This does not prove whole-process VRAM/RSS, all-time arbitrary-driver bounds, absent untraced driver APIs or zero normal display migration. Reachable CPU-only callback graph and independent CPU memory/static ownership bounds are required alongside this trace."
+}

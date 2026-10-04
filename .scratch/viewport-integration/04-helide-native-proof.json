@@ -1,0 +1,48 @@
+{
+  "device": "helide",
+  "viewportIdentity": "v:1.17215365296822155347:1",
+  "agentIdentity": "v:1.17215365296822155347:0",
+  "native": [
+    758,
+    229
+  ],
+  "display": {
+    "width": 1011,
+    "height": 305.4340515136719,
+    "scale_x": 1.33377308707124,
+    "scale_y": 1.3337731507147244,
+    "coordinate_units": "imgui_logical_units",
+    "scale_convention": "display_units_per_native_pixel",
+    "framebuffer_scale": [
+      1,
+      1
+    ]
+  },
+  "negativeFrameObservations": 13,
+  "rpcRoundTripMs": {
+    "max": 39.9466289999998,
+    "mean": 31.943888333333366
+  },
+  "readbackQualified": false,
+  "imageParityQualified": false,
+  "sceneWrites": 0,
+  "observationMetadataUnchanged": true,
+  "resizedNative": [
+    278,
+    139
+  ],
+  "resizedDisplay": {
+    "width": 371,
+    "height": 185.5,
+    "scale_x": 1.3345323741007193,
+    "scale_y": 1.3345323741007193,
+    "coordinate_units": "imgui_logical_units",
+    "scale_convention": "display_units_per_native_pixel",
+    "framebuffer_scale": [
+      1,
+      1
+    ]
+  },
+  "unavailableImageRetrievals": 12,
+  "legacyImageItems": 1
+}

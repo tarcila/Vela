@@ -1,0 +1,132 @@
+{
+  "baseline": {
+    "path": ".scratch/viewport-integration/logs/04-baseline-memcheck-barney-viewer.log",
+    "toolPassed": false,
+    "errors": 263,
+    "contexts": [
+      {
+        "kind": "Conditional jump or move depends on uninitialised value(s)",
+        "firstThreeFrames": [
+          "at <address>: ??? (in <store>/lib/libnvoptix.so.615.71.09)",
+          "by <address>: ??? (in <store>/lib/libnvoptix.so.615.71.09)",
+          "by <address>: ??? (in <store>/lib/libnvoptix.so.615.71.09)"
+        ]
+      },
+      {
+        "kind": "Conditional jump or move depends on uninitialised value(s)",
+        "firstThreeFrames": [
+          "at <address>: ??? (in <store>/lib/libnvoptix.so.615.71.09)",
+          "by <address>: ??? (in <store>/lib/libnvoptix.so.615.71.09)",
+          "by <address>: __pthread_once_slow.isra.0 (in <store>/lib/libc.so.6)"
+        ]
+      },
+      {
+        "kind": "Syscall param writev(vector[1]) points to uninitialised byte(s)",
+        "firstThreeFrames": [
+          "at <address>: writev (in <store>/lib/libc.so.6)",
+          "by <address>: _xcb_conn_wait (in <store>/lib/libxcb.so.1.1.0)",
+          "by <address>: xcb_writev (in <store>/lib/libxcb.so.1.1.0)"
+        ]
+      },
+      {
+        "kind": "Syscall param writev(vector[0]) points to uninitialised byte(s)",
+        "firstThreeFrames": [
+          "at <address>: writev (in <store>/lib/libc.so.6)",
+          "by <address>: _xcb_conn_wait (in <store>/lib/libxcb.so.1.1.0)",
+          "by <address>: xcb_writev (in <store>/lib/libxcb.so.1.1.0)"
+        ]
+      },
+      {
+        "kind": "realloc() with size 0",
+        "firstThreeFrames": [
+          "at <address>: realloc (in <store>/libexec/valgrind/vgpreload_memcheck-amd64-linux.so)",
+          "by <address>: ??? (in <store>/lib/libnvidia-glcore.so.615.71.09)",
+          "by <address>: ??? (in <store>/lib/libGLX_nvidia.so.615.71.09)"
+        ]
+      },
+      {
+        "kind": "Unsafe allocation with size of zero is implementation-defined",
+        "firstThreeFrames": [
+          "at <address>: posix_memalign (in <store>/libexec/valgrind/vgpreload_memcheck-amd64-linux.so)",
+          "by <address>: ??? (in <store>/lib/libnvidia-glcore.so.615.71.09)",
+          "by <address>: ??? (in <store>/lib/libGLX_nvidia.so.615.71.09)"
+        ]
+      },
+      {
+        "kind": "2,064 bytes in 1 blocks are definitely lost in loss record 4,574 of 4,792",
+        "firstThreeFrames": [
+          "at <address>: realloc (in <store>/libexec/valgrind/vgpreload_memcheck-amd64-linux.so)",
+          "by <address>: _dbus_string_lengthen (in <store>/lib/libdbus-1.so.3.38.3)",
+          "by <address>: _dbus_read (in <store>/lib/libdbus-1.so.3.38.3)"
+        ]
+      }
+    ],
+    "definiteLostBytes": 2064
+  },
+  "observed": {
+    "path": ".scratch/viewport-integration/logs/04-memcheck-barney-viewer.log",
+    "toolPassed": false,
+    "errors": 255,
+    "contexts": [
+      {
+        "kind": "Syscall param writev(vector[1]) points to uninitialised byte(s)",
+        "firstThreeFrames": [
+          "at <address>: writev (in <store>/lib/libc.so.6)",
+          "by <address>: _xcb_conn_wait (in <store>/lib/libxcb.so.1.1.0)",
+          "by <address>: xcb_writev (in <store>/lib/libxcb.so.1.1.0)"
+        ]
+      },
+      {
+        "kind": "Syscall param writev(vector[0]) points to uninitialised byte(s)",
+        "firstThreeFrames": [
+          "at <address>: writev (in <store>/lib/libc.so.6)",
+          "by <address>: _xcb_conn_wait (in <store>/lib/libxcb.so.1.1.0)",
+          "by <address>: xcb_writev (in <store>/lib/libxcb.so.1.1.0)"
+        ]
+      },
+      {
+        "kind": "Conditional jump or move depends on uninitialised value(s)",
+        "firstThreeFrames": [
+          "at <address>: ??? (in <store>/lib/libnvoptix.so.615.71.09)",
+          "by <address>: ??? (in <store>/lib/libnvoptix.so.615.71.09)",
+          "by <address>: ??? (in <store>/lib/libnvoptix.so.615.71.09)"
+        ]
+      },
+      {
+        "kind": "Conditional jump or move depends on uninitialised value(s)",
+        "firstThreeFrames": [
+          "at <address>: ??? (in <store>/lib/libnvoptix.so.615.71.09)",
+          "by <address>: ??? (in <store>/lib/libnvoptix.so.615.71.09)",
+          "by <address>: __pthread_once_slow.isra.0 (in <store>/lib/libc.so.6)"
+        ]
+      },
+      {
+        "kind": "realloc() with size 0",
+        "firstThreeFrames": [
+          "at <address>: realloc (in <store>/libexec/valgrind/vgpreload_memcheck-amd64-linux.so)",
+          "by <address>: ??? (in <store>/lib/libnvidia-glcore.so.615.71.09)",
+          "by <address>: ??? (in <store>/lib/libGLX_nvidia.so.615.71.09)"
+        ]
+      },
+      {
+        "kind": "Unsafe allocation with size of zero is implementation-defined",
+        "firstThreeFrames": [
+          "at <address>: posix_memalign (in <store>/libexec/valgrind/vgpreload_memcheck-amd64-linux.so)",
+          "by <address>: ??? (in <store>/lib/libnvidia-glcore.so.615.71.09)",
+          "by <address>: ??? (in <store>/lib/libGLX_nvidia.so.615.71.09)"
+        ]
+      },
+      {
+        "kind": "2,064 bytes in 1 blocks are definitely lost in loss record 4,575 of 4,793",
+        "firstThreeFrames": [
+          "at <address>: realloc (in <store>/libexec/valgrind/vgpreload_memcheck-amd64-linux.so)",
+          "by <address>: _dbus_string_lengthen (in <store>/lib/libdbus-1.so.3.38.3)",
+          "by <address>: _dbus_read (in <store>/lib/libdbus-1.so.3.38.3)"
+        ]
+      }
+    ],
+    "definiteLostBytes": 2064
+  },
+  "matchedOriginContexts": 7,
+  "limitations": "Both Memcheck tools failed. Matching GUI/driver/DBus origins is attribution only, not blanket suppression, clean GPU memory, or a proof about uninstrumented driver storage."
+}
