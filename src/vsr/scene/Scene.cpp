@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#include "vsr/scene/Scene.hpp"
+// vsr_core
 #include "vsr/core/Logging.hpp"
+// vsr_scene
 #include "vsr/scene/Object.hpp"
 #include "vsr/scene/ObjectUsePtr.hpp"
+#include "vsr/scene/Scene.hpp"
 // std
 #include <algorithm>
 #include <sstream>
@@ -210,7 +212,9 @@ std::string objectDBInfo(const ObjectDatabase &db)
 // Scene definitions //////////////////////////////////////////////////////////
 
 Scene::Scene()
+    : m_dependencyState(std::make_shared<detail::SceneDependencyState>())
 {
+  m_dependencyState->scene = this;
   defaultMaterial();
   defaultCamera();
 
@@ -258,6 +262,11 @@ Scene::Scene()
   });
 }
 
+std::uint64_t Scene::dependencyRevision() const
+{
+  return m_dependencyState->revision;
+}
+
 Scene::~Scene()
 {
   logRemainingDelegates(m_updateDelegate);
@@ -266,6 +275,9 @@ Scene::~Scene()
   m_defaultObjects.material.reset();
   m_defaultObjects.camera.reset();
   m_layers.clear();
+  // Externally retained Layers/payloads must stop resolving before any pool
+  // is destroyed, even though their weak control blocks can still be locked.
+  m_dependencyState->scene = nullptr;
 
   auto reportObjectUsages = [&](auto &array) {
     foreach_item_const(array, [&](auto *o) {
@@ -800,6 +812,7 @@ void Scene::removeLayer(Token name)
   if (!m_layers.contains(name))
     return;
   m_updateDelegate.signalLayerRemoved(m_layers[name].ptr.get());
+  m_layers[name].ptr->revokeMembership();
   if (m_layers[name].active)
     m_numActiveLayers--;
   m_layers.erase(name);
@@ -811,6 +824,7 @@ void Scene::removeLayer(const Layer *layer)
     if (m_layers.at_index(i).second.ptr.get() == layer) {
       m_updateDelegate.signalLayerRemoved(
           m_layers.at_index(i).second.ptr.get());
+      m_layers.at_index(i).second.ptr->revokeMembership();
       m_layers.erase(i);
       return;
     }
@@ -821,6 +835,7 @@ void Scene::removeAllLayers()
 {
   for (auto itr = m_layers.begin(); itr != m_layers.end(); itr++) {
     m_updateDelegate.signalLayerRemoved(itr->second.ptr.get());
+    itr->second.ptr->revokeMembership();
   }
 
   m_layers.clear();

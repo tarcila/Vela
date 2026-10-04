@@ -13,6 +13,7 @@
 #define STBI_NO_STDIO
 #include "../../../external/vela_stb_image/stb_image.h"
 // std
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -97,6 +98,56 @@ double refDecode(int v)
 {
   const double e = v / 255.0;
   return e <= 0.04045 ? e / 12.92 : std::pow((e + 0.055) / 1.055, 2.4);
+}
+
+std::vector<std::uint8_t> entropyRgba(std::uint32_t width, std::uint32_t height)
+{
+  std::vector<std::uint8_t> rgba(std::size_t(width) * height * 4);
+  std::uint32_t state = 0x12345678;
+  for (auto &byte : rgba) {
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    byte = std::uint8_t(state);
+  }
+  return rgba;
+}
+
+std::uint32_t readU32(const std::vector<std::uint8_t> &bytes, std::size_t at)
+{
+  REQUIRE(at + 4 <= bytes.size());
+  return (std::uint32_t(bytes[at]) << 24) | (std::uint32_t(bytes[at + 1]) << 16)
+      | (std::uint32_t(bytes[at + 2]) << 8) | bytes[at + 3];
+}
+
+// Parse the public file format, not encoder internals. The bytewise CRC
+// reference deliberately differs from the encoder's table implementation.
+std::vector<std::uint8_t> checkedIdat(const std::vector<std::uint8_t> &png)
+{
+  const std::array<std::string, 4> types = {"IHDR", "sRGB", "IDAT", "IEND"};
+  std::size_t at = 8;
+  std::vector<std::uint8_t> idat;
+  for (const auto &type : types) {
+    const std::size_t length = readU32(png, at);
+    REQUIRE(png.size() - at >= 12);
+    REQUIRE(length <= png.size() - at - 12);
+    CHECK(std::string(png.begin() + at + 4, png.begin() + at + 8) == type);
+    std::uint32_t crc = 0xFFFFFFFFu;
+    for (std::size_t i = at + 4; i < at + 8 + length; ++i) {
+      crc ^= png[i];
+      for (int bit = 0; bit < 8; ++bit)
+        crc = (crc >> 1) ^ ((crc & 1) ? 0xEDB88320u : 0);
+    }
+    CHECK(readU32(png, at + 8 + length) == ~crc);
+    if (type == "sRGB") {
+      REQUIRE(length == 1);
+      CHECK(png[at + 8] == 0); // perceptual rendering intent
+    } else if (type == "IDAT")
+      idat.assign(png.begin() + at + 8, png.begin() + at + 8 + length);
+    at += 12 + length;
+  }
+  CHECK(at == png.size());
+  return idat;
 }
 
 } // namespace
@@ -318,6 +369,155 @@ TEST_CASE("Result owns its bytes independently of the source buffer",
     for (int x = 0; x < 2; ++x)
       CHECK(
           pixelAt(d, x, y) == std::array<std::uint8_t, 4>{255, 255, 255, 255});
+}
+
+TEST_CASE("High-entropy full-HD PNG fits the unchanged default cap",
+    "[integration][image][png-bound]")
+{
+  const auto rgba = entropyRgba(1920, 1080);
+  const auto png = encodePngRgba8(1920, 1080, rgba.data());
+  REQUIRE(!png.empty());
+  CHECK(png.size() <= 8 * 1024 * 1024);
+  CHECK(png.size() == 8296191);
+  const auto d = decodePng(png);
+  CHECK(d.width == 1920);
+  CHECK(d.height == 1080);
+  CHECK(d.channels == 4);
+  CHECK(d.rgba == rgba);
+  CHECK(encodePngRgba8(1920, 1080, rgba.data()) == png);
+}
+
+TEST_CASE("PNG bound covers every default height and maximum legal width",
+    "[integration][image][png-bound]")
+{
+  CHECK(pngRgba8OutputBound(1, 1) == 86);
+  CHECK(pngRgba8OutputBound(1280, 720) == 3687481);
+  CHECK(pngRgba8OutputBound(1920, 1080) == 8296191);
+  CHECK(pngRgba8OutputBound(1024, 2025) == 8297136);
+  std::size_t greatest = 0;
+  for (std::uint32_t h = 1; h <= 2048; ++h) {
+    const std::uint32_t w = std::min(2048u, 2073600u / h);
+    // Independent uint64 oracle: pay five bytes for each nonempty block,
+    // including the last, rather than sharing checked/ceiling arithmetic.
+    const std::uint64_t raw = (4ull * w + 1) * h;
+    std::uint64_t expected = raw + 76;
+    for (std::uint64_t remaining = raw; remaining != 0;) {
+      expected += 5;
+      remaining -= std::min(remaining, std::uint64_t(65535));
+    }
+    const auto bound = pngRgba8OutputBound(w, h);
+    REQUIRE(bound);
+    CHECK(*bound == expected);
+    CHECK(*bound <= 8388608);
+    greatest = std::max(greatest, *bound);
+  }
+  // At fixed height raw and block count are monotonic in width, so the
+  // checked maxima also cover every smaller width. The maximum is NOT HD.
+  CHECK(greatest == 8297136);
+}
+
+TEST_CASE("Worst default PNG envelope and extreme aspect ratios round-trip",
+    "[integration][image][png-bound]")
+{
+  const std::array<std::array<std::uint32_t, 2>, 3> dimensions = {
+      {{1024, 2025}, {2048, 1}, {1, 2048}}};
+  for (const auto &size : dimensions) {
+    const auto rgba = entropyRgba(size[0], size[1]);
+    const auto png = encodePngRgba8(size[0], size[1], rgba.data());
+    const auto bound = pngRgba8OutputBound(size[0], size[1]);
+    REQUIRE(bound);
+    REQUIRE(!png.empty());
+    CHECK(png.size() <= *bound);
+    const auto d = decodePng(png);
+    CHECK(d.width == int(size[0]));
+    CHECK(d.height == int(size[1]));
+    CHECK(d.rgba == rgba);
+    CHECK(encodePngRgba8(size[0], size[1], rgba.data()) == png);
+  }
+}
+
+TEST_CASE(
+    "PNG dimensions reject before source reads or normalization allocation",
+    "[integration][image][png-bound]")
+{
+  const std::uint8_t pixel[4] = {1, 2, 3, 4};
+  const auto max = std::numeric_limits<std::uint32_t>::max();
+  const std::array<std::array<std::uint32_t, 2>, 7> dimensions = {{{0, 1},
+      {1, 0},
+      {max, max},
+      {max, 1},
+      {1, max},
+      {536870911, 1},
+      {1, 429496729}}};
+  for (const auto &size : dimensions) {
+    CHECK_FALSE(pngRgba8OutputBound(size[0], size[1]));
+    CHECK(encodePngRgba8(size[0], size[1], pixel).empty());
+    SourceImage src;
+    src.width = size[0];
+    src.height = size[1];
+    src.encoding = ChannelEncoding::SRGB_UINT8;
+    src.pixels = pixel; // only four accessible bytes, never a huge allocation
+    CHECK(normalizeToPng(src).error == NormalizeError::INVALID_DIMENSIONS);
+  }
+  CHECK(encodePngRgba8(1, 1, nullptr).empty());
+  CHECK(pngRgba8OutputBound(1, 429463948) == 2147483646);
+  CHECK_FALSE(pngRgba8OutputBound(1, 429463949));
+  CHECK(decodePng(encodePngRgba8(1, 1, pixel)).rgba
+      == std::vector<std::uint8_t>(pixel, pixel + 4));
+}
+
+TEST_CASE("Stored-deflate framing handles exact and partial block boundaries",
+    "[integration][image][png-bound]")
+{
+  // Width 1: five filtered bytes per row, exactly 65535 at height 13107.
+  // Width 32767: 131069 filtered bytes, one below two full blocks.
+  const std::array<std::array<std::uint32_t, 2>, 5> dimensions = {
+      {{1, 13106}, {1, 13107}, {1, 13108}, {1, 26214}, {32767, 1}}};
+  const std::array<std::size_t, 5> bounds = {
+      65611, 65616, 65626, 131156, 131155};
+  for (std::size_t test = 0; test < dimensions.size(); ++test) {
+    const auto size = dimensions[test];
+    const auto rgba = entropyRgba(size[0], size[1]);
+    const auto png = encodePngRgba8(size[0], size[1], rgba.data());
+    REQUIRE(pngRgba8OutputBound(size[0], size[1]) == bounds[test]);
+    REQUIRE(png.size() == bounds[test]); // fallback attained its exact bound
+    const auto z = checkedIdat(png);
+    REQUIRE(z.size() >= 11);
+    CHECK(z[0] == 0x78);
+    CHECK(z[1] == 0x01);
+    std::vector<std::uint8_t> filtered;
+    std::size_t at = 2;
+    bool final = false;
+    while (!final) {
+      REQUIRE(at + 5 <= z.size() - 4);
+      CHECK((z[at] & 0xFE) == 0); // stored, zero alignment padding
+      final = z[at++] == 1;
+      const unsigned length = z[at] | (unsigned(z[at + 1]) << 8);
+      const unsigned complement = z[at + 2] | (unsigned(z[at + 3]) << 8);
+      CHECK((length ^ complement) == 65535);
+      REQUIRE(length > 0);
+      at += 4;
+      REQUIRE(at + length <= z.size() - 4);
+      filtered.insert(filtered.end(), z.begin() + at, z.begin() + at + length);
+      at += length;
+    }
+    REQUIRE(at == z.size() - 4);
+    REQUIRE(filtered.size() == (std::size_t(size[0]) * 4 + 1) * size[1]);
+    for (std::size_t row = 0; row < size[1]; ++row)
+      CHECK(filtered[row * (std::size_t(size[0]) * 4 + 1)] == 4); // Paeth
+    std::uint64_t a = 1;
+    std::uint64_t b = 0;
+    for (const auto byte : filtered) {
+      a += byte;
+      b += a;
+    }
+    CHECK(readU32(z, at) == ((b % 65521) << 16 | (a % 65521)));
+    const auto d = decodePng(png);
+    CHECK(d.width == int(size[0]));
+    CHECK(d.height == int(size[1]));
+    CHECK(d.rgba == rgba);
+    CHECK(encodePngRgba8(size[0], size[1], rgba.data()) == png);
+  }
 }
 
 TEST_CASE("PNG image data is deflate-compressed and deterministic",

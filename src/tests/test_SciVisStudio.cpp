@@ -2632,7 +2632,22 @@ SCENARIO("SciVis Studio dataset lifecycle workflows preserve asset semantics",
   REQUIRE(dataset);
   REQUIRE(dataset->status == DatasetStatus::Available);
   const auto originalId = dataset->id;
-  REQUIRE(projectContext.saveProject(root));
+  const auto originalRoot = projectContext.resolveDatasetRoot(*dataset);
+  REQUIRE(originalRoot);
+  for (int save = 0; save < 3; ++save) {
+    REQUIRE(projectContext.saveProject(root));
+    // Saving replaces the Project's records, not its live dataset subtree.
+    dataset = project::findDataset(projectContext.project(), originalId);
+    REQUIRE(dataset);
+    REQUIRE(dataset->id == originalId);
+    REQUIRE(dataset->name == "Mesh");
+    REQUIRE_FALSE(dataset->dirty);
+    REQUIRE(projectContext.resolveDatasetRoot(*dataset) == originalRoot);
+    const auto *binding = shot::findDatasetBinding(
+        projectContext.project().shots.front(), originalId);
+    REQUIRE(binding);
+    REQUIRE(binding->enabled);
+  }
   REQUIRE(std::filesystem::exists(root / "datasets" / "Mesh.vsr"));
 
   REQUIRE(projectContext.saveDatasetArchive(originalId, savedArchive));
@@ -2641,22 +2656,60 @@ SCENARIO("SciVis Studio dataset lifecycle workflows preserve asset semantics",
   REQUIRE(savedValidation.dataset.id.empty());
 
   std::string error;
-  auto originalRoot = projectContext.resolveDatasetRoot(*dataset);
-  REQUIRE(originalRoot);
+  auto *extra =
+      projectContext.loadDatasetArchive(savedArchive, "Extra", &error);
+  REQUIRE(extra);
+  const auto extraId = extra->id;
+  REQUIRE(extraId != originalId);
+  dataset = project::findDataset(projectContext.project(), originalId);
+  REQUIRE(dataset);
+  REQUIRE(projectContext.resolveDatasetRoot(*dataset) == originalRoot);
+  REQUIRE(projectContext.removeDataset(extraId, false, &error));
+  dataset = project::findDataset(projectContext.project(), originalId);
+  REQUIRE(dataset);
+  REQUIRE(projectContext.resolveDatasetRoot(*dataset) == originalRoot);
+
   std::filesystem::remove(source);
   REQUIRE_FALSE(projectContext.reimportStaticDataset(originalId, &error));
+  REQUIRE_FALSE(error.empty());
+  dataset = project::findDataset(projectContext.project(), originalId);
+  REQUIRE(dataset);
   REQUIRE(projectContext.resolveDatasetRoot(*dataset) == originalRoot);
+  REQUIRE(dataset->id == originalId);
+  REQUIRE(dataset->name == "Mesh");
+  REQUIRE(dataset->persistedName == "Mesh");
+  REQUIRE(dataset->source.sourcePath == source.string());
+  REQUIRE(dataset->status == DatasetStatus::Available);
+  REQUIRE(dataset->residency == DatasetResidency::Loaded);
+  REQUIRE_FALSE(dataset->dirty);
+  REQUIRE(projectContext.project().shots.front().datasetBindings.size() == 1);
+  REQUIRE(
+      projectContext.project().shots.front().datasetBindings.front().datasetId
+      == originalId);
+  REQUIRE(
+      projectContext.project().shots.front().datasetBindings.front().enabled);
 
   {
     std::ofstream obj(source);
     obj << "v 0 0 0\nv 2 0 0\nv 0 2 0\nf 1 2 3\n";
   }
   REQUIRE(projectContext.reimportStaticDataset(originalId, &error));
-  REQUIRE(projectContext.project().datasets.front().id == originalId);
+  dataset = project::findDataset(projectContext.project(), originalId);
+  REQUIRE(dataset);
+  REQUIRE(dataset->id == originalId);
+  REQUIRE(dataset->dirty);
+  const auto reimportedRoot = projectContext.resolveDatasetRoot(*dataset);
+  REQUIRE(reimportedRoot);
 
   REQUIRE(projectContext.renameDataset(originalId, "Renamed", &error));
   REQUIRE_FALSE(projectContext.renameDataset(originalId, "bad/name", &error));
   REQUIRE(projectContext.saveProject(root));
+  dataset = project::findDataset(projectContext.project(), originalId);
+  REQUIRE(dataset);
+  REQUIRE(dataset->id == originalId);
+  REQUIRE(dataset->name == "Renamed");
+  REQUIRE_FALSE(dataset->dirty);
+  REQUIRE(projectContext.resolveDatasetRoot(*dataset) == reimportedRoot);
   REQUIRE(std::filesystem::exists(root / "datasets" / "Renamed.vsr"));
   REQUIRE_FALSE(std::filesystem::exists(root / "datasets" / "Mesh.vsr"));
 

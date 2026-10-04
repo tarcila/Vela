@@ -3,6 +3,7 @@
 
 #include "ImageNormalization.hpp"
 // std
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <limits>
@@ -20,6 +21,11 @@ namespace vsr::integration::image {
 namespace {
 
 constexpr int ZLIB_QUALITY = 8; // stb's default PNG level
+constexpr std::size_t STORED_BLOCK_BYTES = 65535;
+// Signature 8 + IHDR 25 + sRGB 13 + IDAT framing 12 + IEND 12.
+constexpr std::size_t PNG_FRAMING_BYTES = 70;
+// CMF/FLG 2 + Adler-32 4.
+constexpr std::size_t ZLIB_FRAMING_BYTES = 6;
 
 std::uint32_t crc32(
     const std::uint8_t *data, std::size_t size, std::uint32_t crc = 0)
@@ -56,7 +62,8 @@ void putChunk(std::vector<std::uint8_t> &out,
   putU32(out, std::uint32_t(size));
   const std::size_t typeAt = out.size();
   out.insert(out.end(), type, type + 4);
-  out.insert(out.end(), data, data + size);
+  if (size != 0)
+    out.insert(out.end(), data, data + size);
   putU32(out, crc32(out.data() + typeAt, 4 + size));
 }
 
@@ -93,27 +100,97 @@ std::vector<std::uint8_t> filterRows(
   return raw;
 }
 
+std::vector<std::uint8_t> storedZlib(
+    const std::vector<std::uint8_t> &raw, std::size_t bound)
+{
+  std::vector<std::uint8_t> out;
+  out.reserve(bound);
+  out.push_back(0x78);
+  out.push_back(0x01); // deflate, no dictionary, fastest level, FCHECK
+  std::uint32_t s1 = 1;
+  std::uint32_t s2 = 0;
+  for (std::size_t pos = 0; pos < raw.size();) {
+    const auto length = std::min(STORED_BLOCK_BYTES, raw.size() - pos);
+    out.push_back(pos + length == raw.size() ? 1 : 0); // BFINAL, BTYPE=00
+    out.push_back(std::uint8_t(length));
+    out.push_back(std::uint8_t(length >> 8));
+    out.push_back(std::uint8_t(~length));
+    out.push_back(std::uint8_t((~length) >> 8));
+    out.insert(out.end(), raw.data() + pos, raw.data() + pos + length);
+    for (std::size_t i = pos; i < pos + length; ++i) {
+      s1 = (s1 + raw[i]) % 65521;
+      s2 = (s2 + s1) % 65521;
+    }
+    pos += length;
+  }
+  putU32(out, (s2 << 16) | s1);
+  return out;
+}
+
 } // namespace
+
+std::optional<std::size_t> pngRgba8OutputBound(
+    std::uint32_t width, std::uint32_t height)
+{
+  if (width == 0 || height == 0)
+    return {};
+  const auto max = std::numeric_limits<std::size_t>::max();
+  if (std::size_t(width) > (max - 1) / 4)
+    return {};
+  const std::size_t row = std::size_t(width) * 4 + 1;
+  if (row > max / height)
+    return {};
+  const std::size_t raw = row * height;
+  if (raw > std::size_t(std::numeric_limits<int>::max()))
+    return {};
+  // Division/remainder avoids overflow in rounding up the block count.
+  const std::size_t blocks =
+      raw / STORED_BLOCK_BYTES + (raw % STORED_BLOCK_BYTES != 0);
+  constexpr std::size_t FRAMING = PNG_FRAMING_BYTES + ZLIB_FRAMING_BYTES;
+  if (raw > max - FRAMING || blocks > (max - FRAMING - raw) / 5)
+    return {};
+  const std::size_t bound = raw + blocks * 5 + FRAMING;
+  // PNG chunk lengths are limited to 2^31-1. Checking the complete output
+  // is stricter and also keeps downstream int-sized decoders representable.
+  if (bound > std::size_t(std::numeric_limits<int>::max())
+      || bound > std::vector<std::uint8_t>().max_size())
+    return {};
+  return bound;
+}
 
 std::vector<std::uint8_t> encodePngRgba8(
     std::uint32_t width, std::uint32_t height, const std::uint8_t *rgba)
 {
-  const std::size_t rowBytes = std::size_t(width) * 4;
-  if (width == 0 || height == 0 || !rgba
-      || (rowBytes + 1) > std::size_t(std::numeric_limits<int>::max()) / height)
+  const auto bound = pngRgba8OutputBound(width, height);
+  if (!bound || !rgba)
     return {};
 
   auto raw = filterRows(width, height, rgba);
+  const std::size_t zbound = *bound - PNG_FRAMING_BYTES;
   int zlen = 0;
-  // Owned exception-safely: the vector growth below may throw.
-  std::unique_ptr<unsigned char, void (*)(void *)> z(
-      stbi_zlib_compress(raw.data(), int(raw.size()), &zlen, ZLIB_QUALITY),
-      std::free);
-  if (!z)
+  std::unique_ptr<unsigned char, void (*)(void *)> z(nullptr, std::free);
+  // stb uses signed-int doubling for its stretchy output buffer. Literals
+  // cost <=9 bits/byte; matches cost <=31 bits for >=3 bytes. Thus output
+  // is <=2*raw+8, and capacity growth stays below 4*output+8. This cutoff
+  // keeps those intermediates in int range; larger inputs go straight to
+  // stored blocks, without depending on stb's allocation arithmetic.
+  if (raw.size() <= std::size_t(std::numeric_limits<int>::max()) / 16)
+    z.reset(
+        stbi_zlib_compress(raw.data(), int(raw.size()), &zlen, ZLIB_QUALITY));
+  std::vector<std::uint8_t> stored;
+  const std::uint8_t *zdata = z.get();
+  std::size_t zsize = zlen > 0 ? std::size_t(zlen) : 0;
+  if (!z || zsize == 0 || zsize > zbound) {
+    z.reset(); // release the rejected candidate before fallback allocation
+    stored = storedZlib(raw, zbound);
+    zdata = stored.data();
+    zsize = stored.size();
+  }
+  if (zsize > zbound)
     return {};
 
   std::vector<std::uint8_t> png = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
-  png.reserve(png.size() + 25 + 13 + 12 + std::size_t(zlen) + 12);
+  png.reserve(PNG_FRAMING_BYTES + zsize);
 
   std::vector<std::uint8_t> ihdr;
   putU32(ihdr, width);
@@ -126,8 +203,10 @@ std::vector<std::uint8_t> encodePngRgba8(
   putChunk(png, "IHDR", ihdr.data(), ihdr.size());
   const std::uint8_t srgb = 0; // perceptual rendering intent
   putChunk(png, "sRGB", &srgb, 1);
-  putChunk(png, "IDAT", z.get(), std::size_t(zlen));
+  putChunk(png, "IDAT", zdata, zsize);
   putChunk(png, "IEND", nullptr, 0);
+  if (png.size() > *bound)
+    return {};
   return png;
 }
 

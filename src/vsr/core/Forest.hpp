@@ -3,18 +3,30 @@
 
 #pragma once
 
+// vsr_core
 #include "vsr/core/ObjectPool.hpp"
 #include "vsr/core/TypeMacros.hpp"
 // std
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <type_traits>
 #include <utility>
 
 namespace vsr::core {
 
 template <typename T>
 struct Forest;
+
+// Optional value-specific storage relocation, not a public payload edit.
+template <typename T>
+struct ForestStorageTraits
+{
+  static T relocate(T &&value) noexcept(
+      std::is_nothrow_move_constructible_v<T>);
+  static void relocateAssign(T &destination, T &&source) noexcept(
+      std::is_nothrow_move_assignable_v<T>);
+};
 
 /*
  * Intrusive tree node that stores a value and maintains parent, sibling, and
@@ -32,6 +44,11 @@ struct ForestNode
 
   ForestNode() = default;
   ForestNode(T initialValue, Forest<T> *f);
+  VSR_DEFAULT_COPYABLE(ForestNode)
+  ForestNode(ForestNode &&o) noexcept(
+      noexcept(ForestStorageTraits<T>::relocate(std::move(o.m_value))));
+  ForestNode &operator=(ForestNode &&o) noexcept(noexcept(
+      ForestStorageTraits<T>::relocateAssign(m_value, std::move(o.m_value))));
 
   T &value();
   const T &value() const;
@@ -159,7 +176,23 @@ struct Forest
   using NodeRef = typename ForestNode<T>::Ref;
   using Visitor = ForestVisitor<T>;
 
-  Forest(T &&initialRootValue);
+  // Optional destination binding after successful storage, including root.
+  // Does not run for allocation gaps, rejected slots or storage relocation.
+  using ValueBinding = std::function<void(T &)>;
+
+  // Optional successful membership edits, separate from storage binding.
+  // Root construction, reserve, gaps and rejected slots are not edits.
+  using MembershipChange = std::function<void()>;
+
+  // Optional copy preflight, before any destination storage or membership
+  // edits. Generic values need no validation; clients may reject incompatible
+  // owners.
+  using CopyValidation = std::function<void(const T &)>;
+
+  Forest(T &&initialRootValue,
+      ValueBinding bindValue = {},
+      MembershipChange membershipChange = {},
+      CopyValidation validateCopy = {});
   Forest() = delete;
   ~Forest() = default;
 
@@ -222,7 +255,12 @@ struct Forest
   NodeRef make_ForestNode(T &&v);
   NodeRef make_ForestNode_at(size_t index, T &&v);
   void link_last_child(NodeRef n, NodeRef newForestNode);
+  void noteMembershipChange();
+  NodeRef copy_subtree_impl(NodeRef source, NodeRef newParent);
 
+  ValueBinding m_bindValue;
+  MembershipChange m_membershipChange;
+  CopyValidation m_validateCopy;
   ObjectPool<ForestNode<T>> m_nodes;
   NodeRef m_root;
   std::uint64_t m_nextLifetime{1};
@@ -250,7 +288,56 @@ ForestNodeRef<T> find_first_child(ForestNodeRef<T> node, PREDICATE &&pred);
 // Inlined definitions ////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////
 
+template <typename T>
+inline T ForestStorageTraits<T>::relocate(T &&value) noexcept(
+    std::is_nothrow_move_constructible_v<T>)
+{
+  return T(std::move(value));
+}
+
+template <typename T>
+inline void ForestStorageTraits<T>::relocateAssign(
+    T &destination, T &&source) noexcept(std::is_nothrow_move_assignable_v<T>)
+{
+  destination = std::move(source);
+}
+
 // ForestNode<> //
+
+template <typename T>
+inline ForestNode<T>::ForestNode(ForestNode &&o) noexcept(
+    noexcept(ForestStorageTraits<T>::relocate(std::move(o.m_value))))
+    : m_lifetime(o.m_lifetime),
+      m_topologyVersion(o.m_topologyVersion),
+      m_value(ForestStorageTraits<T>::relocate(std::move(o.m_value))),
+      m_prev(o.m_prev),
+      m_children_begin(o.m_children_begin),
+      m_children_end(o.m_children_end),
+      m_next(o.m_next),
+      m_parent(o.m_parent),
+      m_self(o.m_self),
+      m_forest(o.m_forest)
+{}
+
+template <typename T>
+inline ForestNode<T> &ForestNode<T>::operator=(ForestNode &&o) noexcept(
+    noexcept(
+        ForestStorageTraits<T>::relocateAssign(m_value, std::move(o.m_value))))
+{
+  if (this == &o)
+    return *this;
+  ForestStorageTraits<T>::relocateAssign(m_value, std::move(o.m_value));
+  m_lifetime = o.m_lifetime;
+  m_topologyVersion = o.m_topologyVersion;
+  m_prev = o.m_prev;
+  m_children_begin = o.m_children_begin;
+  m_children_end = o.m_children_end;
+  m_next = o.m_next;
+  m_parent = o.m_parent;
+  m_self = o.m_self;
+  m_forest = o.m_forest;
+  return *this;
+}
 
 template <typename T>
 inline ForestNode<T>::ForestNode(T v, Forest<T> *f)
@@ -438,7 +525,13 @@ inline void ForestVisitor<T>::postChildren_const(const ForestNode<T> &, int)
 // Forest<> //
 
 template <typename T>
-inline Forest<T>::Forest(T &&v)
+inline Forest<T>::Forest(T &&v,
+    ValueBinding bindValue,
+    MembershipChange membershipChange,
+    CopyValidation validateCopy)
+    : m_bindValue(std::move(bindValue)),
+      m_membershipChange(std::move(membershipChange)),
+      m_validateCopy(std::move(validateCopy))
 {
   m_root = make_ForestNode(std::forward<T>(v));
 }
@@ -504,6 +597,7 @@ inline typename Forest<T>::NodeRef Forest<T>::insert_first_child(
   else
     n->m_children_begin->m_prev = newForestNode;
   n->m_children_begin = newForestNode;
+  noteMembershipChange();
   return newForestNode;
 }
 
@@ -539,6 +633,14 @@ inline void Forest<T>::link_last_child(
   else
     n->m_children_end->m_next = newForestNode;
   n->m_children_end = newForestNode;
+  noteMembershipChange();
+}
+
+template <typename T>
+inline void Forest<T>::noteMembershipChange()
+{
+  if (m_membershipChange)
+    m_membershipChange();
 }
 
 template <typename T>
@@ -566,6 +668,7 @@ inline void Forest<T>::erase(Forest<T>::NodeRef n)
     next->m_prev = prev;
 
   m_nodes.erase(n.index());
+  noteMembershipChange();
 }
 
 template <typename T>
@@ -594,6 +697,7 @@ inline void Forest<T>::erase_subtree(Forest<T>::NodeRef n)
 
   n->m_children_begin = n;
   n->m_children_end = n;
+  noteMembershipChange();
 }
 
 template <typename T>
@@ -606,16 +710,32 @@ inline typename Forest<T>::NodeRef Forest<T>::copy_subtree(
   if (source->isRoot())
     return NodeRef();
 
+  if (newParent->container() != this)
+    return NodeRef();
+
   if (source == newParent) {
     newParent = newParent->parent();
   }
 
+  if (m_validateCopy) {
+    source->container()->traverse_const(source, [&](const auto &node, int) {
+      m_validateCopy(node.value());
+      return true;
+    });
+  }
+  return copy_subtree_impl(source, newParent);
+}
+
+template <typename T>
+inline typename Forest<T>::NodeRef Forest<T>::copy_subtree_impl(
+    Forest<T>::NodeRef source, Forest<T>::NodeRef newParent)
+{
   auto newNode = insert_last_child(newParent, T(source->value()));
 
   if (!source->isLeaf()) {
     auto child = source->next();
     while (child && child != source) {
-      copy_subtree(child, newNode);
+      copy_subtree_impl(child, newNode);
       child = child->sibling();
     }
   }
@@ -645,6 +765,10 @@ inline void Forest<T>::move_subtree(
     Forest<T>::NodeRef source, Forest<T>::NodeRef newParent)
 {
   if (!source || !newParent || source == newParent)
+    return;
+
+  // Reparent preserves storage and therefore cannot cross Forest ownership.
+  if (source->container() != this || newParent->container() != this)
     return;
 
   if (source->isRoot())
@@ -685,6 +809,7 @@ inline void Forest<T>::move_subtree(
   else
     newParent->m_children_end->m_next = source;
   newParent->m_children_end = source;
+  noteMembershipChange();
 }
 
 template <typename T>
@@ -832,6 +957,8 @@ inline typename Forest<T>::NodeRef Forest<T>::make_ForestNode(T &&v)
   n->m_self = n;
   n->m_children_end = n;
   n->m_children_begin = n;
+  if (m_bindValue)
+    m_bindValue(n->value());
   return n;
 }
 
@@ -849,6 +976,8 @@ inline typename Forest<T>::NodeRef Forest<T>::make_ForestNode_at(
   n->m_self = n;
   n->m_children_end = n;
   n->m_children_begin = n;
+  if (m_bindValue)
+    m_bindValue(n->value());
   return n;
 }
 

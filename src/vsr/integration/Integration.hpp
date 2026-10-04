@@ -3,7 +3,10 @@
 
 #pragma once
 
+// vsr_integration
+#include "vsr/integration/identity/Identity.hpp"
 // std
+#include <array>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -64,11 +67,59 @@ struct SceneRegistration
   bool nodeEdits{false}; // explicit exposure, in addition to the edit grant
 };
 
+// Value-only, owning-thread snapshot of the actual host binding. The adapter
+// must only copy cached state: no device calls, allocations, waits or
+// mutations. Settings include every effective public setting, including quality
+// defaults. No handles, addresses, credentials or arbitrary diagnostics in text
+// fields. Each view needs a distinct ViewRevisionTracker supplied through
+// Inspector::setViewRevisions. The host must notify it on every effective
+// change (including change-back between observations), using the camera,
+// renderer, dimensions and notePipelineChanged contracts. Observations also
+// detect changed returned values, but cannot reconstruct unreported history.
+// Bound references assert actual source bindings, not convenient unrelated
+// Scene objects.
+struct EffectiveSetting
+{
+  std::string name;
+  std::vector<double> numbers;
+  std::string text;
+};
+
+struct EffectiveCamera
+{
+  std::string projection{"perspective"};
+  std::array<double, 3> position{0., 0., 0.};
+  std::array<double, 3> direction{0., 0., -1.};
+  std::array<double, 3> up{0., 1., 0.};
+  double fovyDegrees{60.};
+  // For other read-only projections, complete public projection parameters.
+  std::vector<EffectiveSetting> projectionSettings;
+};
+
+struct EffectiveViewBinding
+{
+  EffectiveCamera camera;
+  std::uint32_t width{0};
+  std::uint32_t height{0};
+  std::string deviceIdentifier;
+  std::string rendererSubtype;
+  std::vector<EffectiveSetting> rendererSettings;
+  std::string rendererConfigurationRevision;
+  std::string pipelineSource;
+  std::vector<EffectiveSetting> pipelineSettings;
+  std::string pipelineConfigurationRevision;
+  identity::ObjectHandle cameraHandle;
+  identity::ObjectHandle rendererHandle;
+};
+
+using BindingObserver = std::function<std::optional<EffectiveViewBinding>()>;
+
 struct ViewRegistration
 {
   std::string name;
   SceneId scene{INVALID_SCENE_ID};
   ViewGrants grants;
+  BindingObserver observeBinding;
 };
 
 struct SessionTiming
@@ -137,6 +188,8 @@ class Integration
   std::size_t queueCapacity() const;
   // True only on the servicing thread while it runs submitted work.
   bool inServiceCall() const;
+  // Invokes the explicit host adapter only from submitted safe-point work.
+  std::optional<EffectiveViewBinding> observeViewBinding(ViewId id) const;
 
   // Host registration (host thread, before activation) //
 

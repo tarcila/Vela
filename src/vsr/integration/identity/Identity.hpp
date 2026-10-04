@@ -189,6 +189,8 @@ struct Revision
 struct SceneRevisionTag;
 struct ViewRevisionTag;
 struct InspectionRevisionTag;
+struct CapturePolicyRevisionTag;
+using CapturePolicyRevision = Revision<CapturePolicyRevisionTag>;
 using SceneRevision = Revision<SceneRevisionTag>;
 using ViewRevision = Revision<ViewRevisionTag>;
 using InspectionRevision = Revision<InspectionRevisionTag>;
@@ -309,6 +311,7 @@ class SceneIdentity
 
   static anari::DataType normalize(anari::DataType t);
   static bool isViewObject(anari::DataType t);
+  static void advanceRevision(std::uint64_t &revision);
   static std::size_t fingerprint(const scene::Object &o);
 
   Entry *entryOf(const scene::Object *o);
@@ -319,6 +322,7 @@ class SceneIdentity
   void metadataChanged(const scene::Object *o);
   void sceneContentChanged();
   void inspectionChanged();
+  void observeDependencies() const;
   void remap(const scene::IndexRemapper &remapper);
   void trackExisting();
 
@@ -348,8 +352,9 @@ class SceneIdentity
   mutable std::unordered_map<std::uint64_t, NodeEntry> m_nodes;
   Observer *m_observer{nullptr};
   std::size_t m_defragToken{0};
-  std::uint64_t m_sceneRevision{1};
-  std::uint64_t m_inspectionRevision{1};
+  mutable std::uint64_t m_sceneRevision{1};
+  mutable std::uint64_t m_inspectionRevision{1};
+  mutable std::uint64_t m_seenDependencyRevision{0};
   std::unordered_map<Key, std::uint64_t, KeyHash> m_serialOf;
   std::unordered_map<std::uint64_t, Entry> m_entries;
 };
@@ -364,6 +369,9 @@ class ViewRevisionTracker
   void setDimensions(std::uint32_t width, std::uint32_t height);
   // Host reports any Image Pipeline configuration change for this view.
   void notePipelineChanged();
+  // Bounded complete effective observation, not a collision-prone fingerprint.
+  void observeConfiguration(const std::string &configuration);
+  CapturePolicyRevision capturePolicyRevision() const;
 
   // Folds in camera/renderer parameter changes observed since the last call.
   ViewRevision revision();
@@ -382,6 +390,8 @@ class ViewRevisionTracker
   SceneIdentity *m_scene{nullptr};
   std::uint64_t m_domain{0};
   std::uint64_t m_value{1};
+  std::uint64_t m_policyDomain{0};
+  std::string m_configuration;
   Bound m_camera;
   Bound m_renderer;
   std::uint32_t m_width{0};
@@ -505,7 +515,8 @@ inline SceneIdentity::SceneIdentity(
       m_scene(&scene),
       m_domain(authority.nextDomain(HandleKind::OBJECT)),
       m_layerDomain(authority.nextDomain(HandleKind::LAYER)),
-      m_nodeDomain(authority.nextDomain(HandleKind::NODE))
+      m_nodeDomain(authority.nextDomain(HandleKind::NODE)),
+      m_seenDependencyRevision(scene.dependencyRevision())
 {
   trackExisting();
   for (const auto &entry : scene.layers())
@@ -715,13 +726,25 @@ inline bool SceneIdentity::isCurrent(const ParameterVersionToken &t) const
   return current && *current == t;
 }
 
+inline void SceneIdentity::observeDependencies() const
+{
+  const auto revision = m_scene->dependencyRevision();
+  if (revision == m_seenDependencyRevision)
+    return;
+  m_seenDependencyRevision = revision;
+  advanceRevision(m_sceneRevision);
+  advanceRevision(m_inspectionRevision);
+}
+
 inline SceneRevision SceneIdentity::sceneRevision() const
 {
+  observeDependencies();
   return SceneRevision{m_authority->launch(), m_domain, m_sceneRevision};
 }
 
 inline InspectionRevision SceneIdentity::inspectionRevision() const
 {
+  observeDependencies();
   return InspectionRevision{
       m_authority->launch(), m_domain, m_inspectionRevision};
 }
@@ -773,6 +796,12 @@ inline bool SceneIdentity::isViewObject(anari::DataType t)
   return t == ANARI_CAMERA || t == ANARI_RENDERER;
 }
 
+inline void SceneIdentity::advanceRevision(std::uint64_t &revision)
+{
+  if (++revision == 0)
+    std::terminate();
+}
+
 inline std::size_t SceneIdentity::fingerprint(const scene::Object &o)
 {
   // The metadata version is not preserved across object moves, so it is
@@ -803,7 +832,7 @@ inline void SceneIdentity::track(const scene::Object *o)
   m_serialOf[key] = serial;
   m_entries[serial] = Entry{key, 1, fingerprint(*o)};
   if (!isViewObject(key.type))
-    m_sceneRevision++;
+    advanceRevision(m_sceneRevision);
   inspectionChanged();
 }
 
@@ -818,7 +847,7 @@ inline void SceneIdentity::untrack(const scene::Object *o)
   m_entries.erase(it->second);
   m_serialOf.erase(it);
   if (!isViewObject(key.type))
-    m_sceneRevision++;
+    advanceRevision(m_sceneRevision);
   inspectionChanged();
 }
 
@@ -826,7 +855,7 @@ inline void SceneIdentity::untrackAll()
 {
   m_serialOf.clear();
   m_entries.clear();
-  m_sceneRevision++;
+  advanceRevision(m_sceneRevision);
   inspectionChanged();
 }
 
@@ -837,7 +866,7 @@ inline void SceneIdentity::parameterChanged(const scene::Object *o)
     return;
   e->parameterVersion++;
   if (!isViewObject(e->key.type))
-    m_sceneRevision++;
+    advanceRevision(m_sceneRevision);
   inspectionChanged();
 }
 
@@ -852,13 +881,13 @@ inline void SceneIdentity::metadataChanged(const scene::Object *o)
 
 inline void SceneIdentity::sceneContentChanged()
 {
-  m_sceneRevision++;
+  advanceRevision(m_sceneRevision);
   inspectionChanged();
 }
 
 inline void SceneIdentity::inspectionChanged()
 {
-  m_inspectionRevision++;
+  advanceRevision(m_inspectionRevision);
 }
 
 inline void SceneIdentity::remap(const scene::IndexRemapper &remapper)
@@ -900,7 +929,10 @@ inline void SceneIdentity::trackExisting()
 
 inline ViewRevisionTracker::ViewRevisionTracker(
     IdentityAuthority &authority, SceneIdentity &scene)
-    : m_authority(&authority), m_scene(&scene), m_domain(authority.nextDomain())
+    : m_authority(&authority),
+      m_scene(&scene),
+      m_domain(authority.nextDomain()),
+      m_policyDomain(authority.nextDomain())
 {}
 
 inline void ViewRevisionTracker::setCamera(const ObjectHandle &camera)
@@ -926,6 +958,20 @@ inline void ViewRevisionTracker::setDimensions(
 inline void ViewRevisionTracker::notePipelineChanged()
 {
   m_value++;
+}
+
+inline void ViewRevisionTracker::observeConfiguration(
+    const std::string &configuration)
+{
+  if (configuration == m_configuration)
+    return;
+  m_configuration = configuration;
+  m_value++;
+}
+
+inline CapturePolicyRevision ViewRevisionTracker::capturePolicyRevision() const
+{
+  return {m_authority->launch(), m_policyDomain, 1};
 }
 
 inline ViewRevision ViewRevisionTracker::revision()

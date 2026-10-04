@@ -3,10 +3,13 @@
 
 #pragma once
 
+// vsr_core
 #include "vsr/core/Any.hpp"
 #include "vsr/core/FlatMap.hpp"
 #include "vsr/core/Forest.hpp"
 #include "vsr/core/VSRMath.hpp"
+// vsr_scene
+#include "vsr/scene/SceneDependencyState.hpp"
 
 namespace vsr::scene {
 
@@ -59,8 +62,9 @@ struct LayerNodeData
   bool isEnabled() const;
 
   // Local editable write history, independent of layer notifications and names.
-  // Copy/move construction preserves it for storage relocation; node lifetime
-  // distinguishes clones. Assignments are writes to the destination.
+  // Copies and genuine move-outs are detached values; assignments write the
+  // receiving node. Forest storage relocation preserves attachment/history,
+  // while node lifetime distinguishes clones.
   std::uint64_t editVersion() const;
   // Globally ordered payload/transform history, excluding enabled-only writes.
   std::uint64_t transformVersion() const;
@@ -98,6 +102,16 @@ struct LayerNodeData
   void clearInstanceParameters();
 
  private:
+  friend struct Layer;
+  friend struct vsr::core::ForestStorageTraits<LayerNodeData>;
+  struct StorageRelocationTag
+  {
+  };
+  LayerNodeData(LayerNodeData &&o, StorageRelocationTag) noexcept;
+  void relocateAssign(LayerNodeData &&o) noexcept;
+  void bind(Layer *layer);
+  void noteDependencyChange();
+  void checkAssignmentOwner(const LayerNodeData &o) const;
   void noteEdit(bool transformWrite = true);
   void incObjectUseCount();
   void decObjectUseCount();
@@ -112,11 +126,10 @@ struct LayerNodeData
   Any m_defaultValue;
   math::mat3 m_srt; // scale, azelrot, translation
   InstanceParameterMap m_instanceParameters;
-  Layer *m_layer{nullptr};
+  std::weak_ptr<detail::LayerOwnerState> m_layerOwner;
+  std::weak_ptr<detail::SceneDependencyState> m_sceneOwner;
+  bool m_attached{false};
 };
-
-using LayerNode = ForestNode<LayerNodeData>;
-using LayerNodeRef = LayerNode::Ref;
 
 // Inlined definitions ////////////////////////////////////////////////////////
 
@@ -126,4 +139,34 @@ inline LayerNodeData::LayerNodeData(
     : LayerNodeData(layer, obj.data(), n)
 {}
 
+} // namespace vsr::scene
+
+namespace vsr::core {
+
+template <>
+struct ForestStorageTraits<scene::LayerNodeData>
+{
+  static scene::LayerNodeData relocate(scene::LayerNodeData &&value) noexcept;
+  static void relocateAssign(scene::LayerNodeData &destination,
+      scene::LayerNodeData &&source) noexcept;
+};
+
+inline scene::LayerNodeData ForestStorageTraits<scene::LayerNodeData>::relocate(
+    scene::LayerNodeData &&value) noexcept
+{
+  return scene::LayerNodeData(
+      std::move(value), scene::LayerNodeData::StorageRelocationTag{});
+}
+
+inline void ForestStorageTraits<scene::LayerNodeData>::relocateAssign(
+    scene::LayerNodeData &destination, scene::LayerNodeData &&source) noexcept
+{
+  destination.relocateAssign(std::move(source));
+}
+
+} // namespace vsr::core
+
+namespace vsr::scene {
+using LayerNode = ForestNode<LayerNodeData>;
+using LayerNodeRef = LayerNode::Ref;
 } // namespace vsr::scene

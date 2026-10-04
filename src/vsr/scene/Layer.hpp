@@ -3,6 +3,7 @@
 
 #pragma once
 
+// vsr_scene
 #include "vsr/scene/LayerNodeData.hpp"
 
 namespace vsr::scene {
@@ -69,10 +70,16 @@ struct Layer final
       ConstVisitorExitFunction &&onNodeExit) const;
 
  private:
+  void noteMembershipChange();
+  void revokeMembership();
+  void validateCopy(const LayerNodeData &value) const;
+
+  friend struct Scene; // Scene removal revokes tracking, not object resolution.
+  friend struct LayerNodeData;
   const std::uint64_t m_lifetime;
-  Scene *m_scene{nullptr};
+  std::shared_ptr<detail::LayerOwnerState> m_owner;
   std::string m_name;
-  Forest<LayerNodeData> m_tree{{this, math::IDENTITY_MAT4, "root"}};
+  Forest<LayerNodeData> m_tree;
 };
 
 using LayerVisitor = Layer::Visitor;

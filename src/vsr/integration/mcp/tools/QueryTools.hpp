@@ -172,6 +172,71 @@ inline void addQueryTools(std::vector<Tool> &tools, QueryDeps deps)
     return submitAndAck(deps.engine, c, args, std::move(built.request));
   };
   tools.push_back(std::move(inspect));
+
+  Tool bounds;
+  bounds.name = "vsr_bounds";
+  bounds.description =
+      "Observe default-visible scene bounds at a safe point: active layers "
+      "and effectively enabled contributors only. Missing host binding is "
+      "unavailable/missing_binding, not empty geometry. No scans, renderer "
+      "setup or provider work. include_disabled=true and any node_handle "
+      "are unsupported. Fixed work ceilings: 256 node/geometry steps and "
+      "4096 vertex values per slice; 4096 nodes and 1048576 vertex values "
+      "per operation; deadline 5 seconds including queue time; shared "
+      "temporary scratch at most 8 MiB. Value-only results claim no scans.";
+  bounds.inputSchemaJson =
+      std::string("{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{")
+      + requestIdSchema()
+      + ",\"scene_id\":{\"type\":\"integer\",\"minimum\":0},"
+        "\"include_disabled\":{\"type\":\"boolean\",\"enum\":[false],\"default\":false}},"
+        "\"required\":[\"request_id\",\"scene_id\"]}";
+  bounds.handler = [deps](
+                       const session::Credentials &c, const json::Value &args) {
+    for (const auto &property : args.o)
+      if (property.first != "request_id" && property.first != "scene_id"
+          && property.first != "include_disabled")
+        return rejected(Outcome::INVALID_REQUEST);
+    const auto scene = targetIdArg(args, "scene_id");
+    inspection::bounds::Args selection;
+    if (!scene || args.get("node_handle"))
+      return rejected(Outcome::INVALID_REQUEST);
+    if (const auto *include = args.get("include_disabled")) {
+      if (include->type != json::Value::Type::BOOL)
+        return rejected(Outcome::INVALID_REQUEST);
+      selection.includeDisabled = include->b;
+    }
+    auto built = deps.inspector.makeBounds(c.sessionId, *scene, selection);
+    if (built.code != Outcome::OK)
+      return rejected(built.code);
+    return submitAndAck(deps.engine, c, args, std::move(built.request));
+  };
+  tools.push_back(std::move(bounds));
+
+  Tool viewInfo;
+  viewInfo.name = "vsr_view_info";
+  viewInfo.description =
+      "Read the registered host's effective world-space camera, dimensions, "
+      "Device Identifier, renderer settings and Image Pipeline provenance at "
+      "a safe point. Perspective FOV is degrees; aspect comes from dimensions. "
+      "Capture remains unexposed/unqualified, with no supported quality units. "
+      "Fixed limits: axis 2048, pixels 2073600, quality maximum 1024, deadline "
+      "120 seconds, PNG 8 MiB, response 12 MiB, per-view/global capacity 1, "
+      "host/device budgets 256 MiB each. Metadata grants no capture authority.";
+  viewInfo.inputSchemaJson =
+      std::string("{\"type\":\"object\",\"properties\":{") + requestIdSchema()
+      + ",\"view_id\":{\"type\":\"integer\",\"minimum\":0}},"
+        "\"required\":[\"request_id\",\"view_id\"]}";
+  viewInfo.handler = [deps](const session::Credentials &c,
+                         const json::Value &args) {
+    const auto view = targetIdArg(args, "view_id");
+    if (!view)
+      return rejected(Outcome::INVALID_REQUEST);
+    auto built = deps.inspector.makeViewInfo(c.sessionId, *view);
+    if (built.code != Outcome::OK)
+      return rejected(built.code);
+    return submitAndAck(deps.engine, c, args, std::move(built.request));
+  };
+  tools.push_back(std::move(viewInfo));
 }
 
 } // namespace vsr::integration::mcp::tools

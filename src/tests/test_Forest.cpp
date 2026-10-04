@@ -5,6 +5,145 @@
 #include "catch.hpp"
 // vsr
 #include "vsr/core/Forest.hpp"
+// std
+#include <stdexcept>
+#include <vector>
+
+SCENARIO("Forest value binding is optional and only binds stored members",
+    "[Forest]")
+{
+  int bindings = 0;
+  vsr::core::Forest<int> tree(-1, [&](int &value) {
+    ++bindings;
+    value *= 10;
+  });
+  CHECK(bindings == 1);
+  CHECK(tree.root()->value() == -10);
+  auto first = tree.root()->insert_first_child(2);
+  auto last = tree.insert_last_child(tree.root(), 3);
+  auto chosen = tree.root()->insert_last_child_at(20, 4);
+  CHECK(bindings == 4);
+  CHECK(first->value() == 20);
+  CHECK(last->value() == 30);
+  CHECK(chosen->value() == 40);
+  CHECK(tree.size() == 4);
+  CHECK_FALSE(tree.at(10));
+  CHECK_FALSE(tree.root()->insert_last_child_at(20, 5));
+  CHECK_FALSE(tree.root()->insert_last_child_at(VSR_INVALID_INDEX, 5));
+  tree.reserve(4096);
+  CHECK(bindings == 4);
+  tree.erase(first);
+  auto reused = tree.root()->insert_last_child(6);
+  CHECK(reused.index() == first.index());
+  CHECK(reused->value() == 60);
+  CHECK(bindings == 5);
+  tree.clear();
+  CHECK(tree.size() == 1);
+  CHECK(tree.root()->value() == -10);
+  CHECK(bindings == 5);
+}
+
+SCENARIO("Forest membership instrumentation is optional and allocation neutral",
+    "[Forest]")
+{
+  using vsr::core::Forest;
+  Forest<int> *observed = nullptr;
+  std::vector<size_t> sizes;
+  int bindings = 0;
+  Forest<int> tree(
+      -1,
+      [&](int &) { ++bindings; },
+      [&]() {
+        REQUIRE(observed);
+        sizes.push_back(observed->size());
+      });
+  observed = &tree;
+  CHECK(bindings == 1);
+  CHECK(sizes.empty());
+  CHECK(tree.root()->isRoot());
+  tree.reserve(1024);
+  tree.clear();
+  tree.erase(tree.root());
+  CHECK(sizes.empty());
+  auto first = tree.root()->insert_first_child(2);
+  auto last = tree.insert_last_child_at(tree.root(), 8, 3);
+  CHECK(tree.root()->next() == first);
+  CHECK(first->sibling() == last);
+  CHECK(last->sibling() == tree.root());
+  CHECK(sizes == std::vector<size_t>{2, 3});
+  CHECK(bindings == 3);
+  for (size_t i = 2; i < 8; ++i)
+    CHECK_FALSE(tree.at(i));
+  CHECK_FALSE(tree.root()->insert_last_child_at(8, 4));
+  CHECK_FALSE(tree.root()->insert_last_child_at(VSR_INVALID_INDEX, 4));
+  tree.erase_subtree(first);
+  tree.reserve(2048);
+  CHECK(sizes == std::vector<size_t>{2, 3});
+  CHECK(bindings == 3);
+  first->erase_self();
+  CHECK(sizes == std::vector<size_t>{2, 3, 2});
+  tree.clear();
+  CHECK(sizes == std::vector<size_t>{2, 3, 2, 1});
+  CHECK(tree.root()->value() == -1);
+  CHECK(bindings == 3);
+  tree.clear();
+  CHECK(sizes.size() == 4);
+}
+
+SCENARIO("Forest copy validation is optional and precedes all clone edits",
+    "[Forest]")
+{
+  using vsr::core::Forest;
+  Forest<int> source(-1);
+  auto branch = source.root()->insert_last_child(2);
+  branch->insert_last_child(3);
+  branch->insert_last_child(4);
+  int bindings = 0;
+  int changes = 0;
+  std::vector<int> validated;
+  Forest<int> destination(
+      -1,
+      [&](int &) { ++bindings; },
+      [&]() { ++changes; },
+      [&](const int &value) {
+        validated.push_back(value);
+        if (value == 4)
+          throw std::runtime_error("rejected value");
+      });
+  CHECK(bindings == 1);
+  CHECK_THROWS_AS(
+      destination.copy_subtree(branch, destination.root()), std::runtime_error);
+  CHECK(validated == std::vector<int>{2, 3, 4});
+  CHECK(destination.size() == 1);
+  CHECK(destination.root()->isLeaf());
+  CHECK(bindings == 1);
+  CHECK(changes == 0);
+  validated.clear();
+  source.erase(branch->next()->sibling());
+  auto clone = destination.copy_subtree(branch, destination.root());
+  REQUIRE(clone);
+  CHECK(validated == std::vector<int>{2, 3});
+  CHECK(clone->value() == 2);
+  CHECK(clone->next()->value() == 3);
+  CHECK(clone->parent() == destination.root());
+  CHECK(destination.size() == 3);
+  CHECK(bindings == 3);
+  CHECK(changes == 2);
+  auto sibling = destination.root()->insert_last_child(5);
+  destination.move_subtree(clone, sibling);
+  CHECK(clone->parent() == sibling);
+  CHECK(changes == 4);
+  destination.move_subtree(clone, sibling);
+  CHECK(changes == 4);
+
+  Forest<int> plain(-10);
+  auto plainCopy = plain.copy_subtree(branch, plain.root());
+  REQUIRE(plainCopy);
+  CHECK(plainCopy->value() == 2);
+  CHECK(plainCopy->next()->value() == 3);
+  CHECK(plain.size() == 3);
+  CHECK(source.size() == 3);
+}
 
 SCENARIO("vsr::core::Forest<> interface", "[Forest]")
 {

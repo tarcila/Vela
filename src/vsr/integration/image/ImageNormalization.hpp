@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -221,10 +222,19 @@ inline std::vector<std::uint8_t> normalizeToRgba8(const SourceImage &src)
 
 // PNG encoding ///////////////////////////////////////////////////////////////
 
+// Complete PNG byte bound, including filtered rows, stored-deflate blocks,
+// zlib framing and all four PNG chunks. No pixels are accessed or allocated.
+// Returns no value for zero dimensions, arithmetic/container overflow, or
+// filtered data / complete output exceeding INT_MAX (encoder/chunk limits).
+// Every successful encodePngRgba8() output is at most this bound. Allocation
+// failures in encoding/normalization propagate as standard exceptions.
+std::optional<std::size_t> pngRgba8OutputBound(
+    std::uint32_t width, std::uint32_t height);
+
 // Encodes top-left-origin RGBA8 rows as a PNG (color type 6, bit depth 8)
 // with deflate-compressed image data. An sRGB chunk marks the RGB channels
 // as sRGB-encoded. Output is byte-deterministic for a given input. Returns
-// an empty vector when the image is too large to encode.
+// an empty vector for null pixels or dimensions rejected by the bound helper.
 std::vector<std::uint8_t> encodePngRgba8(
     std::uint32_t width, std::uint32_t height, const std::uint8_t *rgba);
 
@@ -233,7 +243,8 @@ inline NormalizeResult normalizeToPng(const SourceImage &src)
 {
   NormalizeResult result;
   std::size_t count = 0;
-  if (!detail::pixelCount(src, count)) {
+  if (!pngRgba8OutputBound(src.width, src.height)
+      || !detail::pixelCount(src, count)) {
     result.error = NormalizeError::INVALID_DIMENSIONS;
     return result;
   }

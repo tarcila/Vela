@@ -354,6 +354,197 @@ struct Fixture
 
 } // namespace
 
+SCENARIO("MCP effective binding observation polls and replays over loopback",
+    "[integration][view-info]")
+{
+  Fixture f;
+  identity::ViewRevisionTracker tracker(f.ids, *f.sceneIds);
+  f.inspector->setViewRevisions([&](ViewId) { return &tracker; });
+  EffectiveViewBinding binding;
+  binding.camera.position = {7., 8., 9.};
+  binding.width = 1280;
+  binding.height = 720;
+  binding.deviceIdentifier = "default@helide";
+  binding.rendererSubtype = "default";
+  binding.rendererConfigurationRevision = "r1";
+  binding.rendererSettings = {{"samples", {1.}}};
+  binding.pipelineSource = "standalone-agent";
+  binding.pipelineConfigurationRevision = "p1";
+  ViewId view{};
+  ViewId otherView{};
+  bool observed = false;
+  f.integration.submit(f.sceneId, [&](vsr::scene::Scene &) {
+    ViewRegistration v{"agent", f.sceneId, {true, true}};
+    v.observeBinding = [&] {
+      REQUIRE(f.integration.inServiceCall());
+      observed = true;
+      return std::optional<EffectiveViewBinding>(binding);
+    };
+    view = *f.integration.registerView(v);
+    otherView = *f.integration.registerView({"other", f.sceneId, {true, true}});
+  });
+  f.drain();
+  auto s = f.attach();
+  const auto listedTools = json::write(f.rpc("tools/list", "{}").json);
+  CHECK(listedTools.find("vsr_view_info") != std::string::npos);
+  CHECK(listedTools.find("vsr_capture\"") == std::string::npos);
+  const std::string args =
+      "{\"request_id\":1,\"view_id\":" + std::to_string(view) + "}";
+  auto ack = f.tool(s, "vsr_view_info", args);
+  REQUIRE(ack.str("state") == "pending");
+  CHECK_FALSE(observed);
+  CHECK(f.status(s, s.id, 1).str("progress") == "queued");
+  f.drain();
+  auto complete = f.status(s, s.id, 1);
+  REQUIRE(complete.str("outcome") == "ok");
+  const auto *result = complete.result();
+  REQUIRE(result);
+  CHECK(result->get("camera")->get("position")->a[0].n == 7.);
+  CHECK(result->get("camera")->get("fovy_deg")->n == 60.);
+  CHECK(result->get("renderer_settings")->a[0].get("numbers")->a[0].n == 1.);
+  CHECK(result->get("device_private_state")->get("state")->s == "unknown");
+  CHECK_FALSE(result->get("capture_policy")->get("exposed")->b);
+  CHECK(result->get("view_id")->n == view);
+  CHECK(result->get("scene_id")->n == f.sceneId);
+  CHECK(result->get("width")->n == 1280);
+  CHECK(result->get("height")->n == 720);
+  CHECK(result->get("device_identifier")->s == "default@helide");
+  CHECK(result->get("renderer_subtype")->s == "default");
+  CHECK(result->get("pipeline_source")->s == "standalone-agent");
+  CHECK(result->get("capture_policy_revision")->s
+      != result->get("view_revision")->s);
+  CHECK(result->get("scene_revision")->s != result->get("view_revision")->s);
+  CHECK(result->get("capture_policy")->get("max_png_bytes")->n == 8388608);
+  CHECK(
+      result->get("capture_policy")->get("host_budget_bytes")->n == 268435456);
+  const auto original = json::write(*result);
+  CHECK(f.tool(s,
+             "vsr_view_info",
+             "{\"request_id\":1,\"view_id\":" + std::to_string(otherView) + "}")
+            .errorCode()
+      == "request_id_conflict");
+  binding.camera.position[0] = 10.;
+  CHECK(f.tool(s, "vsr_view_info", args).flag("replayed"));
+  f.drain();
+  CHECK(json::write(*f.status(s, s.id, 1).result()) == original);
+  CHECK(f.tool(s, "vsr_view_info", "{\"request_id\":1,\"view_id\":999}")
+            .errorCode()
+      == "invalid_request");
+  f.tool(s,
+      "vsr_view_info",
+      "{\"request_id\":2,\"view_id\":" + std::to_string(view) + "}");
+  f.drain();
+  auto changed = f.status(s, s.id, 2);
+  REQUIRE(changed.str("outcome") == "ok");
+  CHECK(changed.result()->get("camera")->get("position")->a[0].n == 10.);
+  CHECK(changed.result()->get("view_revision")->s
+      != result->get("view_revision")->s);
+  binding.pipelineSource = std::string(5000, 'x');
+  f.tool(s,
+      "vsr_view_info",
+      "{\"request_id\":3,\"view_id\":" + std::to_string(view) + "}");
+  f.drain();
+  auto oversized = f.status(s, s.id, 3);
+  REQUIRE(oversized.str("outcome") == "ok");
+  CHECK(oversized.result()->get("reason")->s == "representation_unavailable");
+  CHECK_FALSE(oversized.result()->get("camera"));
+  f.tool(s, "vsr_discover", "{\"request_id\":10}");
+  f.drain();
+  auto discovery = f.status(s, s.id, 10);
+  REQUIRE(discovery.str("outcome") == "ok");
+  bool advertised = false;
+  for (const auto &item : discovery.result()->get("items")->a) {
+    if (item.get("kind")->s != "view")
+      continue;
+    CHECK(item.get("binding_observation")->s == "vsr_view_info");
+    CHECK_FALSE(item.get("capture_policy")->get("exposed")->b);
+    advertised = true;
+  }
+  CHECK(advertised);
+  f.authority->restrict(
+      session::Target::scene(f.sceneId), session::Capability::READ);
+  CHECK_FALSE(f.status(s, s.id, 1).result());
+  CHECK(f.tool(s,
+             "vsr_view_info",
+             "{\"request_id\":4,\"view_id\":" + std::to_string(view) + "}")
+            .errorCode()
+      == "forbidden");
+  f.authority->relax(
+      session::Target::scene(f.sceneId), session::Capability::READ);
+  f.authority->restrict(session::Target::view(view), session::Capability::READ);
+  CHECK(f.tool(s,
+             "vsr_view_info",
+             "{\"request_id\":4,\"view_id\":" + std::to_string(view) + "}")
+            .errorCode()
+      == "forbidden");
+}
+
+SCENARIO("MCP bounds admits only default-visible missing observations",
+    "[integration][bounds-mcp]")
+{
+  Fixture f;
+  const auto s = f.attach();
+  const auto listed = f.rpc("tools/list", "{}");
+  const auto *tools = listed.json.get("result")->get("tools");
+  REQUIRE(tools);
+  const json::Value *schema = nullptr;
+  for (const auto &tool : tools->a)
+    if (tool.get("name")->s == "vsr_bounds")
+      schema = tool.get("inputSchema");
+  REQUIRE(schema);
+  CHECK_FALSE(
+      schema->get("properties")->get("include_disabled")->get("default")->b);
+  CHECK_FALSE(schema->get("additionalProperties")->b);
+  const auto suffix = ",\"scene_id\":" + std::to_string(f.sceneId);
+  const auto args = "{\"request_id\":1" + suffix + "}";
+  for (const auto *choice : {",\"include_disabled\":true",
+           ",\"node_handle\":\"\"",
+           ",\"node_handle\":null",
+           ",\"include_disabled\":0",
+           ",\"deadline_seconds\":999"})
+    CHECK(f.tool(s, "vsr_bounds", "{\"request_id\":1" + suffix + choice + "}")
+              .errorCode()
+        == "invalid_request");
+  REQUIRE(f.tool(s, "vsr_bounds", args).str("state") == "pending");
+  CHECK(f.status(s, s.id, 1).str("progress") == "queued");
+  f.drain();
+  const auto completed = f.status(s, s.id, 1);
+  REQUIRE(completed.str("outcome") == "ok");
+  const auto *result = completed.result();
+  REQUIRE(result);
+  CHECK(result->get("state")->s == "unavailable");
+  CHECK(result->get("reason")->s == "missing_binding");
+  CHECK(result->get("scene_id")->n == f.sceneId);
+  CHECK(result->get("scene_revision")->s == token(f.sceneIds->sceneRevision()));
+  CHECK(result->get("inspection_revision")->s
+      == token(f.sceneIds->inspectionRevision()));
+  CHECK_FALSE(result->get("selection")->get("include_disabled")->b);
+  CHECK_FALSE(result->get("min"));
+  CHECK_FALSE(result->get("source"));
+  CHECK(f.tool(s, "vsr_bounds", args).flag("replayed"));
+  const auto explicitFalse =
+      "{\"request_id\":1" + suffix + ",\"include_disabled\":false}";
+  CHECK(f.tool(s, "vsr_bounds", explicitFalse).errorCode()
+      == "request_id_conflict");
+  const auto second =
+      "{\"request_id\":2" + suffix + ",\"include_disabled\":false}";
+  REQUIRE(f.tool(s, "vsr_bounds", second).str("state") == "pending");
+  f.drain();
+  CHECK(f.tool(s, "vsr_bounds", second).flag("replayed"));
+  CHECK(f.tool(s, "vsr_bounds", "{\"request_id\":2" + suffix + "}").errorCode()
+      == "request_id_conflict");
+  f.authority->restrict(
+      session::Target::scene(f.sceneId), session::Capability::READ);
+  const auto hidden = f.status(s, s.id, 1);
+  CHECK_FALSE(hidden.result());
+  CHECK_FALSE(hidden.sc()->get("scene_id"));
+  CHECK_FALSE(hidden.sc()->get("scene_revision"));
+  CHECK_FALSE(hidden.sc()->get("selection"));
+  CHECK(f.tool(s, "vsr_bounds", "{\"request_id\":3" + suffix + "}").errorCode()
+      == "forbidden");
+  CHECK(f.inspector->scratch().used() == 0);
+}
+
 SCENARIO(
     "MCP discovery and inspection tools page over loopback", "[integration]")
 {

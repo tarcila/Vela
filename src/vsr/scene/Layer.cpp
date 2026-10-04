@@ -1,12 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#include "vsr/scene/Layer.hpp"
+// vsr_core
 #include "vsr/core/Logging.hpp"
+// vsr_scene
+#include "vsr/scene/Layer.hpp"
 #include "vsr/scene/Scene.hpp"
 // std
 #include <atomic>
 #include <exception>
+#include <stdexcept>
 
 namespace vsr::scene {
 
@@ -22,14 +25,29 @@ std::uint64_t nextLayerLifetime()
 } // namespace
 
 Layer::Layer(Scene *scene, std::string name)
-    : m_lifetime(nextLayerLifetime()), m_scene(scene), m_name(std::move(name))
+    : m_lifetime(nextLayerLifetime()),
+      m_owner(std::make_shared<detail::LayerOwnerState>(
+          detail::LayerOwnerState{this,
+              scene ? scene->m_dependencyState
+                    : std::weak_ptr<detail::SceneDependencyState>{}})),
+      m_name(std::move(name)),
+      m_tree(
+          {this, math::IDENTITY_MAT4, "root"},
+          [this](LayerNodeData &value) { value.bind(this); },
+          [this]() { noteMembershipChange(); },
+          [this](const LayerNodeData &value) { validateCopy(value); })
 {}
 
-Layer::~Layer() = default;
+Layer::~Layer()
+{
+  // Detached payloads can still resolve their Scene and balance references.
+  m_owner->layer = nullptr;
+}
 
 Scene *Layer::scene() const
 {
-  return m_scene;
+  auto owner = m_owner->scene.lock();
+  return owner ? owner->scene : nullptr;
 }
 
 const std::string &Layer::name() const
@@ -67,6 +85,29 @@ LayerNodeRef Layer::at(size_t i) const
   return m_tree.at(i);
 }
 
+void Layer::noteMembershipChange()
+{
+  if (!m_owner->dependencyAttached)
+    return;
+  if (auto owner = m_owner->scene.lock())
+    owner->noteChange();
+}
+
+void Layer::validateCopy(const LayerNodeData &value) const
+{
+  // Compare ownership identities, not raw pointers or numeric object indices.
+  // Expired owners must not be revived by allocator reuse in another Scene.
+  if (m_owner->scene.owner_before(value.m_sceneOwner)
+      || value.m_sceneOwner.owner_before(m_owner->scene))
+    throw std::runtime_error("Cannot copy a subtree across Scenes");
+}
+
+void Layer::revokeMembership()
+{
+  noteMembershipChange();
+  m_owner->dependencyAttached = false;
+}
+
 void Layer::erase(LayerNodeRef obj)
 {
   m_tree.erase(obj);
@@ -75,8 +116,8 @@ void Layer::erase(LayerNodeRef obj)
 void Layer::clear()
 {
   m_tree.clear();
-  if (m_scene)
-    m_scene->signalLayerStructureChanged(this);
+  if (auto *s = scene())
+    s->signalLayerStructureChanged(this);
 }
 
 bool Layer::isAncestorOf(

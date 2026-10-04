@@ -166,6 +166,92 @@ TEST_CASE("Scene synchronization states use the frozen names", "[integration]")
   REQUIRE(std::string(syncStateName(SyncState::FAILED)) == "failed");
 }
 
+SCENARIO("automatic validity survives successful then failed synchronization",
+    "[integration][transfer-validity][cumulative-validity]")
+{
+  const bool inspectionFirst = GENERATE(false, true);
+  Fixture fx;
+  auto root = fx.sceneA.defaultLayer()->root();
+  auto parent = fx.sceneA.insertChildTransformNode(root);
+  auto node = fx.sceneA.insertChildTransformNode(parent);
+  auto sibling = fx.sceneA.insertChildNode(root);
+  auto originalBatch = fx.opacity(0.75);
+  REQUIRE(
+      fx.edits->submit(fx.creds, fx.ref(1), originalBatch).code == Outcome::OK);
+  fx.drain();
+  const auto successful = *fx.edits->result(fx.ref(1));
+  REQUIRE(successful.outcome == Outcome::OK);
+  REQUIRE(successful.sceneRevision);
+  REQUIRE(fx.hookCalls == 1);
+  REQUIRE(fx.sync->viewReady(fx.a1));
+  const auto before = fx.identityA->sceneRevision();
+  const auto inspected = fx.identityA->inspectionRevision();
+  const auto historical = fx.engine->status(fx.creds, fx.ref(1));
+  const auto translated =
+      vsr::math::translation_matrix(vsr::math::float3(3.f, 0.f, 0.f));
+  SECTION("original local transform reproduction")
+  {
+    node->value().setAsTransform(translated);
+  }
+  SECTION("original ancestor transform reproduction")
+  {
+    parent->value().setAsTransform(translated);
+  }
+  SECTION("original ancestor enablement reproduction")
+  {
+    parent->value().setEnabled(false);
+  }
+  SECTION("original Layer erase reproduction")
+  {
+    fx.sceneA.defaultLayer()->erase(node);
+  }
+  SECTION("original Scene empty helper reproduction")
+  {
+    fx.sceneA.insertChildNode(root);
+  }
+  SECTION("original direct insertion reproduction")
+  {
+    root->insert_last_child(vsr::scene::LayerNodeData(root->value().layer()));
+  }
+  SECTION("instance parameter reproduction")
+  {
+    node->value().setInstanceParameter("id", vsr::core::Any(7));
+  }
+  SECTION("subtree copy")
+  {
+    root->container()->copy_subtree(parent, sibling);
+  }
+  SECTION("reparent away and back without reads")
+  {
+    root->container()->move_subtree(node, sibling);
+    root->container()->move_subtree(node, parent);
+  }
+  fx.recovery = [](SceneId) { return false; };
+  const auto failed = fx.resync(2, fx.a);
+  REQUIRE_FALSE(failed.ready);
+  REQUIRE(fx.sync->state(fx.a) == SyncState::FAILED);
+  REQUIRE_FALSE(fx.sync->viewReady(fx.a1));
+  REQUIRE(fx.sync->viewReady(fx.b1));
+  if (inspectionFirst) {
+    CHECK(fx.identityA->inspectionRevision() != inspected);
+    CHECK(fx.identityA->sceneRevision() != before);
+  } else {
+    CHECK(fx.identityA->sceneRevision() != before);
+    CHECK(fx.identityA->inspectionRevision() != inspected);
+  }
+  const auto current = fx.identityA->sceneRevision();
+  const auto currentInspection = fx.identityA->inspectionRevision();
+  CHECK(fx.identityA->sceneRevision() == current);
+  CHECK(fx.identityA->inspectionRevision() == currentInspection);
+  CHECK(fx.hookCalls == 1);
+  const auto replay = fx.edits->submit(fx.creds, fx.ref(1), originalBatch);
+  REQUIRE(replay.replayed);
+  CHECK(replay.status.result == historical.result);
+  CHECK(fx.edits->result(fx.ref(1))->sceneRevision == successful.sceneRevision);
+  CHECK(fx.edits->result(fx.ref(1))->sceneRevision != current);
+  CHECK(*fx.matte->parameterValueAs<float>("opacity") == 0.75f);
+}
+
 SCENARIO("A failure blocks every view of its scene, not unrelated scenes",
     "[integration]")
 {

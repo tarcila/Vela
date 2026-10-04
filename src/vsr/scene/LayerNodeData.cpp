@@ -1,17 +1,24 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+// vsr_core
 #include "vsr/core/Logging.hpp"
+// vsr_scene
 #include "vsr/scene/Layer.hpp"
 #include "vsr/scene/Scene.hpp"
 // std
 #include <atomic>
 #include <exception>
+#include <stdexcept>
 
 namespace vsr::scene {
 
-LayerNodeData::LayerNodeData(Layer *layer, const char *n) : m_layer(layer)
+LayerNodeData::LayerNodeData(Layer *layer, const char *n)
 {
+  if (layer) {
+    m_layerOwner = layer->m_owner;
+    m_sceneOwner = layer->m_owner->scene;
+  }
   setEmpty();
   m_name = n;
 }
@@ -43,7 +50,8 @@ LayerNodeData::LayerNodeData(const LayerNodeData &o)
   m_defaultValue = o.m_defaultValue;
   m_srt = o.m_srt;
   m_instanceParameters = o.m_instanceParameters;
-  m_layer = o.m_layer;
+  m_layerOwner = o.m_layerOwner;
+  m_sceneOwner = o.m_sceneOwner;
   incObjectUseCount();
 }
 
@@ -56,14 +64,78 @@ LayerNodeData::LayerNodeData(LayerNodeData &&o)
   m_defaultValue = std::move(o.m_defaultValue);
   m_srt = std::move(o.m_srt);
   m_instanceParameters = std::move(o.m_instanceParameters);
-  m_layer = std::move(o.m_layer);
-  o.m_layer = nullptr;
+  m_layerOwner = o.m_layerOwner;
+  m_sceneOwner = o.m_sceneOwner;
   o.m_value.reset();
   o.noteEdit();
 }
 
+LayerNodeData::LayerNodeData(LayerNodeData &&o, StorageRelocationTag) noexcept
+    : m_name(std::move(o.m_name)),
+      m_enabled(o.m_enabled),
+      m_editVersion(o.m_editVersion),
+      m_transformVersion(o.m_transformVersion),
+      m_value(std::move(o.m_value)),
+      m_defaultValue(std::move(o.m_defaultValue)),
+      m_srt(o.m_srt),
+      m_instanceParameters(std::move(o.m_instanceParameters)),
+      m_layerOwner(std::move(o.m_layerOwner)),
+      m_sceneOwner(std::move(o.m_sceneOwner)),
+      m_attached(o.m_attached)
+{
+  o.m_attached = false;
+  o.m_value.reset();
+}
+
+void LayerNodeData::relocateAssign(LayerNodeData &&o) noexcept
+{
+  if (this == &o)
+    return;
+  decObjectUseCount();
+  m_name = std::move(o.m_name);
+  m_enabled = o.m_enabled;
+  m_editVersion = o.m_editVersion;
+  m_transformVersion = o.m_transformVersion;
+  m_value = std::move(o.m_value);
+  m_defaultValue = std::move(o.m_defaultValue);
+  m_srt = o.m_srt;
+  m_instanceParameters = std::move(o.m_instanceParameters);
+  m_layerOwner = std::move(o.m_layerOwner);
+  m_sceneOwner = std::move(o.m_sceneOwner);
+  m_attached = o.m_attached;
+  o.m_attached = false;
+  o.m_value.reset();
+}
+
+void LayerNodeData::bind(Layer *layer)
+{
+  // Empty and expired weak references differ: never revive a dead Scene's
+  // object indices when allocator storage is reused by another Scene.
+  std::weak_ptr<detail::SceneDependencyState> empty;
+  if (!m_sceneOwner.owner_before(empty) && !empty.owner_before(m_sceneOwner)) {
+    m_sceneOwner = layer->m_owner->scene;
+    incObjectUseCount();
+  }
+  m_layerOwner = layer->m_owner;
+  m_attached = true;
+}
+
+void LayerNodeData::checkAssignmentOwner(const LayerNodeData &o) const
+{
+  if (!m_attached
+      || (!m_sceneOwner.owner_before(o.m_sceneOwner)
+          && !o.m_sceneOwner.owner_before(m_sceneOwner)))
+    return;
+  bool hasObjectIndices = o.isObject() || o.m_defaultValue.holdsObject();
+  for (const auto &parameter : o.m_instanceParameters)
+    hasObjectIndices |= parameter.second.holdsObject();
+  if (hasObjectIndices)
+    throw std::runtime_error("Cannot assign object indices across Scenes");
+}
+
 LayerNodeData &LayerNodeData::operator=(const LayerNodeData &o)
 {
+  checkAssignmentOwner(o);
   noteEdit();
   if (this == &o)
     return *this;
@@ -74,13 +146,17 @@ LayerNodeData &LayerNodeData::operator=(const LayerNodeData &o)
   m_defaultValue = o.m_defaultValue;
   m_srt = o.m_srt;
   m_instanceParameters = o.m_instanceParameters;
-  m_layer = o.m_layer;
+  if (!m_attached) {
+    m_layerOwner = o.m_layerOwner;
+    m_sceneOwner = o.m_sceneOwner;
+  }
   incObjectUseCount();
   return *this;
 }
 
 LayerNodeData &LayerNodeData::operator=(LayerNodeData &&o)
 {
+  checkAssignmentOwner(o);
   noteEdit();
   if (this == &o)
     return *this;
@@ -91,8 +167,11 @@ LayerNodeData &LayerNodeData::operator=(LayerNodeData &&o)
   m_defaultValue = std::move(o.m_defaultValue);
   m_srt = std::move(o.m_srt);
   m_instanceParameters = std::move(o.m_instanceParameters);
-  m_layer = std::move(o.m_layer);
-  o.m_layer = nullptr;
+  if (!m_attached) {
+    m_layerOwner = o.m_layerOwner;
+    m_sceneOwner = o.m_sceneOwner;
+  }
+  // The source reference is transferred, not released and reacquired.
   o.m_value.reset();
   o.noteEdit();
   return *this;
@@ -105,12 +184,14 @@ LayerNodeData::~LayerNodeData()
 
 const Layer *LayerNodeData::layer() const
 {
-  return m_layer;
+  auto owner = m_layerOwner.lock();
+  return owner ? owner->layer : nullptr;
 }
 
 Layer *LayerNodeData::layer()
 {
-  return m_layer;
+  auto owner = m_layerOwner.lock();
+  return owner ? owner->layer : nullptr;
 }
 
 bool LayerNodeData::hasDefault() const
@@ -127,7 +208,9 @@ void LayerNodeData::setToDefaultValue()
 {
   if (hasDefault()) {
     noteEdit();
+    decObjectUseCount();
     m_value = m_defaultValue;
+    incObjectUseCount();
     if (isTransform())
       setAsTransform(getTransform()); // ensure srt matrix is up to date
   }
@@ -275,8 +358,19 @@ std::uint64_t LayerNodeData::transformVersion() const
   return m_transformVersion;
 }
 
+void LayerNodeData::noteDependencyChange()
+{
+  if (!m_attached)
+    return;
+  auto owner = m_layerOwner.lock();
+  auto scene = owner ? owner->scene.lock() : nullptr;
+  if (owner && owner->layer && owner->dependencyAttached && scene)
+    scene->noteChange();
+}
+
 void LayerNodeData::noteEdit(bool transformWrite)
 {
+  noteDependencyChange();
   // One ordered clock across all payloads makes the latest event on a chain
   // sufficient; unrelated writes never change a chain member's stamp.
   static std::atomic<std::uint64_t> clock{0};
@@ -292,7 +386,8 @@ void LayerNodeData::noteEdit(bool transformWrite)
 
 Object *LayerNodeData::getObject() const
 {
-  auto *scene = m_layer ? m_layer->scene() : nullptr;
+  auto owner = m_sceneOwner.lock();
+  auto *scene = owner ? owner->scene : nullptr;
   return isObject() && scene ? scene->getObject(m_value) : nullptr;
 }
 
@@ -358,11 +453,13 @@ const InstanceParameterMap &LayerNodeData::getInstanceParameters() const
 
 void LayerNodeData::setInstanceParameter(const std::string &name, Any v)
 {
+  noteDependencyChange();
   m_instanceParameters.set(name, v);
 }
 
 void LayerNodeData::clearInstanceParameters()
 {
+  noteDependencyChange();
   m_instanceParameters.clear();
 }
 

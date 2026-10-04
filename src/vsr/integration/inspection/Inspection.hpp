@@ -8,9 +8,12 @@
 
 // vsr_integration
 #include "vsr/integration/identity/Identity.hpp"
+#include "vsr/integration/inspection/Bounds.hpp"
+#include "vsr/integration/inspection/ViewInfo.hpp"
 #include "vsr/integration/operations/Operations.hpp"
 #include "vsr/integration/values/EditableValues.hpp"
 // std
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <charconv>
@@ -88,15 +91,8 @@ class ScratchPool
 {
  public:
   explicit ScratchPool(std::size_t capacity) : m_capacity(capacity) {}
-  bool reserve(std::size_t n)
-  {
-    auto cur = m_used.load();
-    do {
-      if (cur + n > m_capacity)
-        return false;
-    } while (!m_used.compare_exchange_weak(cur, cur + n));
-    return true;
-  }
+  bool reserve(std::size_t n,
+      std::size_t ceiling = std::numeric_limits<std::size_t>::max());
   void release(std::size_t n)
   {
     m_used -= n;
@@ -110,6 +106,17 @@ class ScratchPool
   std::size_t m_capacity;
   std::atomic<std::size_t> m_used{0};
 };
+
+inline bool ScratchPool::reserve(std::size_t n, std::size_t ceiling)
+{
+  const auto capacity = std::min(m_capacity, ceiling);
+  auto cur = m_used.load();
+  do {
+    if (cur > capacity || n > capacity - cur)
+      return false;
+  } while (!m_used.compare_exchange_weak(cur, cur + n));
+  return true;
+}
 
 namespace detail {
 
@@ -449,6 +456,15 @@ class Inspector
   {
     return make(Query::INSPECT, sessionId, Target::scene(scene), args);
   }
+
+  // Value-only read of the registered host binding, admitted like inspection.
+  Built makeViewInfo(const std::string &sessionId, ViewId view);
+
+  // Default-visible scene bounds only. Unsupported choices reject before
+  // admission; missing host data is not evidence of empty geometry.
+  Built makeBounds(const std::string &sessionId,
+      SceneId scene,
+      const bounds::Args &args = {});
 
  private:
   // Explicit values preserve the authenticated cursor's uint64 carrier.
@@ -879,6 +895,9 @@ class Inspector
       if (auto *tracker = m_views(i))
         item += ",\"view_revision\":\""
             + detail::revisionToken(tracker->revision()) + "\"";
+    if (views)
+      item += ",\"binding_observation\":\"vsr_view_info\",\"capture_policy\":"
+          + viewinfo::policyJson();
     item += "}";
     if (!append(j, item, tooLarge))
       return false;
@@ -1478,6 +1497,172 @@ class Inspector
 };
 
 // Inlined definitions ////////////////////////////////////////////////////////
+
+inline Built Inspector::makeBounds(
+    const std::string &sessionId, SceneId scene, const bounds::Args &args)
+{
+  constexpr bounds::Limits limits;
+  static_assert(limits.valid(), "invalid fixed bounds limits");
+  if (args.nodeHandle || args.includeDisabled.value_or(false)
+      || !m_integration.isRegisteredScene(scene))
+    return {Outcome::INVALID_REQUEST, {}};
+  const auto target = Target::scene(scene);
+  if (m_authority.authorizeExecution(
+          sessionId, target, session::Capability::READ)
+      != session::Code::OK)
+    return {Outcome::FORBIDDEN, {}};
+  // RAII lifetime follows the admitted executor, including unadmitted requests
+  // and all engine terminal paths. Use the inspection pool, never another pool.
+  const auto bytes = sizeof(Job) + bounds::TEMPORARY_BYTES;
+  Job reservation;
+  reservation.pool = m_scratch;
+  if (!m_scratch->reserve(bytes, limits.scratchBytes))
+    return {Outcome::BUSY, {}};
+  reservation.reserved = bytes;
+  auto job = std::make_shared<Job>();
+  job->pool = m_scratch;
+  job->reserved = bytes;
+  reservation.reserved = 0;
+  Request request;
+  request.kind = "bounds";
+  request.target = target;
+  request.canonicalArguments = "bounds:" + std::to_string(scene)
+      + (args.includeDisabled ? ":explicit_false" : ":omitted")
+      + ":effective_false";
+  request.deadlineSeconds = limits.deadlineSeconds;
+  request.executor = [this, scene, sessionId, job](StepContext &ctx) {
+    if (ctx.abandoned) {
+      job->releaseScratch();
+      return Step{Step::Status::COMPLETE, Outcome::CANCELLED};
+    }
+    auto *ids = m_identities(scene);
+    if (!ids) {
+      job->releaseScratch();
+      return Step{Step::Status::COMPLETE, Outcome::INVALID_REQUEST};
+    }
+    // No Scene walk, renderer readiness or provider work. Both tokens describe
+    // this same owning-thread safe-point observation, not admission time.
+    const auto result = "{\"state\":\"unavailable\",\"reason\":\"missing_binding\","
+        "\"scene_id\":" + std::to_string(scene)
+        + ",\"target\":{\"kind\":\"scene\",\"scene_id\":"
+        + std::to_string(scene) + "},\"scene_revision\":"
+        + detail::jsonString(detail::revisionToken(ids->sceneRevision()))
+        + ",\"inspection_revision\":"
+        + detail::jsonString(detail::revisionToken(ids->inspectionRevision()))
+        + ",\"selection\":{\"include_disabled\":false,"
+          "\"active_layers_only\":true,\"effectively_enabled_only\":true}}";
+    job->releaseScratch();
+    const auto read = m_authority.authorizeExecution(
+        sessionId, Target::scene(scene), session::Capability::READ);
+    if (read != session::Code::OK)
+      return Step{Step::Status::COMPLETE, operations::fromSessionCode(read)};
+    if (result.size() > bounds::MAX_RESULT_BYTES
+        || result.size() > m_limits.itemBytes)
+      return Step{Step::Status::COMPLETE, Outcome::ITEM_TOO_LARGE};
+    return Step{Step::Status::COMPLETE, Outcome::OK, result};
+  };
+  return {Outcome::OK, std::move(request)};
+}
+
+inline Built Inspector::makeViewInfo(const std::string &sessionId, ViewId view)
+{
+  const auto sceneId = m_integration.sceneOfView(view);
+  if (!sceneId)
+    return {Outcome::INVALID_REQUEST, {}};
+  if (m_authority.authorizeExecution(
+          sessionId, Target::scene(*sceneId), session::Capability::READ)
+      != session::Code::OK)
+    return {Outcome::FORBIDDEN, {}};
+  Request request;
+  request.kind = "view_info";
+  request.target = Target::view(view);
+  request.canonicalArguments = "view_info:" + std::to_string(view);
+  request.deadlineSeconds = m_limits.deadlineSeconds;
+  request.executor = [this, view, sessionId](StepContext &) {
+    const auto scene = m_integration.sceneOfView(view);
+    if (!scene
+        || m_authority.authorizeExecution(
+               sessionId, Target::scene(*scene), session::Capability::READ)
+            != session::Code::OK)
+      return Step{Step::Status::COMPLETE, Outcome::FORBIDDEN};
+    auto *ids = scene ? m_identities(*scene) : nullptr;
+    auto *tracker = m_views ? m_views(view) : nullptr;
+    if (!ids || !tracker) {
+      const std::string result = "{\"view_id\":" + std::to_string(view)
+          + ",\"scene_id\":" + std::to_string(*scene)
+          + ",\"scene_revision\":"
+          + (ids ? detail::jsonString(detail::revisionToken(ids->sceneRevision())) : "null")
+          + ",\"view_revision\":null,\"capture_policy_revision\":null,"
+            "\"state\":\"unavailable\",\"reason\":\"missing_revision_tracking\","
+            "\"capture_policy\":" + viewinfo::policyJson() + "}";
+      return Step{Step::Status::COMPLETE,
+          result.size() > m_limits.itemBytes ? Outcome::ITEM_TOO_LARGE
+                                             : Outcome::OK,
+          result.size() > m_limits.itemBytes ? std::string{} : result};
+    }
+    const auto before = ids->inspectionRevision();
+    const auto viewBefore = tracker->revision();
+    auto binding = m_integration.observeViewBinding(view);
+    if (m_authority.authorizeExecution(
+            sessionId, Target::scene(*scene), session::Capability::READ)
+            != session::Code::OK
+        || m_authority.authorizeExecution(
+               sessionId, Target::view(view), session::Capability::READ)
+            != session::Code::OK)
+      return Step{Step::Status::COMPLETE, Outcome::FORBIDDEN};
+    if (!m_integration.isRegisteredView(view)
+        || ids->inspectionRevision() != before
+        || tracker->revision() != viewBefore)
+      return Step{Step::Status::COMPLETE, Outcome::SUPERSEDED};
+    const char *reason =
+        binding ? viewinfo::validate(*binding) : "missing_binding";
+    auto validReference = [&](const identity::ObjectHandle &h,
+                              anari::DataType type) {
+      auto *object = ids->resolve(h);
+      return !h.valid() || (object && object->type() == type);
+    };
+    if (binding
+        && (!validReference(binding->cameraHandle, ANARI_CAMERA)
+            || !validReference(binding->rendererHandle, ANARI_RENDERER)))
+      reason = "invalid_bound_reference";
+    std::string payload;
+    if (reason)
+      payload =
+          "\"state\":\"unavailable\",\"reason\":" + detail::jsonString(reason);
+    else {
+      payload = viewinfo::bindingJson(*binding, detail::jsonString);
+      auto reference = [&](const char *key, const identity::ObjectHandle &h) {
+        if (h.valid())
+          payload += std::string(",\"") + key + "\":\""
+              + detail::hex64(h.domain) + detail::hex64(h.serial) + "\"";
+      };
+      reference("camera_handle", binding->cameraHandle);
+      reference("renderer_handle", binding->rendererHandle);
+    }
+    if (payload.size() > viewinfo::MAX_BINDING_BYTES
+        || payload.size() > m_limits.itemBytes)
+      return Step{Step::Status::COMPLETE, Outcome::ITEM_TOO_LARGE};
+    tracker->observeConfiguration(payload);
+    if (!reason) {
+      tracker->setCamera(binding->cameraHandle);
+      tracker->setRenderer(binding->rendererHandle);
+      tracker->setDimensions(binding->width, binding->height);
+    }
+    const std::string result = "{\"view_id\":" + std::to_string(view)
+        + ",\"scene_id\":" + std::to_string(*scene) + ",\"scene_revision\":"
+        + detail::jsonString(detail::revisionToken(ids->sceneRevision()))
+        + ",\"view_revision\":"
+        + detail::jsonString(detail::revisionToken(tracker->revision()))
+        + ",\"capture_policy_revision\":"
+        + detail::jsonString(
+            detail::revisionToken(tracker->capturePolicyRevision()))
+        + ",\"capture_policy\":" + viewinfo::policyJson() + "," + payload + "}";
+    if (result.size() > m_limits.itemBytes)
+      return Step{Step::Status::COMPLETE, Outcome::ITEM_TOO_LARGE};
+    return Step{Step::Status::COMPLETE, Outcome::OK, result};
+  };
+  return {Outcome::OK, std::move(request)};
+}
 
 inline Inspector::TransformIssue Inspector::matrixIssue(
     const core::math::mat4 &matrix)

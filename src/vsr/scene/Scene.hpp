@@ -3,6 +3,7 @@
 
 #pragma once
 
+// vsr_scene
 #include "vsr/scene/DefragCallback.hpp"
 #include "vsr/scene/Layer.hpp"
 #include "vsr/scene/UpdateDelegate.hpp"
@@ -146,6 +147,9 @@ struct Scene
 
   const ObjectDatabase &objectDB() const;
 
+  // O(1) dependency observation, separate from UpdateDelegate delivery.
+  std::uint64_t dependencyRevision() const;
+
   ///////////////////////////////////////////////////////
   // Instanced objects (surfaces, volumes, and lights) //
   ///////////////////////////////////////////////////////
@@ -237,6 +241,8 @@ struct Scene
   void removeDefragCallback(size_t token);
 
  private:
+  friend struct Layer;
+  friend struct LayerNodeData;
   friend bool ::vsr::io::deserialize_CameraArchive(
       Scene &, core::DataNode &, ::vsr::io::ArchiveValidationResult *);
 
@@ -254,6 +260,7 @@ struct Scene
   // object actually has layer references.
   void clearLayerReferencesToObject(const Object &o);
 
+  std::shared_ptr<detail::SceneDependencyState> m_dependencyState;
   ObjectDatabase m_db;
 
   struct DefaultObjects

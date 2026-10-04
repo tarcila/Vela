@@ -149,6 +149,481 @@ const vsr::integration::mcp::json::Value &parameter(
 
 } // namespace
 
+SCENARIO("scene bounds never infer a value from missing binding",
+    "[integration][bounds]")
+{
+  const int materials = GENERATE(0, 3);
+  Fixture f(materials);
+  if (materials) {
+    auto geometry = f.scene.createObject<vsr::scene::Geometry>("sphere");
+    geometry->setParameter("radius", 2.f);
+    auto surface = f.scene.createSurface("sphere", geometry);
+    f.scene.insertChildObjectNode(f.scene.defaultLayer()->root(), surface);
+  }
+  const auto sceneRevision = f.sceneIds->sceneRevision();
+  const auto inspectionRevision = f.sceneIds->inspectionRevision();
+  auto token = [](const auto &r) {
+    return std::to_string(r.launch.activation) + "."
+        + std::to_string(r.launch.nonce) + "." + std::to_string(r.domain) + "."
+        + std::to_string(r.value);
+  };
+  REQUIRE(
+      f.submit(f.inspector->makeBounds(f.creds.sessionId, f.sceneId), 1).code
+      == Outcome::OK);
+  CHECK(f.engine->status(f.creds, {f.creds.sessionId, 1}).progress
+      == Progress::QUEUED);
+  const auto result = page(f.drain(1));
+  CHECK(result.get("state")->s == "unavailable");
+  CHECK(result.get("reason")->s == "missing_binding");
+  CHECK(result.get("scene_id")->n == f.sceneId);
+  CHECK(result.get("target")->get("kind")->s == "scene");
+  CHECK(result.get("target")->get("scene_id")->n == f.sceneId);
+  CHECK(result.get("scene_revision")->s == token(sceneRevision));
+  CHECK(result.get("inspection_revision")->s == token(inspectionRevision));
+  CHECK(result.get("selection")->get("active_layers_only")->b);
+  CHECK(result.get("selection")->get("effectively_enabled_only")->b);
+  CHECK_FALSE(result.get("selection")->get("include_disabled")->b);
+  for (const auto *key : {"source",
+           "min",
+           "max",
+           "world",
+           "visited",
+           "vertex_values",
+           "pending",
+           "complete"})
+    CHECK_FALSE(result.get(key));
+  CHECK(f.inspector->scratch().used() == 0);
+}
+
+SCENARIO("bounds observes safe-point revisions under fixed limits",
+    "[integration][bounds]")
+{
+  PageLimits pageLimits;
+  pageLimits.deadlineSeconds = 120.;
+  Fixture f(0, pageLimits);
+  const auto cameras = f.scene.objectDB().camera.size();
+  const auto renderers = f.scene.objectDB().renderer.size();
+  auto built = f.inspector->makeBounds(f.creds.sessionId, f.sceneId);
+  REQUIRE(built.code == Outcome::OK);
+  CHECK(built.request.deadlineSeconds == 5.);
+  const bounds::Limits limits;
+  CHECK(limits.valid());
+  CHECK(limits.sliceSteps == 256);
+  CHECK(limits.sliceVertexValues == 4096);
+  CHECK(limits.totalNodes == 4096);
+  CHECK(limits.totalVertexValues == 1048576);
+  CHECK(limits.scratchBytes == 8388608);
+  const auto before = f.sceneIds->inspectionRevision();
+  REQUIRE(f.submit(std::move(built), 1).code == Outcome::OK);
+  f.scene.createObject<vsr::scene::Material>("matte");
+  const auto current = f.sceneIds->inspectionRevision();
+  REQUIRE(current != before);
+  const auto expected = std::to_string(current.launch.activation) + "."
+      + std::to_string(current.launch.nonce) + "."
+      + std::to_string(current.domain) + "." + std::to_string(current.value);
+  CHECK(page(f.drain(1)).get("inspection_revision")->s == expected);
+  CHECK(f.scene.objectDB().renderer.size() == renderers);
+  CHECK(f.scene.objectDB().camera.size() == cameras);
+  CHECK(f.inspector->scratch().used() == 0);
+}
+
+SCENARIO("bounds selection identity preserves original optional choice",
+    "[integration][bounds]")
+{
+  Fixture f(0);
+  bounds::Args selection;
+  selection.includeDisabled = true;
+  CHECK(f.inspector->makeBounds(f.creds.sessionId, f.sceneId, selection).code
+      == Outcome::INVALID_REQUEST);
+  selection.includeDisabled.reset();
+  selection.nodeHandle = "";
+  CHECK(f.inspector->makeBounds(f.creds.sessionId, f.sceneId, selection).code
+      == Outcome::INVALID_REQUEST);
+  CHECK(f.inspector->scratch().used() == 0);
+  REQUIRE(
+      f.submit(f.inspector->makeBounds(f.creds.sessionId, f.sceneId), 1).code
+      == Outcome::OK);
+  const auto original = f.drain(1).result;
+  CHECK(f.submit(f.inspector->makeBounds(f.creds.sessionId, f.sceneId), 1)
+          .replayed);
+  selection.nodeHandle.reset();
+  selection.includeDisabled = false;
+  CHECK(
+      f.submit(
+           f.inspector->makeBounds(f.creds.sessionId, f.sceneId, selection), 1)
+          .code
+      == Outcome::REQUEST_ID_CONFLICT);
+  REQUIRE(
+      f.submit(
+           f.inspector->makeBounds(f.creds.sessionId, f.sceneId, selection), 2)
+          .code
+      == Outcome::OK);
+  CHECK(f.drain(2).result == original);
+  CHECK(
+      f.submit(
+           f.inspector->makeBounds(f.creds.sessionId, f.sceneId, selection), 2)
+          .replayed);
+  CHECK(f.submit(f.inspector->makeBounds(f.creds.sessionId, f.sceneId), 2).code
+      == Outcome::REQUEST_ID_CONFLICT);
+  f.scene.createObject<vsr::scene::Material>("matte");
+  REQUIRE(
+      f.submit(f.inspector->makeBounds(f.creds.sessionId, f.sceneId), 3).code
+      == Outcome::OK);
+  CHECK(f.drain(3).result != original);
+  CHECK(f.submit(f.inspector->makeBounds(f.creds.sessionId, f.sceneId), 1)
+          .replayed);
+  CHECK(f.drain(1).result == original);
+  CHECK(f.inspector->scratch().used() == 0);
+}
+
+SCENARIO("bounds lifecycle releases shared temporary storage",
+    "[integration][bounds]")
+{
+  PageLimits limits;
+  const bool smallMetadataLimit = GENERATE(false, true);
+  if (smallMetadataLimit)
+    limits.itemBytes = 64;
+  Fixture f(0, limits);
+  REQUIRE(
+      f.submit(f.inspector->makeBounds(f.creds.sessionId, f.sceneId), 1).code
+      == Outcome::OK);
+  REQUIRE(f.inspector->scratch().used() > 0);
+  if (limits.itemBytes == 64) {
+    const auto status = f.drain(1);
+    CHECK(status.terminal == Outcome::ITEM_TOO_LARGE);
+    CHECK(status.result.empty());
+  } else {
+    SECTION("cancel before execution")
+    {
+      CHECK(f.engine->cancel(f.creds, {f.creds.sessionId, 1}).terminal
+          == Outcome::CANCELLED);
+      CHECK(f.drain(1).result.empty());
+    }
+    SECTION("queue time uses fixed five second deadline")
+    {
+      f.now += 5.;
+      const auto status = f.drain(1);
+      CHECK(status.terminal == Outcome::TIMEOUT);
+      CHECK(status.result.empty());
+    }
+    SECTION("withdraw read before execution")
+    {
+      f.authority->restrict(
+          Target::scene(f.sceneId), session::Capability::READ);
+      const auto status = f.drain(1);
+      CHECK(status.terminal == Outcome::FORBIDDEN);
+      CHECK_FALSE(status.resultVisible);
+      CHECK(status.result.empty());
+    }
+    SECTION("withdraw read after completion suppresses payload and replay")
+    {
+      REQUIRE(f.drain(1).terminal == Outcome::OK);
+      f.authority->restrict(
+          Target::scene(f.sceneId), session::Capability::READ);
+      const auto status = f.engine->status(f.creds, {f.creds.sessionId, 1});
+      CHECK(status.terminal == Outcome::OK);
+      CHECK_FALSE(status.resultVisible);
+      CHECK(status.result.empty());
+      CHECK(f.inspector->makeBounds(f.creds.sessionId, f.sceneId).code
+          == Outcome::FORBIDDEN);
+    }
+  }
+  CHECK(f.inspector->scratch().used() == 0);
+}
+
+SCENARIO(
+    "bounds uses bounded existing operation history", "[integration][bounds]")
+{
+  Fixture f(0);
+  operations::Limits limits;
+  limits.statusRecords = 2;
+  f.engine.reset();
+  f.engine = OperationEngine::create(
+      f.integration, *f.authority, limits, [&] { return f.now; });
+  REQUIRE(f.engine);
+  for (std::uint64_t id = 1; id <= 3; ++id) {
+    REQUIRE(
+        f.submit(f.inspector->makeBounds(f.creds.sessionId, f.sceneId), id).code
+        == Outcome::OK);
+    CHECK(f.drain(id).terminal == Outcome::OK);
+  }
+  CHECK(f.engine->status(f.creds, {f.creds.sessionId, 1}).code
+      == Outcome::OUTCOME_UNAVAILABLE);
+  CHECK(f.submit(f.inspector->makeBounds(f.creds.sessionId, f.sceneId), 1).code
+      == Outcome::OUTCOME_UNAVAILABLE);
+  CHECK(f.inspector->scratch().used() == 0);
+}
+
+SCENARIO("bounds publication rechecks current read authority",
+    "[integration][bounds]")
+{
+  Fixture f(0);
+  f.inspector =
+      std::make_unique<Inspector>(f.integration, *f.authority, [&](SceneId) {
+        REQUIRE(f.integration.inServiceCall());
+        f.authority->restrict(
+            Target::scene(f.sceneId), session::Capability::READ);
+        return f.sceneIds.get();
+      });
+  REQUIRE(
+      f.submit(f.inspector->makeBounds(f.creds.sessionId, f.sceneId), 1).code
+      == Outcome::OK);
+  const auto hidden = f.drain(1);
+  CHECK(hidden.terminal == Outcome::FORBIDDEN);
+  CHECK(hidden.result.empty());
+  f.authority->relax(Target::scene(f.sceneId), session::Capability::READ);
+  // Withdrawal prevents publication, not just lookup-time redaction.
+  CHECK(f.engine->status(f.creds, {f.creds.sessionId, 1}).result.empty());
+  CHECK(f.inspector->scratch().used() == 0);
+}
+
+SCENARIO("bounds shares scratch with held admitted inspection work",
+    "[integration][bounds]")
+{
+  PageLimits limits;
+  limits.displayString = 1u << 20;
+  Fixture f(0, limits);
+  PageArgs args;
+  // Existing inspection's bounded input/failure-table allocations nearly fill
+  // the fixed 8 MiB shared pool. No bounds policy override or scene scan.
+  args.filters.nameContains = std::string(838500, 'x');
+  REQUIRE(
+      f.submit(
+           f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args), 1)
+          .code
+      == Outcome::OK);
+  CHECK(f.inspector->makeBounds(f.creds.sessionId, f.sceneId).code
+      == Outcome::BUSY);
+  f.engine->cancel(f.creds, {f.creds.sessionId, 1});
+  f.drain(1);
+  CHECK(f.inspector->scratch().used() == 0);
+  REQUIRE(
+      f.submit(f.inspector->makeBounds(f.creds.sessionId, f.sceneId), 2).code
+      == Outcome::OK);
+  CHECK(f.drain(2).terminal == Outcome::OK);
+  CHECK(f.inspector->scratch().used() == 0);
+  // A constructed request rejected by the engine releases its reservation.
+  REQUIRE(
+      f.submit(f.inspector->makeBounds(f.creds.sessionId, f.sceneId), 3).code
+      == Outcome::OK);
+  bounds::Args selection;
+  selection.includeDisabled = false;
+  CHECK(
+      f.submit(
+           f.inspector->makeBounds(f.creds.sessionId, f.sceneId, selection), 3)
+          .code
+      == Outcome::REQUEST_ID_CONFLICT);
+  f.drain(3);
+  CHECK(f.inspector->scratch().used() == 0);
+  {
+    auto unsubmitted = f.inspector->makeBounds(f.creds.sessionId, f.sceneId);
+    REQUIRE(unsubmitted.code == Outcome::OK);
+    CHECK(f.inspector->scratch().used() > 0);
+  }
+  CHECK(f.inspector->scratch().used() == 0);
+}
+
+SCENARIO("effective view observation is admitted and capture stays closed",
+    "[integration][view-info]")
+{
+  Fixture f(0);
+  auto unrelated = f.scene.createObject<vsr::scene::Camera>("perspective");
+  unrelated->setParameter("position", vsr::core::math::float3(99.f));
+  identity::ViewRevisionTracker tracker(f.ids, *f.sceneIds);
+  f.inspector->setViewRevisions([&](ViewId) { return &tracker; });
+  EffectiveViewBinding binding;
+  binding.camera.position = {1., 2., 3.};
+  binding.width = 1280;
+  binding.height = 720;
+  binding.deviceIdentifier = "default@helide";
+  binding.rendererSubtype = "default";
+  binding.rendererSettings = {{"background", {0.1, 0.2, 0.3, 1.}}};
+  binding.rendererConfigurationRevision = "renderer-1";
+  binding.pipelineSource = "standalone-agent";
+  binding.pipelineConfigurationRevision = "pipeline-1";
+  binding.pipelineSettings = {{"toneMap", {0.}}};
+  bool observed = false;
+  f.integration.submit(f.sceneId, [&](vsr::scene::Scene &) {
+    ViewRegistration v{"effective", f.sceneId, {true, true}};
+    v.observeBinding = [&] {
+      REQUIRE(f.integration.inServiceCall());
+      observed = true;
+      return std::optional<EffectiveViewBinding>(binding);
+    };
+    f.viewId = *f.integration.registerView(v);
+  });
+  f.integration.service();
+  REQUIRE(
+      f.submit(f.inspector->makeViewInfo(f.creds.sessionId, f.viewId), 1).code
+      == Outcome::OK);
+  CHECK_FALSE(observed);
+  const auto first = page(f.drain(1));
+  CHECK(observed);
+  CHECK(first.get("camera")->get("position")->a[0].n == 1.);
+  CHECK(first.get("camera")->get("aspect")->n == Approx(16. / 9.));
+  CHECK(first.get("device_identifier")->s == "default@helide");
+  CHECK_FALSE(first.get("capture_policy")->get("exposed")->b);
+  CHECK(first.get("capture_policy")->get("quality_units")->a.empty());
+  CHECK(first.get("capture_policy")->get("max_pixels")->n == 2073600);
+  const auto *policy = first.get("capture_policy");
+  CHECK(policy->get("max_axis")->n == 2048);
+  CHECK(policy->get("max_quality_count")->n == 1024);
+  CHECK(policy->get("deadline_seconds")->n == 120);
+  CHECK(policy->get("max_png_bytes")->n == 8388608);
+  CHECK(policy->get("max_response_bytes")->n == 12582912);
+  CHECK(policy->get("per_view_capacity")->n == 1);
+  CHECK(policy->get("global_active_capacity")->n == 1);
+  CHECK(policy->get("host_budget_bytes")->n == 268435456);
+  CHECK(policy->get("device_budget_bytes")->n == 268435456);
+  CHECK(first.get("renderer_configuration_revision")->s == "renderer-1");
+  CHECK(first.get("pipeline_configuration_revision")->s == "pipeline-1");
+  CHECK_FALSE(first.get("camera_handle"));
+  binding.camera.position[0] = 4.;
+  binding.pipelineConfigurationRevision = "pipeline-2";
+  REQUIRE(
+      f.submit(f.inspector->makeViewInfo(f.creds.sessionId, f.viewId), 2).code
+      == Outcome::OK);
+  const auto changed = page(f.drain(2));
+  CHECK(changed.get("camera")->get("position")->a[0].n == 4.);
+  CHECK(changed.get("view_revision")->s != first.get("view_revision")->s);
+  CHECK(changed.get("capture_policy_revision")->s
+      == first.get("capture_policy_revision")->s);
+  REQUIRE(f.submit(f.inspector->makeViewInfo(f.creds.sessionId, f.viewId), 1)
+          .replayed);
+  CHECK(page(f.drain(1)).get("camera")->get("position")->a[0].n == 1.);
+  auto previous = changed.get("view_revision")->s;
+  for (std::uint64_t i = 3; i < 7; ++i) {
+    if (i == 3)
+      binding.width = 1920;
+    if (i == 4)
+      binding.deviceIdentifier = "default@visrtx";
+    if (i == 5)
+      binding.rendererSubtype = "scivis";
+    if (i == 6)
+      binding.rendererSettings[0].numbers[0] = 0.5;
+    REQUIRE(
+        f.submit(f.inspector->makeViewInfo(f.creds.sessionId, f.viewId), i).code
+        == Outcome::OK);
+    const auto next = page(f.drain(i));
+    CHECK(next.get("view_revision")->s != previous);
+    CHECK(next.get("scene_revision")->s == first.get("scene_revision")->s);
+    previous = next.get("view_revision")->s;
+  }
+  CHECK(
+      unrelated->parameter("position")->value().get<vsr::core::math::float3>().x
+      == 99.f);
+  CHECK(f.scene.objectDB().renderer.size() == 0);
+}
+
+SCENARIO("view info reports missing or oversized bindings without payload",
+    "[integration][view-info]")
+{
+  Fixture f(0);
+  identity::ViewRevisionTracker tracker(f.ids, *f.sceneIds);
+  f.inspector->setViewRevisions([&](ViewId) { return &tracker; });
+  REQUIRE(
+      f.submit(f.inspector->makeViewInfo(f.creds.sessionId, f.viewId), 1).code
+      == Outcome::OK);
+  const auto missing = page(f.drain(1));
+  CHECK(missing.get("reason")->s == "missing_binding");
+  CHECK(missing.get("scene_id")->n == f.sceneId);
+  CHECK(missing.get("capture_policy_revision")->s
+      != missing.get("view_revision")->s);
+  CHECK_FALSE(f.integration.observeViewBinding(f.viewId));
+  bool mutate = false;
+  EffectiveViewBinding binding;
+  binding.width = 1920;
+  binding.height = 1080;
+  binding.deviceIdentifier = "default@helide";
+  binding.rendererSubtype = "default";
+  binding.rendererConfigurationRevision = "r1";
+  binding.pipelineSource = "viewport";
+  binding.pipelineConfigurationRevision = "p1";
+  binding.rendererSettings = {{"background", {0., 0., 0., 1.}}};
+  auto camera = f.scene.createObject<vsr::scene::Camera>("perspective");
+  auto renderer = f.scene.createRenderer("default", "default");
+  binding.cameraHandle = f.sceneIds->handleOf(camera.data());
+  binding.rendererHandle = f.sceneIds->handleOf(renderer.get());
+  f.integration.submit(f.sceneId, [&](vsr::scene::Scene &) {
+    ViewRegistration v{"bound", f.sceneId, {true, true}};
+    v.observeBinding = [&] {
+      if (mutate)
+        camera->setParameter("fovy", 1.f);
+      return std::optional<EffectiveViewBinding>(binding);
+    };
+    f.viewId = *f.integration.registerView(v);
+  });
+  f.integration.service();
+  auto observe = [&](std::uint64_t id) {
+    REQUIRE(f.submit(f.inspector->makeViewInfo(f.creds.sessionId, f.viewId), id)
+                .code
+        == Outcome::OK);
+    return f.drain(id);
+  };
+  const auto first = page(observe(2));
+  CHECK(first.get("camera_handle"));
+  CHECK(first.get("renderer_handle"));
+  const auto unchanged = page(observe(3));
+  CHECK(unchanged.get("view_revision")->s == first.get("view_revision")->s);
+  camera->setParameter("fovy", 0.5f);
+  const auto parameterChanged = page(observe(4));
+  CHECK(parameterChanged.get("view_revision")->s
+      != first.get("view_revision")->s);
+  binding.rendererSettings[0].text = std::string(5000, 'x');
+  const auto oversized = page(observe(5));
+  CHECK(oversized.get("state")->s == "unavailable");
+  CHECK(oversized.get("reason")->s == "representation_unavailable");
+  CHECK_FALSE(oversized.get("renderer_settings"));
+  binding.rendererSettings[0].text.clear();
+  mutate = true;
+  CHECK(observe(6).terminal == Outcome::SUPERSEDED);
+  mutate = false;
+  binding.camera.direction = {0., 0., 0.};
+  CHECK(page(observe(7)).get("reason")->s == "invalid_camera");
+  binding.camera.direction = {0., 0., -1.};
+  binding.camera.projection = "orthographic";
+  CHECK(page(observe(8)).get("reason")->s == "incomplete_projection");
+  binding.camera.projectionSettings = {{"height", {4.}}};
+  CHECK(page(observe(9)).get("camera")->get("projection")->s == "orthographic");
+  const auto beforeRendererChange = page(observe(10));
+  renderer->setParameter("ambientRadiance", 0.3f);
+  const auto afterRendererChange = page(observe(11));
+  CHECK(afterRendererChange.get("view_revision")->s
+      != beforeRendererChange.get("view_revision")->s);
+  CHECK(afterRendererChange.get("scene_revision")->s
+      == beforeRendererChange.get("scene_revision")->s);
+  binding.cameraHandle = f.sceneIds->handleOf(
+      f.scene.createObject<vsr::scene::Material>("matte").data());
+  CHECK(page(observe(12)).get("reason")->s == "invalid_bound_reference");
+  f.authority->restrict(
+      session::Target::scene(f.sceneId), session::Capability::READ);
+  CHECK(f.engine->status(f.creds, {f.creds.sessionId, 2}).result.empty());
+  CHECK(f.inspector->makeViewInfo(f.creds.sessionId, f.viewId).code
+      == Outcome::FORBIDDEN);
+}
+
+SCENARIO("view observation respects small retained item limits",
+    "[integration][view-info]")
+{
+  PageLimits limits;
+  limits.itemBytes = 128;
+  Fixture f(0, limits);
+  REQUIRE(
+      f.submit(f.inspector->makeViewInfo(f.creds.sessionId, f.viewId), 1).code
+      == Outcome::OK);
+  auto missingTracker = f.drain(1);
+  CHECK(missingTracker.terminal == Outcome::ITEM_TOO_LARGE);
+  CHECK(missingTracker.result.empty());
+  identity::ViewRevisionTracker tracker(f.ids, *f.sceneIds);
+  f.inspector->setViewRevisions([&](ViewId) { return &tracker; });
+  REQUIRE(
+      f.submit(f.inspector->makeViewInfo(f.creds.sessionId, f.viewId), 2).code
+      == Outcome::OK);
+  auto missingBinding = f.drain(2);
+  CHECK(missingBinding.terminal == Outcome::ITEM_TOO_LARGE);
+  CHECK(missingBinding.result.empty());
+}
+
 SCENARIO("node dependencies distinguish structural and ancestor write history",
     "[integration][node-dependency]")
 {

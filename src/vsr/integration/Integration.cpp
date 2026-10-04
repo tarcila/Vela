@@ -123,6 +123,20 @@ bool Integration::inServiceCall() const
   return m_servicingThread == std::this_thread::get_id();
 }
 
+std::optional<EffectiveViewBinding> Integration::observeViewBinding(
+    ViewId id) const
+{
+  BindingObserver observer;
+  {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_active || m_servicingThread != std::this_thread::get_id()
+        || id >= m_views.size() || m_views[id].removed)
+      return {};
+    observer = m_views[id].registration.observeBinding;
+  }
+  return observer ? observer() : std::optional<EffectiveViewBinding>{};
+}
+
 // Registration ///////////////////////////////////////////////////////////////
 
 std::optional<SceneId> Integration::registerScene(

@@ -99,6 +99,9 @@ struct ProjectContext
   // its caller commits it (markRevised).
   bool setPlaying(const ShotID &id, bool playing, std::string *error = nullptr);
   void setActiveShotFrame(int frame);
+  // Returned Dataset pointers borrow records in project().datasets. Keep a
+  // DatasetID across inventory changes or Project replacement (including a
+  // successful save), then reacquire with project::findDataset().
   Dataset *addStaticDataset(const std::string &name,
       const std::filesystem::path &sourcePath,
       vsr::io::ImporterType importerType);
@@ -154,7 +157,8 @@ struct ProjectContext
   void syncAnimationManagerToActiveShot();
 
   // A project carries no UI state: that belongs to the application
-  // (docs/adr/0040).
+  // (docs/adr/0040). Success replaces the Project's records, invalidating
+  // borrowed Dataset pointers without replacing their live scene subtrees.
   bool saveProject(
       const std::filesystem::path &directory, std::string *error = nullptr);
   bool openProject(const std::filesystem::path &directory,
