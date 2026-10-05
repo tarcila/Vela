@@ -28,6 +28,7 @@ project_add_executable(
   test_Downsample.cpp
   test_FlatMap.cpp
   test_FrameChannelCatalog.cpp
+  test_FrameChannelState.cpp
   test_Forest.cpp
   test_Geometry.cpp
   test_ImageImport.cpp
@@ -159,6 +160,7 @@ add_dependencies(${PROJECT_NAME} anari_library_channel_test)
 add_test(NAME vsr::ChannelVisualization COMMAND ${PROJECT_NAME} "[ChannelVisualization]")
 set_tests_properties(vsr::ChannelVisualization PROPERTIES
   ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/$<CONFIG>:$ENV{LD_LIBRARY_PATH}")
+add_test(NAME vsr::FrameChannelState COMMAND ${PROJECT_NAME} "[FrameChannelState]")
 add_test(NAME vsr::FrameChannelCatalog COMMAND ${PROJECT_NAME} "[FrameChannelCatalog]")
 add_test(NAME vsr::FrameChannelSmoke COMMAND ${PROJECT_NAME} "[FrameChannelSmoke]")
 set_tests_properties(vsr::FrameChannelCatalog vsr::FrameChannelSmoke PROPERTIES

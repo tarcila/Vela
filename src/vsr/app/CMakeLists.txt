@@ -8,6 +8,8 @@ project_sources(PRIVATE
   ANARIDeviceManager.cpp
   ApplicationDump.cpp
   Context.cpp
+  FrameChannelState.cpp
+  FrameChannelOptions.cpp
   LegacyApplicationContext.cpp
   renderAnimationSequence.cpp
 )

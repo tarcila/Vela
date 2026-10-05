@@ -14,12 +14,12 @@
 #include "vsr/rendering/pipeline/ImagePipeline.h"
 #include "vsr/rendering/pipeline/passes/AnariSceneRenderPass.h"
 #include "vsr/rendering/pipeline/passes/AutoExposurePass.h"
+#include "vsr/rendering/pipeline/passes/ChannelVisualizationPass.h"
 #include "vsr/rendering/pipeline/passes/CopyToSDLTexturePass.h"
 #include "vsr/rendering/pipeline/passes/OutlineRenderPass.h"
 #include "vsr/rendering/pipeline/passes/OutputTransformPass.h"
 #include "vsr/rendering/pipeline/passes/PrimitiveOutlineRenderPass.h"
 #include "vsr/rendering/pipeline/passes/ToneMapPass.h"
-#include "vsr/rendering/pipeline/passes/VisualizeAOVPass.h"
 #include "vsr/rendering/pipeline/saveImage.h"
 #include "vsr/rendering/view/Manipulator.hpp"
 // anari
@@ -89,6 +89,7 @@ struct Viewport : public BaseViewport
   void ui_menubar_Device();
   void ui_menubar_Camera();
   void ui_menubar_Viewport();
+  void ui_channelSelection();
   void ui_menubar_World();
 
   bool ui_picking();
@@ -116,10 +117,8 @@ struct Viewport : public BaseViewport
   int m_worldBoundsWidth{1};
   std::optional<float> m_frameProgress{0.f};
 
-  vsr::rendering::AOVType m_visualizeAOV{vsr::rendering::AOVType::NONE};
-  float m_depthVisualMinimum{0.f};
-  float m_depthVisualMaximum{1.f};
-  bool m_edgeInvert{false};
+  vsr::rendering::FrameChannelSelection m_channelSelection;
+  std::string m_channelMessage;
   anari::DataType m_colorFormat{ANARI_UFIXED8_RGBA_SRGB};
 
   vsr::rendering::ToneMapOperator m_toneMapOperator{
@@ -143,7 +142,7 @@ struct Viewport : public BaseViewport
   // Display //
 
   vsr::rendering::AnariSceneRenderPass *m_anariPass{nullptr};
-  vsr::rendering::VisualizeAOVPass *m_visualizeAOVPass{nullptr};
+  vsr::rendering::ChannelVisualizationPass *m_channelPass{nullptr};
   vsr::rendering::AutoExposurePass *m_autoExposurePass{nullptr};
   vsr::rendering::ToneMapPass *m_toneMapPass{nullptr};
   vsr::rendering::OutputTransformPass *m_outputTransformPass{nullptr};

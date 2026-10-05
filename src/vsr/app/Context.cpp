@@ -4,6 +4,7 @@
 #define ANARI_EXTENSION_UTILITY_IMPL
 
 #include "Context.h"
+#include "FrameChannelState.h"
 // vsr_animation
 #include "vsr/animation/Animation.hpp"
 // vsr_core
@@ -667,6 +668,13 @@ void OfflineRenderSequenceConfig::saveSettings(vsr::core::DataNode &root) const
   aovRoot["depthMin"] = aov.depthMin;
   aovRoot["depthMax"] = aov.depthMax;
   aovRoot["edgeInvert"] = aov.edgeInvert;
+
+  vsr::rendering::FrameChannelSelection selection;
+  std::string error;
+  if (channelSelection)
+    saveFrameChannelSelection(root["channelSelection"], *channelSelection);
+  else if (loadFrameChannelSelection(nullptr, &aovRoot, selection, error))
+    saveFrameChannelSelection(root["channelSelection"], selection);
 }
 
 void OfflineRenderSequenceConfig::loadSettings(vsr::core::DataNode &root)
@@ -712,11 +720,31 @@ void OfflineRenderSequenceConfig::loadSettings(vsr::core::DataNode &root)
 
   auto &aovRoot = root["aov"];
   int aovTypeInt = static_cast<int>(aov.aovType);
-  aovRoot["aovType"].getValue(ANARI_INT32, &aovTypeInt);
-  aov.aovType = static_cast<vsr::rendering::AOVType>(aovTypeInt);
-  aovRoot["depthMin"].getValue(ANARI_FLOAT32, &aov.depthMin);
-  aovRoot["depthMax"].getValue(ANARI_FLOAT32, &aov.depthMax);
-  aovRoot["edgeInvert"].getValue(ANARI_BOOL, &aov.edgeInvert);
+  if (const auto *node = aovRoot.child("aovType"))
+    node->getValue(ANARI_INT32, &aovTypeInt);
+  // Retain only validated wire-era values for old UI/export consumers.
+  aov.aovType = aovTypeInt >= int(vsr::rendering::AOVType::NONE)
+          && aovTypeInt <= int(vsr::rendering::AOVType::INSTANCE_ID)
+      ? static_cast<vsr::rendering::AOVType>(aovTypeInt)
+      : vsr::rendering::AOVType::NONE;
+  // Preserve missing fields for migration: reading must not manufacture
+  // explicitly saved depth bounds or a malformed empty legacy value.
+  if (const auto *node = aovRoot.child("depthMin"))
+    node->getValue(ANARI_FLOAT32, &aov.depthMin);
+  if (const auto *node = aovRoot.child("depthMax"))
+    node->getValue(ANARI_FLOAT32, &aov.depthMax);
+  if (const auto *node = aovRoot.child("edgeInvert"))
+    node->getValue(ANARI_BOOL, &aov.edgeInvert);
+
+  vsr::rendering::FrameChannelSelection selection;
+  channelSelection.reset();
+  if (loadFrameChannelSelection(root.child("channelSelection"),
+          &aovRoot,
+          selection,
+          channelSelectionError,
+          {},
+          false))
+    channelSelection = std::move(selection);
 }
 
 } // namespace vsr::app
