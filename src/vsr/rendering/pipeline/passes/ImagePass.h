@@ -7,6 +7,7 @@
 #include "vsr/core/TypeMacros.hpp"
 #include "vsr/core/VSRMath.hpp"
 // vsr_rendering
+#include "vsr/rendering/pipeline/FrameChannelCatalog.h"
 #include "vsr/rendering/pipeline/passes/detail/ComputeStream.h"
 
 namespace vsr::rendering {
@@ -41,6 +42,38 @@ constexpr bool hasChannels(ImageChannels set, ImageChannels subset);
  * by an enabled pass and is supported by the source. Channel buffers start
  * out as "background": infinite depth, ~0u IDs, zero elsewhere.
  */
+struct FrameChannelRequest
+{
+  std::string deviceName;
+  ANARIDataType pixelType{ANARI_UNKNOWN};
+};
+
+bool operator==(const FrameChannelRequest &a, const FrameChannelRequest &b);
+
+enum class FrameChannelStatus
+{
+  PENDING,
+  VALID,
+  FAILED
+};
+
+// Read-only view into source-owned staging. Valid until demand/size/source
+// changes or the next render; VALID alone permits reading data. Host maps are
+// copied to managed storage under CUDA, so either execution route can consume
+// it.
+struct FrameChannelData
+{
+  std::string deviceName;
+  ANARIDataType pixelType{ANARI_UNKNOWN};
+  FrameChannelStatus status{FrameChannelStatus::PENDING};
+  const void *data{nullptr};
+  uint32_t width{0};
+  uint32_t height{0};
+  std::string error;
+  anari::Device device{nullptr};
+  anari::Renderer renderer{nullptr};
+};
+
 struct ImageBuffers
 {
   uint32_t *color{nullptr};
@@ -51,6 +84,10 @@ struct ImageBuffers
   uint32_t *instanceId{nullptr};
   vsr::math::float3 *albedo{nullptr};
   vsr::math::float3 *normal{nullptr};
+  std::vector<FrameChannelData> namedChannels;
+  // Status of the source's Color for its current size/renderer configuration.
+  FrameChannelStatus sourceStatus{FrameChannelStatus::VALID};
+  std::string sourceError;
   detail::ComputeStream stream{};
 };
 
@@ -122,6 +159,8 @@ struct ImageSource : public ImageStage
   virtual ImageChannels supportedChannels() const;
   // The channels the pipeline asked for; always within supportedChannels().
   ImageChannels channels() const;
+  const std::vector<FrameChannelRequest> &namedChannels() const;
+  virtual const FrameChannelData *channelResult(std::string_view name) const;
 
  protected:
   // Called after channels() changed; start or stop producing channels here.
@@ -130,7 +169,9 @@ struct ImageSource : public ImageStage
 
  private:
   void setChannels(ImageChannels channels);
+  void setNamedChannels(std::vector<FrameChannelRequest> channels);
 
+  std::vector<FrameChannelRequest> m_namedChannels;
   ImageChannels m_channels{ImageChannels::NONE};
 
   friend struct ImagePipeline;
@@ -153,6 +194,7 @@ struct ImagePass : public ImageStage
   // The channels this pass reads in its current configuration. A requested
   // channel may still be null in render() when the source cannot produce it.
   virtual ImageChannels requiredChannels() const;
+  virtual std::vector<FrameChannelRequest> requiredNamedChannels() const;
 
  protected:
   virtual void render(ImageBuffers &b, FrameState &frame) = 0;

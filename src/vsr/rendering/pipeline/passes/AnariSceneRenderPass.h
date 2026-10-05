@@ -32,6 +32,8 @@ struct AnariSceneRenderPass : public ImageSource, public PickableSource
   ~AnariSceneRenderPass() override;
   const char *name() const override;
   ImageChannels supportedChannels() const override;
+  const FrameChannelCatalog &channelCatalog() const;
+  const FrameChannelData *channelResult(std::string_view name) const override;
 
   void setCamera(anari::Camera c);
   void setRenderer(anari::Renderer r);
@@ -66,14 +68,24 @@ struct AnariSceneRenderPass : public ImageSource, public PickableSource
   void updateCameraAspect();
   void restartFrame();
   void render(ImageBuffers &b) override;
-  void copyFrameData();
+  bool copyFrameData();
+  void updateNamedChannels();
+  void clearNamedData();
+  void copyNamedData();
   void publish(ImageBuffers &b);
+
+  FrameChannelCatalog m_catalog;
+  std::vector<FrameChannelData> m_namedData;
+  std::vector<FrameChannelRequest> m_appliedNamedChannels;
 
   ImageBuffers m_buffers; // staging: the latest completed ANARI frame
   ImageChannels m_stagingChannels{ImageChannels::NONE};
   ImageChannels m_frameChannels{ImageChannels::NONE}; // set on m_frame
   ImageChannels m_deviceChannels{ImageChannels::NONE};
 
+  FrameChannelStatus m_colorStatus{FrameChannelStatus::PENDING};
+  std::string m_colorError;
+  bool m_haveFrameData{false};
   bool m_firstFrame{true};
   // Channels were toggled since the last render: restart the frame once at
   // the next render() instead of once per toggle.
@@ -82,7 +94,9 @@ struct AnariSceneRenderPass : public ImageSource, public PickableSource
   bool m_runAsync{true};
   bool m_useImplicitAspectRatio{false};
 
+  // Retain the user's beauty format while diagnostic Color negotiates storage.
   anari::DataType m_format{ANARI_UFIXED8_RGBA_SRGB};
+  anari::DataType m_activeFormat{ANARI_UFIXED8_RGBA_SRGB};
 
   anari::Device m_device{nullptr};
   anari::Camera m_camera{nullptr};

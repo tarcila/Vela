@@ -5,8 +5,11 @@
 #include "vsr/core/Logging.hpp"
 // vsr_algorithms
 #include "vsr/algorithms/cpu/clearBuffers.hpp"
+#include "vsr/algorithms/cpu/visualizeChannel.hpp"
+#include "vsr/algorithms/detail/ChannelPixelLayout.h"
 #ifdef VSR_ALGORITHMS_HAS_CUDA
 #include "vsr/algorithms/cuda/clearBuffers.hpp"
+#include "vsr/algorithms/cuda/visualizeChannel.hpp"
 #endif
 // std
 #include <algorithm>
@@ -115,6 +118,7 @@ AnariSceneRenderPass::AnariSceneRenderPass(anari::Device d) : m_device(d)
 
   m_deviceSupportsCUDAFrames = supportsCUDAFbData(d);
   m_deviceChannels = deviceChannels(d);
+  m_catalog = discoverFrameChannels(d);
 
   if (m_deviceSupportsCUDAFrames)
     vsr::core::logStatus("[ImagePipeline] using CUDA-mapped fb channels");
@@ -124,6 +128,7 @@ AnariSceneRenderPass::AnariSceneRenderPass(anari::Device d) : m_device(d)
 
 AnariSceneRenderPass::~AnariSceneRenderPass()
 {
+  clearNamedData();
   detail::freeImageBuffers(m_buffers);
 
   anari::discard(m_device, m_frame);
@@ -155,6 +160,11 @@ void AnariSceneRenderPass::setRenderer(anari::Renderer r)
   anari::commitParameters(m_device, m_frame);
   anari::release(m_device, m_renderer);
   m_renderer = r;
+  m_catalog = discoverFrameChannels(m_device);
+  m_deviceChannels = deviceChannels(m_device);
+  updateNamedChannels();
+  m_colorStatus = FrameChannelStatus::PENDING;
+  m_pendingRestart = true;
 }
 
 void AnariSceneRenderPass::setWorld(anari::World w)
@@ -169,24 +179,183 @@ void AnariSceneRenderPass::setWorld(anari::World w)
 
 void AnariSceneRenderPass::setColorFormat(anari::DataType t)
 {
+  if (m_format == t)
+    return;
+  m_colorStatus = FrameChannelStatus::PENDING;
+  m_pendingRestart = true;
   m_format = t;
-  anari::setParameter(m_device, m_frame, "channel.color", t);
-  anari::commitParameters(m_device, m_frame);
+  updateNamedChannels();
 }
 
 ImageChannels AnariSceneRenderPass::supportedChannels() const
 {
   // HDR color exists only when the frame itself renders float color.
-  const ImageChannels hdr = m_format == ANARI_FLOAT32_VEC4
+  const ImageChannels hdr = m_activeFormat == ANARI_FLOAT32_VEC4
       ? ImageChannels::HDR_COLOR
       : ImageChannels::NONE;
   return m_deviceChannels | hdr;
+}
+
+const FrameChannelCatalog &AnariSceneRenderPass::channelCatalog() const
+{
+  return m_catalog;
+}
+
+const FrameChannelData *AnariSceneRenderPass::channelResult(
+    std::string_view name) const
+{
+  for (const auto &result : m_namedData)
+    if (result.deviceName == name)
+      return &result;
+  return nullptr;
+}
+
+void AnariSceneRenderPass::clearNamedData()
+{
+  for (auto &result : m_namedData)
+    detail::free_(const_cast<void *>(result.data));
+  m_namedData.clear();
+}
+
+void AnariSceneRenderPass::updateNamedChannels()
+{
+  clearNamedData();
+  auto format = m_format;
+  const auto color = std::find_if(m_catalog.channels.begin(),
+      m_catalog.channels.end(),
+      [](const auto &c) { return c.deviceName == "channel.color"; });
+  if (color != m_catalog.channels.end()
+      && std::find(color->pixelTypes.begin(), color->pixelTypes.end(), format)
+          == color->pixelTypes.end()) {
+    for (auto type : color->pixelTypes) {
+      if (channelTypeSupportsVisualization(type, "channel.color", "color")) {
+        format = type;
+        break;
+      }
+    }
+  }
+  for (const auto &request : namedChannels()) {
+    if (request.deviceName == "channel.color"
+        && color != m_catalog.channels.end()
+        && std::find(color->pixelTypes.begin(),
+               color->pixelTypes.end(),
+               request.pixelType)
+            != color->pixelTypes.end()
+        && vsr::algorithms::detail::channelPixelLayout(request.pixelType)
+                .components
+            >= 3)
+      format = request.pixelType;
+  }
+  if (format != m_activeFormat) {
+    m_activeFormat = format;
+    m_colorStatus = FrameChannelStatus::PENDING;
+    m_pendingRestart = true;
+  }
+  anari::setParameter(m_device, m_frame, "channel.color", m_activeFormat);
+  const auto standardWanted = [&](std::string_view name) {
+    if (name == "channel.color")
+      return true;
+    for (const auto &c : FRAME_CHANNELS)
+      if (name == c.parameter && hasChannels(channels(), c.channel))
+        return true;
+    return false;
+  };
+  for (const auto &old : m_appliedNamedChannels) {
+    if (!standardWanted(old.deviceName))
+      anari::unsetParameter(m_device, m_frame, old.deviceName.c_str());
+  }
+  m_appliedNamedChannels.clear();
+  for (const auto &request : namedChannels()) {
+    FrameChannelData result;
+    result.deviceName = request.deviceName;
+    result.pixelType = request.pixelType;
+    result.device = m_device;
+    result.renderer = m_renderer;
+    const auto descriptor = std::find_if(m_catalog.channels.begin(),
+        m_catalog.channels.end(),
+        [&](const auto &c) { return c.deviceName == request.deviceName; });
+    bool compatible = descriptor != m_catalog.channels.end()
+        && !descriptor->ambiguous
+        && std::find(descriptor->pixelTypes.begin(),
+               descriptor->pixelTypes.end(),
+               request.pixelType)
+            != descriptor->pixelTypes.end()
+        && (channelTypeSupportsVisualization(
+                request.pixelType, request.deviceName, "color")
+            || channelTypeSupportsVisualization(
+                request.pixelType, request.deviceName, "grayscale")
+            || channelTypeSupportsVisualization(
+                request.pixelType, request.deviceName, "magnitude"));
+    for (const auto &other : namedChannels())
+      if (other.deviceName == request.deviceName
+          && other.pixelType != request.pixelType)
+        compatible = false;
+    if (standardWanted(request.deviceName)) {
+      if (request.deviceName == "channel.color")
+        compatible &= request.pixelType == m_activeFormat;
+      for (const auto &c : FRAME_CHANNELS)
+        if (request.deviceName == c.parameter)
+          compatible &= request.pixelType == c.type;
+    }
+    if (!compatible) {
+      result.status = FrameChannelStatus::FAILED;
+      result.error = "incompatible advertised storage for Frame Channel '"
+          + request.deviceName + "'";
+    } else {
+      anari::setParameter(
+          m_device, m_frame, request.deviceName.c_str(), request.pixelType);
+      m_appliedNamedChannels.push_back(request);
+    }
+    m_namedData.push_back(std::move(result));
+  }
+  anari::commitParameters(m_device, m_frame);
+  if (!namedChannels().empty())
+    m_pendingRestart = true;
+}
+
+void AnariSceneRenderPass::copyNamedData()
+{
+  const auto size = dimensions();
+  for (auto &result : m_namedData) {
+    if (result.status == FrameChannelStatus::FAILED && !result.data)
+      continue;
+    auto mapped =
+        anari::map<void>(m_device, m_frame, result.deviceName.c_str());
+    if (!mapped.data || mapped.pixelType != result.pixelType
+        || mapped.width != size.x || mapped.height != size.y) {
+      detail::free_(const_cast<void *>(result.data));
+      result.data = nullptr;
+      result.status = FrameChannelStatus::FAILED;
+      result.error = "failed to map Frame Channel '" + result.deviceName
+          + "': null data, unexpected type or dimensions";
+    } else {
+      const size_t bytesPerPixel =
+          vsr::algorithms::detail::channelPixelLayout(result.pixelType).size;
+      const size_t bytes = size_t(size.x) * size.y * bytesPerPixel;
+      void *storage = result.data ? const_cast<void *>(result.data)
+                                  : detail::allocate_(bytes);
+      if (storage) {
+        detail::memcpy_(storage, mapped.data, bytes);
+        result.data = storage;
+        result.width = size.x;
+        result.height = size.y;
+        result.status = FrameChannelStatus::VALID;
+        result.error.clear();
+      } else {
+        result.status = FrameChannelStatus::FAILED;
+        result.error = "cannot allocate staging for Frame Channel '"
+            + result.deviceName + "'";
+      }
+    }
+    anari::unmap(m_device, m_frame, result.deviceName.c_str());
+  }
 }
 
 void AnariSceneRenderPass::updateChannels()
 {
   const bool added = setFrameChannels(channels());
   resizeStaging();
+  updateNamedChannels();
 
   // A frame already in flight lacks the added channels: restart once, at the
   // next render(), so they are produced before being read.
@@ -338,11 +507,28 @@ anari::Frame AnariSceneRenderPass::getFrame() const
 
 void AnariSceneRenderPass::updateSize()
 {
+  m_colorStatus = FrameChannelStatus::PENDING;
+  m_haveFrameData = false;
   auto size = dimensions();
+  if (size.x == 0 || size.y == 0) {
+    clearNamedData();
+    for (const auto &request : namedChannels()) {
+      FrameChannelData result;
+      result.deviceName = request.deviceName;
+      result.pixelType = request.pixelType;
+      result.device = m_device;
+      result.renderer = m_renderer;
+      m_namedData.push_back(std::move(result));
+    }
+    detail::freeImageBuffers(m_buffers);
+    m_stagingChannels = ImageChannels::NONE;
+    return;
+  }
   anari::setParameter(m_device, m_frame, "size", size);
   anari::commitParameters(m_device, m_frame);
 
   updateCameraAspect();
+  updateNamedChannels();
 
   detail::freeImageBuffers(m_buffers);
   m_stagingChannels = ImageChannels::NONE;
@@ -408,13 +594,26 @@ void AnariSceneRenderPass::render(ImageBuffers &b)
   }
 
   if (anari::isReady(m_device, m_frame)) {
-    copyFrameData();
+    if (copyFrameData()) {
+      m_colorStatus = FrameChannelStatus::VALID;
+      m_colorError.clear();
+      m_haveFrameData = true;
+    } else {
+      m_colorStatus = FrameChannelStatus::FAILED;
+      m_colorError =
+          "failed to map Frame Channel 'channel.color': null data, unexpected type or dimensions";
+    }
+    if (!nothingToShow)
+      copyNamedData();
     // Only the asynchronous mode keeps a render in flight between calls.
     if (m_runAsync)
       anari::render(m_device, m_frame);
   }
 
-  if (!nothingToShow)
+  b.namedChannels = m_namedData;
+  b.sourceStatus = nothingToShow ? FrameChannelStatus::PENDING : m_colorStatus;
+  b.sourceError = m_colorError;
+  if (!nothingToShow && m_haveFrameData)
     publish(b);
   else {
     const auto size = dimensions();
@@ -428,7 +627,7 @@ void AnariSceneRenderPass::render(ImageBuffers &b)
   }
 }
 
-void AnariSceneRenderPass::copyFrameData()
+bool AnariSceneRenderPass::copyFrameData()
 {
   const char *colorChannel =
       m_deviceSupportsCUDAFrames ? "channel.colorCUDA" : "channel.color";
@@ -466,15 +665,14 @@ void AnariSceneRenderPass::copyFrameData()
   const bool sizeMatches =
       totalSize > 0 && size.x == color.width && size.y == color.height;
   const bool colorMapped =
-      color.data != nullptr && color.pixelType != ANARI_UNKNOWN;
-  const bool depthMappedIfRequested = !enableDepth || depth.data != nullptr;
+      color.data != nullptr && color.pixelType == m_activeFormat;
 
-  const bool valid = sizeMatches && colorMapped && depthMappedIfRequested;
+  const bool valid = sizeMatches && colorMapped;
   if (!valid) {
     anari::unmap(m_device, m_frame, colorChannel);
     if (enableDepth)
       anari::unmap(m_device, m_frame, depthChannel);
-    return;
+    return false;
   }
 
   if (color.pixelType == ANARI_FLOAT32_VEC4) {
@@ -484,11 +682,50 @@ void AnariSceneRenderPass::copyFrameData()
         (const float *)color.data,
         (uint8_t *)m_buffers.color,
         totalSize * 4);
-  } else
+  } else if (color.pixelType == ANARI_UFIXED8_VEC4
+      || color.pixelType == ANARI_UFIXED8_RGBA_SRGB)
     detail::copy(m_buffers.color, (uint32_t *)color.data, totalSize);
+  else {
+#ifdef VSR_ALGORITHMS_HAS_CUDA
+    if (m_buffers.stream)
+      vsr::algorithms::cuda::visualizeChannel(m_buffers.stream,
+          color.data,
+          color.pixelType,
+          m_buffers.color,
+          uint32_t(totalSize),
+          vsr::algorithms::cuda::ChannelVisualization::COLOR,
+          false,
+          0.,
+          1.);
+    else
+#endif
+      vsr::algorithms::cpu::visualizeChannel(color.data,
+          color.pixelType,
+          m_buffers.color,
+          uint32_t(totalSize),
+          vsr::algorithms::cpu::ChannelVisualization::COLOR,
+          false,
+          0.,
+          1.);
+  }
 
-  if (enableDepth)
-    detail::copy(m_buffers.depth, depth.data, totalSize);
+  if (enableDepth) {
+    if (depth.data && depth.pixelType == ANARI_FLOAT32 && depth.width == size.x
+        && depth.height == size.y)
+      detail::copy(m_buffers.depth, depth.data, totalSize);
+    else {
+#ifdef VSR_ALGORITHMS_HAS_CUDA
+      if (m_buffers.stream)
+        vsr::algorithms::cuda::fill(m_buffers.stream,
+            m_buffers.depth,
+            uint32_t(totalSize),
+            vsr::math::inf);
+      else
+#endif
+        vsr::algorithms::cpu::fill(
+            m_buffers.depth, uint32_t(totalSize), vsr::math::inf);
+    }
+  }
   // A requested channel that fails to map this frame reads as background
   // rather than keeping an earlier frame's values.
   const uint32_t totalPixels = uint32_t(totalSize);
@@ -512,7 +749,9 @@ void AnariSceneRenderPass::copyFrameData()
     vsr::algorithms::cpu::fill(f, totalPixels * 3, 0.f);
   };
   auto copyOr = [&](auto *dst, const auto &mapped, auto &&background) {
-    if (mapped.data)
+    using T = std::remove_pointer_t<decltype(dst)>;
+    if (mapped.data && mapped.pixelType == anari::ANARITypeFor<T>::value
+        && mapped.width == size.x && mapped.height == size.y)
       detail::copy(dst, mapped.data, totalSize);
     else
       background(dst);
@@ -557,6 +796,7 @@ void AnariSceneRenderPass::copyFrameData()
     anari::unmap(m_device, m_frame, albedoChannel);
   if (has(ImageChannels::NORMAL))
     anari::unmap(m_device, m_frame, normalChannel);
+  return true;
 }
 
 void AnariSceneRenderPass::publish(ImageBuffers &b)

@@ -65,6 +65,7 @@ struct ImagePipeline final
   vsr::math::uint2 dimensions() const;
   const std::vector<PassTiming> &getPassTimings() const;
   ImageSource *source() const;
+  const FrameChannelData *channelResult(std::string_view deviceName) const;
   bool empty() const;
 
   void setDimensions(uint32_t width, uint32_t height);

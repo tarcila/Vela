@@ -3,7 +3,85 @@
 Turns VSR scenes into images: render indexes feed ANARI devices, and an image
 pipeline of composable passes produces the final per-pixel output.
 
+## Named-channel production contract
+
+`FrameChannelSelection` is shared name-based state: full `deviceName`, resolved
+internal `pixelType`, visualization, `ChannelRangePolicy::AUTO` / `FIXED`,
+`rangeMin` / `rangeMax` and `invertEdges`. Catalog resolution accepts only exact
+presentation names, reports ambiguity/unavailable types, and validates finite
+ordered Fixed bounds. Common visualization spellings are `color`, `grayscale`,
+`normal`, `id-colors`, `edges`, `component-x`, `component-y`, `component-z`,
+`component-w`, `magnitude`. Common range spellings are `auto` and `fixed`;
+tool adapters use `--range auto` or `--range fixed --range-min N --range-max N`.
+Compatibility is not a promise that every conversion is already implemented.
+
+Image Passes declare `requiredNamedChannels()` as full-name/type requests.
+Enabled-pass requests compose with standard bit demands; discovery alone does
+not request, allocate or map channel data. The ANARI Image Source validates
+storage against its catalog and preserves standard consumers' storage choices.
+Beauty Color uses the source's configured format (including HDR) when advertised,
+otherwise an advertised supported Color representation. Diagnostic named Color
+negotiates its requested representation with the producer without overwriting
+that configured beauty preference; returning to beauty restores it. Conflicting
+named storage requests still fail explicitly. Conversion and finite-range
+reduction live in mirrored CPU/CUDA free functions under `vsr/algorithms/`;
+the Image Pass selects the visualization and dispatches the backend.
+
+`ImagePipeline::channelResult(fullName)` and `ImageBuffers::namedChannels`
+expose source-owned read-only views. Absent demand has no result. `PENDING`
+means no completed frame of this selection/size is available; only `VALID`
+permits reading `data`. `FAILED` clears data and supplies the complete name,
+error and public ANARI device/renderer handles; adapters already owning their
+Device Identifier and renderer name can construct contextual diagnostics.
+A failed selection can be reconfigured or refreshed with the renderer; it is
+not silently mapped again as Color. Views expire at the next render or any
+size/demand/source change. While same-selection work accumulates asynchronously,
+the last valid completed frame remains readable. A transition clears old views.
+
+Named maps always use the advertised full name, including unprefixed names.
+Host maps are copied before unmapping into source-owned CPU storage or CUDA
+managed storage, following the configured pipeline allocation route; no guessed
+`CUDA` suffix is appended to arbitrary names. Ordinary standard-channel CUDA
+maps, Color/HDR transforms, FrameState exchange and isolated picking are retained.
+
+## Scalar Channel Visualization contract
+
+`ChannelVisualizationPass` implements scalar grayscale, vector components and
+magnitude, compatible Color/normal conversion and identity colors/edges;
+ordinary `channel.color` / `color` leaves the beauty transform path intact. Place it after beauty exposure,
+tone mapping and output transformation, before overlays. It does not modify
+FrameState exposure. Unsupported conversions are rejected.
+Use shared catalog resolution first to validate availability and compatibility.
+Only enabled, valid diagnostic selections request named data; standard overlay
+requests still compose independently.
+
+Auto range uses the current completed frame's finite minimum and maximum.
+Negative samples participate normally. A finite constant Auto frame is opaque
+mid-gray (128); nonfinite samples and frames with no finite samples are opaque
+black. Fixed requires finite minimum < maximum, clamps values, and maps the
+bounds to black/white. Numeric mapping uses double precision (including UINT32
+limits) and nearest-byte rounding. Scalar data has no inferred background
+sentinel: all finite values participate. Pending transitions may
+retain a completed display without claiming new-channel success; invalid and
+failed selections clear output to opaque black. Only VALID pass status means
+successful visualization, never a fallback
+to beauty Color. Public source channel results remain independently available.
+`setUseCUDA(false)` exercises host conversion in a CUDA-configured pipeline;
+the default uses the pipeline's CUDA stream when present.
+
 ## Language
+
+**Frame Channel**:
+Per-pixel data produced by a rendering device for a frame, such as color,
+depth, normals, or object identity. An image derived from that data, such as
+an edge visualization, is not itself a Frame Channel.
+_Avoid_: AOV (when referring to a Frame Channel)
+
+**Channel Visualization**:
+A visible image derived from a Frame Channel's values, such as grayscale
+depth, normal colors, hashed identity colors, or edges. A Frame Channel can
+have several Channel Visualizations.
+_Avoid_: AOV (when referring to a Channel Visualization)
 
 **Image Pipeline**:
 One Image Source, followed by ordered Image Passes, followed by Image Sinks,

@@ -13,6 +13,7 @@ PRIVATE
   pipeline/passes/AnariAxesRenderPass.cpp
   pipeline/passes/AnariSceneRenderPass.cpp
   pipeline/passes/AutoExposurePass.cpp
+  pipeline/passes/ChannelVisualizationPass.cpp
   pipeline/passes/BoxOutlineRenderPass.cpp
   pipeline/passes/CopyFromColorBufferPass.cpp
   pipeline/passes/CopyToSDLTexturePass.cpp
@@ -26,6 +27,7 @@ PRIVATE
   pipeline/passes/VisualizeAOVPass.cpp
   overlay/WorldBoundsOverlay.cpp
   pick/PickRequest.cpp
+  pipeline/FrameChannelCatalog.cpp
   pipeline/ImagePipeline.cpp
   pipeline/saveImage.cpp
   view/CameraView.cpp
@@ -53,6 +55,7 @@ if (VSR_USE_CUDA)
     pipeline/passes/AnariAxesRenderPass.cpp
     pipeline/passes/AnariSceneRenderPass.cpp
     pipeline/passes/AutoExposurePass.cpp
+    pipeline/passes/ChannelVisualizationPass.cpp
     pipeline/passes/BoxOutlineRenderPass.cpp
     pipeline/passes/ImagePass.cpp
     pipeline/passes/OutlineRenderPass.cpp

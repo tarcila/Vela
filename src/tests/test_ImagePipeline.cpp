@@ -21,6 +21,26 @@ namespace {
 
 using Log = std::vector<std::string>;
 
+struct NamedDemandPass : rendering::ImagePass
+{
+  std::vector<rendering::FrameChannelRequest> requests;
+  std::vector<rendering::FrameChannelRequest> requiredNamedChannels()
+      const override;
+  rendering::ImageChannels requiredChannels() const override;
+  void render(rendering::ImageBuffers &, rendering::FrameState &) override {}
+};
+
+std::vector<rendering::FrameChannelRequest>
+NamedDemandPass::requiredNamedChannels() const
+{
+  return requests;
+}
+
+rendering::ImageChannels NamedDemandPass::requiredChannels() const
+{
+  return rendering::ImageChannels::DEPTH;
+}
+
 struct FakeSource : public rendering::ImageSource
 {
   FakeSource(Log *log, uint32_t value = 1u) : m_log(log), m_value(value) {}
@@ -85,6 +105,166 @@ struct CaptureSink : public rendering::ImageSink
 };
 
 } // namespace
+
+TEST_CASE("ANARI pipeline produces exact named channels only on demand",
+    "[ImagePipeline][NamedFrameChannels]")
+{
+  auto library = anari::loadLibrary("channel_test");
+  REQUIRE(library);
+  auto device = anari::newDevice(library, "default");
+  REQUIRE(device);
+  {
+    rendering::ImagePipeline pipeline(2, 2);
+    auto *source = pipeline.setSource<rendering::AnariSceneRenderPass>(device);
+    source->setRunAsync(false);
+    auto *pass = pipeline.addPass<NamedDemandPass>();
+    pipeline.render();
+    CHECK_FALSE(pipeline.channelResult("Temperature_RAW"));
+    pass->requests = {{"Temperature_RAW", ANARI_FLOAT32}};
+    pipeline.render();
+    const auto *result = pipeline.channelResult("Temperature_RAW");
+    REQUIRE(result);
+    REQUIRE(result->status == rendering::FrameChannelStatus::VALID);
+    REQUIRE(result->data);
+    CHECK(static_cast<const float *>(result->data)[1] == 1.f);
+    CHECK(result->width == 2);
+    CHECK(result->deviceName == "Temperature_RAW");
+    pipeline.setDimensions(3, 1);
+    CHECK(pipeline.channelResult("Temperature_RAW")->status
+        == rendering::FrameChannelStatus::PENDING);
+    pipeline.render();
+    CHECK(pipeline.channelResult("Temperature_RAW")->width == 3);
+    auto *other = pipeline.addPass<NamedDemandPass>();
+    other->requests = {{"channel.motionVectors", ANARI_FLOAT32_VEC2}};
+    pipeline.render();
+    REQUIRE(pipeline.channelResult("channel.motionVectors"));
+    CHECK(pipeline.channelResult("channel.motionVectors")->status
+        == rendering::FrameChannelStatus::VALID);
+    bool requested = false;
+    REQUIRE(anariGetProperty(device,
+        source->getFrame(),
+        "test.requested.channel.depth",
+        ANARI_BOOL,
+        &requested,
+        sizeof(requested),
+        ANARI_WAIT));
+    CHECK(requested);
+    REQUIRE(anariGetProperty(device,
+        source->getFrame(),
+        "test.requested.channel.Temperature_RAW",
+        ANARI_BOOL,
+        &requested,
+        sizeof(requested),
+        ANARI_WAIT));
+    CHECK_FALSE(requested);
+    pass->setEnabled(false);
+    pipeline.render();
+    CHECK_FALSE(pipeline.channelResult("Temperature_RAW"));
+    CHECK(pipeline.channelResult("channel.motionVectors"));
+    REQUIRE(anariGetProperty(device,
+        source->getFrame(),
+        "test.requested.Temperature_RAW",
+        ANARI_BOOL,
+        &requested,
+        sizeof(requested),
+        ANARI_WAIT));
+    CHECK_FALSE(requested);
+    REQUIRE(anariGetProperty(device,
+        source->getFrame(),
+        "test.mapped.channel.unusual",
+        ANARI_BOOL,
+        &requested,
+        sizeof(requested),
+        ANARI_WAIT));
+    CHECK_FALSE(requested);
+    pipeline.setDimensions(0, 0);
+    REQUIRE(pipeline.channelResult("channel.motionVectors"));
+    CHECK(pipeline.channelResult("channel.motionVectors")->status
+        == rendering::FrameChannelStatus::PENDING);
+    CHECK_FALSE(pipeline.channelResult("channel.motionVectors")->data);
+    pipeline.setDimensions(2, 2);
+    pipeline.render();
+    CHECK(pipeline.channelResult("channel.motionVectors")->status
+        == rendering::FrameChannelStatus::VALID);
+    other->setEnabled(false);
+    pipeline.render();
+    CHECK_FALSE(pipeline.channelResult("channel.motionVectors"));
+    REQUIRE(anariGetProperty(device,
+        source->getFrame(),
+        "test.requested.channel.color",
+        ANARI_BOOL,
+        &requested,
+        sizeof(requested),
+        ANARI_WAIT));
+    CHECK(requested);
+    source->setColorFormat(ANARI_FLOAT32_VEC4);
+    pass->requests = {{"channel.color", ANARI_FLOAT32_VEC4}};
+    pass->setEnabled(true);
+    pipeline.render();
+    REQUIRE(pipeline.channelResult("channel.color"));
+    CHECK(pipeline.channelResult("channel.color")->status
+        == rendering::FrameChannelStatus::VALID);
+    CHECK(pipeline.channelResult("channel.color")->pixelType
+        == ANARI_FLOAT32_VEC4);
+    CHECK(static_cast<const float *>(
+              pipeline.channelResult("channel.color")->data)[3]
+        == 3.f);
+  }
+  anari::release(device, device);
+  anari::unloadLibrary(library);
+}
+
+TEST_CASE("Named production distinguishes pending and failed maps",
+    "[ImagePipeline][NamedFrameChannels]")
+{
+  auto library = anari::loadLibrary("channel_test");
+  REQUIRE(library);
+  auto device = anari::newDevice(library, "default");
+  REQUIRE(device);
+  {
+    rendering::ImagePipeline pipeline(2, 2);
+    auto *source = pipeline.setSource<rendering::AnariSceneRenderPass>(device);
+    auto *pass = pipeline.addPass<NamedDemandPass>();
+    pass->requests = {{"Temperature_RAW", ANARI_FLOAT32}};
+    SECTION("pending work is not a failure")
+    {
+      anari::setParameter(device, device, "test.pending", true);
+      pipeline.render();
+      pipeline.render();
+      REQUIRE(pipeline.channelResult("Temperature_RAW"));
+      CHECK(pipeline.channelResult("Temperature_RAW")->status
+          == rendering::FrameChannelStatus::PENDING);
+      CHECK_FALSE(pipeline.channelResult("Temperature_RAW")->data);
+      anari::setParameter(device, device, "test.pending", false);
+      pipeline.render();
+      CHECK(pipeline.channelResult("Temperature_RAW")->status
+          == rendering::FrameChannelStatus::VALID);
+    }
+    SECTION("invalid completed map never republishes stale samples")
+    {
+      auto renderer = anari::newObject<anari::Renderer>(device, "diagnostic");
+      REQUIRE(renderer);
+      source->setRenderer(renderer);
+      anari::release(device, renderer);
+      source->setRunAsync(false);
+      pipeline.render();
+      REQUIRE(pipeline.channelResult("Temperature_RAW")->status
+          == rendering::FrameChannelStatus::VALID);
+      const auto mode = GENERATE("null", "wrong-type", "wrong-size");
+      anari::setParameter(device, device, "test.map", mode);
+      pipeline.render();
+      const auto *result = pipeline.channelResult("Temperature_RAW");
+      REQUIRE(result);
+      CHECK(result->status == rendering::FrameChannelStatus::FAILED);
+      CHECK_FALSE(result->data);
+      CHECK(result->error.find("Temperature_RAW") != std::string::npos);
+      CHECK(result->device == device);
+      CHECK(result->renderer == renderer);
+    }
+  }
+  anari::release(device, device);
+  anari::unloadLibrary(library);
+}
 
 TEST_CASE(
     "Image Pipeline runs source, then passes, then sinks", "[ImagePipeline]")

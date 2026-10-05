@@ -6,6 +6,10 @@ if (NOT BUILD_TESTING)
 endif()
 
 project(vsrTests LANGUAGES CXX)
+add_library(anari_library_channel_test SHARED ChannelTestDevice.cpp)
+target_link_libraries(anari_library_channel_test PRIVATE anari::anari anari::anari_backend)
+set_target_properties(anari_library_channel_test PROPERTIES
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>")
 project_add_executable(
   test_App.cpp
   test_AnimationManager.cpp
@@ -13,6 +17,7 @@ project_add_executable(
   test_AnimationManagerArchive.cpp
   test_ArchiveCompatibility.cpp
   test_CameraRendererArchive.cpp
+  test_ChannelVisualization.cpp
   test_Algorithms.cpp
   test_AutoExposure.cpp
   test_AnyArray.cpp
@@ -22,6 +27,7 @@ project_add_executable(
   test_DataTree.cpp
   test_Downsample.cpp
   test_FlatMap.cpp
+  test_FrameChannelCatalog.cpp
   test_Forest.cpp
   test_Geometry.cpp
   test_ImageImport.cpp
@@ -149,10 +155,20 @@ add_test(NAME vsr::ComponentSerialization
 add_test(NAME vsr::DataPath      COMMAND ${PROJECT_NAME} "[DataPath]"     )
 add_test(NAME vsr::DataTree      COMMAND ${PROJECT_NAME} "[DataTree]"     )
 add_test(NAME vsr::FlatMap       COMMAND ${PROJECT_NAME} "[FlatMap]"      )
+add_dependencies(${PROJECT_NAME} anari_library_channel_test)
+add_test(NAME vsr::ChannelVisualization COMMAND ${PROJECT_NAME} "[ChannelVisualization]")
+set_tests_properties(vsr::ChannelVisualization PROPERTIES
+  ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/$<CONFIG>:$ENV{LD_LIBRARY_PATH}")
+add_test(NAME vsr::FrameChannelCatalog COMMAND ${PROJECT_NAME} "[FrameChannelCatalog]")
+add_test(NAME vsr::FrameChannelSmoke COMMAND ${PROJECT_NAME} "[FrameChannelSmoke]")
+set_tests_properties(vsr::FrameChannelCatalog vsr::FrameChannelSmoke PROPERTIES
+  ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/$<CONFIG>:$ENV{LD_LIBRARY_PATH}")
 add_test(NAME vsr::Forest        COMMAND ${PROJECT_NAME} "[Forest]"       )
 add_test(NAME vsr::Geometry      COMMAND ${PROJECT_NAME} "[Geometry]"     )
 add_test(NAME vsr::ImageImport   COMMAND ${PROJECT_NAME} "[ImageImport]"  )
 add_test(NAME vsr::ImagePipeline COMMAND ${PROJECT_NAME} "[ImagePipeline]")
+set_tests_properties(vsr::ImagePipeline PROPERTIES
+  ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/$<CONFIG>:$ENV{LD_LIBRARY_PATH}")
 add_test(NAME vsr::Importers     COMMAND ${PROJECT_NAME} "[Importers]"    )
 add_test(NAME vsr::LayerSubtreeArchive
   COMMAND ${PROJECT_NAME} "[LayerSubtreeArchive]")

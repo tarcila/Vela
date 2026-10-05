@@ -3,6 +3,7 @@
 
 #include "ImagePipeline.h"
 // std
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <limits>
@@ -50,6 +51,12 @@ ImageSource *ImagePipeline::source() const
   return m_source.get();
 }
 
+const FrameChannelData *ImagePipeline::channelResult(
+    std::string_view name) const
+{
+  return m_source ? m_source->channelResult(name) : nullptr;
+}
+
 bool ImagePipeline::empty() const
 {
   return !m_source && m_passes.empty() && m_sinks.empty();
@@ -64,9 +71,6 @@ void ImagePipeline::setDimensions(uint32_t width, uint32_t height)
 
   // Reallocated lazily, with the channels in demand, by the next render().
   cleanup();
-
-  if (width == 0 || height == 0)
-    return;
 
   if (m_source)
     m_source->setDimensions(width, height);
@@ -93,6 +97,8 @@ void ImagePipeline::render()
   FrameState frame;
 
   auto start = clock::now();
+  m_buffers.sourceStatus = FrameChannelStatus::VALID;
+  m_buffers.sourceError.clear();
   m_source->render(m_buffers);
   timeStage(*m_source, elapsed(start));
 
@@ -143,10 +149,18 @@ void ImagePipeline::timeStage(ImageStage &s, float milliseconds)
 void ImagePipeline::updateChannels()
 {
   ImageChannels demand = ImageChannels::NONE;
+  std::vector<FrameChannelRequest> named;
   for (auto &p : m_passes) {
-    if (p->isEnabled())
+    if (p->isEnabled()) {
       demand |= p->requiredChannels();
+      for (const auto &request : p->requiredNamedChannels()) {
+        if (std::find(named.begin(), named.end(), request) == named.end())
+          named.push_back(request);
+      }
+    }
   }
+  m_source->setNamedChannels(std::move(named));
+  m_buffers.namedChannels.clear();
   const ImageChannels channels = demand & m_source->supportedChannels();
 
   m_source->setChannels(channels);
