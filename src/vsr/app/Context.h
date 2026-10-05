@@ -10,6 +10,7 @@
 #include "vsr/scene/Scene.hpp"
 // vsr_rendering
 #include "vsr/rendering/index/RenderIndex.hpp"
+#include "vsr/rendering/pipeline/FrameChannelCatalog.h"
 #include "vsr/rendering/pipeline/passes/VisualizeAOVPass.h"
 #include "vsr/rendering/view/CameraPath.h"
 #include "vsr/rendering/view/Manipulator.hpp"
@@ -19,6 +20,7 @@
 #include "vsr/app/ANARIDeviceManager.h"
 #include "vsr/app/renderAnimationSequence.h"
 // std
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -133,7 +135,13 @@ struct OfflineRenderSequenceConfig
     float depthMin{0.f};
     float depthMax{1.f};
     bool edgeInvert{false};
-  } aov;
+  } aov; // Compatibility input for standard-channel export consumers.
+
+  // Named intent is authoritative when present; legacy editors clear it when
+  // deliberately changing the compatibility settings. Load errors are retained
+  // for strict noninteractive validation, not silently converted to Color.
+  std::optional<vsr::rendering::FrameChannelSelection> channelSelection;
+  std::string channelSelectionError;
 
   void saveSettings(vsr::core::DataNode &root) const;
   void loadSettings(vsr::core::DataNode &root);

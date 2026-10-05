@@ -4,6 +4,7 @@
 // catch
 #include "catch.hpp"
 // vsr_app
+#include "vsr/app/FrameChannelOptions.h"
 // vsr_core
 #include "vsr/core/TypeMacros.hpp"
 // vsr_rendering
@@ -928,6 +929,204 @@ TEST_CASE("Color production exposes pending and failed completed frames",
   pipeline.render();
   CHECK(pass->status() == rendering::FrameChannelStatus::FAILED);
   CHECK(pass->error().find("channel.color") != std::string::npos);
+}
+
+TEST_CASE(
+    "Renderer rediscovery preserves named intent and exposes capability loss",
+    "[ChannelVisualization][ChannelLifecycle]")
+{
+  ChannelDevice fixture;
+  REQUIRE(fixture.device);
+  rendering::ImagePipeline pipeline(2, 2);
+  auto *source =
+      pipeline.setSource<rendering::AnariSceneRenderPass>(fixture.device);
+  source->setRunAsync(false);
+  auto *pass = pipeline.addPass<rendering::ChannelVisualizationPass>();
+  rendering::FrameChannelSelection selection;
+  selection.visualization = "component-y";
+  selection.rangePolicy = rendering::ChannelRangePolicy::FIXED;
+  selection.rangeMin = -1.f;
+  selection.rangeMax = 4.f;
+  std::string message;
+  REQUIRE(rendering::resolveFrameChannelSelection(
+      source->channelCatalog(), "motionVectors", selection, message, true));
+  REQUIRE(pass->setSelection(selection));
+  pipeline.render();
+  REQUIRE(pass->status() == rendering::FrameChannelStatus::VALID);
+  const auto firstName = source->channelCatalog().channels.front().deviceName;
+  auto setRenderer = [&](const char *name) {
+    auto renderer = anari::newObject<anari::Renderer>(fixture.device, name);
+    REQUIRE(renderer);
+    source->setRenderer(renderer);
+    anari::release(fixture.device, renderer);
+  };
+  setRenderer("reordered");
+  CHECK(source->channelCatalog().channels.front().deviceName != firstName);
+  REQUIRE(vsr::app::resolveInteractiveFrameChannelSelection(
+      source->channelCatalog(), selection, message));
+  CHECK(selection.deviceName == "channel.motionVectors");
+  CHECK(selection.visualization == "component-y");
+  CHECK(selection.rangeMin == -1.f);
+  REQUIRE(pass->setSelection(selection));
+  pipeline.render();
+  CHECK(pass->status() == rendering::FrameChannelStatus::VALID);
+  SECTION("renderer loses the advertised channel")
+  {
+    setRenderer("limited");
+    CHECK_FALSE(vsr::app::resolveInteractiveFrameChannelSelection(
+        source->channelCatalog(), selection, message));
+  }
+  SECTION("advertised channel becomes undisplayable")
+  {
+    REQUIRE(rendering::resolveFrameChannelSelection(
+        source->channelCatalog(), "Temperature_RAW", selection, message));
+    setRenderer("opaque");
+    CHECK_FALSE(vsr::app::resolveInteractiveFrameChannelSelection(
+        source->channelCatalog(), selection, message));
+    CHECK(message.find("pixel types") != std::string::npos);
+  }
+  SECTION(
+      "replacing the running device rediscovers instead of reusing a catalog")
+  {
+    auto device = anari::newDevice(fixture.library, "default");
+    REQUIRE(device);
+    anari::setParameter(device, device, "test.metadata", "missing");
+    source = pipeline.setSource<rendering::AnariSceneRenderPass>(device);
+    anari::release(device, device);
+    source->setRunAsync(false);
+    CHECK_FALSE(source->channelCatalog().find("motionVectors"));
+    CHECK_FALSE(vsr::app::resolveInteractiveFrameChannelSelection(
+        source->channelCatalog(), selection, message));
+  }
+  CHECK(selection.deviceName == "channel.color");
+  CHECK(message.find("returned to Color") != std::string::npos);
+  REQUIRE(pass->setSelection(selection));
+  pipeline.render();
+  CHECK(pass->status() == rendering::FrameChannelStatus::VALID);
+  CHECK_FALSE(pipeline.channelResult("channel.motionVectors"));
+  CHECK(pipeline.getColorBuffer()[0] == 0xff030201u);
+}
+
+TEST_CASE("Device replacement preserves a supported named selection",
+    "[ChannelVisualization][ChannelLifecycle]")
+{
+  ChannelDevice fixture;
+  REQUIRE(fixture.device);
+  rendering::ImagePipeline pipeline(2, 2);
+  auto *source =
+      pipeline.setSource<rendering::AnariSceneRenderPass>(fixture.device);
+  source->setRunAsync(false);
+  auto *pass = pipeline.addPass<rendering::ChannelVisualizationPass>();
+  const bool useCUDA = GENERATE(false, true);
+  pass->setUseCUDA(useCUDA);
+#ifdef VSR_ALGORITHMS_HAS_CUDA
+  std::cout << "device replacement visualization backend: "
+            << (useCUDA ? "CUDA (stream verified)" : "CPU") << '\n';
+#else
+  std::cout
+      << "device replacement visualization backend: CPU; CUDA unavailable (not configured)\n";
+#endif
+  pipeline.addPass<BackendObserver>();
+  rendering::FrameChannelSelection selection;
+  selection.visualization = "component-y";
+  selection.rangePolicy = rendering::ChannelRangePolicy::FIXED;
+  selection.rangeMin = -1.f;
+  selection.rangeMax = 4.f;
+  std::string message;
+  REQUIRE(rendering::resolveFrameChannelSelection(
+      source->channelCatalog(), "motionVectors", selection, message, true));
+  REQUIRE(pass->setSelection(selection));
+  pipeline.render();
+  REQUIRE(pass->status() == rendering::FrameChannelStatus::VALID);
+  const std::vector<uint32_t> expected(
+      pipeline.getColorBuffer(), pipeline.getColorBuffer() + 4);
+  auto replacement = anari::newDevice(fixture.library, "default");
+  REQUIRE(replacement);
+  anari::setParameter(replacement, replacement, "test.metadata", "reordered");
+  anari::commitParameters(replacement, replacement);
+  source = pipeline.setSource<rendering::AnariSceneRenderPass>(replacement);
+  anari::release(replacement, replacement);
+  source->setRunAsync(false);
+  REQUIRE(vsr::app::resolveInteractiveFrameChannelSelection(
+      source->channelCatalog(), selection, message));
+  CHECK(selection.deviceName == "channel.motionVectors");
+  CHECK(selection.visualization == "component-y");
+  CHECK(selection.rangeMin == -1.f);
+  CHECK(selection.rangeMax == 4.f);
+  REQUIRE(pass->setSelection(selection));
+  pipeline.render();
+  CHECK(pass->status() == rendering::FrameChannelStatus::VALID);
+  CHECK(std::vector<uint32_t>(
+            pipeline.getColorBuffer(), pipeline.getColorBuffer() + 4)
+      == expected);
+}
+
+TEST_CASE(
+    "Interactive failed production falls back once and explicit selection recovers",
+    "[ChannelVisualization][ChannelLifecycle]")
+{
+  ChannelDevice fixture;
+  REQUIRE(fixture.device);
+  rendering::ImagePipeline pipeline(2, 2);
+  auto *source =
+      pipeline.setSource<rendering::AnariSceneRenderPass>(fixture.device);
+  source->setRunAsync(false);
+  auto *pass = pipeline.addPass<rendering::ChannelVisualizationPass>();
+  rendering::FrameChannelSelection selection;
+  std::string message;
+  REQUIRE(rendering::resolveFrameChannelSelection(
+      source->channelCatalog(), "Temperature_RAW", selection, message));
+  REQUIRE(pass->setSelection(selection));
+  pipeline.render();
+  REQUIRE(pass->status() == rendering::FrameChannelStatus::VALID);
+  const auto failure =
+      GENERATE("custom-null", "wrong-size", "wrong-type", "renderer");
+  if (std::string(failure) == "renderer") {
+    auto renderer = anari::newObject<anari::Renderer>(fixture.device, "broken");
+    REQUIRE(renderer);
+    source->setRenderer(renderer);
+    anari::release(fixture.device, renderer);
+  } else
+    anari::setParameter(fixture.device, fixture.device, "test.map", failure);
+  pipeline.render();
+  REQUIRE(pass->status() == rendering::FrameChannelStatus::FAILED);
+  CHECK_FALSE(pipeline.channelResult("Temperature_RAW")->data);
+  REQUIRE_FALSE(vsr::app::resolveInteractiveFrameChannelSelection(
+      source->channelCatalog(), selection, message, pass->error()));
+  CHECK(message.find("Temperature_RAW") != std::string::npos);
+  CHECK(message.find("returned to Color") != std::string::npos);
+  REQUIRE(pass->setSelection(selection));
+  // Color itself must be mappable for a successful fallback. A device-wide
+  // failure is not misrepresented as a successful Color frame.
+  anari::setParameter(
+      fixture.device, fixture.device, "test.map", "custom-null");
+  for (int i = 0; i < 3; ++i) {
+    pipeline.render();
+    CHECK(pass->status() == rendering::FrameChannelStatus::VALID);
+    CHECK_FALSE(pipeline.channelResult("Temperature_RAW"));
+    bool requested = true;
+    REQUIRE(anari::getProperty(fixture.device,
+        source->getFrame(),
+        "test.requested.Temperature_RAW",
+        requested,
+        ANARI_WAIT));
+    CHECK_FALSE(requested);
+    CHECK(pipeline.getColorBuffer()[0] == 0xff030201u);
+  }
+  anariSetParameter(
+      fixture.device, fixture.device, "test.map", ANARI_STRING, "");
+  auto renderer =
+      anari::newObject<anari::Renderer>(fixture.device, "diagnostic");
+  source->setRenderer(renderer);
+  anari::release(fixture.device, renderer);
+  vsr::app::FrameChannelOptions options;
+  options.channel = "Temperature_RAW";
+  REQUIRE(vsr::app::applyFrameChannelOptions(
+      options, source->channelCatalog(), selection, message));
+  REQUIRE(pass->setSelection(selection));
+  pipeline.render();
+  REQUIRE(pass->status() == rendering::FrameChannelStatus::VALID);
+  checkGray(pipeline, 3, 255);
 }
 
 TEST_CASE(

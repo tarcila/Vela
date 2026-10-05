@@ -4,6 +4,8 @@
 #include "Viewport.h"
 // vsr_app
 #include "vsr/app/ANARIDeviceManager.h"
+#include "vsr/app/FrameChannelOptions.h"
+#include "vsr/app/FrameChannelState.h"
 // vsr_ui_imgui
 #include "imgui.h"
 #include "vsr/ui/imgui/Application.h"
@@ -15,6 +17,7 @@
 // vsr_rendering
 #include "vsr/rendering/view/ManipulatorToVSR.hpp"
 // std
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -70,6 +73,13 @@ void Viewport::buildUI()
   }
 
   ui_menubar();
+  if (!m_channelMessage.empty())
+    ImGui::TextWrapped("%s", m_channelMessage.c_str());
+  if (m_channelPass
+      && m_channelPass->status() == vsr::rendering::FrameChannelStatus::PENDING)
+    ImGui::TextWrapped(
+        "Frame Channel '%s' pending; waiting for a completed frame (previous display retained when available)",
+        m_channelSelection.deviceName.c_str());
 
   ImGui::BeginDisabled(!BaseViewport::viewport_isActive());
 
@@ -312,10 +322,8 @@ void Viewport::saveSettings(vsr::core::DataNode &root)
   root["showWorldBounds"] = m_showWorldBounds;
   root["worldBoundsColor"] = m_worldBoundsColor;
   root["worldBoundsWidth"] = m_worldBoundsWidth;
-  root["visualizeAOV"] = static_cast<int>(m_visualizeAOV);
-  root["depthVisualMinimum"] = m_depthVisualMinimum;
-  root["depthVisualMaximum"] = m_depthVisualMaximum;
-  root["edgeInvert"] = m_edgeInvert;
+  vsr::app::saveFrameChannelSelection(
+      root["channelSelection"], m_channelSelection);
   root["autoExposureEnabled"] = m_autoExposureEnabled;
   root["toneMapExposure"] = m_toneMapExposure;
   root["toneMapGamma"] = m_toneMapGamma;
@@ -339,12 +347,19 @@ void Viewport::loadSettings(vsr::core::DataNode &root)
   root["showWorldBounds"].getValue(ANARI_BOOL, &m_showWorldBounds);
   root["worldBoundsColor"].getValue(ANARI_FLOAT32_VEC4, &m_worldBoundsColor);
   root["worldBoundsWidth"].getValue(ANARI_INT32, &m_worldBoundsWidth);
-  int aovType = static_cast<int>(m_visualizeAOV);
-  root["visualizeAOV"].getValue(ANARI_INT32, &aovType);
-  m_visualizeAOV = static_cast<vsr::rendering::AOVType>(aovType);
-  root["depthVisualMinimum"].getValue(ANARI_FLOAT32, &m_depthVisualMinimum);
-  root["depthVisualMaximum"].getValue(ANARI_FLOAT32, &m_depthVisualMaximum);
-  root["edgeInvert"].getValue(ANARI_BOOL, &m_edgeInvert);
+  if (!vsr::app::loadFrameChannelSelection(root.child("channelSelection"),
+          &root,
+          m_channelSelection,
+          m_channelMessage,
+          {"visualizeAOV",
+              "depthVisualMinimum",
+              "depthVisualMaximum",
+              "edgeInvert"})) {
+    m_channelSelection = {};
+    m_channelMessage += "; returned to Color";
+  }
+  if (m_anariPass)
+    syncImagePassState();
   root["autoExposureEnabled"].getValue(ANARI_BOOL, &m_autoExposureEnabled);
   root["toneMapExposure"].getValue(ANARI_FLOAT32, &m_toneMapExposure);
   root["toneMapGamma"].getValue(ANARI_FLOAT32, &m_toneMapGamma);
@@ -399,9 +414,6 @@ void Viewport::imagePipeline_populate(vsr::rendering::ImagePipeline &p)
   m_anariPass->setEnabled(m_renderingEnabled);
   m_anariPass->setUseImplicitAspectRatio(m_camera.useImplicitAspectRatio);
 
-  if (!sourceSupports(vsr::rendering::requiredChannels(m_visualizeAOV)))
-    m_visualizeAOV = vsr::rendering::AOVType::NONE;
-
   m_autoExposurePass = p.addPass<vsr::rendering::AutoExposurePass>();
 
   m_toneMapPass = p.addPass<vsr::rendering::ToneMapPass>();
@@ -412,9 +424,7 @@ void Viewport::imagePipeline_populate(vsr::rendering::ImagePipeline &p)
   m_outputTransformPass = p.addPass<vsr::rendering::OutputTransformPass>();
   m_outputTransformPass->setGamma(m_toneMapGamma);
 
-  m_visualizeAOVPass = p.addPass<vsr::rendering::VisualizeAOVPass>();
-  m_visualizeAOVPass->setEnabled(false);
-  m_visualizeAOVPass->setEdgeInvert(m_edgeInvert);
+  m_channelPass = p.addPass<vsr::rendering::ChannelVisualizationPass>();
 
   m_primitiveOutlinePass =
       p.addPass<vsr::rendering::PrimitiveOutlineRenderPass>();
@@ -532,7 +542,7 @@ void Viewport::teardownDevice()
     BaseViewport::viewport_setActive(false);
 
   m_anariPass = nullptr;
-  m_visualizeAOVPass = nullptr;
+  m_channelPass = nullptr;
   m_autoExposurePass = nullptr;
   m_toneMapPass = nullptr;
   m_outputTransformPass = nullptr;
@@ -640,6 +650,7 @@ void Viewport::updateFrame()
   if (m_renderers.current) {
     m_anariPass->setRenderer(m_rIdx->renderer(m_renderers.current->index()));
     m_prevRenderer = m_renderers.current;
+    syncImagePassState();
   }
 }
 
@@ -671,6 +682,22 @@ void Viewport::updateImage()
 
   auto start = std::chrono::steady_clock::now();
   BaseViewport::imagePipeline_render();
+  if (m_channelPass
+      && m_channelPass->status()
+          == vsr::rendering::FrameChannelStatus::FAILED) {
+    const std::string renderer = m_renderers.current
+        ? m_renderers.current->subtype().c_str()
+        : "unknown";
+    const std::string failure = m_channelPass->error() + " (device '"
+        + m_libName + "', renderer '" + renderer + "')";
+    vsr::app::resolveInteractiveFrameChannelSelection(
+        m_anariPass->channelCatalog(),
+        m_channelSelection,
+        m_channelMessage,
+        failure);
+    vsr::core::logWarning("[viewport] %s", m_channelMessage.c_str());
+    syncImagePassState();
+  }
   if (m_autoExposurePass)
     m_currentAutoExposure = m_autoExposurePass->currentExposure();
   auto end = std::chrono::steady_clock::now();
@@ -709,16 +736,19 @@ void Viewport::syncImagePassState()
 
   m_anariPass->setColorFormat(m_colorFormat);
 
-  if (m_visualizeAOVPass) {
-    m_visualizeAOVPass->setAOVType(m_visualizeAOV);
-    m_visualizeAOVPass->setDepthRange(
-        m_depthVisualMinimum, m_depthVisualMaximum);
-    m_visualizeAOVPass->setEdgeInvert(m_edgeInvert);
+  std::string error;
+  if (!vsr::app::resolveInteractiveFrameChannelSelection(
+          m_anariPass->channelCatalog(), m_channelSelection, error)) {
+    m_channelMessage = error;
+    vsr::core::logWarning("[viewport] %s", error.c_str());
   }
+  if (vsr::app::frameChannelShowsBeauty(m_channelSelection))
+    m_channelSelection.pixelType = m_colorFormat;
+  if (m_channelPass)
+    m_channelPass->setSelection(m_channelSelection);
 
   if (m_primitiveOutlinePass) {
     m_primitiveOutlinePass->setEnabled(m_outlinePrimitives
-        && m_visualizeAOV == vsr::rendering::AOVType::NONE
         && sourceSupports(m_primitiveOutlinePass->requiredChannels()));
   }
 
@@ -737,7 +767,7 @@ void Viewport::updateDisplayPassState()
   if (!m_toneMapPass || !m_outputTransformPass)
     return;
 
-  const bool showBeauty = m_visualizeAOV == vsr::rendering::AOVType::NONE;
+  const bool showBeauty = vsr::app::frameChannelShowsBeauty(m_channelSelection);
   if (m_autoExposurePass) {
     m_autoExposurePass->setEnabled(showBeauty && m_autoExposureEnabled);
     m_autoExposurePass->setHDREnabled(
@@ -779,6 +809,101 @@ void Viewport::ui_menubar_Device()
     if (ImGui::MenuItem("Reload Current Device"))
       refreshCurrentDevice();
     ImGui::EndMenu();
+  }
+}
+
+void Viewport::ui_channelSelection()
+{
+  if (!m_anariPass)
+    return;
+  const auto &catalog = m_anariPass->channelCatalog();
+  auto selected = std::find_if(
+      catalog.channels.begin(), catalog.channels.end(), [&](const auto &c) {
+        return c.deviceName == m_channelSelection.deviceName;
+      });
+  const char *label = selected == catalog.channels.end()
+      ? "Unavailable"
+      : selected->presentationName.c_str();
+  if (ImGui::BeginCombo("Channel", label)) {
+    for (const auto &channel : catalog.channels) {
+      ImGui::PushID(channel.deviceName.c_str());
+      const bool enabled =
+          !channel.ambiguous && !channel.visualizations.empty();
+      const bool current = channel.deviceName == m_channelSelection.deviceName;
+      ImGui::BeginDisabled(!enabled);
+      if (ImGui::Selectable(channel.presentationName.c_str(), current)
+          && enabled) {
+        vsr::app::FrameChannelOptions options;
+        options.channel = channel.presentationName;
+        if (vsr::app::applyFrameChannelOptions(
+                options, catalog, m_channelSelection, m_channelMessage))
+          syncImagePassState();
+      }
+      if (current)
+        ImGui::SetItemDefaultFocus();
+      ImGui::EndDisabled();
+      if (!enabled && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", channel.unavailableReason.c_str());
+      if (!enabled)
+        ImGui::TextDisabled("  %s", channel.unavailableReason.c_str());
+      ImGui::PopID();
+    }
+    ImGui::EndCombo();
+  }
+  selected = std::find_if(
+      catalog.channels.begin(), catalog.channels.end(), [&](const auto &c) {
+        return c.deviceName == m_channelSelection.deviceName;
+      });
+  if (selected != catalog.channels.end()
+      && ImGui::BeginCombo(
+          "Visualization", m_channelSelection.visualization.c_str())) {
+    for (const auto &mode : selected->visualizations) {
+      if (ImGui::Selectable(
+              mode.c_str(), mode == m_channelSelection.visualization)) {
+        vsr::app::FrameChannelOptions options;
+        options.visualization = mode;
+        if (vsr::app::applyFrameChannelOptions(
+                options, catalog, m_channelSelection, m_channelMessage))
+          syncImagePassState();
+      }
+    }
+    ImGui::EndCombo();
+  }
+  if (vsr::app::frameChannelUsesRange(m_channelSelection)) {
+    auto next = m_channelSelection;
+    bool changed = false;
+    if (ImGui::RadioButton("Auto Range",
+            next.rangePolicy == vsr::rendering::ChannelRangePolicy::AUTO)) {
+      next.rangePolicy = vsr::rendering::ChannelRangePolicy::AUTO;
+      changed = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Fixed Range",
+            next.rangePolicy == vsr::rendering::ChannelRangePolicy::FIXED)) {
+      next.rangePolicy = vsr::rendering::ChannelRangePolicy::FIXED;
+      changed = true;
+    }
+    if (next.rangePolicy == vsr::rendering::ChannelRangePolicy::FIXED) {
+      changed |= ImGui::DragFloat("Minimum", &next.rangeMin, 0.1f);
+      changed |= ImGui::DragFloat("Maximum", &next.rangeMax, 0.1f);
+    }
+    if (changed) {
+      if (vsr::rendering::validChannelRange(next)) {
+        m_channelSelection = next;
+        m_channelMessage.clear();
+        syncImagePassState();
+      } else
+        m_channelMessage =
+            "Fixed range requires finite minimum < maximum; change rejected";
+    }
+  }
+  if (m_channelSelection.visualization == "edges"
+      && ImGui::Checkbox("Invert Edges", &m_channelSelection.invertEdges))
+    syncImagePassState();
+  if (!m_channelMessage.empty()) {
+    ImGui::TextWrapped("%s", m_channelMessage.c_str());
+    if (ImGui::SmallButton("Dismiss Channel Message"))
+      m_channelMessage.clear();
   }
 }
 
@@ -844,63 +969,7 @@ void Viewport::ui_menubar_Viewport()
     ImGui::Separator();
 
     {
-      ImGui::Text("AOV Visualization:");
-      ImGui::Indent(INDENT_AMOUNT);
-
-      const char *aovItems[] = {"default",
-          "depth",
-          "albedo",
-          "normal",
-          "edges",
-          "object ID",
-          "primitive ID",
-          "instance ID"};
-      if (ImGui::BeginCombo("AOV", aovItems[int(m_visualizeAOV)])) {
-        for (int i = 0; i < IM_ARRAYSIZE(aovItems); ++i) {
-          const bool isSelected = i == int(m_visualizeAOV);
-          const bool supported =
-              sourceSupports(vsr::rendering::requiredChannels(
-                  static_cast<vsr::rendering::AOVType>(i)));
-          if (!supported)
-            ImGui::BeginDisabled();
-          if (ImGui::Selectable(aovItems[i], isSelected) && supported) {
-            m_visualizeAOV = static_cast<vsr::rendering::AOVType>(i);
-            syncImagePassState();
-          }
-          if (isSelected)
-            ImGui::SetItemDefaultFocus();
-          if (!supported)
-            ImGui::EndDisabled();
-        }
-        ImGui::EndCombo();
-      }
-
-      ImGui::BeginDisabled(m_visualizeAOV != vsr::rendering::AOVType::DEPTH);
-      bool depthRangeChanged = false;
-      depthRangeChanged |= ImGui::DragFloat("Depth Minimum",
-          &m_depthVisualMinimum,
-          0.1f,
-          0.f,
-          m_depthVisualMaximum);
-      depthRangeChanged |= ImGui::DragFloat("Depth Maximum",
-          &m_depthVisualMaximum,
-          0.1f,
-          m_depthVisualMinimum,
-          1e20f);
-      if (depthRangeChanged)
-        m_visualizeAOVPass->setDepthRange(
-            m_depthVisualMinimum, m_depthVisualMaximum);
-      ImGui::EndDisabled();
-
-      ImGui::BeginDisabled(m_visualizeAOV != vsr::rendering::AOVType::EDGES);
-      bool edgeSettingsChanged = false;
-      edgeSettingsChanged |= ImGui::Checkbox("Invert Edges", &m_edgeInvert);
-      if (edgeSettingsChanged) {
-        m_visualizeAOVPass->setEdgeInvert(m_edgeInvert);
-      }
-      ImGui::EndDisabled();
-
-      ImGui::Unindent(INDENT_AMOUNT);
+      ui_channelSelection();
     }
 
     ImGui::Separator();
@@ -910,7 +979,7 @@ void Viewport::ui_menubar_Viewport()
       ImGui::Indent(INDENT_AMOUNT);
 
       ImGui::BeginDisabled(m_colorFormat != ANARI_FLOAT32_VEC4
-          || m_visualizeAOV != vsr::rendering::AOVType::NONE);
+          || !vsr::app::frameChannelShowsBeauty(m_channelSelection));
 
       if (ImGui::Checkbox("Auto Exposure", &m_autoExposureEnabled))
         updateDisplayPassState();
@@ -936,7 +1005,7 @@ void Viewport::ui_menubar_Viewport()
       ImGui::Indent(INDENT_AMOUNT);
 
       ImGui::BeginDisabled(m_colorFormat != ANARI_FLOAT32_VEC4
-          || m_visualizeAOV != vsr::rendering::AOVType::NONE);
+          || !vsr::app::frameChannelShowsBeauty(m_channelSelection));
 
       const char *toneMapItems[] = {"None",
           "Reinhard",
@@ -961,7 +1030,7 @@ void Viewport::ui_menubar_Viewport()
       ImGui::Indent(INDENT_AMOUNT);
 
       ImGui::BeginDisabled(m_colorFormat == ANARI_UFIXED8_RGBA_SRGB
-          || m_visualizeAOV != vsr::rendering::AOVType::NONE);
+          || !vsr::app::frameChannelShowsBeauty(m_channelSelection));
 
       if (ImGui::DragFloat("Gamma", &m_toneMapGamma, 0.01f, 0.1f, 5.f))
         m_outputTransformPass->setGamma(m_toneMapGamma);
