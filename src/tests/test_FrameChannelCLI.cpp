@@ -66,6 +66,29 @@ void OfflineRun::checkGrayscale(
 }
 } // namespace
 
+TEST_CASE("Offline writes native fixed16 signed direction pixels",
+    "[FrameChannelCLI][DirectionCLI]")
+{
+  const auto options = GENERATE("--channel shadingNormal",
+      "--channel CustomDirection --visualization normal");
+  OfflineRun run(
+      "fixed16-direction", options, "VSR_CHANNEL_TEST_METADATA=directions");
+  INFO(run.diagnostic);
+  REQUIRE(run.result == 0);
+  int width = 0, height = 0, channels = 0;
+  auto *pixels = stbi_load(
+      (run.directory / "image.png").c_str(), &width, &height, &channels, 4);
+  REQUIRE(pixels);
+  std::vector<unsigned char> image(pixels, pixels + width * height * 4);
+  stbi_image_free(pixels);
+  REQUIRE(width == 2);
+  REQUIRE(height == 2);
+  // File rows are inverted relative to the ANARI frame. Normal has no gamma.
+  const std::vector<unsigned char> expected{
+      159, 96, 223, 255, 128, 128, 128, 255, 0, 0, 128, 255, 255, 191, 64, 255};
+  CHECK(image == expected);
+}
+
 TEST_CASE("Offline writes standard identity colors through shared defaults",
     "[FrameChannelCLI][IdentityChannels]")
 {

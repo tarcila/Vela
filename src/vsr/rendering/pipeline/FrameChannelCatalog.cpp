@@ -18,6 +18,13 @@ std::string presentationName(const std::string &name)
   return name.compare(0, 8, "channel.") == 0 ? name.substr(8) : name;
 }
 
+bool directionName(const std::string &name)
+{
+  const auto label = presentationName(name);
+  return label == "normal" || label == "shadingNormal" || label == "tangent"
+      || label == "bitangent";
+}
+
 void appendUnique(std::vector<std::string> &values, const std::string &value)
 {
   if (std::find(values.begin(), values.end(), value) == values.end())
@@ -43,7 +50,7 @@ void describeCompatibility(FrameChannelDescriptor &channel)
             channel.visualizations, std::string("component-") + "xyzw"[i]);
       appendUnique(channel.visualizations, "magnitude");
     }
-    if (type == ANARI_FLOAT32_VEC3 && channel.deviceName == "channel.normal")
+    if (type == ANARI_FLOAT32_VEC3 || type == ANARI_FIXED16_VEC3)
       appendUnique(channel.visualizations, "normal");
     if (type == ANARI_UINT32
         && (channel.deviceName == "channel.objectId"
@@ -110,7 +117,7 @@ bool resolveFrameChannelSelection(const FrameChannelCatalog &catalog,
       return false;
     }
     next.visualization = c->visualizations.front();
-    if (c->deviceName == "channel.normal" && compatible("normal"))
+    if (directionName(c->deviceName) && compatible("normal"))
       next.visualization = "normal";
     if ((c->deviceName == "channel.objectId"
             || c->deviceName == "channel.primitiveId"
@@ -126,7 +133,8 @@ bool resolveFrameChannelSelection(const FrameChannelCatalog &catalog,
       break;
     }
   }
-  if ((c->deviceName == "channel.normal" || c->deviceName == "channel.albedo")
+  if ((directionName(c->deviceName)
+          || presentationName(c->deviceName) == "albedo")
       && std::find(
              c->pixelTypes.begin(), c->pixelTypes.end(), ANARI_FLOAT32_VEC3)
           != c->pixelTypes.end()

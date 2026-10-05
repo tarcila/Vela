@@ -28,8 +28,12 @@ void visualizeChannel(cudaStream_t stream,
       : mode == ChannelVisualization::GRAYSCALE
       ? 0
       : int(mode) - int(ChannelVisualization::COMPONENT_X);
-  const algorithms::detail::VectorSample sample{
-      data, layout.components, component, layout.bytes, type == ANARI_UINT32};
+  const algorithms::detail::VectorSample sample{data,
+      layout.components,
+      component,
+      layout.bytes,
+      type == ANARI_UINT32,
+      layout.signed16};
   const auto begin = thrust::make_counting_iterator(uint32_t(0));
   const auto policy = thrust::cuda::par.on(stream);
   if (mode == ChannelVisualization::COLOR

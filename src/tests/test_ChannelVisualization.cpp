@@ -358,6 +358,110 @@ TEST_CASE("Vector scalar views range finite current samples across shapes",
   checkGray(pipeline, 2, 255);
 }
 
+TEST_CASE("Native signed directions preserve pixels and diagnostics",
+    "[ChannelVisualization][DirectionPixels]")
+{
+  ChannelDevice fixture;
+  REQUIRE(fixture.device);
+  anari::setParameter(
+      fixture.device, fixture.device, "test.metadata", "directions");
+  const auto type = GENERATE(ANARI_FIXED16_VEC3, ANARI_FLOAT32_VEC3);
+  anari::setParameter(fixture.device, fixture.device, "test.type", type);
+  rendering::ImagePipeline pipeline(2, 2);
+  auto *source =
+      pipeline.setSource<rendering::AnariSceneRenderPass>(fixture.device);
+  source->setRunAsync(false);
+  auto *pass = pipeline.addPass<rendering::ChannelVisualizationPass>();
+  const bool useCUDA = GENERATE(false, true);
+  pass->setUseCUDA(useCUDA);
+  pipeline.addPass<BackendObserver>();
+  INFO("CUDA=" << useCUDA);
+  rendering::FrameChannelSelection selection;
+  std::string error;
+  REQUIRE(rendering::resolveFrameChannelSelection(
+      source->channelCatalog(), "shadingNormal", selection, error));
+  REQUIRE(selection.pixelType == type);
+  REQUIRE(selection.visualization == "normal");
+  REQUIRE(pass->setSelection(selection));
+  pipeline.render();
+  INFO(pass->error());
+  REQUIRE(pass->status() == rendering::FrameChannelStatus::VALID);
+  const auto *result = pipeline.channelResult("shadingNormal");
+  REQUIRE(result);
+  REQUIRE(result->status == rendering::FrameChannelStatus::VALID);
+  REQUIRE(result->pixelType == type);
+  // Observe the real source-owned copy, after the fixture poisons its mapped
+  // data.
+  const int16_t raw[] = {
+      -32768, -32767, 0, 32767, 16384, -16384, 8192, -8192, 24575, 0, 0, 0};
+  if (type == ANARI_FIXED16_VEC3)
+    CHECK(std::memcmp(result->data, raw, sizeof(raw)) == 0);
+  else {
+    const float values[] = {
+        -1.f, -1.f, 0.f, 1.f, .5f, -.5f, .25f, -.25f, .75f, 0.f, 0.f, 0.f};
+    CHECK(std::memcmp(result->data, values, sizeof(values)) == 0);
+  }
+  const uint8_t normals[] = {
+      0, 0, 128, 255, 255, 191, 64, 255, 159, 96, 223, 255, 128, 128, 128, 255};
+  CHECK(std::memcmp(pipeline.getColorBuffer(), normals, sizeof(normals)) == 0);
+  selection.deviceName = "CustomDirection";
+  REQUIRE(pass->setSelection(selection));
+  pipeline.render();
+  REQUIRE(pass->status() == rendering::FrameChannelStatus::VALID);
+  CHECK(std::memcmp(pipeline.getColorBuffer(), normals, sizeof(normals)) == 0);
+  selection.visualization = "color";
+  REQUIRE(pass->setSelection(selection));
+  pipeline.render();
+  const uint8_t colors[] = {
+      0, 0, 0, 255, 255, 188, 0, 255, 137, 0, 225, 255, 0, 0, 0, 255};
+  CHECK(std::memcmp(pipeline.getColorBuffer(), colors, sizeof(colors)) == 0);
+  // Independently worked signed component remaps, then lengths in [0,2].
+  const uint8_t components[3][4] = {
+      {0, 255, 159, 128}, {0, 191, 96, 128}, {128, 64, 223, 128}};
+  selection.rangePolicy = rendering::ChannelRangePolicy::FIXED;
+  selection.rangeMin = -1.f;
+  selection.rangeMax = 1.f;
+  for (int c = 0; c < 3; ++c) {
+    selection.visualization = std::string("component-") + "xyz"[c];
+    REQUIRE(pass->setSelection(selection));
+    pipeline.render();
+    REQUIRE(pass->status() == rendering::FrameChannelStatus::VALID);
+    for (size_t i = 0; i < 4; ++i)
+      checkGray(pipeline, i, components[c][i]);
+  }
+  if (type == ANARI_FIXED16_VEC3) {
+    // A narrow range makes the -32768 clamp observable (not hidden by
+    // rounding).
+    selection.visualization = "component-x";
+    selection.rangeMin = -1.00004f;
+    selection.rangeMax = -1.f;
+    REQUIRE(pass->setSelection(selection));
+    pipeline.render();
+    checkGray(pipeline, 0, 255);
+    // 16384 / 32767 lies about 76.19% along [.5, .50002], not at .5.
+    selection.visualization = "component-y";
+    selection.rangeMin = .5f;
+    selection.rangeMax = .50002f;
+    REQUIRE(pass->setSelection(selection));
+    pipeline.render();
+    checkGray(pipeline, 1, 194);
+  }
+  selection.visualization = "magnitude";
+  selection.rangeMin = 0.f;
+  selection.rangeMax = 2.f;
+  REQUIRE(pass->setSelection(selection));
+  pipeline.render();
+  const uint8_t lengths[] = {180, 156, 106, 0};
+  for (size_t i = 0; i < 4; ++i)
+    checkGray(pipeline, i, lengths[i]);
+  selection.rangePolicy = rendering::ChannelRangePolicy::AUTO;
+  REQUIRE(pass->setSelection(selection));
+  pipeline.render();
+  const uint8_t autoLengths[] = {255, 221, 150, 0};
+  for (size_t i = 0; i < 4; ++i)
+    checkGray(pipeline, i, autoLengths[i]);
+}
+
 TEST_CASE("Normalized byte components and magnitude are numeric diagnostics",
     "[ChannelVisualization]")
 {

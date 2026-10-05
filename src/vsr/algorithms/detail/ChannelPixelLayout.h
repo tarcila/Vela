@@ -18,6 +18,7 @@ struct ChannelPixelLayout
   bool bytes{false};
   bool srgb{false};
   size_t size{0};
+  bool signed16{false};
 };
 
 VSR_HOST_DEVICE_FCN inline ChannelPixelLayout channelPixelLayout(
@@ -31,6 +32,8 @@ VSR_HOST_DEVICE_FCN inline ChannelPixelLayout channelPixelLayout(
     return {2, false, false, 8};
   case ANARI_FLOAT32_VEC3:
     return {3, false, false, 12};
+  case ANARI_FIXED16_VEC3:
+    return {3, false, false, 6, true};
   case ANARI_FLOAT32_VEC4:
     return {4, false, false, 16};
   case ANARI_UFIXED8_VEC3:
