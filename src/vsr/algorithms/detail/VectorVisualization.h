@@ -17,6 +17,7 @@ struct VectorSample
   int component; // Negative selects Euclidean magnitude.
   bool bytes{false};
   bool integers{false};
+  bool signed16{false};
 
   VSR_HOST_DEVICE_FCN double value(size_t i, int c) const;
   VSR_HOST_DEVICE_FCN double operator()(size_t i) const;
@@ -42,6 +43,11 @@ struct VectorRange
 VSR_HOST_DEVICE_FCN inline double VectorSample::value(size_t i, int c) const
 {
   const size_t offset = i * components + c;
+  if (signed16) {
+    const double v =
+        double(static_cast<const int16_t *>(data)[offset]) / 32767.;
+    return v < -1. ? -1. : v > 1. ? 1. : v;
+  }
   return bytes   ? double(static_cast<const uint8_t *>(data)[offset]) / 255.
       : integers ? double(static_cast<const uint32_t *>(data)[offset])
                  : double(static_cast<const float *>(data)[offset]);

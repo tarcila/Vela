@@ -19,6 +19,8 @@ namespace {
 /* A loadable ANARI boundary fixture. Device parameters test.metadata select
  * full/missing/incomplete/ambiguous/unsupported metadata. test.map selects
  * null/wrong-type/wrong-size maps, and test.type overrides custom pixel types.
+ * Opt-in directions/directions-alt expose fixed16-only signed RGB;
+ * directions-mixed also offers F32. test.type can override the directions type.
  * Environment VSR_CHANNEL_TEST_METADATA supplies the subprocess equivalent.
  * Other objects are deliberately inert; frames own deterministic sample data.
  */
@@ -36,6 +38,7 @@ struct TestObject
   std::vector<float> pixels;
   std::vector<uint32_t> integerPixels;
   std::vector<uint8_t> bytePixels;
+  std::vector<int16_t> signedPixels;
   std::map<std::string, ANARIDataType> requested;
   std::vector<std::string> mapped;
 };
@@ -427,6 +430,30 @@ const void *TestDevice::getObjectInfo(
       {"channel.normal", ANARI_DATA_TYPE},
       {"channel.albedo", ANARI_DATA_TYPE},
       {nullptr, ANARI_UNKNOWN}};
+  static const ANARIParameter directions[] = {
+      {"channel.normal", ANARI_DATA_TYPE},
+      {"shadingNormal", ANARI_DATA_TYPE},
+      {"channel.tangent", ANARI_DATA_TYPE},
+      {"bitangent", ANARI_DATA_TYPE},
+      {"CustomDirection", ANARI_DATA_TYPE},
+      {"channel.normalish", ANARI_DATA_TYPE},
+      {"channel.ShadingNormal", ANARI_DATA_TYPE},
+      {"channel.channel.tangent", ANARI_DATA_TYPE},
+      {"channel.albedo", ANARI_DATA_TYPE},
+      {"channel.color", ANARI_DATA_TYPE},
+      {nullptr, ANARI_UNKNOWN}};
+  static const ANARIParameter alternateDirections[] = {
+      {"normal", ANARI_DATA_TYPE},
+      {"channel.shadingNormal", ANARI_DATA_TYPE},
+      {"tangent", ANARI_DATA_TYPE},
+      {"channel.bitangent", ANARI_DATA_TYPE},
+      {"CustomDirection", ANARI_DATA_TYPE},
+      {"channel.normalish", ANARI_DATA_TYPE},
+      {"channel.ShadingNormal", ANARI_DATA_TYPE},
+      {"channel.channel.tangent", ANARI_DATA_TYPE},
+      {"channel.albedo", ANARI_DATA_TYPE},
+      {"channel.color", ANARI_DATA_TYPE},
+      {nullptr, ANARI_UNKNOWN}};
   static const ANARIParameter reordered[] = {
       {"channel.albedo", ANARI_DATA_TYPE},
       {"channel.color", ANARI_DATA_TYPE},
@@ -458,6 +485,10 @@ const void *TestDevice::getObjectInfo(
   if (type != ANARI_FRAME || infoType != ANARI_PARAMETER_LIST
       || std::strcmp(name, "parameter") != 0 || m_metadata == "missing")
     return nullptr;
+  if (m_metadata == "directions-alt")
+    return alternateDirections;
+  if (m_metadata == "directions" || m_metadata == "directions-mixed")
+    return directions;
   if (m_metadata == "identities")
     return identities;
   if (metadata == "incomplete" || metadata == "depth")
@@ -483,6 +514,18 @@ const void *TestDevice::getParameterInfo(ANARIDataType type,
   if (m_rendererMetadata == "opaque"
       && std::strcmp(name, "Temperature_RAW") == 0) {
     m_types = {ANARI_FLOAT64, ANARI_UNKNOWN};
+    return m_types.data();
+  }
+  if ((m_metadata == "directions" || m_metadata == "directions-mixed"
+          || m_metadata == "directions-alt")
+      && std::strcmp(name, "channel.color") != 0) {
+    m_types = m_metadata == "directions-mixed"
+        ? std::vector<ANARIDataType>{ANARI_FIXED16_VEC3,
+              ANARI_FLOAT32_VEC3,
+              ANARI_UNKNOWN}
+        : std::vector<ANARIDataType>{
+              m_type == ANARI_UNKNOWN ? ANARI_FIXED16_VEC3 : m_type,
+              ANARI_UNKNOWN};
     return m_types.data();
   }
   if (m_metadata == "identities"
@@ -538,7 +581,9 @@ const void *TestDevice::frameBufferMap(ANARIFrame frame,
       || m_map == "custom-null" && std::strcmp(channel, "Temperature_RAW") == 0
       || m_map == "null" || (m_map == "after-first" && m_renderCount > 1)
       || (m_map == "identity-null" && identity)
-      || (!identity && std::strcmp(channel, "Temperature_RAW") != 0
+      || (!identity && m_metadata != "directions"
+          && m_metadata != "directions-mixed" && m_metadata != "directions-alt"
+          && std::strcmp(channel, "Temperature_RAW") != 0
           && std::strcmp(channel, "channel.motionVectors") != 0
           && std::strcmp(channel, "channel.color") != 0
           && std::strcmp(channel, "channel.normal") != 0
@@ -563,6 +608,15 @@ const void *TestDevice::frameBufferMap(ANARIFrame frame,
       o.integerPixels[i] = colors[i % 4];
     return o.integerPixels.data();
   }
+  if (*type == ANARI_FIXED16_VEC3) {
+    // Four distinct packed RGB pixels: signed extrema, fractional values, zero.
+    static constexpr int16_t samples[] = {
+        -32768, -32767, 0, 32767, 16384, -16384, 8192, -8192, 24575, 0, 0, 0};
+    o.signedPixels.resize(size_t(o.width) * o.height * 3);
+    for (size_t i = 0; i < o.signedPixels.size(); ++i)
+      o.signedPixels[i] = samples[i % 12];
+    return o.signedPixels.data();
+  }
   if (*type == ANARI_UFIXED8_VEC3 || *type == ANARI_UFIXED8_VEC4
       || *type == ANARI_UFIXED8_RGB_SRGB || *type == ANARI_UFIXED8_RGBA_SRGB) {
     const int components =
@@ -573,6 +627,16 @@ const void *TestDevice::frameBufferMap(ANARIFrame frame,
     for (size_t i = 0; i < o.bytePixels.size(); ++i)
       o.bytePixels[i] = samples[i % 4];
     return o.bytePixels.data();
+  }
+  if ((m_metadata == "directions" || m_metadata == "directions-mixed"
+          || m_metadata == "directions-alt")
+      && *type == ANARI_FLOAT32_VEC3) {
+    static constexpr float samples[] = {
+        -1.f, -1.f, 0.f, 1.f, .5f, -.5f, .25f, -.25f, .75f, 0.f, 0.f, 0.f};
+    o.pixels.resize(size_t(o.width) * o.height * 3);
+    for (size_t i = 0; i < o.pixels.size(); ++i)
+      o.pixels[i] = samples[i % 12];
+    return o.pixels.data();
   }
   if ((*type == ANARI_FLOAT32_VEC2 || *type == ANARI_FLOAT32_VEC3
           || *type == ANARI_FLOAT32_VEC4)
@@ -614,6 +678,8 @@ void TestDevice::frameBufferUnmap(ANARIFrame frame, const char *)
   std::fill(pixels.begin(), pixels.end(), -999.f);
   auto &integers = reinterpret_cast<TestObject *>(frame)->integerPixels;
   std::fill(integers.begin(), integers.end(), ~0u);
+  auto &signedPixels = reinterpret_cast<TestObject *>(frame)->signedPixels;
+  std::fill(signedPixels.begin(), signedPixels.end(), int16_t(-12345));
 }
 void TestDevice::renderFrame(ANARIFrame frame)
 {

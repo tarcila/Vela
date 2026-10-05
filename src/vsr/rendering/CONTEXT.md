@@ -44,6 +44,26 @@ managed storage, following the configured pipeline allocation route; no guessed
 `CUDA` suffix is appended to arbitrary names. Ordinary standard-channel CUDA
 maps, Color/HDR transforms, FrameState exchange and isolated picking are retained.
 
+## Direction-vector storage and interpretation
+
+Native FIXED16_VEC3 is packed six-byte RGB with three signed-normalized int16
+components. Shared layout and decoding drive catalog compatibility, source copy
+allocation and CPU/CUDA conversion. Clamp each raw / 32767 to [-1, 1]: -32768
+and -32767 become -1, zero remains zero, and 32767 becomes +1. This does not
+add other fixed16 shapes or change existing float/normalized-byte storage.
+
+The `normal` view accepts FLOAT32_VEC3 and FIXED16_VEC3 regardless of name.
+It maps each signed component into RGB with (v + 1) / 2, clamps display values,
+and writes opaque alpha, without gamma or vector-length normalization.
+Components, magnitude and Color are also available for native fixed16 RGB.
+Exact `normal`, `shadingNormal`, `tangent` and `bitangent` names (optionally
+one leading `channel.`) default to Normal and prefer an advertised FLOAT32_VEC3
+alternative, as does albedo for Color. Unfamiliar vec3 names default to Color;
+case, complete names and one-prefix-only behavior are preserved.
+
+Controlled fixture coverage is not certification of inaccessible external
+Barney builds or their types, units and coordinate spaces.
+
 ## Scalar Channel Visualization contract
 
 `ChannelVisualizationPass` implements scalar grayscale, vector components and

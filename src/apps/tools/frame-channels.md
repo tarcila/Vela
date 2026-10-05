@@ -21,12 +21,20 @@ Shared visualization spellings are `color`, `grayscale`, `normal`, `id-colors`,
 Use the catalog for compatibility and defaults. Compatibility in a listing is
 not proof of a successful map or of an implemented converter. At this stage
 vsrOffline implements ordinary Color, FLOAT32/UINT32 scalar `grayscale`,
-FLOAT32 vectors with two through four components, and normalized-byte linear
-and sRGB RGB/RGBA. Vectors offer their existing components and Euclidean
-`magnitude`; RGB/RGBA also offer `color`. An unfamiliar vec2 defaults to
+FLOAT32 vectors with two through four components, native FIXED16_VEC3, and
+normalized-byte linear and sRGB RGB/RGBA. FIXED16_VEC3 occupies six bytes per
+pixel: three signed int16 components decoded by clamping raw / 32767 to [-1, 1].
+Both -32768 and -32767 decode to -1; zero decodes to 0, and 32767 to +1.
+Vectors offer their existing components and Euclidean `magnitude`; RGB/RGBA also offer `color`. An unfamiliar vec2 defaults to
 `component-x`, while unfamiliar RGB/RGBA vectors default to `color`. Standard
-normal and albedo prefer advertised FLOAT32 RGB and default to `normal` and
-`color`, respectively. Unsupported conversions fail explicitly instead of
+directions named exactly `normal`, `shadingNormal`, `tangent` or `bitangent`
+(with or without one leading `channel.`) default to `normal` when compatible.
+These directions and `albedo` prefer advertised FLOAT32 RGB over alternatives;
+`albedo` defaults to `color`. Names and case are preserved; substring matches,
+aliases and double prefixes do not imply direction semantics. Explicit `normal`
+is available on any FLOAT32_VEC3 or FIXED16_VEC3, including unfamiliar channels
+whose default remains `color`. Four-component vectors and normalized bytes do
+not offer `normal`. Unsupported conversions fail explicitly instead of
 substituting Color.
 
 vsrOffline defaults to `color` and keeps its existing importer, camera,
@@ -46,7 +54,14 @@ conversion. Scalar, component, magnitude and normal diagnostics bypass beauty
 exposure/tone mapping by using the shared visualization pass; ordinary Color
 remains unchanged. Diagnostic Color converts linear RGB to sRGB, preserves
 already-sRGB bytes and keeps alpha linear. Normal colors map [-1, 1] to [0, 1]
-without a beauty transform.
+component-wise without a beauty transform or length normalization, with opaque
+alpha. Negative Color components instead clamp to zero before linear-to-sRGB
+conversion.
+
+Controlled ANARI fixture tests cover fixed16-only catalogs, actual source copies,
+CPU/CUDA visualization and tool output. They do not certify external Barney:
+its repository/build is inaccessible, and its advertised types, units and
+coordinate spaces remain unverified.
 
 See `src/vsr/rendering/CONTEXT.md` for shared selection, production and scalar
 conversion contracts, including the agreed constant, nonfinite and background

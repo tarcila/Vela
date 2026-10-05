@@ -250,6 +250,60 @@ TEST_CASE("Catalog reports fallback, incomplete and ambiguous metadata",
   }
 }
 
+TEST_CASE("Direction catalogs use exact names and type driven Normal views",
+    "[FrameChannelCatalog][DirectionViews]")
+{
+  CatalogDevice fixture;
+  REQUIRE(fixture.device);
+  const auto type = GENERATE(ANARI_FIXED16_VEC3,
+      ANARI_FLOAT32_VEC3,
+      ANARI_FLOAT32_VEC4,
+      ANARI_UFIXED8_VEC3);
+  fixture.metadata(GENERATE("directions", "directions-alt"));
+  anari::setParameter(fixture.device, fixture.device, "test.type", type);
+  const auto catalog = vsr::rendering::discoverFrameChannels(fixture.device);
+  const bool signedDirection =
+      type == ANARI_FIXED16_VEC3 || type == ANARI_FLOAT32_VEC3;
+  for (const auto *name : {"normal",
+           "shadingNormal",
+           "tangent",
+           "bitangent",
+           "CustomDirection",
+           "normalish",
+           "ShadingNormal",
+           "channel.tangent"}) {
+    INFO(name << " type=" << int(type));
+    const auto *channel = catalog.find(name);
+    REQUIRE(channel);
+    CHECK(channel->pixelTypes == std::vector<ANARIDataType>{type});
+    vsr::rendering::FrameChannelSelection selection;
+    std::string error;
+    REQUIRE(vsr::rendering::resolveFrameChannelSelection(
+        catalog, name, selection, error));
+    const bool known = std::string(name) == "normal"
+        || std::string(name) == "shadingNormal"
+        || std::string(name) == "tangent" || std::string(name) == "bitangent";
+    CHECK(selection.visualization
+        == (known && signedDirection ? "normal" : "color"));
+    CHECK(selection.deviceName == channel->deviceName);
+    selection.visualization = "normal";
+    CHECK(vsr::rendering::resolveFrameChannelSelection(
+              catalog, name, selection, error, true)
+        == signedDirection);
+  }
+  CHECK_FALSE(catalog.find("Shadingnormal"));
+  fixture.metadata("directions-mixed");
+  const auto mixed = vsr::rendering::discoverFrameChannels(fixture.device);
+  for (const auto *name :
+      {"normal", "shadingNormal", "tangent", "bitangent", "albedo"}) {
+    vsr::rendering::FrameChannelSelection selection;
+    std::string error;
+    REQUIRE(vsr::rendering::resolveFrameChannelSelection(
+        mixed, name, selection, error));
+    CHECK(selection.pixelType == ANARI_FLOAT32_VEC3);
+  }
+}
+
 TEST_CASE("Installed devices expose usable catalogs when available",
     "[FrameChannelSmoke]")
 {

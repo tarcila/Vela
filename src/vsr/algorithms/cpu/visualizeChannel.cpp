@@ -24,8 +24,12 @@ void visualizeChannel(const void *data,
       : mode == ChannelVisualization::GRAYSCALE
       ? 0
       : int(mode) - int(ChannelVisualization::COMPONENT_X);
-  const algorithms::detail::VectorSample sample{
-      data, layout.components, component, layout.bytes, type == ANARI_UINT32};
+  const algorithms::detail::VectorSample sample{data,
+      layout.components,
+      component,
+      layout.bytes,
+      type == ANARI_UINT32,
+      layout.signed16};
   if (mode == ChannelVisualization::COLOR
       || mode == ChannelVisualization::NORMAL) {
     const algorithms::detail::VectorColor convert{
