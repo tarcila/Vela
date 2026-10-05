@@ -28,6 +28,7 @@ project_add_executable(
   test_Downsample.cpp
   test_FlatMap.cpp
   test_FrameChannelCatalog.cpp
+  test_FrameChannelCLI.cpp
   test_FrameChannelState.cpp
   test_Forest.cpp
   test_Geometry.cpp
@@ -45,6 +46,7 @@ project_add_executable(
   test_Parameter.cpp
   test_PickRequest.cpp
   test_Procedural.cpp
+  test_RenderChannels.cpp
   test_RenderIndex.cpp
   test_Scene.cpp
   test_SceneArchive.cpp
@@ -165,6 +167,19 @@ add_test(NAME vsr::FrameChannelCatalog COMMAND ${PROJECT_NAME} "[FrameChannelCat
 add_test(NAME vsr::FrameChannelSmoke COMMAND ${PROJECT_NAME} "[FrameChannelSmoke]")
 set_tests_properties(vsr::FrameChannelCatalog vsr::FrameChannelSmoke PROPERTIES
   ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/$<CONFIG>:$ENV{LD_LIBRARY_PATH}")
+if (TARGET vsrOffline AND TARGET vsrRender)
+  add_dependencies(${PROJECT_NAME} vsrOffline vsrRender)
+  target_compile_definitions(${PROJECT_NAME} PRIVATE
+    VSR_OFFLINE_EXECUTABLE="$<TARGET_FILE:vsrOffline>"
+    VSR_RENDER_EXECUTABLE="$<TARGET_FILE:vsrRender>"
+    CHANNEL_TEST_DIRECTORY="${CMAKE_BINARY_DIR}/channel-tests")
+  add_test(NAME vsr::RenderChannels COMMAND ${PROJECT_NAME} "[RenderChannels]")
+  set_tests_properties(vsr::RenderChannels PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/$<CONFIG>:$ENV{LD_LIBRARY_PATH}")
+  add_test(NAME vsr::FrameChannelCLI COMMAND ${PROJECT_NAME} "[FrameChannelCLI]")
+  set_tests_properties(vsr::FrameChannelCLI PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/$<CONFIG>:$ENV{LD_LIBRARY_PATH}")
+endif()
 add_test(NAME vsr::Forest        COMMAND ${PROJECT_NAME} "[Forest]"       )
 add_test(NAME vsr::Geometry      COMMAND ${PROJECT_NAME} "[Geometry]"     )
 add_test(NAME vsr::ImageImport   COMMAND ${PROJECT_NAME} "[ImageImport]"  )

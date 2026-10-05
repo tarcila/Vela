@@ -72,7 +72,14 @@ Usage:
 
 ```bash
 ./vsrRender state_file.vsr
+./vsrRender state_file.vsr --list-channels
 ```
+
+`--list-channels` retains the required state file and initializes its saved
+ANARI device and selected renderer, including saved renderer parameters. It
+lists Frame Channels and exits without rendering or writing PNG frames.
+An invalid saved renderer selection, unavailable device or unusable catalog
+returns a nonzero status with a diagnostic.
 
 ## `vsrOffline`
 
@@ -94,6 +101,8 @@ Common options:
 - `-o, --output <file>` output image path (default `vsrOffline.png`)
 - `--lib <name>` ANARI library
 - `--renderer <name>` renderer subtype (default `default`)
+- `--list-channels` list Frame Channels for that device/renderer, then exit
+  without importing a scene, prompting for a camera or writing an image
 - `--camera <name-or-index>` select a scene camera by exact name or object index
 - `--campos <x y z>`, `--lookpos <x y z>`, `--upvec <x y z>`, `--fovy <float>`
 - `--aperture <float>`, `--focus <float>`
@@ -118,6 +127,33 @@ Example:
 ```bash
 ./vsrOffline -gltf scene.glb -w 1920 -h 1080 -s 256 -o render.png
 ```
+
+### Frame Channel discovery
+
+Both tools use the same catalog. For example:
+
+```bash
+./vsrOffline --lib helide --renderer default --list-channels
+./vsrRender state_file.vsr --list-channels
+```
+
+Listings preserve the advertised device name, removing exactly one leading
+`channel.` for presentation: `channel.motionVectors` becomes `motionVectors`,
+while `Temperature_RAW` remains unchanged. Entries show advertised pixel-type
+alternatives and type-compatible visualization names (`grayscale`, `color`,
+`component-x/y/z/w`, `magnitude`, `normal`, `id-colors`, `edges`, as applicable).
+This is compatibility information, not a promise that a renderer can produce
+or map each channel, nor verification of image output. Unsupported types and
+unknown type metadata remain visible with explanations; ambiguous presentation
+names are marked unavailable. Core/extension standard fallback entries are
+identified separately from explicit metadata. Proprietary channels are never
+inferred from a device's name.
+
+`vsrOffline` uses its existing `--lib` and `--renderer` choices and does not
+require `-o`. `vsrRender` uses the saved state's device and renderer, not the
+environment's default. Device/renderer initialization failures or a catalog
+with no unambiguous, type-compatible entry return nonzero. Channel rendering
+selection is a separate capability from this discovery command.
 
 ## `vsrVolumeToNanoVDB`
 

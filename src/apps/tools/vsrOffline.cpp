@@ -2,8 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <vsr/app/Context.h>
+#include <vsr/app/FrameChannelOptions.h>
+#include <vsr/rendering/pipeline/FrameChannelCatalog.h>
 #include <vsr/rendering/pipeline/ImagePipeline.h>
+#include <vsr/rendering/pipeline/passes/ChannelVisualizationPass.h>
 #include <vsr/rendering/pipeline/saveImage.h>
+#include <stdexcept>
 #include <vsr/core/Logging.hpp>
 #include <vsr/core/Timer.hpp>
 #include <vsr/io/procedural.hpp>
@@ -39,6 +43,7 @@ static anari::Device g_device{nullptr};
 static anari::Camera g_camera{nullptr};
 static bool g_numFramesExplicit = false;
 static bool g_usingSceneCamera = false;
+static vsr::rendering::ChannelVisualizationPass *g_visualization = nullptr;
 
 struct Config
 {
@@ -52,6 +57,10 @@ struct Config
   bool createdDefaultCamera = false;
   std::string cameraSelection;
 
+  bool listChannels = false;
+  std::string channelName = "color";
+  vsr::rendering::FrameChannelSelection channelSelection;
+  vsr::app::FrameChannelOptions channelOptions;
   std::string rendererName = "default";
   std::string outputFile = "vsrOffline.png";
 
@@ -88,6 +97,11 @@ static void printUsage(const char *programName)
       << "  --lib <name>               ANARI library name (default: VSR_ANARI_LIBRARIES[0], environment, or visrtx)\n";
   std::cout
       << "  --renderer <name>          Renderer name (default: default)\n";
+  std::cout
+      << "  --list-channels            List device channels/types/compatible visualizations; no image output\n";
+  std::cout
+      << vsr::app::frameChannelOptionsHelp()
+      << "  Defaults: color channel, channel-default visualization, Auto range.\n";
   std::cout
       << "  --camera <name-or-index>   Use a scene camera by exact name or object index\n";
   std::cout << "  --campos <x y z>           Camera position (3 floats)\n";
@@ -481,9 +495,23 @@ static int parseRenderingOptions(
   for (int i = 1; i < argc; i++) {
     std::string arg = argv[i];
 
+    std::string channelError;
+    const auto parsed = vsr::app::parseFrameChannelOption(
+        argc, argv, i, g_config.channelOptions, channelError);
+    if (parsed == vsr::app::FrameChannelOptionResult::ERROR) {
+      std::cerr << "Error: "
+                << vsr::app::frameChannelOptionError(argc, argv, channelError)
+                << '\n';
+      return -1;
+    }
+    if (parsed == vsr::app::FrameChannelOptionResult::PARSED)
+      continue;
+
     if (arg == "--help") {
       printUsage(argv[0]);
       return -1;
+    } else if (arg == "--list-channels") {
+      g_config.listChannels = true;
     } else if (arg == "-w" || arg == "--width") {
       if (i + 1 >= argc) {
         std::cerr << "Error: " << arg << " requires an argument\n";
@@ -635,7 +663,7 @@ static int parseRenderingOptions(
   return static_cast<int>(importerArgv.size());
 }
 
-static void loadANARIDevice()
+static bool loadANARIDevice()
 {
   auto statusFunc = [](const void *,
                         ANARIDevice,
@@ -659,10 +687,42 @@ static void loadANARIDevice()
 
   g_timer.start();
   g_library = anari::loadLibrary(libraryName.c_str(), statusFunc);
-  g_device = anari::newDevice(g_library, "default");
+  if (g_library)
+    g_device = anari::newDevice(g_library, "default");
   g_timer.end();
+  if (!g_device) {
+    std::cerr << "Error: cannot initialize ANARI device '" << libraryName
+              << "'; check --lib and the library search path\n";
+    return false;
+  }
+  anari::commitParameters(g_device, g_device);
 
   printf("done (%.2f ms)\n", g_timer.milliseconds());
+  return true;
+}
+
+static int listFrameChannels()
+{
+  auto renderer = anari::newObject<anari::Renderer>(
+      g_device, g_config.rendererName.c_str());
+  if (!renderer) {
+    std::cerr << "Error: cannot initialize renderer '" << g_config.rendererName
+              << "' on device '" << g_deviceName.c_str()
+              << "'; check --renderer\n";
+    return 1;
+  }
+  anari::commitParameters(g_device, renderer);
+  const auto catalog = vsr::rendering::discoverFrameChannels(g_device);
+  vsr::rendering::printFrameChannels(std::cout, catalog);
+  anari::release(g_device, renderer);
+  if (!catalog.usable()) {
+    std::cerr << "Error: no usable Frame Channel catalog for device '"
+              << g_deviceName.c_str() << "', renderer '"
+              << g_config.rendererName
+              << "'; check device metadata and supported pixel types\n";
+    return 1;
+  }
+  return 0;
 }
 
 static void initVSRRenderIndex()
@@ -737,6 +797,33 @@ static void setupLights()
   printf("done (%.2f ms)\n", g_timer.milliseconds());
 }
 
+static bool reportChannelError(const std::string &error)
+{
+  std::cerr
+      << "Error: Frame Channel '" << g_config.channelName << "', device '"
+      << g_ctx->offline.renderer.libraryName << "', renderer '"
+      << g_config.rendererName << "': " << error
+      << "; use --list-channels for available channels and visualizations\n";
+  return false;
+}
+
+static bool validateChannelSelection()
+{
+  g_config.channelName = g_config.channelOptions.channel.value_or("color");
+  std::string error;
+  // Offline has no saved visualization: resolve semantic/type defaults.
+  if (!vsr::app::applyFrameChannelOptions(g_config.channelOptions,
+          vsr::rendering::discoverFrameChannels(g_device),
+          g_config.channelSelection,
+          error,
+          false))
+    return reportChannelError(error);
+  vsr::rendering::ChannelVisualizationPass validation;
+  if (!validation.setSelection(g_config.channelSelection))
+    return reportChannelError(validation.error());
+  return true;
+}
+
 static void setupImagePipeline()
 {
   const auto frameWidth = g_ctx->offline.frame.width;
@@ -784,6 +871,9 @@ static void setupImagePipeline()
   arp->setRenderer(r);
   arp->setCamera(g_camera);
   arp->setRunAsync(false);
+  g_visualization =
+      g_renderPipeline->addPass<vsr::rendering::ChannelVisualizationPass>();
+  g_visualization->setSelection(g_config.channelSelection);
 
   anari::release(g_device, r);
 
@@ -792,7 +882,7 @@ static void setupImagePipeline()
   printf("done (%.2f ms)\n", g_timer.milliseconds());
 }
 
-static void renderFrames()
+static bool renderFrames()
 {
 #ifdef VSR_USE_MPI
   int mpiRank = 0, mpiSize = 1;
@@ -846,6 +936,9 @@ static void renderFrames()
     g_timer.start();
     for (int s = 0; s < (int)frameSamples; ++s) {
       g_renderPipeline->render();
+      if (g_visualization->status()
+          == vsr::rendering::FrameChannelStatus::FAILED)
+        return reportChannelError(g_visualization->error());
       if ((s + 1) % 10 == 0 || s == (int)frameSamples - 1) {
         if (animMode)
           printf("[rank %d] frame %d/%d: %d/%u spp\r",
@@ -872,6 +965,9 @@ static void renderFrames()
       outPath = g_config.outputFile;
     }
 
+    if (g_visualization->status() != vsr::rendering::FrameChannelStatus::VALID)
+      return reportChannelError(
+          "selected output is still pending; no image saved");
     vsr::rendering::saveImage(*g_renderPipeline, outPath);
 
     printf("[rank %d] written: %s (%.2f ms)\n",
@@ -879,6 +975,7 @@ static void renderFrames()
         outPath.c_str(),
         g_timer.milliseconds());
   }
+  return true;
 }
 
 static void cleanup()
@@ -936,6 +1033,7 @@ int main(int argc, const char *argv[])
   std::vector<const char *> importerArgv;
   int importerArgc = parseRenderingOptions(argc, argv, importerArgv);
   if (importerArgc < 0) {
+    reportChannelError("rendering option parsing failed");
     return 1;
   }
 
@@ -964,7 +1062,25 @@ int main(int argc, const char *argv[])
   }
 
   // Context already initializes its scene, no separate initialization needed
-  loadANARIDevice();
+  if (!loadANARIDevice())
+    return 1;
+  if (g_config.listChannels) {
+    const int result = listFrameChannels();
+    cleanup();
+    g_ctx.reset();
+#ifdef VSR_USE_MPI
+    MPI_Finalize();
+#endif
+    return result;
+  }
+  if (!validateChannelSelection()) {
+    cleanup();
+    g_ctx.reset();
+#ifdef VSR_USE_MPI
+    MPI_Finalize();
+#endif
+    return 1;
+  }
   populateVSRScene(); // Load Archive or import foreign data first
   setupLights(); // Then add lights
   initVSRRenderIndex(); // THEN create render index with populated scene
@@ -975,7 +1091,7 @@ int main(int argc, const char *argv[])
   else
     setupManualCameraPose();
   setupImagePipeline();
-  renderFrames();
+  const bool rendered = renderFrames();
   cleanup();
 
   g_ctx.reset();
@@ -984,5 +1100,5 @@ int main(int argc, const char *argv[])
   MPI_Finalize();
 #endif
 
-  return 0;
+  return rendered ? 0 : 1;
 }
