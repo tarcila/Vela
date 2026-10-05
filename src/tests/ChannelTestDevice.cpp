@@ -6,6 +6,8 @@
 #include <anari/backend/LibraryImpl.h>
 // std
 #include <algorithm>
+#include <array>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -25,6 +27,9 @@ struct TestObject
   unsigned refs{1};
   std::string subtype;
   TestObject *renderer{nullptr};
+  TestObject *camera{nullptr};
+  std::array<float, 3> position{};
+  std::array<float, 3> direction{};
   uint32_t width{2};
   uint32_t height{2};
   uint32_t renders{0};
@@ -277,6 +282,17 @@ void TestDevice::setParameter(
         : subtype == "reordered"              ? "reordered"
         : subtype == "opaque"                 ? "opaque"
                                               : "";
+  } else if (std::getenv("VSR_CHANNEL_TEST_CAMERA_LOG") && type == ANARI_CAMERA
+      && std::strcmp(name, "camera") == 0) {
+    reinterpret_cast<TestObject *>(object)->camera =
+        reinterpret_cast<TestObject *>(*static_cast<const ANARICamera *>(mem));
+  } else if (std::getenv("VSR_CHANNEL_TEST_CAMERA_LOG")
+      && type == ANARI_FLOAT32_VEC3
+      && (std::strcmp(name, "position") == 0
+          || std::strcmp(name, "direction") == 0)) {
+    auto &o = *reinterpret_cast<TestObject *>(object);
+    auto &value = std::strcmp(name, "position") == 0 ? o.position : o.direction;
+    std::copy_n(static_cast<const float *>(mem), 3, value.begin());
   } else if (type == ANARI_DATA_TYPE) {
     reinterpret_cast<TestObject *>(object)->requested[name] =
         *static_cast<const ANARIDataType *>(mem);
@@ -603,6 +619,22 @@ void TestDevice::renderFrame(ANARIFrame frame)
 {
   ++reinterpret_cast<TestObject *>(frame)->renders;
   ++m_renderCount;
+  if (const char *path = std::getenv("VSR_CHANNEL_TEST_CAMERA_LOG")) {
+    const auto *camera = reinterpret_cast<TestObject *>(frame)->camera;
+    if (camera) {
+      if (auto *log = std::fopen(path, "w")) {
+        std::fprintf(log,
+            "%.9g %.9g %.9g %.9g %.9g %.9g\n",
+            camera->position[0],
+            camera->position[1],
+            camera->position[2],
+            camera->direction[0],
+            camera->direction[1],
+            camera->direction[2]);
+        std::fclose(log);
+      }
+    }
+  }
   if (std::getenv("VSR_CHANNEL_TEST_FORBID_RENDER"))
     std::abort();
 }

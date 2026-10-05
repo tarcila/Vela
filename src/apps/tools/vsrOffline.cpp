@@ -441,9 +441,10 @@ static void setupManualCameraPose()
         vsr::math::length(g_config.cameraPos - g_config.cameraLookAt);
 
     auto dir = vsr::math::normalize(g_config.cameraPos - g_config.cameraLookAt);
-    float azimuth = std::atan2(dir.x, dir.z) * 180.f / M_PI;
-    float elevation = std::asin(dir.y) * 180.f / M_PI;
-    pose.azeldist = {azimuth, elevation, pose.fixedDist};
+    vsr::rendering::Manipulator manualPose;
+    manualPose.setPose(g_config.cameraPos, -dir, {0.f, 1.f, 0.f});
+    const auto azel = manualPose.azel();
+    pose.azeldist = {azel.x, azel.y, pose.fixedDist};
     pose.upAxis = static_cast<int>(vsr::rendering::UpAxis::POS_Y);
   }
 

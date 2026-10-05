@@ -6,6 +6,8 @@
 // stb_image
 #include "stb_image.h"
 // std
+#include <array>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -338,5 +340,57 @@ TEST_CASE("Offline does not label pending selection as a failed map",
   CHECK(run.result != 0);
   CHECK(run.diagnostic.find("still pending") != std::string::npos);
   CHECK_FALSE(std::filesystem::exists(run.directory / "image.png"));
+}
+
+TEST_CASE("Offline honors manual eye and look-at at the ANARI boundary",
+    "[FrameChannelCLI][OfflineCamera]")
+{
+  struct CameraCase
+  {
+    const char *options;
+    std::array<float, 3> eye;
+    std::array<float, 3> target;
+  };
+  const CameraCase cases[] = {
+      {"--campos 0 0 3 --lookpos 0 0 0", {0, 0, 3}, {0, 0, 0}},
+      {"--campos 0 0 -3 --lookpos 0 0 0", {0, 0, -3}, {0, 0, 0}},
+      {"--campos 2 3 6 --lookpos 0 0 0", {2, 3, 6}, {0, 0, 0}},
+      {"--campos 3 5 9 --lookpos 1 2 3", {3, 5, 9}, {1, 2, 3}}};
+  const auto index = GENERATE(0, 1, 2, 3);
+  const auto &pose = cases[index];
+  OfflineRun run("manual-camera-" + std::to_string(index),
+      pose.options,
+      "VSR_CHANNEL_TEST_CAMERA_LOG=camera.txt");
+  struct Cleanup
+  {
+    std::filesystem::path directory;
+    ~Cleanup()
+    {
+      std::filesystem::remove_all(directory);
+    }
+  } cleanup{run.directory};
+  INFO(run.diagnostic);
+  INFO(pose.options);
+  REQUIRE(run.result == 0);
+  std::ifstream capture(run.directory / "camera.txt");
+  std::array<float, 3> eye{}, direction{};
+  for (auto &value : eye)
+    REQUIRE(bool(capture >> value));
+  for (auto &value : direction)
+    REQUIRE(bool(capture >> value));
+
+  // Expected viewing direction is independently derived from the CLI points,
+  // not from the application's Euler conversion or Manipulator convention.
+  float distanceSquared = 0.f;
+  for (size_t i = 0; i < 3; ++i) {
+    const float delta = pose.target[i] - pose.eye[i];
+    distanceSquared += delta * delta;
+  }
+  const float distance = std::sqrt(distanceSquared);
+  for (size_t i = 0; i < 3; ++i) {
+    CHECK(eye[i] == Approx(pose.eye[i]).margin(1e-5));
+    CHECK(direction[i]
+        == Approx((pose.target[i] - pose.eye[i]) / distance).margin(1e-5));
+  }
 }
 #endif
