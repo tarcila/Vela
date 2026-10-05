@@ -21,6 +21,9 @@
 // vsr_integration
 #include <vsr/integration/activity/Activity.hpp>
 #include <vsr/integration/context/ContextAdapter.hpp>
+#include <vsr/integration/edit/Translation.hpp>
+#include <vsr/integration/frame/FrameObservation.hpp>
+#include <vsr/integration/frame/ViewerFrameSource.hpp>
 #include <vsr/integration/identity/Identity.hpp>
 #include <vsr/integration/inspection/Inspection.hpp>
 #include <vsr/integration/render/RevisionRender.hpp>
@@ -28,6 +31,7 @@
 #include <vsr/integration/descriptor/LaunchDescriptor.hpp>
 #include <vsr/integration/mcp/McpServer.hpp>
 #include <vsr/integration/mcp/tools/EditTools.hpp>
+#include <vsr/integration/mcp/tools/FrameTools.hpp>
 #include <vsr/integration/mcp/tools/LookupTools.hpp>
 #include <vsr/integration/mcp/tools/QueryTools.hpp>
 #include <vsr/integration/mcp/tools/RenderTools.hpp>
@@ -38,8 +42,11 @@
 #endif
 
 // std
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -65,35 +72,77 @@ struct SecondaryViewport : public vsr_ui::Viewport
 };
 
 #ifdef VSR_USE_INTEGRATION
-// The agent-renderable view: a helide device with its own offscreen Image
-// Pipeline, independent of the interactive viewports. Its camera frames the
-// scene's world bounds like the viewport's reset-view (addendum 08), posed
-// once the bounds are known and fixed afterwards; it is not a scene object,
-// so it never appears in (or pollutes) the user's scene.
+// The agent-renderable view: an ANARI device with its own offscreen Image
+// Pipeline, independent of the interactive viewports. The device follows the
+// viewer's default selection (vsr::app::defaultDeviceIdentifier(): first
+// VSR_ANARI_LIBRARIES entry, else ANARI_LIBRARY, else helide); an agent may
+// override it among deviceCandidates() through vsr_select_device. Its camera
+// frames the scene's world bounds like the viewport's reset-view (addendum
+// 08), posed once the bounds are known and fixed afterwards; it is not a
+// scene object, so it never appears in (or pollutes) the user's scene.
 struct AgentView : vsr::integration::render::RenderBackend
 {
   static constexpr uint32_t WIDTH = 640;
   static constexpr uint32_t HEIGHT = 360;
+  // Frames accumulated per agent render. Progressive devices (VisRTX,
+  // barney, ...) converge over unchanged frames; the others just redraw.
+  static constexpr int ACCUMULATION_FRAMES = 32;
+
+  // Everything bound to one ANARI device. A device switch builds a new set
+  // and swaps it in only once it is complete, so a failed switch leaves the
+  // current device rendering.
+  struct DeviceResources
+  {
+    std::string identifier;
+    anari::Device device{nullptr};
+    vsr::rendering::RenderIndex *index{nullptr};
+    anari::Camera camera{nullptr};
+    anari::Renderer renderer{nullptr};
+    std::unique_ptr<vsr::rendering::ImagePipeline> pipeline;
+    vsr::rendering::AnariSceneRenderPass *pass{nullptr};
+    bool denoise{false}; // the renderer advertises and enables "denoise"
+  };
+
+  // Whether `d`'s default renderer advertises parameter `name` of `type`.
+  static bool rendererHasParameter(
+      anari::Device d, const char *name, anari::DataType type)
+  {
+    auto *p = (const ANARIParameter *)anariGetObjectInfo(
+        d, ANARI_RENDERER, "default", "parameter", ANARI_PARAMETER_LIST);
+    for (; p && p->name; ++p) {
+      if (p->type == type && std::strcmp(p->name, name) == 0)
+        return true;
+    }
+    return false;
+  }
 
   vsr::app::Context *ctx{nullptr};
-  anari::Device device{nullptr};
-  vsr::rendering::RenderIndex *index{nullptr};
-  anari::Camera camera{nullptr};
-  anari::Renderer renderer{nullptr};
-  vsr::rendering::ImagePipeline pipeline;
-  vsr::rendering::AnariSceneRenderPass *pass{nullptr};
+  DeviceResources res;
+  float fovy{vsr::math::radians(40.f)};
+  // The current pose: framed on the scene bounds once they are known, or set
+  // by an agent (which then wins over framing). Reapplied to a replacement
+  // device's camera.
+  struct Pose
+  {
+    vsr::math::float3 eye{0.f};
+    vsr::math::float3 dir{0.f, 0.f, -1.f};
+    vsr::math::float3 up{0.f, 1.f, 0.f};
+  };
+  std::optional<Pose> pose;
   bool rendered{false};
-  bool framed{false};
+  vsr::integration::EffectiveViewBinding binding;
+  std::optional<vsr::integration::EffectiveViewBinding> renderedConfiguration;
 
   // Poses the camera on the world bounds if they are known and it has not
   // been posed yet; true when this call posed it.
   bool frameSceneBounds()
   {
-    if (framed || !device || !index || !camera || !index->world())
+    if (pose || !res.device || !res.index || !res.camera
+        || !res.index->world())
       return false;
     vsr::math::float3 b[2];
-    if (!anariGetProperty(device,
-            index->world(),
+    if (!anariGetProperty(res.device,
+            res.index->world(),
             "bounds",
             ANARI_FLOAT32_BOX3,
             &b[0],
@@ -105,43 +154,176 @@ struct AgentView : vsr::integration::render::RenderBackend
           || b[0][i] > b[1][i])
         return false;
     }
-    vsr::rendering::Manipulator pose;
-    pose.setConfig(index->computeDefaultView());
-    vsr::rendering::updateCameraParametersPerspective(device, camera, pose);
-    anari::commitParameters(device, camera);
-    framed = true;
+    vsr::rendering::Manipulator framing;
+    framing.setConfig(res.index->computeDefaultView());
+    setPose({framing.eye(), framing.dir(), framing.up()}, "framed");
     return true;
+  }
+
+  // Applies `p` (and the current fovy) to the bound device and records it
+  // as the view's effective camera.
+  void setPose(const Pose &p, const char *revision)
+  {
+    pose = p;
+    applyPose(res);
+    binding.camera.position = {p.eye.x, p.eye.y, p.eye.z};
+    binding.camera.direction = {p.dir.x, p.dir.y, p.dir.z};
+    binding.camera.up = {p.up.x, p.up.y, p.up.z};
+    binding.camera.fovyDegrees = vsr::math::degrees(fovy);
+    binding.pipelineConfigurationRevision = revision;
+  }
+
+  void applyPose(DeviceResources &r) const
+  {
+    if (!r.device || !r.camera)
+      return;
+    anari::setParameter(r.device, r.camera, "fovy", fovy);
+    if (pose) {
+      anari::setParameter(r.device, r.camera, "position", pose->eye);
+      anari::setParameter(r.device, r.camera, "direction", pose->dir);
+      anari::setParameter(r.device, r.camera, "up", pose->up);
+    }
+    anari::commitParameters(r.device, r.camera);
+  }
+
+  // RenderBackend camera control: the agent's pose replaces the framing.
+  bool cameraControllable() const override
+  {
+    return true;
+  }
+
+  bool setCamera(const std::array<double, 3> &position,
+      const std::array<double, 3> &direction,
+      const std::array<double, 3> &up,
+      double fovyDegrees) override
+  {
+    if (!res.device || !res.camera)
+      return false;
+    auto f3 = [](const std::array<double, 3> &v) {
+      return vsr::math::float3(float(v[0]), float(v[1]), float(v[2]));
+    };
+    if (fovyDegrees > 0.)
+      fovy = vsr::math::radians(float(fovyDegrees));
+    setPose({f3(position),
+                vsr::math::normalize(f3(direction)),
+                vsr::math::normalize(f3(up))},
+        "agent_camera");
+    rendered = false;
+    renderedConfiguration.reset();
+    return true;
+  }
+
+  // Loads `identifier` and builds its index, camera, renderer and pipeline.
+  // On failure everything acquired is released and `out` stays empty.
+  bool acquire(const std::string &identifier, DeviceResources &out)
+  {
+    DeviceResources r;
+    r.identifier = identifier;
+    r.device = ctx->anari.loadDevice(identifier);
+    if (!r.device)
+      return false;
+    r.index = ctx->anari.acquireRenderIndex(
+        ctx->vsr.scene, vsr::core::Token(identifier), r.device);
+    if (!r.index) {
+      release(r);
+      return false;
+    }
+
+    r.camera = anari::newObject<anari::Camera>(r.device, "perspective");
+    anari::setParameter(r.device, r.camera, "fovy", fovy);
+    anari::setParameter(
+        r.device, r.camera, "position", vsr::math::float3(0.f));
+    anari::setParameter(
+        r.device, r.camera, "direction", vsr::math::float3(0.f, 0.f, -1.f));
+    anari::setParameter(
+        r.device, r.camera, "up", vsr::math::float3(0.f, 1.f, 0.f));
+    applyPose(r);
+    r.renderer = anari::newObject<anari::Renderer>(r.device, "default");
+    // Denoise the accumulated frame where the device offers it.
+    r.denoise = rendererHasParameter(r.device, "denoise", ANARI_BOOL);
+    if (r.denoise)
+      anari::setParameter(r.device, r.renderer, "denoise", true);
+    anari::commitParameters(r.device, r.renderer);
+
+    r.pipeline = std::make_unique<vsr::rendering::ImagePipeline>();
+    r.pipeline->setDimensions(WIDTH, HEIGHT);
+    r.pass =
+        r.pipeline->setSource<vsr::rendering::AnariSceneRenderPass>(r.device);
+    r.pass->setRunAsync(false);
+    r.pass->setCamera(r.camera);
+    r.pass->setRenderer(r.renderer);
+    if (!r.index->world()) {
+      release(r);
+      return false;
+    }
+    r.pass->setWorld(r.index->world());
+    out = std::move(r);
+    return true;
+  }
+
+  void release(DeviceResources &r)
+  {
+    if (r.pass)
+      r.pass->waitForCompletion();
+    r.pipeline.reset();
+    r.pass = nullptr;
+    if (r.device) {
+      if (r.camera)
+        anari::release(r.device, r.camera);
+      if (r.renderer)
+        anari::release(r.device, r.renderer);
+      if (r.index)
+        ctx->anari.releaseRenderIndex(ctx->vsr.scene, r.device);
+      anari::release(r.device, r.device);
+    }
+    r = DeviceResources{};
+  }
+
+  void bindDevice()
+  {
+    const auto id = vsr::app::DeviceIdentifier::parse(res.identifier);
+    binding.deviceIdentifier = res.identifier;
+    binding.deviceSubtype = id ? id->subtype : std::string("default");
+    binding.rendererSettings.clear();
+    if (res.denoise)
+      binding.rendererSettings.push_back({"denoise", {1.}, {}});
+    binding.rendererConfigurationRevision =
+        res.denoise ? "independent-denoise" : "independent-default";
   }
 
   bool setup(vsr::app::Context &c)
   {
     ctx = &c;
-    auto &scene = c.vsr.scene;
-    device = c.anari.loadDevice("helide");
-    if (!device)
-      return false;
-    index = c.anari.acquireRenderIndex(scene, "helide", device);
-    if (!index)
-      return false;
+    const auto cam = c.vsr.scene.defaultCamera();
+    fovy = cam ? cam->parameterValueAs<float>("fovy").value_or(
+                     vsr::math::radians(40.f))
+               : vsr::math::radians(40.f);
+    binding.camera.fovyDegrees = vsr::math::degrees(fovy);
+    binding.width = WIDTH;
+    binding.height = HEIGHT;
+    binding.rendererSubtype = "default";
+    binding.rendererSettingsReason = "backend_defaults_not_observed";
+    binding.pipelineSource = "independent_agent_image_pipeline";
+    binding.pipelineConfigurationRevision = "unframed";
+    binding.pipelineSettings = {{"async", {0.}, {}},
+        {"depth", {0.}, {}},
+        {"accumulation_frames", {double(ACCUMULATION_FRAMES)}, {}}};
+    binding.outputColor = "rgba8_srgb";
 
-    camera = anari::newObject<anari::Camera>(device, "perspective");
-    if (auto cam = scene.defaultCamera())
-      anari::setParameter(device,
-          camera,
-          "fovy",
-          cam->parameterValueAs<float>("fovy").value_or(
-              vsr::math::radians(40.f)));
-    anari::commitParameters(device, camera);
-    renderer = anari::newObject<anari::Renderer>(device, "default");
-    anari::commitParameters(device, renderer);
-
-    pipeline.setDimensions(WIDTH, HEIGHT);
-    pass = pipeline.setSource<vsr::rendering::AnariSceneRenderPass>(device);
-    pass->setRunAsync(false);
-    pass->setCamera(camera);
-    pass->setRenderer(renderer);
-    if (!confirm())
-      return false;
+    const auto preferred = vsr::app::defaultDeviceIdentifier();
+    if (!acquire(preferred, res)) {
+      vsr::core::logWarning(
+          "[vsrViewer] agent view: failed to load ANARI device '%s'; falling"
+          " back to '%s'",
+          preferred.c_str(),
+          vsr::app::FALLBACK_DEVICE_IDENTIFIER);
+      if (preferred == vsr::app::FALLBACK_DEVICE_IDENTIFIER
+          || !acquire(vsr::app::FALLBACK_DEVICE_IDENTIFIER, res))
+        return false;
+    }
+    bindDevice();
+    vsr::core::logStatus("[vsrViewer] agent view renders with ANARI device '%s'",
+        res.identifier.c_str());
     frameSceneBounds();
     return true;
   }
@@ -150,12 +332,12 @@ struct AgentView : vsr::integration::render::RenderBackend
   // view's RenderIndex and pipeline are live for the current scene.
   bool confirm()
   {
-    if (!device || !index || !pass || pipeline.empty())
+    if (!res.device || !res.index || !res.pass || res.pipeline->empty())
       return false;
-    auto world = index->world();
+    auto world = res.index->world();
     if (!world)
       return false;
-    pass->setWorld(world);
+    res.pass->setWorld(world);
     return true;
   }
 
@@ -169,31 +351,68 @@ struct AgentView : vsr::integration::render::RenderBackend
   // Recovery: rebuild the view's RenderIndex from the current scene.
   bool recover()
   {
-    if (!index)
+    if (!res.index)
       return false;
-    index->populate();
+    res.index->populate();
     return confirm();
   }
 
   void teardown()
   {
-    if (pass)
-      pass->waitForCompletion();
-    pipeline.clear();
-    pass = nullptr;
-    if (device) {
-      if (camera)
-        anari::release(device, camera);
-      if (renderer)
-        anari::release(device, renderer);
-      if (index)
-        ctx->anari.releaseRenderIndex(ctx->vsr.scene, device);
-      anari::release(device, device);
+    release(res);
+  }
+
+  // RenderBackend device selection: the viewer's device list (what its
+  // viewports offer), with "environment" resolved to ANARI_LIBRARY and the
+  // fallback always present.
+  std::vector<std::string> deviceCandidates() const override
+  {
+    std::vector<std::string> list;
+    auto add = [&](const std::string &id) {
+      if (vsr::app::DeviceIdentifier::parse(id)
+          && std::find(list.begin(), list.end(), id) == list.end())
+        list.push_back(id);
+    };
+    for (const auto &entry : ctx->anari.deviceList()) {
+      if (entry == "environment") {
+        if (const char *env = getenv("ANARI_LIBRARY"); env && *env)
+          add(env);
+      } else
+        add(entry);
     }
-    camera = nullptr;
-    renderer = nullptr;
-    index = nullptr;
-    device = nullptr;
+    add(vsr::app::FALLBACK_DEVICE_IDENTIFIER);
+    add(res.identifier);
+    return list;
+  }
+
+  std::string deviceIdentifier() const override
+  {
+    return res.identifier;
+  }
+
+  bool selectDevice(const std::string &identifier) override
+  {
+    if (identifier == res.identifier)
+      return true;
+    // Build the replacement before releasing the current set. Identifiers
+    // naming the same device share it (and its index) by reference count.
+    DeviceResources next;
+    if (!acquire(identifier, next)) {
+      vsr::core::logWarning(
+          "[vsrViewer] agent view: failed to switch to ANARI device '%s';"
+          " keeping '%s'",
+          identifier.c_str(),
+          res.identifier.c_str());
+      return false;
+    }
+    release(res);
+    res = std::move(next);
+    bindDevice();
+    rendered = false;
+    renderedConfiguration.reset();
+    vsr::core::logStatus("[vsrViewer] agent view switched to ANARI device '%s'",
+        res.identifier.c_str());
+    return true;
   }
 
   // RenderBackend: one synchronous pipeline frame at the view's dimensions.
@@ -201,10 +420,19 @@ struct AgentView : vsr::integration::render::RenderBackend
   {
     if (!confirm())
       return false;
-    pipeline.setDimensions(width, height);
-    // Synchronous mode renders and publishes the current scene in one call.
-    pipeline.render();
-    rendered = pipeline.getColorBuffer() != nullptr;
+    res.pipeline->setDimensions(width, height);
+    // Synchronous pass: each render() renders and waits for one frame of
+    // the current state. Unchanged frames accumulate on progressive devices,
+    // so the last one carries ACCUMULATION_FRAMES samples (then denoised).
+    for (int i = 0; i < ACCUMULATION_FRAMES; ++i)
+      res.pipeline->render();
+    rendered = res.pipeline->getColorBuffer() != nullptr;
+    renderedConfiguration.reset();
+    if (rendered) {
+      renderedConfiguration = binding;
+      renderedConfiguration->width = width;
+      renderedConfiguration->height = height;
+    }
     return rendered;
   }
   vsr::integration::render::BackendState poll() override
@@ -216,19 +444,24 @@ struct AgentView : vsr::integration::render::RenderBackend
   {
     namespace img = vsr::integration::image;
     img::SourceImage src;
-    const auto size = pipeline.dimensions();
+    const auto size = res.pipeline->dimensions();
     src.width = size.x;
     src.height = size.y;
     src.encoding = img::ChannelEncoding::SRGB_UINT8;
     src.alpha = img::AlphaMode::STRAIGHT;
     src.origin = img::RowOrigin::BOTTOM_LEFT;
-    src.pixels = pipeline.getColorBuffer();
+    src.pixels = res.pipeline->getColorBuffer();
     return src;
+  }
+  std::optional<vsr::integration::EffectiveViewBinding> renderedBinding()
+      const override
+  {
+    return renderedConfiguration;
   }
   bool release() override
   {
-    if (pass)
-      pass->waitForCompletion();
+    if (res.pass)
+      res.pass->waitForCompletion();
     rendered = false;
     return true;
   }
@@ -316,6 +549,10 @@ class Application : public VSRApplication
         new vsr_ui::Viewport(this, &ctx->view.manipulator, "Viewport");
     auto *viewport2 =
         new SecondaryViewport(this, &ctx->view.manipulator, "Secondary View");
+#ifdef VSR_USE_INTEGRATION
+    m_viewport = viewport;
+    m_secondaryViewport = viewport2;
+#endif
     auto *animations = new vsr_ui::Animations(this);
     auto *timeline = new vsr_ui::Timeline(this);
     auto *cameras = new vsr_ui::CameraPoses(this);
@@ -418,10 +655,61 @@ class Application : public VSRApplication
     // pose changes the view revision (addendum 08).
     if (m_agentView && m_tracker && m_agentView->frameSceneBounds())
       m_tracker->notePipelineChanged();
+    if (m_integration && m_identity) {
+      m_integration->submit(0, [this](vsr::scene::Scene &) {
+        namespace info = vsr::integration::inspection::viewinfo;
+        registerViewportBindings();
+        for (auto &entry : m_viewportTrackers) {
+          auto binding = m_integration->observeViewBinding(entry.first);
+          const auto reason =
+              binding ? info::validate(*binding) : "missing_binding";
+          entry.second->observeConfiguration(reason
+                  ? std::string("\"state\":\"unavailable\",\"reason\":\"")
+                      + reason + "\""
+                  : info::bindingJson(*binding,
+                        vsr::integration::inspection::detail::jsonString));
+          if (binding && !reason) {
+            entry.second->setCamera(binding->cameraHandle);
+            entry.second->setRenderer(binding->rendererHandle);
+            entry.second->setDimensions(binding->width, binding->height);
+          }
+        }
+      });
+    }
     if (m_serviceHook)
       (*m_serviceHook)();
+    if (m_translations)
+      m_translations->pump();
     if (m_renders)
       m_renders->pump();
+    if (m_frames && m_integration) {
+      // Bind only after initial background setup has completed. Natural render
+      // starts and observation callbacks execute on the viewer owner. The
+      // adapter still rejects off-owner entry before any live Scene/UI reads.
+      for (auto it = m_pendingFrameSources.begin();
+          it != m_pendingFrameSources.end();) {
+        if (it->second->effectiveView().unavailableReason.empty()) {
+          auto source = std::make_unique<ViewportFrameSource>(
+              *m_frames, it->first, *m_identity, *it->second);
+          if (source->connected()) {
+            // SDL_CPU_READY_V1 is instance-bound, not a backend-name grant.
+            // Actual transfer, rendered generation, effects and submission
+            // scale are checked again on every acquisition/presentation.
+            if (!m_frames->setExposed(it->first, true)) {
+              ++it;
+              continue;
+            }
+            m_viewportFrameSources.emplace_back(std::move(source));
+            it = m_pendingFrameSources.erase(it);
+          } else
+            ++it;
+        } else
+          ++it;
+      }
+      m_integration->submit(
+          0, [this](vsr::scene::Scene &) { m_frames->pump(); });
+      m_integration->service();
+    }
   }
 #endif
 
@@ -603,6 +891,7 @@ DockSpace         ID=0x80F5B4C5 Window=0x079D3A04 Pos=0,56 Size=3840,2206 Split=
 #ifdef VSR_USE_INTEGRATION
   void setupIntegration();
   void teardownIntegration();
+  void registerViewportBindings();
 
   bool m_agentIntegrationRequested{false};
   vsr_ui::IntegrationActivity *m_activityWindow{nullptr};
@@ -612,6 +901,7 @@ DockSpace         ID=0x80F5B4C5 Window=0x079D3A04 Pos=0,56 Size=3840,2206 Split=
   std::unique_ptr<vsr::integration::identity::IdentityAuthority> m_ids;
   std::unique_ptr<vsr::integration::identity::SceneIdentity> m_identity;
   std::unique_ptr<vsr::integration::edit::EditService> m_edits;
+  std::unique_ptr<vsr::integration::edit::TranslationService> m_translations;
   std::unique_ptr<vsr::integration::restore::RestoreService> m_restores;
   std::unique_ptr<vsr::integration::sync::SyncService> m_sync;
   std::unique_ptr<vsr::integration::activity::ActivityLog> m_activity;
@@ -620,7 +910,26 @@ DockSpace         ID=0x80F5B4C5 Window=0x079D3A04 Pos=0,56 Size=3840,2206 Split=
   std::unique_ptr<vsr::integration::context::ViewerExecutionHook> m_serviceHook;
   std::unique_ptr<AgentView> m_agentView;
   std::unique_ptr<vsr::integration::identity::ViewRevisionTracker> m_tracker;
+  vsr_ui::Viewport *m_viewport{nullptr};
+  vsr_ui::Viewport *m_secondaryViewport{nullptr};
+  std::vector<std::pair<vsr::integration::ViewId,
+      std::unique_ptr<vsr::integration::identity::ViewRevisionTracker>>>
+      m_viewportTrackers;
   std::unique_ptr<vsr::integration::render::RenderService> m_renders;
+  std::unique_ptr<vsr::integration::frame::FrameService> m_frames;
+  struct ViewportRegistration
+  {
+    vsr_ui::Viewport *viewport{nullptr};
+    std::weak_ptr<const void> lifetime;
+    vsr::integration::ViewId id{vsr::integration::INVALID_VIEW_ID};
+  };
+  std::array<ViewportRegistration, 2> m_viewportRegistrations;
+  vsr::integration::SceneId m_viewportSceneId{};
+  using ViewportFrameSource =
+      vsr::integration::frame::ViewerFrameSource<vsr_ui::Viewport>;
+  std::vector<std::unique_ptr<ViewportFrameSource>> m_viewportFrameSources;
+  std::vector<std::pair<vsr::integration::ViewId, vsr_ui::Viewport *>>
+      m_pendingFrameSources;
   std::unique_ptr<vsr::integration::inspection::Inspector> m_inspector;
 #ifdef VSR_USE_INTEGRATION_MCP
   vsr::integration::descriptor::RuntimeDirectory m_runtimeDir;
@@ -638,7 +947,7 @@ void Application::setupIntegration()
 
   m_agentView = std::make_unique<AgentView>();
   if (!m_agentView->setup(*ctx)) {
-    vsr::core::logError("[vsrViewer] agent view setup failed (helide)");
+    vsr::core::logError("[vsrViewer] agent view setup failed (no ANARI device)");
     teardownIntegration();
     m_agentIntegrationRequested = false;
     return;
@@ -646,8 +955,8 @@ void Application::setupIntegration()
 
   m_integration = std::make_unique<vi::Integration>();
 
-  // Both hooks confirm the agent view's RenderIndex/Image Pipeline for the
-  // current scene (it is the only registered view); recovery rebuilds it.
+  // These hooks confirm only the legacy render-capable AgentView. Metadata
+  // viewport registrations opt out of scene-hook render confirmation.
   vi::context::ContextSceneOptions options;
   options.name = "scene";
   options.grants.read = true;
@@ -665,6 +974,10 @@ void Application::setupIntegration()
     vr.name = "agent";
     vr.scene = *sceneId;
     vr.grants = {true, true};
+    vr.role = vi::ViewRole::INDEPENDENT_AGENT;
+    vr.observeBinding = [view] {
+      return std::optional<vi::EffectiveViewBinding>(view->binding);
+    };
     viewId = m_integration->registerView(vr);
   }
   auto activation = viewId ? m_integration->activate() : vi::ActivationResult{};
@@ -691,6 +1004,9 @@ void Application::setupIntegration()
   m_edits = std::make_unique<vi::edit::EditService>(
       *m_integration, *m_engine, m_authority->launchId());
   m_edits->attachScene(*sceneId, *m_identity);
+  m_translations = std::make_unique<vi::edit::TranslationService>(
+      *m_integration, *m_authority, *m_engine, *m_edits);
+  m_translations->attachScene(*sceneId, *m_identity);
   m_restores =
       std::make_unique<vi::restore::RestoreService>(*m_engine, *m_edits);
   m_restores->attachScene(*sceneId, *m_identity);
@@ -711,14 +1027,27 @@ void Application::setupIntegration()
     return;
   }
   m_renders->setDimensions(*viewId, AgentView::WIDTH, AgentView::HEIGHT);
+  m_frames = std::make_unique<vi::frame::FrameService>(
+      *m_integration, *m_authority, *m_engine);
   auto *identity = m_identity.get();
   auto *tracker = m_tracker.get();
+  m_viewportSceneId = *sceneId;
+  m_viewportRegistrations = {{{m_viewport, m_viewport->lifetime()},
+      {m_secondaryViewport, m_secondaryViewport->lifetime()}}};
+  m_integration->submit(
+      *sceneId, [this](vsr::scene::Scene &) { registerViewportBindings(); });
+  m_integration->service();
   m_inspector = std::make_unique<vi::inspection::Inspector>(
       *m_integration, *m_authority, [identity, sid = *sceneId](vi::SceneId id) {
         return id == sid ? identity : nullptr;
       });
-  m_inspector->setViewRevisions([tracker, vid = *viewId](vi::ViewId id) {
-    return id == vid ? tracker : nullptr;
+  m_inspector->setViewRevisions([this, tracker, vid = *viewId](vi::ViewId id) {
+    if (id == vid)
+      return tracker;
+    for (auto &entry : m_viewportTrackers)
+      if (entry.first == id)
+        return entry.second.get();
+    return static_cast<vi::identity::ViewRevisionTracker *>(nullptr);
   });
   m_serviceHook =
       std::make_unique<vi::context::ViewerExecutionHook>(*m_integration);
@@ -735,8 +1064,10 @@ void Application::setupIntegration()
   vi::mcp::Config cfg;
   vi::mcp::tools::addQueryTools(cfg.tools, {*m_engine, *m_inspector});
   vi::mcp::tools::addLookupTools(cfg.tools, *m_engine);
-  vi::mcp::tools::addEditTools(cfg.tools, {*m_ids, *m_edits, *m_restores});
+  vi::mcp::tools::addEditTools(
+      cfg.tools, {*m_ids, *m_edits, *m_restores, m_translations.get()});
   vi::mcp::tools::addRenderTools(cfg.tools, {*m_renders, *m_sync, *m_engine});
+  vi::mcp::tools::addFrameTools(cfg.tools, {*m_frames, *m_engine});
   cfg.log = [](std::string_view line) {
     vsr::core::logStatus("[vsrViewer] %.*s", int(line.size()), line.data());
   };
@@ -746,13 +1077,89 @@ void Application::setupIntegration()
                cfg, *m_authority, *m_engine, m_runtimeDir, m_mcp);
       !st.ok())
     vsr::core::logError("[vsrViewer] MCP listener: %s", st.reason.c_str());
-  else
+  else {
     services.descriptorPath = m_mcp->published().path();
+    // The path only, never the contents (which carry the launch
+    // credential): pass it to vsrMcpProxy as its descriptor argument.
+    vsr::core::logStatus("[vsrViewer] MCP descriptor: %s",
+        services.descriptorPath.c_str());
+  }
 #endif
 
   m_activityWindow->model().setServices(std::move(services));
   m_activityWindow->show();
   vsr::core::logStatus("[vsrViewer] agent integration active");
+}
+
+void Application::registerViewportBindings()
+{
+  namespace vi = vsr::integration;
+  for (auto &slot : m_viewportRegistrations) {
+    const bool visible =
+        !slot.lifetime.expired() && *slot.viewport->visiblePtr();
+    if (slot.id != vi::INVALID_VIEW_ID && !visible) {
+      const auto id = slot.id;
+      // Disconnect while the live window still exists; a destroyed window
+      // already disconnected at its pre-device teardown notification.
+      m_viewportFrameSources.erase(
+          std::remove_if(m_viewportFrameSources.begin(),
+              m_viewportFrameSources.end(),
+              [id](const auto &source) { return source->viewId() == id; }),
+          m_viewportFrameSources.end());
+      m_pendingFrameSources.erase(
+          std::remove_if(m_pendingFrameSources.begin(),
+              m_pendingFrameSources.end(),
+              [id](const auto &entry) { return entry.first == id; }),
+          m_pendingFrameSources.end());
+      m_integration->unregisterView(id);
+      m_frames->detachViewer(id);
+      m_viewportTrackers.erase(
+          std::remove_if(m_viewportTrackers.begin(),
+              m_viewportTrackers.end(),
+              [id](const auto &entry) { return entry.first == id; }),
+          m_viewportTrackers.end());
+      slot.id = vi::INVALID_VIEW_ID;
+    }
+    if (!visible || slot.id != vi::INVALID_VIEW_ID)
+      continue;
+    auto *viewport = slot.viewport;
+    auto *identity = m_identity.get();
+    vi::ViewRegistration registration;
+    registration.name = viewport == m_viewport ? "Viewport" : "Secondary View";
+    registration.scene = m_viewportSceneId;
+    registration.grants = {true, false};
+    registration.role = vi::ViewRole::INTERACTIVE_VIEWPORT;
+    registration.sceneSyncConfirmsBinding = false;
+    registration.observeBinding = [viewport, identity, life = slot.lifetime] {
+      vi::EffectiveViewBinding binding;
+      if (life.expired() || !*viewport->visiblePtr()) {
+        binding.unavailableReason = "inactive_viewport";
+        return std::optional<vi::EffectiveViewBinding>(std::move(binding));
+      }
+      static_cast<vsr::rendering::EffectiveView &>(binding) =
+          viewport->effectiveView();
+      if (auto camera = viewport->boundCamera())
+        binding.cameraHandle = identity->handleOf(camera.data());
+      if (auto renderer = viewport->boundRenderer())
+        binding.rendererHandle = identity->handleOf(renderer.data());
+      return std::optional<vi::EffectiveViewBinding>(std::move(binding));
+    };
+    auto id = m_integration->registerView(std::move(registration));
+    if (!id)
+      continue;
+    auto tracker =
+        std::make_unique<vi::identity::ViewRevisionTracker>(*m_ids, *identity);
+    if (!m_frames->attachView(*id,
+            *identity,
+            *tracker,
+            vi::frame::SourceQualification::VIEWER_CPU_READY)) {
+      m_integration->unregisterView(*id);
+      continue;
+    }
+    slot.id = *id;
+    m_viewportTrackers.emplace_back(*id, std::move(tracker));
+    m_pendingFrameSources.emplace_back(*id, viewport);
+  }
 }
 
 void Application::teardownIntegration()
@@ -767,11 +1174,16 @@ void Application::teardownIntegration()
   if (m_agentView)
     m_agentView->release();
   m_renders.reset();
+  m_pendingFrameSources.clear();
+  m_viewportFrameSources.clear();
+  m_frames.reset();
   m_tracker.reset();
+  m_viewportTrackers.clear();
   if (m_engine)
     m_engine->setActivitySink(nullptr);
   m_sync.reset();
   m_restores.reset();
+  m_translations.reset();
   m_edits.reset();
   m_identity.reset();
   m_engine.reset();

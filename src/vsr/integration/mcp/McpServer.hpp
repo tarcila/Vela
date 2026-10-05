@@ -5,6 +5,7 @@
 
 // vsr_integration
 #include "vsr/integration/descriptor/LaunchDescriptor.hpp"
+#include "vsr/integration/inspection/RequestDiagnostics.hpp"
 #include "vsr/integration/mcp/Json.hpp"
 #include "vsr/integration/operations/Operations.hpp"
 #include "vsr/integration/session/SessionAuthority.hpp"
@@ -77,6 +78,15 @@ struct ToolResult
   std::string structuredJson;
   // Admitted work that ended in a non-ok terminal outcome (MCP tool error).
   bool isError{false};
+  inspection::RequestDiagnostics diagnostics;
+  std::string diagnosticKind;
+  // Optional owned-resource reservation, transferred to the HTTP response so
+  // slow sends retain their budget until the socket drains or times out.
+  std::shared_ptr<const void> resourceLease;
+  // Optional qualified carrier envelope. Bounded tools reserve serialization
+  // before the handler returns; reject oversized RPC ids/envelopes before the
+  // protected response is serialized. Legacy tools leave this unset.
+  std::size_t maxResponseBytes{0};
 };
 
 struct Tool
@@ -166,6 +176,7 @@ class McpServer
   {
     int status{200};
     std::string body;
+    std::shared_ptr<const void> resourceLease;
   };
 
   McpServer(Config config,
@@ -527,7 +538,13 @@ inline void McpServer::acceptLoop()
     Conn &c = m_conns.back();
     c.fd = fd;
     c.thread = std::thread([this, &c, fd] {
-      serve(fd);
+      try {
+        serve(fd);
+      } catch (const std::bad_alloc &) {
+        // A bounded frame response can still meet host-wide allocation
+        // failure. Unwind its leases and close; never terminate the host or
+        // allocate another protected/error response on the failing path.
+      }
       // Addendum 11: the slot is free no later than the close is visible.
       std::lock_guard<std::mutex> l(m_connMutex);
       ::close(fd);
@@ -895,13 +912,48 @@ inline McpServer::HttpResponse McpServer::dispatch(
       }();
       const auto *args = params->get("arguments");
       const ToolResult r = t.handler(creds, args ? *args : empty);
-      if (r.code != Outcome::OK)
-        return outcomeError(id, r.code);
+      if (r.code != Outcome::OK) {
+        auto response = outcomeError(id, r.code);
+        if (r.diagnostics.count) {
+          // All fields/reasons are closed syntax vocabulary. Kind is never
+          // echoed unless recognized; no live identity or request values.
+          const auto &kind = r.diagnosticKind;
+          const char *safeKind =
+              kind == "objects" || kind == "layers" || kind == "nodes"
+              ? kind.c_str()
+              : "unknown";
+          std::string details = ",\"details\":[";
+          for (std::size_t i = 0; i < r.diagnostics.count
+              && i < inspection::RequestDiagnostics::MAX_ENTRIES;
+              ++i) {
+            const auto &d = r.diagnostics.entries[i];
+            const auto entry = std::string(i ? "," : "") + "{\"field\":"
+                + json::quote(inspection::diagnosticName(d.field))
+                + ",\"kind\":" + json::quote(safeKind) + ",\"reason\":"
+                + json::quote(inspection::diagnosticName(d.reason)) + "}";
+            if (details.size() + entry.size() + 1
+                > inspection::RequestDiagnostics::MAX_BYTES)
+              break;
+            details += entry;
+          }
+          details += "]";
+          response.body.insert(response.body.size() - 3, details);
+        }
+        return response;
+      }
+      if (r.maxResponseBytes
+          && (id.size() > 1024 || r.maxResponseBytes < 4096
+              || r.contentJson.size() > r.maxResponseBytes - 4096
+              || r.structuredJson.size()
+                  > r.maxResponseBytes - 4096 - r.contentJson.size()))
+        return outcomeError(id.size() > 1024 ? "null" : id, Outcome::BUSY);
       std::string res = "{\"content\":" + r.contentJson;
       if (!r.structuredJson.empty())
         res += ",\"structuredContent\":" + r.structuredJson;
-      return rpcResult(
+      auto response = rpcResult(
           id, res + ",\"isError\":" + (r.isError ? "true" : "false") + "}");
+      response.resourceLease = r.resourceLease;
+      return response;
     }
     return rpcError(200, id, -32602, "invalid_request", "unknown tool");
   }

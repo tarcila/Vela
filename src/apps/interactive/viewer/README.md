@@ -160,3 +160,8 @@ continues to use `.1dt` as full RGBA transfer-function state.
 
 `VSR_ANARI_LIBRARIES` controls the ANARI library list shown in the UI (comma-
 separated names). If unset, `vsrViewer` falls back to built-in defaults.
+
+With `--agentIntegration`, the agent's independent view renders on the first
+`VSR_ANARI_LIBRARIES` entry; when that variable is unset or its first entry
+is `environment`, on `ANARI_LIBRARY`; otherwise on `helide`. An agent can
+switch it to any entry of that list with `vsr_select_device`.

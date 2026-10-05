@@ -5,6 +5,9 @@
 
 // vsr_integration
 #include "vsr/integration/identity/Identity.hpp"
+#include "vsr/integration/inspection/CapturePolicy.hpp"
+// vsr_rendering
+#include "vsr/rendering/view/EffectiveView.h"
 // std
 #include <array>
 #include <condition_variable>
@@ -68,51 +71,43 @@ struct SceneRegistration
 };
 
 // Value-only, owning-thread snapshot of the actual host binding. The adapter
-// must only copy cached state: no device calls, allocations, waits or
-// mutations. Settings include every effective public setting, including quality
-// defaults. No handles, addresses, credentials or arbitrary diagnostics in text
-// fields. Each view needs a distinct ViewRevisionTracker supplied through
+// must only copy cached state: no device calls, renderer/readback allocations,
+// waits or mutations. Owned value copies are bounded before retention. Settings
+// include every effective public setting, including quality defaults. No
+// handles, addresses, credentials or arbitrary diagnostics in text fields. Each
+// view needs a distinct ViewRevisionTracker supplied through
 // Inspector::setViewRevisions. The host must notify it on every effective
 // change (including change-back between observations), using the camera,
 // renderer, dimensions and notePipelineChanged contracts. Observations also
 // detect changed returned values, but cannot reconstruct unreported history.
 // Bound references assert actual source bindings, not convenient unrelated
 // Scene objects.
-struct EffectiveSetting
-{
-  std::string name;
-  std::vector<double> numbers;
-  std::string text;
-};
+using EffectiveSetting = rendering::EffectiveSetting;
+using EffectiveCamera = rendering::EffectiveCamera;
 
-struct EffectiveCamera
+struct EffectiveViewBinding : rendering::EffectiveView
 {
-  std::string projection{"perspective"};
-  std::array<double, 3> position{0., 0., 0.};
-  std::array<double, 3> direction{0., 0., -1.};
-  std::array<double, 3> up{0., 1., 0.};
-  double fovyDegrees{60.};
-  // For other read-only projections, complete public projection parameters.
-  std::vector<EffectiveSetting> projectionSettings;
-};
-
-struct EffectiveViewBinding
-{
-  EffectiveCamera camera;
-  std::uint32_t width{0};
-  std::uint32_t height{0};
-  std::string deviceIdentifier;
-  std::string rendererSubtype;
-  std::vector<EffectiveSetting> rendererSettings;
-  std::string rendererConfigurationRevision;
-  std::string pipelineSource;
-  std::vector<EffectiveSetting> pipelineSettings;
-  std::string pipelineConfigurationRevision;
   identity::ObjectHandle cameraHandle;
   identity::ObjectHandle rendererHandle;
 };
 
 using BindingObserver = std::function<std::optional<EffectiveViewBinding>()>;
+
+enum class ViewRole
+{
+  UNKNOWN,
+  GENERIC,
+  HEADLESS,
+  INTERACTIVE_VIEWPORT,
+  INDEPENDENT_AGENT
+};
+
+struct ViewDescription
+{
+  std::string name;
+  ViewRole role{ViewRole::UNKNOWN};
+  std::string identity;
+};
 
 struct ViewRegistration
 {
@@ -120,6 +115,9 @@ struct ViewRegistration
   SceneId scene{INVALID_SCENE_ID};
   ViewGrants grants;
   BindingObserver observeBinding;
+  ViewRole role{ViewRole::UNKNOWN};
+  CapturePolicy capturePolicy;
+  bool sceneSyncConfirmsBinding{true};
 };
 
 struct SessionTiming
@@ -190,6 +188,15 @@ class Integration
   bool inServiceCall() const;
   // Invokes the explicit host adapter only from submitted safe-point work.
   std::optional<EffectiveViewBinding> observeViewBinding(ViewId id) const;
+  std::optional<ViewDescription> viewDescription(ViewId id) const;
+  std::size_t viewSlotCount() const;
+  bool sceneSyncConfirmsView(ViewId id) const;
+  std::optional<CapturePolicyObservation> capturePolicy(ViewId id) const;
+  bool updateCapturePolicy(ViewId id, const CapturePolicy &policy);
+  // Host declaration only; no grant/backend qualification follows from it.
+  // FrameService owns qualification and the finite shared observation budget.
+  bool updateFrameSourceExposure(
+      ViewId id, bool exposed, std::uint64_t hostBudgetBytes);
 
   // Host registration (host thread, before activation) //
 
@@ -243,6 +250,9 @@ class Integration
   {
     ViewRegistration registration;
     bool removed{false};
+    std::uint64_t policyRevision{1};
+    bool framesExposed{false};
+    std::uint64_t frameHostBudgetBytes{0};
   };
 
   struct PendingWork
@@ -254,6 +264,7 @@ class Integration
 
   ActivationResult validate(const SessionTiming &timing) const;
 
+  identity::IdentityAuthority m_viewIdentities;
   mutable std::mutex m_mutex;
   std::condition_variable m_workAvailable;
   bool m_active{false};

@@ -9,6 +9,7 @@
 // vsr_integration
 #include "vsr/integration/identity/Identity.hpp"
 #include "vsr/integration/inspection/Bounds.hpp"
+#include "vsr/integration/inspection/RequestDiagnostics.hpp"
 #include "vsr/integration/inspection/ViewInfo.hpp"
 #include "vsr/integration/operations/Operations.hpp"
 #include "vsr/integration/values/EditableValues.hpp"
@@ -402,6 +403,7 @@ struct Built
 {
   Outcome code{Outcome::OK}; // INVALID_REQUEST for bad page_size
   Request request;
+  RequestDiagnostics diagnostics;
 };
 
 class Inspector
@@ -439,6 +441,9 @@ class Inspector
   {
     return m_limits;
   }
+  // Syntax only; safe on the carrier thread and shared with native validation.
+  RequestDiagnostics requestDiagnostics(Query q, const PageArgs &args) const;
+
   const ScratchPool &scratch() const
   {
     return *m_scratch;
@@ -640,50 +645,66 @@ class Inspector
         + ",\"parent_handle\":" + value(f.parentHandle) + "}";
   }
 
-  bool validFilters(Query q, const PageArgs &args) const
+  bool validFilters(Query q,
+      const PageArgs &args,
+      RequestDiagnostics *diagnostics = nullptr) const
   {
-    if (args.kind != "objects" && args.kind != "layers" && args.kind != "nodes")
-      return false;
-    if (q == Query::DISCOVER && args.kind != "objects")
-      return false;
+    RequestDiagnostics local;
+    auto &errors = diagnostics ? *diagnostics : local;
+    using F = DiagnosticField;
+    using R = DiagnosticReason;
+    if ((args.kind != "objects" && args.kind != "layers"
+            && args.kind != "nodes")
+        || (q == Query::DISCOVER && args.kind != "objects"))
+      errors.add(F::KIND, R::UNSUPPORTED);
     const auto &f = args.filters;
-    if (args.kind != "objects" && (f.objectType || f.objectSubtype))
-      return false;
-    if (args.kind != "nodes" && (f.nodeKind || f.layerHandle || f.parentHandle))
-      return false;
+    const std::pair<F, const std::optional<std::string> *> fields[] = {
+        {F::NAME, &f.name},
+        {F::NAME_CONTAINS, &f.nameContains},
+        {F::HANDLE, &f.handle},
+        {F::OBJECT_TYPE, &f.objectType},
+        {F::OBJECT_SUBTYPE, &f.objectSubtype},
+        {F::NODE_KIND, &f.nodeKind},
+        {F::LAYER_HANDLE, &f.layerHandle},
+        {F::PARENT_HANDLE, &f.parentHandle}};
+    for (const auto &field : fields) {
+      if (!*field.second)
+        continue;
+      const bool objectOnly =
+          field.first == F::OBJECT_TYPE || field.first == F::OBJECT_SUBTYPE;
+      const bool nodeOnly = field.first == F::NODE_KIND
+          || field.first == F::LAYER_HANDLE || field.first == F::PARENT_HANDLE;
+      if (q == Query::DISCOVER || (objectOnly && args.kind != "objects")
+          || (nodeOnly && args.kind != "nodes"))
+        errors.add(field.first, R::INAPPLICABLE);
+      if ((*field.second)->size() > m_limits.displayString)
+        errors.add(field.first, R::LENGTH);
+    }
     if (f.nodeKind && *f.nodeKind != "empty" && *f.nodeKind != "transform"
         && *f.nodeKind != "object" && *f.nodeKind != "transform_array")
-      return false;
-    for (const auto *s : {&f.name,
-             &f.nameContains,
-             &f.handle,
-             &f.objectType,
-             &f.objectSubtype,
-             &f.nodeKind,
-             &f.layerHandle,
-             &f.parentHandle}) {
-      if (*s && (q == Query::DISCOVER || (*s)->size() > m_limits.displayString))
-        return false;
-    }
-    for (const auto &filter :
-        {std::make_pair(&f.handle,
-             args.kind == "layers"      ? identity::HandleKind::LAYER
-                 : args.kind == "nodes" ? identity::HandleKind::NODE
-                                        : identity::HandleKind::OBJECT),
-            std::make_pair(&f.layerHandle, identity::HandleKind::LAYER),
-            std::make_pair(&f.parentHandle, identity::HandleKind::NODE)}) {
-      const auto &handle = *filter.first;
-      if (!handle)
+      errors.add(F::NODE_KIND, R::UNSUPPORTED);
+    for (const auto &field : fields) {
+      if (!*field.second
+          || (field.first != F::HANDLE && field.first != F::LAYER_HANDLE
+              && field.first != F::PARENT_HANDLE))
         continue;
-      if (handle->size() != 32)
-        return false;
-      for (char c : *handle)
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
-          return false;
-      const auto domain = std::stoull(handle->substr(0, 16), nullptr, 16);
-      const auto kind = identity::IdentityAuthority::handleKind(domain);
-      if (kind != filter.second)
-        return false;
+      const auto &handle = **field.second;
+      bool syntax = handle.size() == 32;
+      for (char c : handle)
+        syntax &= (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+      if (!syntax) {
+        errors.add(field.first, R::HANDLE_SYNTAX);
+        continue;
+      }
+      const auto expected = field.first == F::LAYER_HANDLE
+              || (field.first == F::HANDLE && args.kind == "layers")
+          ? identity::HandleKind::LAYER
+          : field.first == F::PARENT_HANDLE || args.kind == "nodes"
+          ? identity::HandleKind::NODE
+          : identity::HandleKind::OBJECT;
+      const auto domain = std::stoull(handle.substr(0, 16), nullptr, 16);
+      if (identity::IdentityAuthority::handleKind(domain) != expected)
+        errors.add(field.first, R::HANDLE_KIND);
     }
     if (f.objectType) {
       bool supported = false;
@@ -692,9 +713,9 @@ class Inspector
       for (auto type : {ANARI_ARRAY1D, ANARI_ARRAY2D, ANARI_ARRAY3D})
         supported |= *f.objectType == anari::toString(type);
       if (!supported)
-        return false;
+        errors.add(F::OBJECT_TYPE, R::UNSUPPORTED);
     }
-    return true;
+    return errors.count == 0;
   }
 
   // Discovery revision covers membership and each target's returned
@@ -730,8 +751,8 @@ class Inspector
   {
     Built b;
     const std::int64_t size = args.pageSize.value_or(m_limits.defaultItems);
-    if (size < 1 || size > m_limits.maxItems || !validFilters(q, args)
-        || !m_limits.nameWork || !m_limits.sliceNameWork) {
+    b.diagnostics = requestDiagnostics(q, args);
+    if (b.diagnostics.count || !m_limits.nameWork || !m_limits.sliceNameWork) {
       b.code = Outcome::INVALID_REQUEST;
       return b;
     }
@@ -784,8 +805,11 @@ class Inspector
     }
     if (!args.cursor.empty()) {
       b.code = decodeCursor(args.cursor, *job);
-      if (b.code != Outcome::OK)
+      if (b.code != Outcome::OK) {
+        if (b.code == Outcome::INVALID_REQUEST)
+          b.diagnostics.add(DiagnosticField::CURSOR, DiagnosticReason::CURSOR);
         return b;
+      }
     }
     b.request.kind = q == Query::DISCOVER ? "discover" : "inspect";
     b.request.target = target;
@@ -867,6 +891,10 @@ class Inspector
                               : m_integration.isRegisteredScene(i);
     if (!exists) {
       if (views) {
+        if (i < m_integration.viewSlotCount()) {
+          j.pos.index++;
+          return true;
+        }
         exhausted = true;
         return false;
       }
@@ -891,13 +919,70 @@ class Inspector
           ",\"inspection\":{\"kinds\":[\"objects\",\"layers\",\"nodes\"],\"default_page_size\":"
           + std::to_string(m_limits.defaultItems)
           + ",\"max_page_size\":" + std::to_string(m_limits.maxItems) + "}";
-    if (views && m_views)
-      if (auto *tracker = m_views(i))
-        item += ",\"view_revision\":\""
-            + detail::revisionToken(tracker->revision()) + "\"";
-    if (views)
+    if (views) {
+      if (auto description = m_integration.viewDescription(i))
+        item += "," + viewinfo::identityJson(*description, detail::jsonString);
+      const auto policy = m_integration.capturePolicy(i);
       item += ",\"binding_observation\":\"vsr_view_info\",\"capture_policy\":"
-          + viewinfo::policyJson();
+          + (policy ? capturePolicyJson(policy->policy,
+                          policy->presentedFramesExposed,
+                          policy->frameHostBudgetBytes)
+                    : viewinfo::policyJson());
+      auto *tracker = m_views ? m_views(i) : nullptr;
+      const auto scene = m_integration.sceneOfView(i);
+      auto *ids = scene ? m_identities(*scene) : nullptr;
+      if (policy && tracker) {
+        tracker->observeCapturePolicy(policy->revision);
+        item += ",\"capture_policy_revision\":"
+            + detail::jsonString(
+                detail::revisionToken(tracker->capturePolicyRevision()));
+      }
+      const auto before =
+          ids ? ids->inspectionRevision() : identity::InspectionRevision{};
+      const auto viewBefore =
+          tracker ? tracker->revision() : identity::ViewRevision{};
+      auto observed = m_integration.observeViewBinding(i);
+      const char *reason =
+          observed ? viewinfo::validate(*observed) : "missing_binding";
+      if (!ids || !tracker)
+        reason = "missing_revision_tracking";
+      else if (ids->inspectionRevision() != before
+          || tracker->revision() != viewBefore)
+        reason = "observation_changed";
+      if (observed && ids) {
+        for (const auto &reference :
+            {std::make_pair(observed->cameraHandle, ANARI_CAMERA),
+                std::make_pair(observed->rendererHandle, ANARI_RENDERER)}) {
+          auto *object = ids->resolve(reference.first);
+          if (reference.first.valid()
+              && (!object || object->type() != reference.second))
+            reason = "invalid_bound_reference";
+        }
+      }
+      const auto payload = reason
+          ? std::string("\"state\":\"unavailable\",\"reason\":")
+              + detail::jsonString(reason)
+          : viewinfo::bindingJson(*observed, detail::jsonString);
+      if (tracker) {
+        tracker->observeConfiguration(payload);
+        if (!reason) {
+          tracker->setCamera(observed->cameraHandle);
+          tracker->setRenderer(observed->rendererHandle);
+          tracker->setDimensions(observed->width, observed->height);
+        }
+      }
+      if (tracker)
+        item += ",\"view_revision\":"
+            + detail::jsonString(detail::revisionToken(tracker->revision()));
+      item += ",\"effective_binding\":{" + payload;
+      if (ids)
+        item += ",\"scene_revision\":"
+            + detail::jsonString(detail::revisionToken(ids->sceneRevision()));
+      if (tracker)
+        item += ",\"view_revision\":"
+            + detail::jsonString(detail::revisionToken(tracker->revision()));
+      item += "}";
+    }
     item += "}";
     if (!append(j, item, tooLarge))
       return false;
@@ -1498,6 +1583,17 @@ class Inspector
 
 // Inlined definitions ////////////////////////////////////////////////////////
 
+inline RequestDiagnostics Inspector::requestDiagnostics(
+    Query q, const PageArgs &args) const
+{
+  RequestDiagnostics errors;
+  validFilters(q, args, &errors);
+  const auto size = args.pageSize.value_or(m_limits.defaultItems);
+  if (size < 1 || size > m_limits.maxItems)
+    errors.add(DiagnosticField::PAGE_SIZE, DiagnosticReason::RANGE);
+  return errors;
+}
+
 inline Built Inspector::makeBounds(
     const std::string &sessionId, SceneId scene, const bounds::Args &args)
 {
@@ -1587,6 +1683,18 @@ inline Built Inspector::makeViewInfo(const std::string &sessionId, ViewId view)
       return Step{Step::Status::COMPLETE, Outcome::FORBIDDEN};
     auto *ids = scene ? m_identities(*scene) : nullptr;
     auto *tracker = m_views ? m_views(view) : nullptr;
+    const auto description = m_integration.viewDescription(view);
+    if (!description)
+      return Step{Step::Status::COMPLETE, Outcome::SUPERSEDED};
+    const auto identityJson =
+        viewinfo::identityJson(*description, detail::jsonString);
+    const auto policy = m_integration.capturePolicy(view);
+    const auto policyJson = policy ? capturePolicyJson(policy->policy,
+                                         policy->presentedFramesExposed,
+                                         policy->frameHostBudgetBytes)
+                                   : viewinfo::policyJson();
+    if (tracker && policy)
+      tracker->observeCapturePolicy(policy->revision);
     if (!ids || !tracker) {
       const std::string result = "{\"view_id\":" + std::to_string(view)
           + ",\"scene_id\":" + std::to_string(*scene)
@@ -1594,7 +1702,7 @@ inline Built Inspector::makeViewInfo(const std::string &sessionId, ViewId view)
           + (ids ? detail::jsonString(detail::revisionToken(ids->sceneRevision())) : "null")
           + ",\"view_revision\":null,\"capture_policy_revision\":null,"
             "\"state\":\"unavailable\",\"reason\":\"missing_revision_tracking\","
-            "\"capture_policy\":" + viewinfo::policyJson() + "}";
+            "\"capture_policy\":" + policyJson + "," + identityJson + "}";
       return Step{Step::Status::COMPLETE,
           result.size() > m_limits.itemBytes ? Outcome::ITEM_TOO_LARGE
                                              : Outcome::OK,
@@ -1612,7 +1720,11 @@ inline Built Inspector::makeViewInfo(const std::string &sessionId, ViewId view)
       return Step{Step::Status::COMPLETE, Outcome::FORBIDDEN};
     if (!m_integration.isRegisteredView(view)
         || ids->inspectionRevision() != before
-        || tracker->revision() != viewBefore)
+        || tracker->revision() != viewBefore
+        || (policy
+            && (!m_integration.capturePolicy(view)
+                || m_integration.capturePolicy(view)->revision
+                    != policy->revision)))
       return Step{Step::Status::COMPLETE, Outcome::SUPERSEDED};
     const char *reason =
         binding ? viewinfo::validate(*binding) : "missing_binding";
@@ -1629,16 +1741,8 @@ inline Built Inspector::makeViewInfo(const std::string &sessionId, ViewId view)
     if (reason)
       payload =
           "\"state\":\"unavailable\",\"reason\":" + detail::jsonString(reason);
-    else {
+    else
       payload = viewinfo::bindingJson(*binding, detail::jsonString);
-      auto reference = [&](const char *key, const identity::ObjectHandle &h) {
-        if (h.valid())
-          payload += std::string(",\"") + key + "\":\""
-              + detail::hex64(h.domain) + detail::hex64(h.serial) + "\"";
-      };
-      reference("camera_handle", binding->cameraHandle);
-      reference("renderer_handle", binding->rendererHandle);
-    }
     if (payload.size() > viewinfo::MAX_BINDING_BYTES
         || payload.size() > m_limits.itemBytes)
       return Step{Step::Status::COMPLETE, Outcome::ITEM_TOO_LARGE};
@@ -1656,7 +1760,8 @@ inline Built Inspector::makeViewInfo(const std::string &sessionId, ViewId view)
         + ",\"capture_policy_revision\":"
         + detail::jsonString(
             detail::revisionToken(tracker->capturePolicyRevision()))
-        + ",\"capture_policy\":" + viewinfo::policyJson() + "," + payload + "}";
+        + ",\"capture_policy\":" + policyJson + "," + identityJson + ","
+        + payload + "}";
     if (result.size() > m_limits.itemBytes)
       return Step{Step::Status::COMPLETE, Outcome::ITEM_TOO_LARGE};
     return Step{Step::Status::COMPLETE, Outcome::OK, result};

@@ -27,6 +27,8 @@ void Window::renderUI()
   ImGui::End();
 }
 
+void Window::completePresentation(bool /*submitted*/) {}
+
 void Window::show()
 {
   m_visible = true;

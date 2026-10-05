@@ -163,6 +163,55 @@ and child world positions use final parents even when the child entry comes
 first. One invalid/stale entry prevents all mutation. Preparation is bounded
 (including at most 4096 ancestor steps/batch); exhaustion returns `busy` unchanged.
 
+## Preview and commit a selection translation
+
+Use `vsr_translate_preview` for a finite **world-space displacement** of an
+explicit selection. Copy all three fresh node dependency tokens for every
+entry, including selected descendants:
+
+```json
+{"request_id":10,"scene_id":0,"selection":[{"handle":"<node.handle>","node_edit_version":"<node.node_edit_version>","structural_version":"<node.structural_version>","ancestry_version":"<node.ancestry_version>"}],"world_delta":[0.1,0,0]}
+```
+
+Poll `vsr_operation_status`. Preview writes nothing and creates no Batch
+Reference or restore eligibility. Its result reports current/predicted origins,
+exact prepared local matrices, topmost selected roots and inherited selected
+nodes. Identical duplicate entries collapse. Selecting both a parent and child
+moves both origins once through inheritance, without editing the child's local
+matrix. Selecting siblings never selects their unselected common parent.
+Unselected descendants inherit naturally and are explicitly **not enumerated**.
+Origins are not geometric/bounds centers. Linear transforms, including shear,
+reflection and supported local zero scales, are preserved; required singular
+parents reject. Ordinary fractional inputs use float32 rounding, not exact
+binary64 round-trip rejection.
+
+Commit by copying the **entire returned `preview_ref`** and using a new request
+identity; do not supply replacement selection, matrices or translation inputs:
+
+```json
+{"request_id":11,"preview_ref":{"launch_id":"<result.preview_ref.launch_id>","preview_id":"<result.preview_ref.preview_id>","scene_id":0}}
+```
+
+The reference's `scene_id` is routing metadata, not an authority grant. The
+server binds the exact plan to its launch, session, Scene and original selection.
+Immediately before mutation it rechecks current read/edit/exposure, lifetime,
+all selected identities (including inherited nodes), ancestry and normalization.
+Relevant changes reject atomically rather than silently rebasing; unrelated
+edits remain valid. Failed commits create no usable batch. A successful commit
+consumes the plan once and returns the normal edit receipt/`batch_ref` for
+`vsr_restore` below. Another request cannot reuse the plan; the same admitted
+request replays historical metadata without another write, even after restore.
+Expired, evicted and foreign references return `outcome_unavailable` rather than
+reviving a plan. Current read withdrawal suppresses protected historical results.
+Before-commit cancellation writes nothing; late cancellation is not rollback.
+Sync failure can still be committed, so inspect both `committed` and `outcome`.
+
+Default bounds remain 64 input selections, 8 plans/session, 32 plans globally,
+16 MiB aggregate owned charges, 4096 ancestry steps, 120 seconds plan lifetime
+and a 5-second operation deadline. Hosts may configure validated narrower
+policies; the tool advertises its actual policy. Historical metadata and held
+status copies remain charged until their real record/copy lifetimes end.
+
 ## Conflicts, synchronization, and restoration
 
 Refresh by exact handle before editing again. Target transform/enabled writes,

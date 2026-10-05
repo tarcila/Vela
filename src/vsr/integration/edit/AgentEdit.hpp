@@ -311,6 +311,37 @@ inline ValueError prepareTransformField(const scene::LayerNodeData &data,
   return ValueError::NONE;
 }
 
+using Affine = std::array<std::array<double, 4>, 4>;
+
+inline Affine identityAffine()
+{
+  Affine result{};
+  for (int i = 0; i < 4; ++i)
+    result[i][i] = 1.;
+  return result;
+}
+
+inline ValueError appendAffine(Affine &parent, const core::math::mat4 &matrix)
+{
+  Affine product{};
+  for (int row = 0; row < 4; ++row) {
+    for (int col = 0; col < 4; ++col) {
+      if (!std::isfinite(matrix[col][row]))
+        return ValueError::NON_FINITE;
+      if (row == 3 && matrix[col][row] != (col == 3 ? 1.f : 0.f))
+        return ValueError::NON_AFFINE;
+      for (int k = 0; k < 4; ++k)
+        product[row][col] += parent[row][k] * double(matrix[col][k]);
+      if (!std::isfinite(product[row][col]))
+        return ValueError::NON_FINITE;
+      if (std::abs(product[row][col]) > std::numeric_limits<float>::max())
+        return ValueError::OUT_OF_DOMAIN;
+    }
+  }
+  parent = product;
+  return ValueError::NONE;
+}
+
 // One bounded walk for the whole request; no retained ancestor snapshots.
 inline Outcome nodeDependencies(SceneIdentity &ids,
     const identity::NodeHandle &h,
@@ -336,6 +367,39 @@ inline Outcome nodeDependencies(SceneIdentity &ids,
 }
 
 } // namespace detail
+
+// Ephemeral safe-point preparation. References never enter retained previews.
+struct Planned
+{
+  scene::Object *object;
+  const EditEntry *entry;
+  core::Any value;
+};
+
+struct PlannedNode
+{
+  scene::LayerNodeRef node;
+  const EditEntry *entry;
+  identity::NodeDependencyWalk dependencies;
+  bool changedEnabled{false};
+  bool enabled{true};
+  bool changedTransform{false};
+  bool changedSRT{false};
+  core::math::mat4 matrix{core::math::IDENTITY_MAT4};
+  core::math::mat3 srt{};
+  std::vector<scene::LayerNodeRef> ancestors;
+  const EditEntry *worldEntry{nullptr};
+  std::size_t worldIndex{0};
+  bool worldPrepared{false};
+};
+
+struct PreparedBatch
+{
+  SceneIdentity *identity{nullptr};
+  std::vector<PlannedNode> nodes;
+  std::vector<const scene::Layer *> layers;
+  std::vector<Planned> objects;
+};
 
 // One stored parameter change, enough to restore it (ticket 09).
 struct Change
@@ -450,8 +514,22 @@ class EditService
   Outcome synchronizeCommitted(SceneId scene);
   RestorationStore &restorations();
   const std::string &launchId() const;
+  std::weak_ptr<const void> lifetime() const;
 
   static std::string canonicalArguments(const EditBatch &batch);
+
+  // Shared by low-level commit and selection preview. Safe-point only;
+  // caller owns the batch and keeps its entries alive through preparation.
+  EditResult prepare(const EditBatch &batch,
+      scene::Scene &scene,
+      PreparedBatch &prepared,
+      std::size_t &remaining);
+  // Exact safe-point plan already validated by the selection service. Shares
+  // the low-level allocation, atomic write, receipt and restoration phase.
+  EditResult commitPrepared(SceneId scene,
+      PreparedBatch &prepared,
+      operations::StepContext &ctx,
+      const std::function<Outcome()> &beforeWrite = {});
 
  private:
   using Slot = std::shared_ptr<std::optional<EditResult>>;
@@ -944,10 +1022,11 @@ inline std::optional<EditResult> EditService::resultLocal(LocalRef ref) const
   return *it->second;
 }
 
-inline EditResult EditService::commit(
-    const EditBatch &batch, operations::StepContext &ctx)
+inline EditResult EditService::prepare(const EditBatch &batch,
+    scene::Scene &scene,
+    PreparedBatch &prepared,
+    std::size_t &remaining)
 {
-  scene::Scene &scene = ctx.scene;
   EditResult res;
   SceneIdentity *ident = nullptr;
   {
@@ -963,32 +1042,10 @@ inline EditResult EditService::commit(
 
   // 1. Validate every entry together; nothing mutates on failure. //
 
-  struct Planned
-  {
-    scene::Object *object;
-    const EditEntry *entry;
-    core::Any value;
-  };
-  struct PlannedNode
-  {
-    scene::LayerNodeRef node;
-    const EditEntry *entry;
-    identity::NodeDependencyWalk dependencies;
-    bool changedEnabled{false};
-    bool enabled{true};
-    bool changedTransform{false};
-    bool changedSRT{false};
-    core::math::mat4 matrix{core::math::IDENTITY_MAT4};
-    core::math::mat3 srt{};
-    std::vector<scene::LayerNodeRef> ancestors;
-    const EditEntry *worldEntry{nullptr};
-    std::size_t worldIndex{0};
-    bool worldPrepared{false};
-  };
-  std::vector<PlannedNode> nodes;
-  std::vector<const scene::Layer *> layers;
-  std::vector<Planned> plan;
-  std::size_t remaining = 4096;
+  prepared.identity = ident;
+  auto &nodes = prepared.nodes;
+  auto &layers = prepared.layers;
+  auto &plan = prepared.objects;
   bool stale = false;
   std::size_t index = 0;
   try {
@@ -1125,9 +1182,7 @@ inline EditResult EditService::commit(
   auto prepareWorld = [&](auto &&self, PlannedNode &p) -> ValueError {
     if (!p.worldEntry || p.worldPrepared)
       return ValueError::NONE;
-    double parent[4][4]{};
-    for (int i = 0; i < 4; ++i)
-      parent[i][i] = 1;
+    auto parent = detail::identityAffine();
     for (auto a = p.ancestors.rbegin(); a != p.ancestors.rend(); ++a) {
       auto proposed = std::find_if(nodes.begin(),
           nodes.end(),
@@ -1145,22 +1200,9 @@ inline EditResult EditService::commit(
       const auto matrix = proposed != nodes.end() && proposed->changedTransform
           ? proposed->matrix
           : data.getTransform();
-      double product[4][4]{};
-      for (int row = 0; row < 4; ++row) {
-        for (int col = 0; col < 4; ++col) {
-          if (!std::isfinite(matrix[col][row]))
-            return ValueError::NON_FINITE;
-          if (row == 3 && matrix[col][row] != (col == 3 ? 1.f : 0.f))
-            return ValueError::NON_AFFINE;
-          for (int k = 0; k < 4; ++k)
-            product[row][col] += parent[row][k] * double(matrix[col][k]);
-          if (!std::isfinite(product[row][col]))
-            return ValueError::NON_FINITE;
-          if (std::abs(product[row][col]) > std::numeric_limits<float>::max())
-            return ValueError::OUT_OF_DOMAIN;
-        }
-      }
-      std::memcpy(parent, product, sizeof(parent));
+      const auto error = detail::appendAffine(parent, matrix);
+      if (error != ValueError::NONE)
+        return error;
     }
     // Pivoted elimination solves the affine point conversion; no repair or
     // pseudoinverse is permitted. Keep binary64 request coordinates here.
@@ -1213,6 +1255,32 @@ inline EditResult EditService::commit(
     }
   }
 
+  return res;
+}
+
+inline EditResult EditService::commit(
+    const EditBatch &batch, operations::StepContext &ctx)
+{
+  PreparedBatch prepared;
+  std::size_t remaining = 4096;
+  auto res = prepare(batch, ctx.scene, prepared, remaining);
+  if (res.outcome != Outcome::OK)
+    return res;
+  return commitPrepared(batch.scene, prepared, ctx);
+}
+
+inline EditResult EditService::commitPrepared(SceneId sceneId,
+    PreparedBatch &prepared,
+    operations::StepContext &ctx,
+    const std::function<Outcome()> &beforeWrite)
+{
+  EditResult res;
+  auto &scene = ctx.scene;
+  auto *ident = prepared.identity;
+  auto &nodes = prepared.nodes;
+  auto &layers = prepared.layers;
+  auto &plan = prepared.objects;
+
   // 2. Prepare allocations, Batch Reference and restoration storage. //
 
   RestorationRecord record;
@@ -1224,7 +1292,7 @@ inline EditResult EditService::commit(
       throw std::bad_alloc();
     if (fault(FaultStage::ALLOCATE))
       throw std::bad_alloc();
-    record.scene = batch.scene;
+    record.scene = sceneId;
     record.nodeChanges.reserve(nodes.size());
     res.nodeVersions.reserve(nodes.size());
     res.versions.reserve(plan.size());
@@ -1276,6 +1344,25 @@ inline EditResult EditService::commit(
     // Admitted ID stays consumed; no commit and no batch.
     res.outcome = Outcome::BUSY;
     return res;
+  }
+
+  // The selection path rechecks authority/lifetime/deadline after allocation,
+  // at the last no-write boundary. Denial releases every unpublished receipt.
+  if (beforeWrite) {
+    Outcome outcome = Outcome::OK;
+    try {
+      outcome = beforeWrite();
+    } catch (const std::bad_alloc &) {
+      outcome = Outcome::BUSY;
+    }
+    if (outcome != Outcome::OK) {
+      if (charged && ctx.cancelRestoration)
+        ctx.cancelRestoration();
+      if (reserved)
+        m_store.cancelReservation();
+      res.outcome = outcome;
+      return res;
+    }
   }
 
   // 3. Commit: store every value, then flush signals. //
@@ -1330,8 +1417,13 @@ inline EditResult EditService::commit(
       return ctx.restorationRetained(r.launchId, r.batchId);
     });
   }
-  m_sync.beginHook(batch.scene);
+  m_sync.beginHook(sceneId);
   return res;
+}
+
+inline std::weak_ptr<const void> EditService::lifetime() const
+{
+  return m_alive;
 }
 
 inline Outcome EditService::synchronizeCommitted(SceneId scene)

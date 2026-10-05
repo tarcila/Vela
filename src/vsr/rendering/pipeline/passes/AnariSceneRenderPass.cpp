@@ -304,12 +304,36 @@ void AnariSceneRenderPass::setUseImplicitAspectRatio(bool on)
   updateCameraAspect();
 }
 
+void AnariSceneRenderPass::setFrameStateProvider(
+    std::function<FrameState()> provider)
+{
+  m_frameStateProvider = std::move(provider);
+}
+
+AnariSceneRenderPass::FrameState AnariSceneRenderPass::frameState() const
+{
+  return m_copiedState;
+}
+
+void AnariSceneRenderPass::startFrame()
+{
+  m_startedState.reset();
+  try {
+    if (m_frameStateProvider)
+      m_startedState = m_frameStateProvider();
+  } catch (...) {
+    // Failed host observation must not halt natural viewing or revive an old
+    // stamp. The completed image remains explicitly unattested instead.
+    m_startedState.reset();
+  }
+  anari::render(m_device, m_frame);
+}
+
 void AnariSceneRenderPass::startFirstFrame(bool wait)
 {
   if (!m_firstFrame)
     return;
-  auto dims = dimensions();
-  anari::render(m_device, m_frame);
+  startFrame();
   if (wait)
     waitForCompletion();
   m_firstFrame = false;
@@ -341,6 +365,7 @@ void AnariSceneRenderPass::updateSize()
   updateCameraAspect();
 
   detail::freeImageBuffers(m_buffers);
+  m_copiedState.reset();
   m_stagingChannels = ImageChannels::NONE;
   resizeStaging();
 
@@ -373,7 +398,7 @@ void AnariSceneRenderPass::restartFrame()
     return;
   anari::discard(m_device, m_frame);
   waitForCompletion();
-  anari::render(m_device, m_frame);
+  startFrame();
   waitForCompletion();
 }
 
@@ -398,16 +423,19 @@ void AnariSceneRenderPass::render(ImageBuffers &b)
   } else {
     if (!m_firstFrame)
       waitForCompletion();
-    anari::render(m_device, m_frame);
+    startFrame();
     waitForCompletion();
     m_firstFrame = false;
   }
 
   if (anari::isReady(m_device, m_frame)) {
-    copyFrameData();
+    if (copyFrameData())
+      m_copiedState = m_startedState;
+    else
+      m_copiedState.reset();
     // Only the asynchronous mode keeps a render in flight between calls.
     if (m_runAsync)
-      anari::render(m_device, m_frame);
+      startFrame();
   }
 
   if (!nothingToShow)
@@ -424,7 +452,7 @@ void AnariSceneRenderPass::render(ImageBuffers &b)
   }
 }
 
-void AnariSceneRenderPass::copyFrameData()
+bool AnariSceneRenderPass::copyFrameData()
 {
   const char *colorChannel =
       m_deviceSupportsCUDAFrames ? "channel.colorCUDA" : "channel.color";
@@ -470,7 +498,7 @@ void AnariSceneRenderPass::copyFrameData()
     anari::unmap(m_device, m_frame, colorChannel);
     if (enableDepth)
       anari::unmap(m_device, m_frame, depthChannel);
-    return;
+    return false;
   }
 
   if (color.pixelType == ANARI_FLOAT32_VEC4) {
@@ -553,6 +581,7 @@ void AnariSceneRenderPass::copyFrameData()
     anari::unmap(m_device, m_frame, albedoChannel);
   if (has(ImageChannels::NORMAL))
     anari::unmap(m_device, m_frame, normalChannel);
+  return true;
 }
 
 void AnariSceneRenderPass::publish(ImageBuffers &b)

@@ -225,6 +225,8 @@ class SceneIdentity
   SceneIdentity &operator=(const SceneIdentity &) = delete;
 
   scene::Scene *scene() const;
+  // Non-owning safe-point source guard for retained edit preparations.
+  std::weak_ptr<const void> lifetime() const;
 
   // Handles //
 
@@ -326,6 +328,7 @@ class SceneIdentity
   void remap(const scene::IndexRemapper &remapper);
   void trackExisting();
 
+  std::shared_ptr<const void> m_lifetime{std::make_shared<int>(0)};
   IdentityAuthority *m_authority{nullptr};
   scene::Scene *m_scene{nullptr};
   std::uint64_t m_domain{0};
@@ -372,6 +375,7 @@ class ViewRevisionTracker
   // Bounded complete effective observation, not a collision-prone fingerprint.
   void observeConfiguration(const std::string &configuration);
   CapturePolicyRevision capturePolicyRevision() const;
+  void observeCapturePolicy(std::uint64_t revision);
 
   // Folds in camera/renderer parameter changes observed since the last call.
   ViewRevision revision();
@@ -391,6 +395,7 @@ class ViewRevisionTracker
   std::uint64_t m_domain{0};
   std::uint64_t m_value{1};
   std::uint64_t m_policyDomain{0};
+  std::uint64_t m_policyValue{1};
   std::string m_configuration;
   Bound m_camera;
   Bound m_renderer;
@@ -528,6 +533,7 @@ inline SceneIdentity::SceneIdentity(
 
 inline SceneIdentity::~SceneIdentity()
 {
+  m_lifetime.reset();
   m_scene->removeDefragCallback(m_defragToken);
   m_scene->updateDelegate().erase(m_observer);
 }
@@ -535,6 +541,11 @@ inline SceneIdentity::~SceneIdentity()
 inline scene::Scene *SceneIdentity::scene() const
 {
   return m_scene;
+}
+
+inline std::weak_ptr<const void> SceneIdentity::lifetime() const
+{
+  return m_lifetime;
 }
 
 inline void SceneIdentity::trackLayer(const scene::Layer *layer)
@@ -971,7 +982,12 @@ inline void ViewRevisionTracker::observeConfiguration(
 
 inline CapturePolicyRevision ViewRevisionTracker::capturePolicyRevision() const
 {
-  return {m_authority->launch(), m_policyDomain, 1};
+  return {m_authority->launch(), m_policyDomain, m_policyValue};
+}
+
+inline void ViewRevisionTracker::observeCapturePolicy(std::uint64_t revision)
+{
+  m_policyValue = revision;
 }
 
 inline ViewRevision ViewRevisionTracker::revision()

@@ -37,6 +37,9 @@ struct Window
   // Interface to override for custom windows //
 
   virtual void buildUI() = 0;
+  // Called after the application's actual SDL submission, including failures.
+  // Hidden windows receive it too so queued source state cannot cross frames.
+  virtual void completePresentation(bool submitted);
   // Presentation settings: this window's part of the application's UI State
   // (docs/adr/0040), never a document's. Overrides chain to these, which
   // keep the window's visibility.

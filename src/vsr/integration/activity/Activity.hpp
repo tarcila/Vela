@@ -288,6 +288,8 @@ class ActivityLog
 // kinds (e.g. test or host-defined work) record as inspection.
 inline OperationKind operationKindOf(const std::string &kind)
 {
+  if (kind == "translate_commit")
+    return OperationKind::EDIT;
   for (auto k : {OperationKind::DISCOVERY,
            OperationKind::INSPECTION,
            OperationKind::RENDER,

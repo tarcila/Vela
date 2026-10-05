@@ -44,6 +44,12 @@ namespace vsr::rendering {
  *   pipeline.render();
  *   auto *pixels = pipeline.getColorBuffer();
  */
+enum class ImageStorage
+{
+  DEFAULT, // existing CUDA-managed storage when CUDA is enabled
+  HOST // synchronous CPU passes; never creates a CUDA stream
+};
+
 struct ImagePipeline final
 {
   struct PassTiming
@@ -54,7 +60,8 @@ struct ImagePipeline final
   };
 
   ImagePipeline();
-  ImagePipeline(int width, int height);
+  ImagePipeline(
+      int width, int height, ImageStorage storage = ImageStorage::DEFAULT);
   ~ImagePipeline();
 
   VSR_NOT_COPYABLE(ImagePipeline)
@@ -63,6 +70,8 @@ struct ImagePipeline final
   // Null until the first render() at a non-zero size.
   const uint32_t *getColorBuffer() const;
   vsr::math::uint2 dimensions() const;
+  ImageStorage storage() const;
+  std::uint64_t production() const;
   const std::vector<PassTiming> &getPassTimings() const;
   ImageSource *source() const;
   bool empty() const;
@@ -92,6 +101,8 @@ struct ImagePipeline final
   ImageBuffers m_buffers;
   ImageChannels m_bufferChannels{ImageChannels::NONE};
   vsr::math::uint2 m_size{0, 0};
+  ImageStorage m_storage{ImageStorage::DEFAULT};
+  std::uint64_t m_production{0};
 };
 
 // Inlined definitions ////////////////////////////////////////////////////////

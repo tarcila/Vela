@@ -11,6 +11,7 @@
 #include "vsr/integration/Integration.hpp"
 #include "vsr/integration/activity/Activity.hpp"
 #include "vsr/integration/edit/AgentEdit.hpp"
+#include "vsr/integration/edit/Translation.hpp"
 #include "vsr/integration/restore/BatchRestore.hpp"
 #include "vsr/integration/sync/SceneSync.hpp"
 #include "vsr/scene/Scene.hpp"
@@ -82,7 +83,7 @@ struct Fixture
   vsr::scene::LightRef light;
   Recorder *recorder{nullptr};
 
-  Fixture(bool nodeEdits = false)
+  Fixture(bool nodeEdits = false, operations::Limits limits = {})
   {
     matte = scene.createObject<vsr::scene::Material>(tokens::material::matte);
     light = scene.createObject<vsr::scene::Light>(tokens::light::directional);
@@ -109,7 +110,7 @@ struct Fixture
         session::SessionAuthority::create(integration, [this] { return now; });
     REQUIRE(authority);
     engine = operations::OperationEngine::create(
-        integration, *authority, {}, [this] { return now; });
+        integration, *authority, limits, [this] { return now; });
     REQUIRE(engine);
     ids = std::make_unique<identity::IdentityAuthority>();
     identity = std::make_unique<identity::SceneIdentity>(*ids, scene);
@@ -210,6 +211,1384 @@ bool isLowerHex32(const std::string &s)
 }
 
 } // namespace
+
+namespace {
+PreviewRef translationPreview(Fixture &f,
+    TranslationService &service,
+    const std::vector<vsr::scene::LayerNodeRef> &nodes,
+    bool local = false)
+{
+  TranslationRequest request;
+  request.scene = f.sceneId;
+  request.worldDelta = {0.1, 2., -3.};
+  for (const auto &node : nodes) {
+    const auto e = f.nodeEntry(node);
+    request.selection.push_back({e.nodeExpected, e.nodeDependencies});
+  }
+  operations::Status status;
+  if (local) {
+    const auto admitted = service.submitLocal(request);
+    REQUIRE(admitted.code == Outcome::OK);
+    while (f.integration.service()) {
+    }
+    status = f.engine->statusLocal(admitted.ref);
+  } else {
+    REQUIRE(service.submit(f.creds, f.ref(1), request).code == Outcome::OK);
+    while (f.integration.service()) {
+    }
+    status = f.engine->status(f.creds, f.ref(1));
+  }
+  REQUIRE(status.terminal == Outcome::OK);
+  mcp::json::Value result;
+  REQUIRE(mcp::json::parse(status.result, result));
+  const auto *ref = result.get("preview_ref");
+  REQUIRE(ref->get("scene_id"));
+  return {ref->get("launch_id")->s,
+      ref->get("preview_id")->s,
+      SceneId(ref->get("scene_id")->n)};
+}
+} // namespace
+
+TEST_CASE("Exact selection commit validates every dependency atomically",
+    "[integration][translation-commit]")
+{
+  Fixture f(true);
+  TranslationService translations(
+      f.integration, *f.authority, *f.engine, *f.edits, {}, [&] {
+        return f.now;
+      });
+  REQUIRE(translations.attachScene(f.sceneId, *f.identity));
+  auto *layer = f.scene.defaultLayer();
+  auto matrix = vsr::core::math::IDENTITY_MAT4;
+  matrix[0].x = -2.f;
+  matrix[1].x = 0.5f; // reflection, shear and local zero scale stay exact
+  matrix[2].z = 0.f;
+  auto parent = layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, matrix, "selected-parent"));
+  auto child = parent->insert_last_child(vsr::scene::LayerNodeData(
+      layer, vsr::core::math::IDENTITY_MAT4, "selected-child"));
+  auto sibling = layer->root()->insert_last_child(vsr::scene::LayerNodeData(
+      layer, vsr::core::math::IDENTITY_MAT4, "selected-sibling"));
+  auto unrelated = layer->root()->insert_last_child(vsr::scene::LayerNodeData(
+      layer, vsr::core::math::IDENTITY_MAT4, "unselected"));
+  auto preview = translationPreview(f, translations, {child, sibling, parent});
+  bool success = false;
+  bool hidden = false;
+  bool cancelled = false;
+  SECTION("ordinary fractional move and unrelated edit")
+  {
+    unrelated->value().setEnabled(false);
+    f.matte->setParameter("opacity", 0.25f);
+    success = true;
+  }
+  SECTION("host authority cannot consume an external owner's preview")
+  {
+    const auto local = translations.submitCommitLocal(preview);
+    REQUIRE(local.code == Outcome::OK);
+    while (f.integration.service()) {
+    }
+    CHECK_FALSE(f.engine->statusLocal(local.ref).committed);
+    CHECK(translations.retainedCount() == 1);
+    success = true;
+  }
+  SECTION("Forest storage relocation preserves the approved identities")
+  {
+    parent->container()->reserve(4096);
+    success = true;
+  }
+  SECTION("inherited selected child state changes")
+  {
+    child->value().setEnabled(false);
+  }
+  SECTION("inherited selected child changes back")
+  {
+    child->value().setEnabled(false);
+    child->value().setEnabled(true);
+  }
+  SECTION("second root becomes ineligible")
+  {
+    sibling->value().setAsObject(f.matte.data());
+  }
+  SECTION("root changes back")
+  {
+    parent->value().setEnabled(false);
+    parent->value().setEnabled(true);
+  }
+  SECTION("relevant ancestor changes back")
+  {
+    auto moved = vsr::core::math::IDENTITY_MAT4;
+    moved[3].x = 3;
+    layer->root()->value().setAsTransform(moved);
+    layer->root()->value().setAsTransform(vsr::core::math::IDENTITY_MAT4);
+  }
+  SECTION("selected child reparenting")
+  {
+    layer->root()->container()->move_subtree(child, unrelated);
+  }
+  SECTION("edit withdrawal")
+  {
+    f.authority->restrict(
+        session::Target::scene(f.sceneId), session::Capability::EDIT);
+  }
+  SECTION("read withdrawal")
+  {
+    f.authority->restrict(
+        session::Target::scene(f.sceneId), session::Capability::READ);
+    hidden = true;
+  }
+  SECTION("source reattachment retires the preview")
+  {
+    REQUIRE(translations.attachScene(f.sceneId, *f.identity));
+  }
+  SECTION("expired reference")
+  {
+    f.now += 121.;
+  }
+  SECTION("foreign launch")
+  {
+    preview.launchId = std::string(32, '0');
+  }
+  SECTION("foreign token")
+  {
+    preview.previewId = std::string(32, '0');
+  }
+  SECTION("foreign session")
+  {
+    REQUIRE(f.engine->detach(f.creds) == Outcome::OK);
+    const auto a = f.authority->attach(f.authority->launchCredential());
+    REQUIRE(a.code == session::Code::OK);
+    f.sessionId = a.sessionId;
+    f.creds = {f.authority->launchCredential(), a.sessionId, a.sessionSecret};
+  }
+  SECTION("cancel before commit")
+  {
+    cancelled = true;
+  }
+  SECTION("allocation failure")
+  {
+    f.edits->setFaultInjector(
+        [](FaultStage stage) { return stage == FaultStage::ALLOCATE; });
+  }
+  SECTION("read withdrawn during allocation cannot cross mutation boundary")
+  {
+    hidden = true;
+    f.edits->setFaultInjector([&](FaultStage stage) {
+      if (stage == FaultStage::ALLOCATE)
+        f.authority->restrict(
+            session::Target::scene(f.sceneId), session::Capability::READ);
+      return false;
+    });
+  }
+  SECTION("deadline crossed during allocation writes nothing")
+  {
+    f.edits->setFaultInjector([&](FaultStage stage) {
+      if (stage == FaultStage::ALLOCATE)
+        f.now += 6.;
+      return false;
+    });
+  }
+  SECTION("restoration reservation failure")
+  {
+    f.edits->setFaultInjector([](FaultStage stage) {
+      return stage == FaultStage::RESERVE_RESTORATION;
+    });
+  }
+  const auto parentBefore = parent->value().getTransform();
+  const auto childBefore = child->value().getTransform();
+  const auto siblingBefore = sibling->value().getValueRaw();
+  const auto revision = f.identity->sceneRevision();
+  const auto parentVersion =
+      *f.identity->nodeEditVersion(f.identity->handleOf(parent));
+  const auto signals = f.recorder->layerSignals;
+  auto admitted = translations.submitCommit(f.creds, f.ref(2), preview);
+  if (admitted.code == Outcome::OK) {
+    if (cancelled)
+      f.engine->cancel(f.creds, f.ref(2));
+    while (f.integration.service()) {
+    }
+    auto status = f.engine->status(f.creds, f.ref(2));
+    CHECK(status.committed == success);
+    if (!success && !hidden) {
+      mcp::json::Value result;
+      if (!status.result.empty()) {
+        REQUIRE(mcp::json::parse(status.result, result));
+        CHECK_FALSE(result.get("batch_ref"));
+      }
+    }
+  } else {
+    CHECK_FALSE(success);
+    CHECK((admitted.code == Outcome::FORBIDDEN
+        || admitted.code == Outcome::UNAUTHENTICATED
+        || admitted.code == Outcome::SESSION_EXPIRED));
+  }
+  if (!success) {
+    CHECK(parent->value().getTransform() == parentBefore);
+    CHECK(child->value().getTransform() == childBefore);
+    CHECK(sibling->value().getValueRaw() == siblingBefore);
+    CHECK(f.identity->sceneRevision() == revision);
+    CHECK(f.identity->isCurrent(parentVersion));
+    CHECK(f.recorder->layerSignals == signals);
+    CHECK(f.edits->restorations().size() == 0);
+  } else {
+    auto expected = matrix;
+    expected[3].x = float(0.1);
+    expected[3].y = 2;
+    expected[3].z = -3;
+    CHECK(parent->value().getTransform() == expected);
+    CHECK(child->value().getTransform() == childBefore);
+    CHECK(sibling->value().getTransform()[3].x == float(0.1));
+    CHECK(sibling->value().getTransform()[3].y == 2.f);
+    CHECK(sibling->value().getTransform()[3].z == -3.f);
+    CHECK(unrelated->value().getTransform()[3].x == 0.f);
+    CHECK(f.edits->restorations().size() == 1);
+    CHECK(f.hookCalls == 1);
+  }
+}
+
+TEST_CASE(
+    "Translation receipts preserve exact conditional restoration histories",
+    "[integration][translation-commit]")
+{
+  Fixture f(true);
+  TranslationService translations(
+      f.integration, *f.authority, *f.engine, *f.edits, {}, [&] {
+        return f.now;
+      });
+  REQUIRE(translations.attachScene(f.sceneId, *f.identity));
+  auto *layer = f.scene.defaultLayer();
+  auto ancestor = layer->root()->insert_last_child(vsr::scene::LayerNodeData(
+      layer, vsr::core::math::IDENTITY_MAT4, "unselected-ancestor"));
+  auto matrix = vsr::core::math::IDENTITY_MAT4;
+  matrix[0].x = -2;
+  matrix[1].x = 0.5f;
+  matrix[2].z = 0;
+  auto node = ancestor->insert_last_child(
+      vsr::scene::LayerNodeData(layer, matrix, "root"));
+  auto child = node->insert_last_child(vsr::scene::LayerNodeData(
+      layer, vsr::core::math::IDENTITY_MAT4, "inherited-child"));
+  const auto beforeSRT = node->value().getTransformSRT();
+  const auto childVersion =
+      *f.identity->nodeEditVersion(f.identity->handleOf(child));
+  auto preview = translationPreview(f, translations, {child, node});
+  REQUIRE(translations.submitCommit(f.creds, f.ref(2), preview).code
+      == Outcome::OK);
+  while (f.integration.service()) {
+  }
+  auto status = f.engine->status(f.creds, f.ref(2));
+  REQUIRE(status.committed);
+  REQUIRE(status.terminal == Outcome::OK);
+  mcp::json::Value receipt;
+  REQUIRE(mcp::json::parse(status.result, receipt));
+  CHECK(receipt.get("versions")->a.empty());
+  REQUIRE(receipt.get("node_versions")->a.size() == 1);
+  CHECK(f.identity->isCurrent(childVersion));
+  const auto *batch = receipt.get("batch_ref");
+  BatchRef ref{batch->get("launch_id")->s, batch->get("batch_id")->s};
+  auto record = f.edits->restorations().find(ref);
+  REQUIRE(record);
+  CHECK(record->nodeChanges.size() == 1);
+  bool conflict = false;
+  SECTION("exact successful one-way restore") {}
+  SECTION("unselected ancestor enabled change stays narrow")
+  {
+    ancestor->value().setEnabled(false);
+  }
+  SECTION("later target change back remains permanent conflict")
+  {
+    node->value().setEnabled(false);
+    node->value().setEnabled(true);
+    conflict = true;
+  }
+  SECTION("required ancestor transform change back remains permanent conflict")
+  {
+    auto moved = vsr::core::math::IDENTITY_MAT4;
+    moved[3].x = 1;
+    ancestor->value().setAsTransform(moved);
+    ancestor->value().setAsTransform(vsr::core::math::IDENTITY_MAT4);
+    conflict = true;
+  }
+  restore::RestoreService restores(*f.engine, *f.edits);
+  restores.attachScene(f.sceneId, *f.identity);
+  auto restore = restores.submit(f.creds, f.ref(3), {f.sceneId, ref});
+  REQUIRE(restore.code == Outcome::OK);
+  while (f.integration.service()) {
+  }
+  REQUIRE(restores.result(f.ref(3)));
+  CHECK(restores.result(f.ref(3))->committed == !conflict);
+  CHECK(restores.result(f.ref(3))->outcome
+      == (conflict ? Outcome::CONFLICT : Outcome::OK));
+  if (!conflict) {
+    CHECK(node->value().getTransform() == matrix);
+    CHECK(node->value().getTransformSRT() == beforeSRT);
+  } else {
+    CHECK(node->value().getTransform()[3].x == float(0.1));
+  }
+  REQUIRE(
+      restores.submit(f.creds, f.ref(4), {f.sceneId, ref}).code == Outcome::OK);
+  while (f.integration.service()) {
+  }
+  CHECK(restores.result(f.ref(4))->outcome
+      == (conflict ? Outcome::CONFLICT : Outcome::ALREADY_RESTORED));
+  // Commit replay is historical even after restore; it never consumes a new
+  // token or causes another displacement.
+  const auto revision = f.identity->sceneRevision();
+  const auto replay = translations.submitCommit(f.creds, f.ref(2), preview);
+  REQUIRE(replay.code == Outcome::OK);
+  CHECK(replay.replayed);
+  CHECK(f.engine->status(f.creds, f.ref(2)).result == status.result);
+  CHECK(f.identity->sceneRevision() == revision);
+}
+
+TEST_CASE("Translation commit local authority and 64-root bounds stay exact",
+    "[integration][translation-commit][translation-memory]")
+{
+  Fixture f(true);
+  PreviewLimits limits;
+  limits.lifetimeSeconds = 2.;
+  TranslationService translations(
+      f.integration, *f.authority, *f.engine, *f.edits, limits, [&] {
+        return f.now;
+      });
+  REQUIRE(translations.attachScene(f.sceneId, *f.identity));
+  auto *layer = f.scene.defaultLayer();
+  std::vector<vsr::scene::LayerNodeRef> roots;
+  for (int i = 0; i < 64; ++i)
+    roots.push_back(layer->root()->insert_last_child(vsr::scene::LayerNodeData(
+        layer, vsr::core::math::IDENTITY_MAT4, "independent-root")));
+  const auto preview = translationPreview(f, translations, roots, true);
+  bool expired = false;
+  SECTION("host commits all 64 without selecting the common parent") {}
+  SECTION("expired host plan cannot mutate")
+  {
+    f.now += 3.;
+    expired = true;
+  }
+  SECTION("foreign session cannot consume a host plan")
+  {
+    REQUIRE(translations.submitCommit(f.creds, f.ref(1), preview).code
+        == Outcome::OK);
+    while (f.integration.service()) {
+    }
+    CHECK_FALSE(f.engine->status(f.creds, f.ref(1)).committed);
+    CHECK(translations.retainedCount() == 1);
+  }
+  const auto revision = f.identity->sceneRevision();
+  auto admitted = translations.submitCommitLocal(preview);
+  REQUIRE(admitted.code == Outcome::OK);
+  while (f.integration.service()) {
+  }
+  auto status = f.engine->statusLocal(admitted.ref);
+  CHECK(status.committed == !expired);
+  CHECK(translations.retainedCount() == 0);
+  for (const auto &root : roots) {
+    CHECK(root->value().getTransform()[3].x == (expired ? 0.f : float(0.1)));
+    CHECK(root->value().getTransform()[3].y == (expired ? 0.f : 2.f));
+    CHECK(root->value().getTransform()[3].z == (expired ? 0.f : -3.f));
+  }
+  CHECK(layer->root()->value().getTransform()[3].x == 0.f);
+  CHECK(f.edits->restorations().size() == (expired ? 0 : 1));
+  if (expired)
+    CHECK(f.identity->sceneRevision() == revision);
+  CHECK(translations.ownedBytes() <= limits.aggregateBytes);
+}
+
+TEST_CASE(
+    "Translation commit boundaries keep truthful synchronization receipts",
+    "[integration][translation-commit][translation-memory]")
+{
+  Fixture f(true);
+  auto translations = std::make_unique<TranslationService>(
+      f.integration, *f.authority, *f.engine, *f.edits, PreviewLimits{}, [&] {
+        return f.now;
+      });
+  REQUIRE(translations->attachScene(f.sceneId, *f.identity));
+  auto *layer = f.scene.defaultLayer();
+  auto node = layer->root()->insert_last_child(vsr::scene::LayerNodeData(
+      layer, vsr::core::math::IDENTITY_MAT4, "selected"));
+  const auto preview = translationPreview(f, *translations, {node});
+  bool failure = false;
+  bool retired = false;
+  bool hidden = false;
+  SECTION("late cancellation is not rollback")
+  {
+    f.hook = [&] {
+      CHECK(f.engine->cancel(f.creds, f.ref(2)).committed);
+      return true;
+    };
+  }
+  SECTION("sync failure still returns the batch")
+  {
+    f.hook = [] { return false; };
+    failure = true;
+  }
+  SECTION("commit metadata survives Translation owner retirement")
+  {
+    retired = true;
+    failure = true;
+  }
+  SECTION("read withdrawal suppresses only protected result")
+  {
+    hidden = true;
+  }
+  REQUIRE(translations->submitCommit(f.creds, f.ref(2), preview).code
+      == Outcome::OK);
+  f.integration.service(); // mutation boundary, synchronization still pending
+  REQUIRE(f.engine->status(f.creds, f.ref(2)).committed);
+  CHECK(node->value().getTransform()[3].x == float(0.1));
+  CHECK(f.engine->cancel(f.creds, f.ref(2)).committed);
+  if (retired)
+    translations.reset();
+  if (hidden)
+    f.authority->restrict(
+        session::Target::scene(f.sceneId), session::Capability::READ);
+  while (f.integration.service()) {
+  }
+  auto status = f.engine->status(f.creds, f.ref(2));
+  CHECK(status.committed);
+  INFO(
+      "retired=" << retired << " hidden=" << hidden << " terminal="
+                 << (status.terminal ? operations::outcomeName(*status.terminal)
+                                     : "none"));
+  CHECK(status.terminal
+      == (failure ? Outcome::APPLIED_WITH_SYNC_FAILURE : Outcome::OK));
+  if (!hidden) {
+    mcp::json::Value receipt;
+    REQUIRE(mcp::json::parse(status.result, receipt));
+    REQUIRE(receipt.get("batch_ref"));
+  } else {
+    CHECK(status.result.empty());
+    CHECK_FALSE(status.resultVisible);
+  }
+  CHECK(node->value().getTransform()[3].x == float(0.1));
+}
+
+TEST_CASE("Translation metadata charges follow actual historical copy lifetime",
+    "[integration][translation-commit][translation-memory]")
+{
+  operations::Limits limits;
+  limits.statusRecords = 2;
+  Fixture f(true, limits);
+  TranslationService translations(
+      f.integration, *f.authority, *f.engine, *f.edits, {}, [&] {
+        return f.now;
+      });
+  REQUIRE(translations.attachScene(f.sceneId, *f.identity));
+  auto *layer = f.scene.defaultLayer();
+  auto node = layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, vsr::core::math::IDENTITY_MAT4, "root"));
+  const auto preview = translationPreview(f, translations, {node});
+  REQUIRE(translations.submitCommit(f.creds, f.ref(2), preview).code
+      == Outcome::OK);
+  while (f.integration.service()) {
+  }
+  auto held = f.engine->status(f.creds, f.ref(2));
+  REQUIRE(held.committed);
+  REQUIRE(held.resourceLease);
+  CHECK(translations.retainedCount() == 0);
+  CHECK(translations.ownedBytes() > TranslationService::INFRASTRUCTURE_BYTES);
+  REQUIRE(
+      f.run(3,
+           f.batch({f.entry(
+               f.matte.data(), "opacity", JsonValue::fromNumber(0.5))}))
+          .committed);
+  REQUIRE(
+      f.run(4,
+           f.batch({f.entry(
+               f.light.data(), "irradiance", JsonValue::fromNumber(2))}))
+          .committed);
+  CHECK(
+      f.engine->status(f.creds, f.ref(2)).code == Outcome::OUTCOME_UNAVAILABLE);
+  CHECK(translations.ownedBytes()
+      == TranslationService::INFRASTRUCTURE_BYTES
+          + 2 * TranslationService::RESULT_BYTES);
+  CHECK_FALSE(held.result.empty());
+  held = {};
+  CHECK(translations.ownedBytes() == TranslationService::INFRASTRUCTURE_BYTES);
+  const auto revision = f.identity->sceneRevision();
+  const auto replay = translations.submitCommit(f.creds, f.ref(2), preview);
+  CHECK(replay.code == Outcome::OUTCOME_UNAVAILABLE);
+  CHECK(f.identity->sceneRevision() == revision);
+}
+
+TEST_CASE(
+    "Queued translation respects current authority source and session lifetime",
+    "[integration][translation-commit][translation-memory]")
+{
+  for (int scenario = 0; scenario < 7; ++scenario) {
+    CAPTURE(scenario);
+    Fixture f(true);
+    auto translations = std::make_unique<TranslationService>(
+        f.integration, *f.authority, *f.engine, *f.edits, PreviewLimits{}, [&] {
+          return f.now;
+        });
+    REQUIRE(translations->attachScene(f.sceneId, *f.identity));
+    auto *layer = f.scene.defaultLayer();
+    auto node = layer->root()->insert_last_child(vsr::scene::LayerNodeData(
+        layer, vsr::core::math::IDENTITY_MAT4, "selected-root"));
+    auto child = node->insert_last_child(vsr::scene::LayerNodeData(
+        layer, vsr::core::math::IDENTITY_MAT4, "selected-child"));
+    const auto preview = translationPreview(f, *translations, {node, child});
+    REQUIRE(translations->submitCommit(f.creds, f.ref(2), preview).code
+        == Outcome::OK);
+    if (scenario == 0)
+      f.identity.reset();
+    if (scenario == 1)
+      f.edits.reset();
+    if (scenario == 2)
+      translations.reset();
+    if (scenario == 3)
+      REQUIRE(f.engine->detach(f.creds) == Outcome::OK);
+    if (scenario == 4)
+      f.authority->restrict(
+          session::Target::scene(f.sceneId), session::Capability::READ);
+    if (scenario == 5)
+      f.authority->restrict(
+          session::Target::scene(f.sceneId), session::Capability::EDIT);
+    if (scenario == 6)
+      layer->erase(child); // removed inherited selection identity
+    const auto before = node->value().getTransform();
+    const auto signals = f.recorder->layerSignals;
+    while (f.integration.service()) {
+    }
+    CHECK(node->value().getTransform() == before);
+    CHECK(f.recorder->layerSignals == signals);
+    if (f.edits)
+      CHECK(f.edits->restorations().size() == 0);
+    if (scenario != 3)
+      CHECK_FALSE(f.engine->status(f.creds, f.ref(2)).committed);
+    if (translations) {
+      translations->pump();
+      CHECK(
+          translations->ownedBytes() <= translations->limits().aggregateBytes);
+      if (scenario != 6)
+        CHECK(translations->retainedCount() == 0);
+    }
+  }
+}
+
+TEST_CASE("Translation commits exactly the approved affine matrices and caches",
+    "[integration][translation-commit]")
+{
+  for (int scenario = 0; scenario < 5; ++scenario) {
+    CAPTURE(scenario);
+    Fixture f(true);
+    TranslationService translations(
+        f.integration, *f.authority, *f.engine, *f.edits, {}, [&] {
+          return f.now;
+        });
+    REQUIRE(translations.attachScene(f.sceneId, *f.identity));
+    auto *layer = f.scene.defaultLayer();
+    auto parentMatrix = vsr::core::math::IDENTITY_MAT4;
+    auto local = vsr::core::math::IDENTITY_MAT4;
+    local[3] = vsr::core::math::float4(2, 3, 4, 1);
+    std::array<double, 3> delta{4, 6, 0};
+    std::array<float, 3> expected{6, 9, 4};
+    if (scenario == 0) {
+      parentMatrix[0].x = 0;
+      parentMatrix[0].y = 1;
+      parentMatrix[1].x = -1;
+      parentMatrix[1].y = 0;
+      parentMatrix[3].x = 10;
+      parentMatrix[3].y = 20;
+      expected = {8, -1, 4};
+    } else if (scenario == 1) {
+      parentMatrix[1].x = 2;
+      local[1].x = 0.5f;
+      expected = {-6, 9, 4};
+    } else if (scenario == 2) {
+      parentMatrix[0].x = -2;
+      local[0].x = -3;
+      expected = {0, 9, 4};
+    } else if (scenario == 3) {
+      local[0].x = -0.f;
+      local[1].y = 0.f;
+    } else {
+      delta = {0.1, 0.2, -0.1};
+      expected = {float(2.1), float(3.2), float(3.9)};
+    }
+    auto parent = layer->root()->insert_last_child(
+        vsr::scene::LayerNodeData(layer, parentMatrix, "unselected"));
+    auto node = parent->insert_last_child(
+        vsr::scene::LayerNodeData(layer, local, "selected"));
+    node->value().setCurrentValueAsDefault();
+    const auto beforeSRT = node->value().getTransformSRT();
+    const auto e = f.nodeEntry(node);
+    TranslationRequest request{
+        f.sceneId, {{e.nodeExpected, e.nodeDependencies}}, delta};
+    REQUIRE(
+        translations.submit(f.creds, f.ref(1), request).code == Outcome::OK);
+    while (f.integration.service()) {
+    }
+    mcp::json::Value previewResult;
+    REQUIRE(mcp::json::parse(
+        f.engine->status(f.creds, f.ref(1)).result, previewResult));
+    const auto &approved =
+        previewResult.get("roots")->a[0].get("prepared_local_matrix")->a;
+    const auto *pr = previewResult.get("preview_ref");
+    PreviewRef preview{
+        pr->get("launch_id")->s, pr->get("preview_id")->s, f.sceneId};
+    REQUIRE(translations.submitCommit(f.creds, f.ref(2), preview).code
+        == Outcome::OK);
+    while (f.integration.service()) {
+    }
+    auto status = f.engine->status(f.creds, f.ref(2));
+    REQUIRE(status.committed);
+    const auto actual = node->value().getTransform();
+    for (int row = 0; row < 4; ++row)
+      for (int col = 0; col < 4; ++col)
+        CHECK(actual[col][row] == float(approved[row].a[col].n));
+    for (int axis = 0; axis < 3; ++axis) {
+      CHECK(actual[3][axis] == expected[axis]);
+      CHECK(node->value().getTransformSRT()[2][axis] == expected[axis]);
+      for (int col = 0; col < 3; ++col)
+        CHECK(actual[col][axis] == local[col][axis]);
+    }
+    if (scenario == 3)
+      CHECK(std::signbit(actual[0].x));
+    CHECK(parent->value().getTransform() == parentMatrix);
+    CHECK_FALSE(node->value().isDefaultValue());
+    mcp::json::Value receipt;
+    REQUIRE(mcp::json::parse(status.result, receipt));
+    const auto *br = receipt.get("batch_ref");
+    BatchRef batch{br->get("launch_id")->s, br->get("batch_id")->s};
+    restore::RestoreService restores(*f.engine, *f.edits);
+    restores.attachScene(f.sceneId, *f.identity);
+    REQUIRE(restores.submit(f.creds, f.ref(3), {f.sceneId, batch}).code
+        == Outcome::OK);
+    while (f.integration.service()) {
+    }
+    REQUIRE(restores.result(f.ref(3))->committed);
+    CHECK(node->value().getTransform() == local);
+    CHECK(node->value().getTransformSRT() == beforeSRT);
+    CHECK(node->value().isDefaultValue());
+  }
+}
+
+TEST_CASE("Translation preview normalizes selected roots without writes",
+    "[integration][translation-preview]")
+{
+  Fixture f(true);
+  TranslationService translations(
+      f.integration, *f.authority, *f.engine, *f.edits, {}, [&] {
+        return f.now;
+      });
+  REQUIRE(translations.attachScene(f.sceneId, *f.identity));
+  auto *layer = f.scene.defaultLayer();
+  auto parent = layer->root()->insert_last_child(vsr::scene::LayerNodeData(
+      layer, vsr::core::math::IDENTITY_MAT4, "parent"));
+  auto matrix = vsr::core::math::IDENTITY_MAT4;
+  matrix[3].x = 1.f;
+  auto child = parent->insert_last_child(
+      vsr::scene::LayerNodeData(layer, matrix, "child"));
+  auto p = f.nodeEntry(parent);
+  auto c = f.nodeEntry(child);
+  const auto revision = f.identity->sceneRevision();
+  const auto inspectionRevision = f.identity->inspectionRevision();
+  identity::ViewRevisionTracker tracker(*f.ids, *f.identity);
+  const auto viewRevision = tracker.revision();
+  const auto beforeSRT = parent->value().getTransformSRT();
+  const auto beforeDefault = parent->value().isDefaultValue();
+  TranslationRequest request{f.sceneId,
+      {{c.nodeExpected, c.nodeDependencies},
+          {p.nodeExpected, p.nodeDependencies},
+          {c.nodeExpected, c.nodeDependencies}},
+      {2., 0., 0.}};
+  REQUIRE(translations.submit(f.creds, f.ref(1), request).code == Outcome::OK);
+  while (f.integration.service()) {
+  }
+  auto status = f.engine->status(f.creds, f.ref(1));
+  REQUIRE(status.terminal == Outcome::OK);
+  mcp::json::Value resultValue;
+  REQUIRE(mcp::json::parse(status.result, resultValue));
+  auto *result = &resultValue;
+  REQUIRE(result->get("roots")->a.size() == 1);
+  REQUIRE(result->get("inherited_selected")->a.size() == 1);
+  CHECK(result->get("duplicates_collapsed")->n == 1);
+  const auto &root = result->get("roots")->a[0];
+  CHECK(root.get("current_world_origin")->a[0].n == 0.);
+  CHECK(root.get("predicted_world_origin")->a[0].n == 2.);
+  CHECK(result->get("inherited_selected")
+            ->a[0]
+            .get("predicted_world_origin")
+            ->a[0]
+            .n
+      == 3.);
+  CHECK(parent->value().getTransform()[3].x == 0.f);
+  CHECK(child->value().getTransform()[3].x == 1.f);
+  CHECK(f.identity->isCurrent(p.nodeExpected));
+  CHECK(f.identity->isCurrent(c.nodeExpected));
+  CHECK(f.identity->sceneRevision() == revision);
+  CHECK(f.identity->inspectionRevision() == inspectionRevision);
+  CHECK(tracker.revision() == viewRevision);
+  const auto afterSRT = parent->value().getTransformSRT();
+  CHECK(std::memcmp(&beforeSRT, &afterSRT, sizeof(beforeSRT)) == 0);
+  CHECK(parent->value().isDefaultValue() == beforeDefault);
+  CHECK(f.edits->restorations().size() == 0);
+  CHECK(f.hookCalls == 0);
+}
+
+TEST_CASE("Preview uses real affine edit preparation and float rounding",
+    "[integration][translation-preview]")
+{
+  for (int scenario = 0; scenario < 9; ++scenario) {
+    CAPTURE(scenario);
+    Fixture f(true);
+    TranslationService translations(
+        f.integration, *f.authority, *f.engine, *f.edits, {}, [&] {
+          return f.now;
+        });
+    REQUIRE(translations.attachScene(f.sceneId, *f.identity));
+    auto *layer = f.scene.defaultLayer();
+    auto parentMatrix = vsr::core::math::IDENTITY_MAT4;
+    auto local = vsr::core::math::IDENTITY_MAT4;
+    local[3] = vsr::core::math::float4(2, 3, 4, 1);
+    std::array<double, 3> delta{4, 6, 0};
+    std::array<double, 3> expectedLocal{6, 9, 4};
+    if (scenario == 0) {
+      parentMatrix[0].x = 0;
+      parentMatrix[0].y = 1;
+      parentMatrix[1].x = -1;
+      parentMatrix[1].y = 0;
+      parentMatrix[3].x = 10;
+      parentMatrix[3].y = 20;
+      expectedLocal = {8, -1, 4};
+    } else if (scenario == 1) {
+      parentMatrix[1].x = 2;
+      expectedLocal = {-6, 9, 4};
+      local[1].x = 0.5f; // shear is preserved, not SRT-repaired
+    } else if (scenario == 2) {
+      parentMatrix[0].x = -2;
+      expectedLocal = {0, 9, 4};
+      local[0].x = -3; // local reflection
+    } else if (scenario == 3) {
+      local[0].x = -0.f;
+      local[1].y = 0.f;
+    } else if (scenario == 4) {
+      delta = {0.1, 0.2, -0.1};
+      expectedLocal = {
+          double(float(2.1)), double(float(3.2)), double(float(3.9))};
+    } else if (scenario == 5) {
+      parentMatrix[0].x = 0; // required inverse must reject
+    } else if (scenario == 6) {
+      local[3].x = std::numeric_limits<float>::max();
+      delta[0] = std::numeric_limits<float>::max();
+    } else if (scenario == 7) {
+      parentMatrix[0].x = std::numeric_limits<float>::max();
+      local[0].x = 2; // composed affine overflow
+    } else {
+      parentMatrix[0].x = std::numeric_limits<float>::quiet_NaN();
+    }
+    auto parent = layer->root()->insert_last_child(
+        vsr::scene::LayerNodeData(layer, parentMatrix, "unselected-parent"));
+    auto node = parent->insert_last_child(
+        vsr::scene::LayerNodeData(layer, local, "selected"));
+    node->value().setCurrentValueAsDefault();
+    auto dependency = f.nodeEntry(node);
+    TranslationRequest request{f.sceneId,
+        {{dependency.nodeExpected, dependency.nodeDependencies}},
+        delta};
+    REQUIRE(
+        translations.submit(f.creds, f.ref(1), request).code == Outcome::OK);
+    while (f.integration.service()) {
+    }
+    auto status = f.engine->status(f.creds, f.ref(1));
+    if (scenario >= 5) {
+      REQUIRE(status.terminal == Outcome::INVALID_REQUEST);
+      CHECK(translations.retainedCount() == 0);
+    } else {
+      REQUIRE(status.terminal == Outcome::OK);
+      mcp::json::Value result;
+      REQUIRE(mcp::json::parse(status.result, result));
+      const auto &matrix =
+          result.get("roots")->a[0].get("prepared_local_matrix")->a;
+      for (int row = 0; row < 3; ++row) {
+        CHECK(matrix[row].a[3].n == Approx(expectedLocal[row]));
+        for (int col = 0; col < 3; ++col)
+          CHECK(matrix[row].a[col].n == double(local[col][row]));
+      }
+      if (scenario == 3)
+        CHECK(std::signbit(matrix[0].a[0].n));
+      // Compare the established low-level world-position edit to the preview.
+      // The literal local positions above, not this comparison, are the oracle.
+      auto e = dependency;
+      e.parameter = "position";
+      e.space = "world";
+      e.hasAncestryVersion = true;
+      const auto &predicted =
+          result.get("roots")->a[0].get("predicted_world_origin")->a;
+      e.value =
+          JsonValue::numbers({predicted[0].n, predicted[1].n, predicted[2].n});
+      auto edited = f.run(2, f.batch({e}));
+      REQUIRE(edited.committed);
+      for (int row = 0; row < 3; ++row)
+        CHECK(
+            node->value().getTransform()[3][row] == Approx(expectedLocal[row]));
+      continue;
+    }
+    const auto unchanged = node->value().getTransform();
+    CHECK(std::memcmp(&unchanged, &local, sizeof(local)) == 0);
+    CHECK(f.identity->isCurrent(dependency.nodeExpected));
+    CHECK(f.edits->restorations().size() == 0);
+  }
+}
+
+TEST_CASE("Preview validates every selected dependency before normalizing",
+    "[integration][translation-preview]")
+{
+  for (int scenario = 0; scenario < 9; ++scenario) {
+    CAPTURE(scenario);
+    Fixture f(true);
+    TranslationService translations(
+        f.integration, *f.authority, *f.engine, *f.edits, {}, [&] {
+          return f.now;
+        });
+    REQUIRE(translations.attachScene(f.sceneId, *f.identity));
+    auto *layer = f.scene.defaultLayer();
+    auto parent = layer->root()->insert_last_child(vsr::scene::LayerNodeData(
+        layer, vsr::core::math::IDENTITY_MAT4, "parent"));
+    auto a = parent->insert_last_child(
+        vsr::scene::LayerNodeData(layer, vsr::core::math::IDENTITY_MAT4, "a"));
+    auto b = parent->insert_last_child(
+        vsr::scene::LayerNodeData(layer, vsr::core::math::IDENTITY_MAT4, "b"));
+    auto independent =
+        layer->root()->insert_last_child(vsr::scene::LayerNodeData(
+            layer, vsr::core::math::IDENTITY_MAT4, "independent"));
+    auto p = f.nodeEntry(parent);
+    auto ae = f.nodeEntry(a);
+    auto be = f.nodeEntry(b);
+    auto ie = f.nodeEntry(independent);
+    TranslationRequest request{f.sceneId,
+        {{ae.nodeExpected, ae.nodeDependencies},
+            {be.nodeExpected, be.nodeDependencies},
+            {ie.nodeExpected, ie.nodeDependencies}},
+        {2, 0, 0}};
+    Outcome expected = Outcome::OK;
+    if (scenario == 1) {
+      request.selection = {{p.nodeExpected, p.nodeDependencies},
+          {ae.nodeExpected, ae.nodeDependencies}};
+      a->value().setEnabled(
+          false); // stale inherited selection must NOT disappear
+      expected = Outcome::CONFLICT;
+    } else if (scenario == 2) {
+      request.selection.push_back(request.selection[0]);
+      ++request.selection.back().expected.version;
+      expected = Outcome::CONFLICT;
+    } else if (scenario == 3) {
+      vsr::scene::Scene foreignScene;
+      identity::SceneIdentity foreignIdentity(*f.ids, foreignScene);
+      auto *foreignLayer = foreignScene.defaultLayer();
+      auto foreign =
+          foreignLayer->root()->insert_last_child(vsr::scene::LayerNodeData(
+              foreignLayer, vsr::core::math::IDENTITY_MAT4, "foreign"));
+      auto h = foreignIdentity.handleOf(foreign);
+      auto walk = *foreignIdentity.beginNodeDependencies(h);
+      while (walk.ancestorSlot)
+        REQUIRE(foreignIdentity.advanceNodeDependencies(walk));
+      request.selection[1] = {*foreignIdentity.nodeEditVersion(h), walk};
+      expected = Outcome::CONFLICT;
+    } else if (scenario == 4) {
+      parent->value().setAsTransform(
+          vsr::core::math::translation_matrix(float3(1, 0, 0)));
+      parent->value().setAsTransform(
+          vsr::core::math::IDENTITY_MAT4); // ancestry change-back
+      expected = Outcome::CONFLICT;
+    } else if (scenario == 5) {
+      auto object =
+          parent->insert_last_child(vsr::scene::LayerNodeData(layer, f.matte));
+      auto e = f.nodeEntry(object);
+      request.selection.push_back({e.nodeExpected, e.nodeDependencies});
+      // Reinspect after topology changed: valid roots precede an ineligible
+      // root, and all must remain unchanged when any root fails.
+      ae = f.nodeEntry(a);
+      be = f.nodeEntry(b);
+      request.selection = {{ae.nodeExpected, ae.nodeDependencies},
+          {be.nodeExpected, be.nodeDependencies},
+          {e.nodeExpected, e.nodeDependencies}};
+      expected = Outcome::INVALID_REQUEST;
+    } else if (scenario == 6) {
+      f.authority->restrict(
+          session::Target::scene(f.sceneId), session::Capability::READ);
+      CHECK(translations.submit(f.creds, f.ref(1), request).code
+          == Outcome::FORBIDDEN);
+      CHECK(f.engine->highWater(f.sessionId) == 0);
+      continue;
+    } else if (scenario == 7) {
+      REQUIRE(
+          translations.submit(f.creds, f.ref(1), request).code == Outcome::OK);
+      f.authority->restrict(
+          session::Target::scene(f.sceneId), session::Capability::EDIT);
+      while (f.integration.service()) {
+      }
+      CHECK(f.engine->status(f.creds, f.ref(1)).terminal == Outcome::FORBIDDEN);
+      CHECK(translations.retainedCount() == 0);
+      continue;
+    } else if (scenario == 8) {
+      // Root may be singular locally; only its required parent must invert.
+      auto singular = vsr::core::math::IDENTITY_MAT4;
+      singular[0].x = 0;
+      parent->value().setAsTransform(singular);
+      p = f.nodeEntry(parent);
+      ae = f.nodeEntry(a);
+      request.selection = {{p.nodeExpected, p.nodeDependencies},
+          {ae.nodeExpected, ae.nodeDependencies}};
+    }
+    const auto beforeA = a->value().getTransform();
+    const auto beforeB = b->value().getTransform();
+    REQUIRE(
+        translations.submit(f.creds, f.ref(1), request).code == Outcome::OK);
+    while (f.integration.service()) {
+    }
+    const auto status = f.engine->status(f.creds, f.ref(1));
+    REQUIRE(status.terminal == expected);
+    mcp::json::Value result;
+    if (expected == Outcome::OK) {
+      REQUIRE(mcp::json::parse(status.result, result));
+      CHECK(result.get("roots")->a.size() == (scenario == 8 ? 1 : 3));
+      CHECK(result.get("inherited_selected")->a.size()
+          == (scenario == 8 ? 1 : 0));
+      CHECK(result.get("impact")->get("unselected_descendants")->s
+          == "not_enumerated");
+      std::reverse(request.selection.begin(), request.selection.end());
+      const auto replay = translations.submit(f.creds, f.ref(1), request);
+      REQUIRE(replay.code == Outcome::OK);
+      CHECK(replay.replayed);
+      CHECK(f.engine->status(f.creds, f.ref(1)).result == status.result);
+    } else {
+      CHECK(translations.retainedCount() == 0);
+      CHECK(status.result.find("preview_ref") == std::string::npos);
+    }
+    const auto afterA = a->value().getTransform();
+    const auto afterB = b->value().getTransform();
+    CHECK(std::memcmp(&beforeA, &afterA, sizeof(beforeA)) == 0);
+    CHECK(std::memcmp(&beforeB, &afterB, sizeof(beforeB)) == 0);
+    CHECK(f.edits->restorations().size() == 0);
+    CHECK(f.hookCalls == 0);
+  }
+}
+
+TEST_CASE(
+    "Preview bounds admission, retention and historical replay separately",
+    "[integration][translation-preview][preview-memory]")
+{
+  Fixture f(true);
+  PreviewLimits limits;
+  limits.perSession = 1;
+  limits.globalCount = 1;
+  limits.lifetimeSeconds = 2;
+  TranslationService translations(
+      f.integration, *f.authority, *f.engine, *f.edits, limits, [&] {
+        return f.now;
+      });
+  REQUIRE(translations.attachScene(f.sceneId, *f.identity));
+  auto *layer = f.scene.defaultLayer();
+  auto n = layer->root()->insert_last_child(vsr::scene::LayerNodeData(
+      layer, vsr::core::math::IDENTITY_MAT4, "selected"));
+  const auto e = f.nodeEntry(n);
+  TranslationRequest request{
+      f.sceneId, {{e.nodeExpected, e.nodeDependencies}}, {0.1, 0, 0}};
+  auto run = [&](unsigned id) {
+    REQUIRE(
+        translations.submit(f.creds, f.ref(id), request).code == Outcome::OK);
+    while (f.integration.service()) {
+    }
+    auto status = f.engine->status(f.creds, f.ref(id));
+    REQUIRE(status.terminal == Outcome::OK);
+    mcp::json::Value result;
+    REQUIRE(mcp::json::parse(status.result, result));
+    const auto &ref = *result.get("preview_ref");
+    return PreviewRef{ref.get("launch_id")->s, ref.get("preview_id")->s};
+  };
+  auto first = run(1);
+  auto second = run(2);
+  CHECK(translations.retainedCount() == 1);
+  Outcome lookup = Outcome::OK;
+  bool used = false;
+  auto lookupRef = [&](PreviewRef ref, operations::Credentials credentials) {
+    REQUIRE(f.integration.submit(f.sceneId, [&](vsr::scene::Scene &) {
+      lookup = translations.withPrepared(
+          credentials, ref, [&](const PreparedTranslation &) {
+            used = true;
+            return Outcome::OK;
+          });
+    }));
+    while (f.integration.service()) {
+    }
+  };
+  lookupRef(first, f.creds);
+  CHECK(lookup == Outcome::OUTCOME_UNAVAILABLE);
+  CHECK_FALSE(used);
+  lookupRef(second, f.creds);
+  CHECK(lookup == Outcome::OK);
+  CHECK(used);
+  auto foreign = second;
+  foreign.launchId = "other-launch";
+  used = false;
+  lookupRef(foreign, f.creds);
+  CHECK(lookup == Outcome::OUTCOME_UNAVAILABLE);
+  CHECK_FALSE(used);
+  f.now += 3;
+  translations.pump();
+  CHECK(translations.retainedCount() == 0);
+  used = false;
+  lookupRef(second, f.creds);
+  CHECK(lookup == Outcome::OUTCOME_UNAVAILABLE);
+  CHECK_FALSE(used);
+  const auto historical = f.engine->status(f.creds, f.ref(2)).result;
+  auto replay = translations.submit(f.creds, f.ref(2), request);
+  REQUIRE(replay.code == Outcome::OK);
+  CHECK(replay.replayed);
+  CHECK(f.engine->status(f.creds, f.ref(2)).result == historical);
+  CHECK(translations.retainedCount() == 0);
+  CHECK(translations.ownedBytes() <= limits.aggregateBytes);
+  auto huge = request;
+  huge.selection.resize(65, huge.selection[0]);
+  CHECK(translations.submit(f.creds, f.ref(3), huge).code
+      == Outcome::INVALID_REQUEST);
+  CHECK(f.engine->highWater(f.sessionId) == 2);
+  f.authority->restrict(
+      session::Target::scene(f.sceneId), session::Capability::READ);
+  CHECK_FALSE(f.engine->status(f.creds, f.ref(2)).resultVisible);
+  CHECK(f.engine->status(f.creds, f.ref(2)).result.empty());
+  CHECK(f.edits->restorations().size() == 0);
+}
+
+TEST_CASE("Preview rejects invalid policies and bounded preparation exhaustion",
+    "[integration][translation-preview][preview-memory]")
+{
+  Fixture f(true);
+  auto *layer = f.scene.defaultLayer();
+  auto n = layer->root()->insert_last_child(vsr::scene::LayerNodeData(
+      layer, vsr::core::math::IDENTITY_MAT4, "selected"));
+  auto e = f.nodeEntry(n);
+  TranslationRequest request{
+      f.sceneId, {{e.nodeExpected, e.nodeDependencies}}, {1, 0, 0}};
+  for (int scenario = 0; scenario < 8; ++scenario) {
+    PreviewLimits limits;
+    if (scenario == 0)
+      limits.perSession = 0;
+    if (scenario == 1)
+      limits.globalCount = 0;
+    if (scenario == 2)
+      limits.aggregateBytes = 0;
+    if (scenario == 3)
+      limits.maxSelection = 65;
+    if (scenario == 4)
+      limits.ancestrySteps = 0;
+    if (scenario == 5)
+      limits.effectEntries = 0;
+    if (scenario == 6)
+      limits.lifetimeSeconds = std::numeric_limits<double>::infinity();
+    if (scenario == 7)
+      limits.deadlineSeconds = 0;
+    TranslationService invalid(
+        f.integration, *f.authority, *f.engine, *f.edits, limits, [&] {
+          return f.now;
+        });
+    CHECK_FALSE(invalid.valid());
+    CHECK_FALSE(invalid.attachScene(f.sceneId, *f.identity));
+    CHECK(invalid.submit(f.creds, f.ref(1), request).code
+        == Outcome::INVALID_REQUEST);
+  }
+  PreviewLimits limits;
+  limits.aggregateBytes = TranslationService::INFRASTRUCTURE_BYTES
+      + TranslationService::PREPARATION_BYTES
+      + 2 * TranslationService::RESULT_BYTES;
+  TranslationService bounded(
+      f.integration, *f.authority, *f.engine, *f.edits, limits, [&] {
+        return f.now;
+      });
+  REQUIRE(bounded.attachScene(f.sceneId, *f.identity));
+  REQUIRE(bounded.submit(f.creds, f.ref(1), request).code == Outcome::OK);
+  while (f.integration.service()) {
+  }
+  CHECK(bounded.ownedBytes()
+      == TranslationService::INFRASTRUCTURE_BYTES
+          + TranslationService::PREPARATION_BYTES);
+  // One status copy fills the remaining budget. A second cannot escape the
+  // shared owned-byte ceiling; releasing the first restores its allowance.
+  auto held = f.engine->status(f.creds, f.ref(1));
+  REQUIRE(held.code == Outcome::OK);
+  CHECK(bounded.ownedBytes() == limits.aggregateBytes);
+  CHECK(f.engine->status(f.creds, f.ref(1)).code == Outcome::BUSY);
+  held = {};
+  auto replay = bounded.submit(f.creds, f.ref(1), request);
+  CHECK(replay.replayed); // replay recognition never needs a new prepared plan
+  REQUIRE(bounded.submit(f.creds, f.ref(2), request).code == Outcome::OK);
+  while (f.integration.service()) {
+  }
+  CHECK(f.engine->status(f.creds, f.ref(2)).terminal == Outcome::BUSY);
+  CHECK(bounded.retainedCount() == 1);
+  CHECK(bounded.ownedBytes() <= limits.aggregateBytes);
+  PreviewLimits shallow;
+  shallow.ancestrySteps = 1;
+  TranslationService ancestry(
+      f.integration, *f.authority, *f.engine, *f.edits, shallow, [&] {
+        return f.now;
+      });
+  REQUIRE(ancestry.attachScene(f.sceneId, *f.identity));
+  REQUIRE(ancestry.submit(f.creds, f.ref(3), request).code == Outcome::OK);
+  while (f.integration.service()) {
+  }
+  CHECK(f.engine->status(f.creds, f.ref(3)).terminal == Outcome::BUSY);
+  CHECK(ancestry.retainedCount() == 0);
+  CHECK(f.identity->isCurrent(e.nodeExpected));
+  CHECK(f.edits->restorations().size() == 0);
+}
+
+TEST_CASE(
+    "Preview handles the full bounded selection and local global eviction",
+    "[integration][translation-preview][preview-memory]")
+{
+  Fixture f(true);
+  PreviewLimits limits;
+  limits.perSession = 1;
+  limits.globalCount = 1;
+  TranslationService translations(
+      f.integration, *f.authority, *f.engine, *f.edits, limits, [&] {
+        return f.now;
+      });
+  REQUIRE(translations.attachScene(f.sceneId, *f.identity));
+  auto *layer = f.scene.defaultLayer();
+  TranslationRequest request;
+  request.scene = f.sceneId;
+  request.worldDelta = {0.1, -2, 3};
+  std::vector<vsr::scene::LayerNodeRef> nodes;
+  nodes.reserve(64);
+  for (int i = 0; i < 64; ++i)
+    nodes.push_back(layer->root()->insert_last_child(vsr::scene::LayerNodeData(
+        layer, vsr::core::math::IDENTITY_MAT4, "part")));
+  // Issue expectations only after every structural insertion.
+  for (auto n : nodes) {
+    auto e = f.nodeEntry(n);
+    request.selection.push_back({e.nodeExpected, e.nodeDependencies});
+  }
+  REQUIRE(request.selection.size() == 64);
+  REQUIRE(translations.submit(f.creds, f.ref(1), request).code == Outcome::OK);
+  while (f.integration.service()) {
+  }
+  auto status = f.engine->status(f.creds, f.ref(1));
+  REQUIRE(status.terminal == Outcome::OK);
+  mcp::json::Value result;
+  REQUIRE(mcp::json::parse(status.result, result));
+  REQUIRE(result.get("roots")->a.size() == 64);
+  CHECK(result.get("inherited_selected")->a.empty());
+  for (const auto &root : result.get("roots")->a) {
+    CHECK(root.get("predicted_world_origin")->a[0].n == double(float(0.1)));
+    CHECK(root.get("predicted_world_origin")->a[1].n == -2);
+    CHECK(root.get("predicted_world_origin")->a[2].n == 3);
+  }
+  auto first = PreviewRef{result.get("preview_ref")->get("launch_id")->s,
+      result.get("preview_ref")->get("preview_id")->s};
+  auto local = translations.submitLocal(request);
+  REQUIRE(local.code == Outcome::OK);
+  while (f.integration.service()) {
+  }
+  auto localStatus = f.engine->statusLocal(local.ref);
+  REQUIRE(localStatus.terminal == Outcome::OK);
+  REQUIRE(mcp::json::parse(localStatus.result, result));
+  auto localRef = PreviewRef{result.get("preview_ref")->get("launch_id")->s,
+      result.get("preview_ref")->get("preview_id")->s};
+  REQUIRE(translations.retainedCount() == 1);
+  Outcome old = Outcome::OK, foreign = Outcome::OK,
+          localOutcome = Outcome::UNKNOWN;
+  REQUIRE(f.integration.submit(f.sceneId, [&](vsr::scene::Scene &) {
+    old = translations.withPrepared(f.creds,
+        first,
+        [](const PreparedTranslation &) { return Outcome::OK; });
+    foreign = translations.withPrepared(f.creds,
+        localRef,
+        [](const PreparedTranslation &) { return Outcome::OK; });
+    localOutcome = translations.withPreparedLocal(
+        localRef, [](const PreparedTranslation &plan) {
+          CHECK(plan.roots.size() == 64);
+          CHECK(plan.input.selection.size() == 64);
+          return Outcome::OK;
+        });
+  }));
+  while (f.integration.service()) {
+  }
+  CHECK(old == Outcome::OUTCOME_UNAVAILABLE);
+  CHECK(foreign == Outcome::OUTCOME_UNAVAILABLE);
+  CHECK(localOutcome == Outcome::OK);
+  CHECK(translations.ownedBytes() <= limits.aggregateBytes);
+  for (const auto &v : request.selection)
+    CHECK(f.identity->isCurrent(v.expected));
+  CHECK(f.edits->restorations().size() == 0);
+}
+
+TEST_CASE(
+    "Preview owner, session and prerequisite teardown cannot retain live plans",
+    "[integration][translation-preview][preview-memory]")
+{
+  for (int scenario = 0; scenario < 11; ++scenario) {
+    CAPTURE(scenario);
+    Fixture f(true);
+    auto translations = std::make_unique<TranslationService>(
+        f.integration, *f.authority, *f.engine, *f.edits, PreviewLimits{}, [&] {
+          return f.now;
+        });
+    REQUIRE(translations->attachScene(f.sceneId, *f.identity));
+    auto *layer = f.scene.defaultLayer();
+    auto n = layer->root()->insert_last_child(vsr::scene::LayerNodeData(
+        layer, vsr::core::math::IDENTITY_MAT4, "selected"));
+    auto e = f.nodeEntry(n);
+    TranslationRequest request{
+        f.sceneId, {{e.nodeExpected, e.nodeDependencies}}, {2, 0, 0}};
+    REQUIRE(
+        translations->submit(f.creds, f.ref(1), request).code == Outcome::OK);
+    if (scenario == 0) {
+      f.engine->cancel(f.creds, f.ref(1));
+    } else if (scenario == 1) {
+      translations.reset(); // queued closure observes expired owner block
+    } else if (scenario == 2) {
+      f.identity.reset(); // queued work must not dereference EditService's old
+                          // pointer
+    } else if (scenario == 3) {
+      f.edits.reset(); // shared preparation prerequisite gone
+    }
+    while (f.integration.service()) {
+    }
+    auto status = f.engine->status(f.creds, f.ref(1));
+    if (scenario == 0)
+      CHECK(status.terminal == Outcome::CANCELLED);
+    if (scenario == 1 || scenario == 2)
+      CHECK(status.terminal == Outcome::OUTCOME_UNAVAILABLE);
+    if (scenario == 3)
+      CHECK(status.terminal == Outcome::FORBIDDEN);
+    if (scenario >= 4) {
+      REQUIRE(status.terminal == Outcome::OK);
+      mcp::json::Value result;
+      REQUIRE(mcp::json::parse(status.result, result));
+      PreviewRef ref{result.get("preview_ref")->get("launch_id")->s,
+          result.get("preview_ref")->get("preview_id")->s};
+      if (scenario == 4) {
+        f.authority->restrict(
+            session::Target::scene(f.sceneId), session::Capability::READ);
+        translations->pump();
+        CHECK_FALSE(f.engine->status(f.creds, f.ref(1)).resultVisible);
+      } else if (scenario == 5) {
+        REQUIRE(f.authority->detach(f.creds) == session::Code::OK);
+        translations->pump();
+        auto attachment = f.authority->attach(f.authority->launchCredential());
+        REQUIRE(attachment.code == session::Code::OK);
+        operations::Credentials foreign{f.authority->launchCredential(),
+            attachment.sessionId,
+            attachment.sessionSecret};
+        Outcome outcome = Outcome::UNKNOWN;
+        REQUIRE(f.integration.submit(f.sceneId, [&](vsr::scene::Scene &) {
+          outcome = translations->withPrepared(foreign,
+              ref,
+              [](const PreparedTranslation &) { return Outcome::OK; });
+        }));
+        while (f.integration.service()) {
+        }
+        CHECK(outcome == Outcome::OUTCOME_UNAVAILABLE);
+      } else if (scenario == 6) {
+        f.identity.reset();
+        translations->pump();
+        const auto historical = f.engine->status(f.creds, f.ref(1));
+        CHECK(historical.code == Outcome::OK);
+        CHECK(historical.result
+            == status.result); // value-only receipt needs no live source
+      } else if (scenario == 9) {
+        translations.reset();
+        const auto historical = f.engine->status(f.creds, f.ref(1));
+        CHECK(historical.code == Outcome::OK);
+        CHECK(historical.result
+            == status.result); // shared budget survives service owner
+      } else if (scenario == 10) {
+        f.edits.reset();
+        translations->pump();
+        const auto historical = f.engine->status(f.creds, f.ref(1));
+        CHECK(historical.code == Outcome::OK);
+        CHECK(historical.result
+            == status
+                .result); // preparation prerequisite is not replay ownership
+      } else {
+        if (scenario == 7) {
+          f.authority->restrict(
+              session::Target::scene(f.sceneId), session::Capability::EDIT);
+          translations->pump();
+          const auto hidden = f.engine->status(f.creds, f.ref(1));
+          CHECK(hidden.code == Outcome::BUSY);
+          CHECK(hidden.result.empty());
+          f.authority->relax(
+              session::Target::scene(f.sceneId), session::Capability::EDIT);
+        } else {
+          REQUIRE(translations->attachScene(
+              f.sceneId, *f.identity)); // source rebind retires plans
+        }
+        Outcome outcome = Outcome::OK;
+        REQUIRE(f.integration.submit(f.sceneId, [&](vsr::scene::Scene &) {
+          outcome = translations->withPrepared(f.creds,
+              ref,
+              [](const PreparedTranslation &) { return Outcome::OK; });
+        }));
+        while (f.integration.service()) {
+        }
+        CHECK(outcome == Outcome::OUTCOME_UNAVAILABLE);
+        CHECK(f.engine->status(f.creds, f.ref(1)).result
+            == status.result); // historical receipt, not revived plan
+      }
+    }
+    if (translations) {
+      translations->pump();
+      CHECK(translations->retainedCount() == 0);
+      CHECK(
+          translations->ownedBytes() <= translations->limits().aggregateBytes);
+    }
+    CHECK(n->value().getTransform()[3].x == 0);
+    CHECK(f.hookCalls == 0);
+    if (f.edits)
+      CHECK(f.edits->restorations().size() == 0);
+  }
+}
+
+TEST_CASE("Preview deadline and exposure failure publish no protected plan",
+    "[integration][translation-preview][preview-memory]")
+{
+  for (int scenario = 0; scenario < 3; ++scenario) {
+    CAPTURE(scenario);
+    Fixture f(scenario != 0);
+    bool advanceClock = false;
+    TranslationService translations(
+        f.integration, *f.authority, *f.engine, *f.edits, {}, [&] {
+          const auto now = f.now;
+          if (advanceClock)
+            f.now += 2.;
+          return now;
+        });
+    REQUIRE(translations.attachScene(f.sceneId, *f.identity));
+    auto *layer = f.scene.defaultLayer();
+    auto n = layer->root()->insert_last_child(vsr::scene::LayerNodeData(
+        layer, vsr::core::math::IDENTITY_MAT4, "selected"));
+    auto e = f.nodeEntry(n);
+    TranslationRequest request{
+        f.sceneId, {{e.nodeExpected, e.nodeDependencies}}, {1, 0, 0}};
+    if (scenario == 2) {
+      request.worldDelta[0] = std::numeric_limits<double>::infinity();
+      CHECK(translations.submit(f.creds, f.ref(1), request).code
+          == Outcome::INVALID_REQUEST);
+      CHECK(f.engine->highWater(f.sessionId) == 0);
+      continue;
+    }
+    REQUIRE(
+        translations.submit(f.creds, f.ref(1), request).code == Outcome::OK);
+    advanceClock = scenario == 1;
+    while (f.integration.service()) {
+    }
+    auto status = f.engine->status(f.creds, f.ref(1));
+    CHECK(status.terminal
+        == (scenario == 0 ? Outcome::FORBIDDEN : Outcome::TIMEOUT));
+    CHECK(status.result.empty());
+    CHECK(translations.retainedCount() == 0);
+    CHECK(
+        translations.ownedBytes() == TranslationService::INFRASTRUCTURE_BYTES);
+    CHECK(f.identity->isCurrent(e.nodeExpected));
+    CHECK(n->value().getTransform()[3].x == 0);
+    CHECK(f.edits->restorations().size() == 0);
+  }
+}
 
 TEST_CASE("Mixed batches commit and restore one complete scene adjustment",
     "[integration][mixed-edit]")
@@ -1031,6 +2410,59 @@ Costs measureCosts()
 }
 
 } // namespace
+
+TEST_CASE("Translation activity and session close preserve committed cleanup",
+    "[integration][translation-commit][translation-memory]")
+{
+  LoggedFixture logged({}, true);
+  auto &f = logged.fx;
+  TranslationService translations(
+      f.integration, *f.authority, *f.engine, *f.edits, {}, [&] {
+        return f.now;
+      });
+  REQUIRE(translations.attachScene(f.sceneId, *f.identity));
+  auto *layer = f.scene.defaultLayer();
+  auto node = layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, vsr::core::math::IDENTITY_MAT4, "root"));
+  const auto preview = translationPreview(f, translations, {node});
+  REQUIRE(logged.log->get(1));
+  CHECK(logged.log->get(1)->eligibility == activity::Eligibility::NONE);
+  CHECK_FALSE(logged.log->get(1)->batchRef);
+  REQUIRE(translations.submitCommit(f.creds, f.ref(2), preview).code
+      == Outcome::OK);
+  f.integration.service();
+  REQUIRE(logged.log->get(2));
+  CHECK(logged.log->get(2)->committed);
+  CHECK(logged.log->get(2)->kind == activity::OperationKind::EDIT);
+  CHECK(logged.log->get(2)->eligibility == activity::Eligibility::ELIGIBLE);
+  SECTION("normal completion remains visible and exactly restorable") {}
+  SECTION("session closes after mutation before synchronization")
+  {
+    REQUIRE(f.engine->detach(f.creds) == Outcome::OK);
+  }
+  while (f.integration.service()) {
+  }
+  auto activity = logged.log->get(2);
+  REQUIRE(activity);
+  CHECK_FALSE(activity->active);
+  CHECK(activity->heldSlots == 0);
+  CHECK(activity->committed);
+  CHECK(activity->terminal == Outcome::OK);
+  REQUIRE(activity->batchRef);
+  CHECK(logged.log->usage().restorableBatches == 1);
+  CHECK(f.hookCalls == 1);
+  restore::RestoreService restores(*f.engine, *f.edits);
+  restores.attachScene(f.sceneId, *f.identity);
+  auto restored = restores.submitLocal({f.sceneId, *activity->batchRef});
+  REQUIRE(restored.code == Outcome::OK);
+  while (f.integration.service()) {
+  }
+  REQUIRE(restores.resultLocal(restored.ref)->committed);
+  CHECK(logged.log->eligibility(*activity->batchRef)
+      == activity::Eligibility::RESTORED);
+  CHECK(logged.log->usage().restorableBatches == 0);
+  CHECK(node->value().getTransform() == vsr::core::math::IDENTITY_MAT4);
+}
 
 TEST_CASE("Mixed restoration payloads count against the shared activity budget",
     "[integration][mixed-edit]")

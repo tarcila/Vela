@@ -68,6 +68,56 @@ inline std::string filterSchemaProps(const inspection::PageLimits &limits)
       "\"parent_handle\":{\"type\":\"string\",\"pattern\":\"^[0-9a-f]{32}$\"}";
 }
 
+inline inspection::RequestDiagnostics argTypes(
+    const json::Value &args, bool inspect)
+{
+  using F = inspection::DiagnosticField;
+  using R = inspection::DiagnosticReason;
+  inspection::RequestDiagnostics errors;
+  if (!args.isObject()) {
+    errors.add(F::ARGUMENTS, R::TYPE);
+    return errors;
+  }
+  const auto idReason = [&](const char *key) {
+    const auto *v = args.get(key);
+    return !v ? R::REQUIRED : !v->isNumber() ? R::TYPE : R::RANGE;
+  };
+  if (!requestIdArg(args.get("request_id")))
+    errors.add(F::REQUEST_ID, idReason("request_id"));
+  if (inspect && !targetIdArg(args, "scene_id"))
+    errors.add(F::SCENE_ID, idReason("scene_id"));
+  std::optional<std::int64_t> size;
+  if (!optionalIntArg(args, "page_size", size))
+    errors.add(F::PAGE_SIZE, R::TYPE);
+  const F strings[] = {F::CURSOR,
+      F::KIND,
+      F::NAME,
+      F::NAME_CONTAINS,
+      F::HANDLE,
+      F::OBJECT_TYPE,
+      F::OBJECT_SUBTYPE,
+      F::NODE_KIND,
+      F::LAYER_HANDLE,
+      F::PARENT_HANDLE};
+  for (const auto field : strings) {
+    if (!inspect && field != F::CURSOR)
+      continue; // legacy discovery ignores unknown properties
+    const auto *value = args.get(inspection::diagnosticName(field));
+    if (value && !value->isString())
+      errors.add(field, R::TYPE);
+  }
+  return errors;
+}
+
+inline ToolResult queryRejected(
+    inspection::RequestDiagnostics errors, const std::string &kind)
+{
+  auto result = rejected(Outcome::INVALID_REQUEST);
+  result.diagnostics = errors;
+  result.diagnosticKind = kind;
+  return result;
+}
+
 inline bool filterArgs(const json::Value &args, inspection::PageArgs &out)
 {
   if (const auto *kind = args.get("kind")) {
@@ -112,7 +162,9 @@ inline void addQueryTools(std::vector<Tool> &tools, QueryDeps deps)
   Tool discover;
   discover.name = "vsr_discover";
   discover.description =
-      "List readable exposed scenes and views with current capabilities."
+      "List readable exposed scenes and views with current capabilities, "
+      "bounded names, roles and current effective bindings. Roles are descriptive "
+      "and grant neither image access nor backend qualification."
       + paging;
   discover.inputSchemaJson =
       std::string("{\"type\":\"object\",\"properties\":{") + requestIdSchema()
@@ -121,11 +173,15 @@ inline void addQueryTools(std::vector<Tool> &tools, QueryDeps deps)
   discover.handler = [deps](const session::Credentials &c,
                          const json::Value &args) {
     inspection::PageArgs page;
-    if (!detail::pageArgs(args, page))
-      return rejected(Outcome::INVALID_REQUEST);
+    auto errors = detail::argTypes(args, false);
+    if (errors.count)
+      return detail::queryRejected(errors, page.kind);
+    detail::pageArgs(args, page);
     auto built = deps.inspector.makeDiscovery(c.sessionId, page);
     if (built.code != Outcome::OK)
-      return rejected(built.code);
+      return built.diagnostics.count
+          ? detail::queryRejected(built.diagnostics, page.kind)
+          : rejected(built.code);
     return submitAndAck(deps.engine, c, args, std::move(built.request));
   };
   tools.push_back(std::move(discover));
@@ -133,6 +189,26 @@ inline void addQueryTools(std::vector<Tool> &tools, QueryDeps deps)
   Tool inspect;
   inspect.name = "vsr_inspect";
   inspect.description =
+      "Minimal examples (IDs illustrative; use a discovered scene_id and fresh "
+      "request_id per operation): {\"request_id\":1,\"scene_id\":0,\"kind\":\"objects\"}; "
+      "{\"request_id\":2,\"scene_id\":0,\"kind\":\"layers\"}; "
+      "{\"request_id\":3,\"scene_id\":0,\"kind\":\"nodes\",\"name\":\"RootDelta\"}. "
+      "Omit unused filters; name=\"\" means the exact empty stored name, not no "
+      "filter. Empty name_contains matches all names; omitted/empty cursor starts "
+      "the first page. Filters intersect: handle plus name selects that same "
+      "node only, not its children; parent_handle selects direct children. "
+      "Use handles and node_edit_version/structural_version/ancestry_version "
+      "from fresh inspection, never zero/invented placeholders. Copy node edit "
+      "versions verbatim into version; world edits also require ancestry_version. "
+      "World position is the node origin (local [0,0,0] transformed by its world "
+      "matrix), not geometry centre or bounds centre. Transform inheritance "
+      "example, identity linear transforms: RootDelta local x=0 has child BodyTop "
+      "local x=1, so origins are 0 and 1. Moving only RootDelta by +2 in local x "
+      "moves both origins once to 2 and 3; BodyTop local x stays 1. Applying +2 "
+      "separately to both local positions puts BodyTop at world x=5 (double "
+      "movement). For two selected sibling roots, move those roots independently; "
+      "do not choose their unselected common parent or move unselected siblings. "
+      "These names are illustrative, not inferred assemblies. "
       "Page through scene objects/parameters (default) or layers with live "
       "root handles. Layer filters: exact stored name, exact layer handle, "
       "and literal case-sensitive name_contains intersect. Object/node-only "
@@ -162,13 +238,22 @@ inline void addQueryTools(std::vector<Tool> &tools, QueryDeps deps)
   inspect.handler = [deps](const session::Credentials &c,
                         const json::Value &args) {
     inspection::PageArgs page;
+    auto errors = detail::argTypes(args, true);
+    if (errors.count) {
+      const auto *kind = args.get("kind");
+      return detail::queryRejected(errors,
+          !kind                  ? page.kind
+              : kind->isString() ? kind->s
+                                 : "unknown");
+    }
     const auto scene = targetIdArg(args, "scene_id");
-    if (!scene || !detail::pageArgs(args, page)
-        || !detail::filterArgs(args, page))
-      return rejected(Outcome::INVALID_REQUEST);
+    detail::pageArgs(args, page);
+    detail::filterArgs(args, page);
     auto built = deps.inspector.makeInspection(c.sessionId, *scene, page);
     if (built.code != Outcome::OK)
-      return rejected(built.code);
+      return built.diagnostics.count
+          ? detail::queryRejected(built.diagnostics, page.kind)
+          : rejected(built.code);
     return submitAndAck(deps.engine, c, args, std::move(built.request));
   };
   tools.push_back(std::move(inspect));
@@ -215,13 +300,19 @@ inline void addQueryTools(std::vector<Tool> &tools, QueryDeps deps)
   Tool viewInfo;
   viewInfo.name = "vsr_view_info";
   viewInfo.description =
-      "Read the registered host's effective world-space camera, dimensions, "
-      "Device Identifier, renderer settings and Image Pipeline provenance at "
-      "a safe point. Perspective FOV is degrees; aspect comes from dimensions. "
-      "Capture remains unexposed/unqualified, with no supported quality units. "
-      "Fixed limits: axis 2048, pixels 2073600, quality maximum 1024, deadline "
-      "120 seconds, PNG 8 MiB, response 12 MiB, per-view/global capacity 1, "
-      "host/device budgets 256 MiB each. Metadata grants no capture authority.";
+      "Read the registered host's actual bound world-space camera/renderer, "
+      "Device Identifier/subtype, native and displayed dimensions/scale, "
+      "Image Pipeline and color settings at an owning-thread safe point. "
+      "Current effective configuration is not an image-producing receipt. "
+      "Perspective FOV is vertical degrees; unknown/incomplete fields carry reasons. "
+      "Interactive viewports and independent previews have distinct role/origin. "
+      "Metadata creates no render, readback, device fallback or camera mutation. "
+      "Capture remains unexposed/unqualified. Host-declared quality units "
+      "do not establish observed samples or a supported runtime quality contract. "
+      "Returned validated policy is authoritative; defaults: axis 2048, pixels "
+      "2073600, quality maximum 1024, deadline 120 seconds, PNG 8 MiB, response "
+      "12 MiB, per-view/global capacity 1, host/device budgets 256 MiB each. "
+      "Roles are descriptive and grant no capture authority.";
   viewInfo.inputSchemaJson =
       std::string("{\"type\":\"object\",\"properties\":{") + requestIdSchema()
       + ",\"view_id\":{\"type\":\"integer\",\"minimum\":0}},"

@@ -115,9 +115,11 @@ inline ToolResult statusResult(const operations::OperationRef &ref,
     const operations::Status &s,
     std::optional<bool> replayed = std::nullopt)
 {
+  if (s.code != Outcome::OK)
+    return rejected(s.code);
   std::string j = "{\"operation_ref\":" + operationRefJson(ref)
-      + ",\"kind\":" + json::quote(s.kind) + ",\"state\":"
-      + (s.terminal ? "\"terminal\"" : "\"pending\"");
+      + ",\"kind\":" + json::quote(s.kind)
+      + ",\"state\":" + (s.terminal ? "\"terminal\"" : "\"pending\"");
   if (s.progress)
     j += ",\"progress\":" + json::quote(operations::progressName(*s.progress));
   if (s.terminal)
@@ -132,6 +134,9 @@ inline ToolResult statusResult(const operations::OperationRef &ref,
   j += "}";
 
   ToolResult r;
+  r.resourceLease = s.resourceLease;
+  if (s.resourceLease)
+    r.maxResponseBytes = 12582912;
   r.structuredJson = j;
   r.contentJson = "[{\"type\":\"text\",\"text\":" + json::quote(j) + "}]";
   r.isError = s.terminal && *s.terminal != Outcome::OK;

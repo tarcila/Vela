@@ -551,6 +551,11 @@ void Application::uiRenderEnd()
   // no-op
 }
 
+void Application::uiRenderBeforePresent()
+{
+  // no-op
+}
+
 void Application::uiFrameEnd()
 {
   // no-op
@@ -1232,7 +1237,10 @@ void Application::mainLoop()
     SDL_SetRenderDrawColorFloat(sdlRenderer, 0.1f, 0.1f, 0.1f, 1.f);
     SDL_RenderClear(sdlRenderer);
     ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), sdlRenderer);
-    SDL_RenderPresent(sdlRenderer);
+    uiRenderBeforePresent();
+    const bool submitted = SDL_RenderPresent(sdlRenderer);
+    for (auto &window : m_impl->windows)
+      window->completePresentation(submitted);
     uiRenderEnd();
 
     m_impl->windowResized = false;

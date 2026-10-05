@@ -15,14 +15,51 @@ namespace vsr::integration::inspection::viewinfo {
 
 constexpr std::size_t MAX_BINDING_BYTES = 64u << 10;
 
+inline std::string jsonString(const std::string &value)
+{
+  constexpr char HEX[] = "0123456789abcdef";
+  std::string result = "\"";
+  for (unsigned char c : value) {
+    if (c == '"' || c == '\\') {
+      result += '\\';
+      result += char(c);
+    } else if (c < 32) {
+      result += "\\u00";
+      result += HEX[c >> 4];
+      result += HEX[c & 15];
+    } else
+      result += char(c);
+  }
+  return result + "\"";
+}
+
+inline const char *roleName(ViewRole role)
+{
+  switch (role) {
+  case ViewRole::GENERIC:
+    return "generic";
+  case ViewRole::HEADLESS:
+    return "headless";
+  case ViewRole::INTERACTIVE_VIEWPORT:
+    return "interactive_viewport";
+  case ViewRole::INDEPENDENT_AGENT:
+    return "independent_agent";
+  default:
+    return "unknown";
+  }
+}
+
+template <typename Quote>
+inline std::string identityJson(const ViewDescription &view, Quote quote)
+{
+  return "\"view_identity\":" + quote(view.identity) + ",\"name\":"
+      + quote(view.name) + ",\"role\":" + quote(roleName(view.role))
+      + ",\"origin\":" + quote(roleName(view.role));
+}
+
 inline std::string policyJson()
 {
-  return "{\"exposed\":false,\"reason\":\"unqualified_binding\","
-         "\"quality_units\":[],\"max_axis\":2048,\"max_pixels\":2073600,"
-         "\"max_quality_count\":1024,\"deadline_seconds\":120,"
-         "\"max_png_bytes\":8388608,\"max_response_bytes\":12582912,"
-         "\"per_view_capacity\":1,\"global_active_capacity\":1,"
-         "\"host_budget_bytes\":268435456,\"device_budget_bytes\":268435456}";
+  return capturePolicyJson(CapturePolicy{});
 }
 
 inline std::string number(double value)
@@ -59,7 +96,11 @@ inline const char *validate(const EffectiveViewBinding &binding)
     }
     return true;
   };
-  if (!text(binding.deviceIdentifier) || !text(binding.rendererSubtype)
+  if (!text(binding.displayCoordinateUnits) || !text(binding.deviceSubtype)
+      || !text(binding.outputColor) || !text(binding.rendererSettingsReason)
+      || !text(binding.pipelineSettingsReason)
+      || !text(binding.unavailableReason) || !text(binding.deviceIdentifier)
+      || !text(binding.rendererSubtype)
       || !text(binding.rendererConfigurationRevision)
       || !text(binding.pipelineSource)
       || !text(binding.pipelineConfigurationRevision)
@@ -67,6 +108,27 @@ inline const char *validate(const EffectiveViewBinding &binding)
       || !settings(binding.pipelineSettings)
       || !settings(binding.camera.projectionSettings))
     return "representation_unavailable";
+  if (!binding.unavailableReason.empty()) {
+    for (const auto *reason : {"device_transition",
+             "missing_bound_source",
+             "incomplete_camera_pose",
+             "incomplete_projection",
+             "unsupported_projection",
+             "inactive_viewport",
+             "unsupported_custom_frame_parameters"})
+      if (binding.unavailableReason == reason)
+        return reason;
+    return "incomplete_binding";
+  }
+  if (!std::isfinite(binding.displayWidth)
+      || !std::isfinite(binding.displayHeight) || binding.displayWidth < 0.
+      || binding.displayHeight < 0.
+      || !std::isfinite(binding.displayFramebufferScaleX)
+      || !std::isfinite(binding.displayFramebufferScaleY)
+      || binding.displayFramebufferScaleX < 0.
+      || binding.displayFramebufferScaleY < 0.
+      || !std::isfinite(binding.camera.aspect) || binding.camera.aspect < 0.)
+    return "incomplete_binding";
   if (!binding.width || !binding.height || binding.deviceIdentifier.empty()
       || binding.rendererSubtype.empty()
       || binding.rendererConfigurationRevision.empty()
@@ -100,7 +162,8 @@ inline const char *validate(const EffectiveViewBinding &binding)
 
 // `quote` is the existing inspection JSON string encoder.
 template <typename Quote>
-inline std::string bindingJson(const EffectiveViewBinding &binding, Quote quote)
+inline std::string bindingJson(
+    const EffectiveViewBinding &binding, Quote quote, bool rendered = false)
 {
   auto vector = [](const std::array<double, 3> &v) {
     return "[" + number(v[0]) + "," + number(v[1]) + "," + number(v[2]) + "]";
@@ -123,28 +186,93 @@ inline std::string bindingJson(const EffectiveViewBinding &binding, Quote quote)
     return result + "]";
   };
   const auto &camera = binding.camera;
-  std::string result =
-      "\"state\":\"available\",\"camera\":{\"coordinate_space\":\"world\","
-      "\"projection\":"
+  std::string result = "\"state\":\"available\",\"provenance_kind\":"
+      + quote(rendered ? "rendered" : "current_effective");
+  if (!rendered)
+    result +=
+        ",\"rendered_configuration\":{\"state\":\"unknown\",\"reason\":\"not_observed\"}";
+  result += ",\"camera\":{\"coordinate_space\":\"world\",\"projection\":"
       + quote(camera.projection) + ",\"position\":" + vector(camera.position)
       + ",\"direction\":" + vector(camera.direction)
       + ",\"up\":" + vector(camera.up)
-      + ",\"aspect\":" + number(double(binding.width) / binding.height);
+      + ",\"pose_convention\":\"position_eye_direction_forward_up_world\""
+      + ",\"fov_convention\":\"vertical_degrees\""
+      + ",\"additional_settings\":{\"state\":\"unknown\",\"reason\":\"not_fully_observed\"}"
+      + ",\"aspect\":"
+      + number(camera.aspect > 0. ? camera.aspect
+                                  : double(binding.width) / binding.height);
   if (camera.projection == "perspective")
     result += ",\"fovy_deg\":" + number(camera.fovyDegrees);
   result += ",\"projection_settings\":" + settings(camera.projectionSettings)
       + "},\"width\":" + std::to_string(binding.width)
       + ",\"height\":" + std::to_string(binding.height)
+      + ",\"dimensions_kind\":\"effective_native_buffer\",\"display\":"
+      + (binding.displayWidth > 0. && binding.displayHeight > 0.
+              ? "{\"width\":" + number(binding.displayWidth) + ",\"height\":"
+                  + number(binding.displayHeight) + ",\"scale_x\":"
+                  + number(binding.displayWidth / binding.width)
+                  + ",\"scale_y\":"
+                  + number(binding.displayHeight / binding.height)
+                  + ",\"coordinate_units\":"
+                  + (binding.displayCoordinateUnits.empty()
+                          ? "{\"state\":\"unknown\",\"reason\":\"not_observed\"}"
+                          : quote(binding.displayCoordinateUnits))
+                  + ",\"scale_convention\":\"display_units_per_native_pixel\""
+                  + ",\"framebuffer_scale\":"
+                  + (binding.displayFramebufferScaleX > 0.
+                              && binding.displayFramebufferScaleY > 0.
+                          ? "[" + number(binding.displayFramebufferScaleX) + ","
+                              + number(binding.displayFramebufferScaleY) + "]"
+                          : "{\"state\":\"unknown\",\"reason\":\"not_observed\"}")
+                  + "}"
+              : "{\"state\":\"unknown\",\"reason\":\"not_displayed\"}")
       + ",\"device_identifier\":" + quote(binding.deviceIdentifier)
+      + ",\"device_subtype\":"
+      + (binding.deviceSubtype.empty()
+              ? "{\"state\":\"unknown\",\"reason\":\"not_observed\"}"
+              : quote(binding.deviceSubtype))
       + ",\"renderer_subtype\":" + quote(binding.rendererSubtype)
       + ",\"renderer_settings\":" + settings(binding.rendererSettings)
+      + ",\"renderer_settings_state\":"
+      + quote(
+          binding.rendererSettingsReason.empty() ? "complete" : "incomplete")
+      + ",\"renderer_settings_reason\":" + quote(binding.rendererSettingsReason)
+      + ",\"renderer_quality\":{\"state\":\"unknown\",\"reason\":\"samples_not_observed\"}"
       + ",\"renderer_configuration_revision\":"
-      + quote(binding.rendererConfigurationRevision)
-      + ",\"pipeline_source\":" + quote(binding.pipelineSource)
-      + ",\"pipeline_settings\":" + settings(binding.pipelineSettings)
+      + quote(binding.rendererConfigurationRevision) + ",\"pipeline_source\":"
+      + quote(binding.pipelineSource) + ",\"pipeline_settings\":"
+      + settings(binding.pipelineSettings) + ",\"pipeline_settings_state\":"
+      + quote(
+          binding.pipelineSettingsReason.empty() ? "complete" : "incomplete")
+      + ",\"pipeline_settings_reason\":" + quote(binding.pipelineSettingsReason)
+      + ",\"output_color\":"
+      + (binding.outputColor.empty()
+              ? "{\"state\":\"unknown\",\"reason\":\"not_observed\"}"
+              : quote(binding.outputColor))
       + ",\"pipeline_configuration_revision\":"
       + quote(binding.pipelineConfigurationRevision)
       + ",\"device_private_state\":{\"state\":\"unknown\",\"reason\":\"not_observed\"}";
+  auto reference = [&](const char *name, const identity::ObjectHandle &handle) {
+    if (!handle.valid())
+      return;
+    auto hex = [](std::uint64_t value) {
+      char buffer[16];
+      const auto converted =
+          std::to_chars(buffer, buffer + sizeof(buffer), value, 16);
+      return std::string(16 - (converted.ptr - buffer), '0')
+          + std::string(buffer, converted.ptr);
+    };
+    result += std::string(",\"") + name
+        + "\":" + quote(hex(handle.domain) + hex(handle.serial));
+  };
+  reference("camera_handle", binding.cameraHandle);
+  reference("renderer_handle", binding.rendererHandle);
+  if (!binding.cameraHandle.valid())
+    result +=
+        ",\"camera_reference\":{\"state\":\"unknown\",\"reason\":\"host_private_camera\"}";
+  if (!binding.rendererHandle.valid())
+    result +=
+        ",\"renderer_reference\":{\"state\":\"unknown\",\"reason\":\"host_private_renderer\"}";
   return result;
 }
 

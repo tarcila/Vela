@@ -121,6 +121,29 @@ static std::vector<std::string> parseDeviceList()
   return libList;
 }
 
+std::string defaultDeviceIdentifier(
+    const char *vsrAnariLibraries, const char *anariLibrary)
+{
+  std::string first;
+  if (vsrAnariLibraries) {
+    const std::string list = vsrAnariLibraries;
+    const auto begin = list.find_first_not_of(',');
+    if (begin != list.npos)
+      first = list.substr(begin, list.find(',', begin) - begin);
+  }
+  if (!first.empty() && first != "environment")
+    return first;
+  if (anariLibrary && *anariLibrary)
+    return anariLibrary;
+  return FALLBACK_DEVICE_IDENTIFIER;
+}
+
+std::string defaultDeviceIdentifier()
+{
+  return defaultDeviceIdentifier(
+      getenv("VSR_ANARI_LIBRARIES"), getenv("ANARI_LIBRARY"));
+}
+
 // ANARIDeviceManager definitions /////////////////////////////////////////////
 
 ANARIDeviceManager::ANARIDeviceManager(const bool *verboseFlag)

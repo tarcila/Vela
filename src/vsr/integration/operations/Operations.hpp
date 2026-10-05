@@ -146,6 +146,10 @@ struct StepContext
   bool abandoned{false};
   // Thread-safe; reschedules this operation after BACKEND_PENDING.
   std::function<void()> wake;
+  // Bounded backend preparation can stay asleep until a host event. This
+  // query lets its owner detect cancellation/deadline without polling status
+  // (or retaining client credentials), then wake once to release resources.
+  std::function<bool()> isAbandoned;
 
   // Restoration storage in the application-owned activity budget (spec §5).
   // Each forwards to the installed ActivitySink for this operation's record
@@ -190,6 +194,13 @@ struct Step
   // Session-wide work only: on COMPLETE, the targets the result lists; they
   // become the record's covered targets (spec §9).
   std::vector<Target> covered;
+  // Optional reservation for retained result ownership; follows the record
+  // through replay/expiry/eviction. No change to admission or result schemas.
+  std::shared_ptr<const void> resourceLease;
+  // Optional bounded-result copy reservation (no global result-store change).
+  // Called before copying visible payloads to a public Status, including
+  // replay.
+  std::function<std::shared_ptr<const void>()> reserveStatus;
 };
 
 using Executor = std::function<Step(StepContext &)>;
@@ -224,6 +235,7 @@ struct Status
   double cleanupElapsedSeconds{0.0};
   std::size_t heldSlots{0};
   bool backendFault{false};
+  std::shared_ptr<const void> resourceLease; // follows this public result copy
 };
 
 struct Admission
@@ -441,6 +453,8 @@ class OperationEngine
     bool backendFault{false};
     std::string result;
     std::optional<ActivitySink::Id> activityId;
+    std::shared_ptr<const void> resourceLease;
+    std::function<std::shared_ptr<const void>()> reserveStatus;
   };
 
   using Key = std::pair<std::string, std::uint64_t>;
@@ -472,7 +486,8 @@ class OperationEngine
   std::optional<SceneId> sceneFor(bool sessionWide, Target target) const;
   // m_mutex NOT held. False when the step could not be queued; queued-phase
   // work has then been finished BUSY and its slot released.
-  bool dispatch(const Key &key);
+  bool dispatch(
+      const Key &key, std::optional<SceneId> cleanupScene = std::nullopt);
   // Stand-in scene for session-wide steps when no scene is registered.
   // Servicing thread only.
   scene::Scene &placeholderScene();
@@ -896,8 +911,7 @@ inline Admission OperationEngine::submit(
   if (a.code != Outcome::OK)
     return a;
   if (ref.sessionId != credentials.sessionId || !validRequestId(ref.requestId)
-      || !request.executor
-      || !sceneFor(request.sessionWide, request.target)) {
+      || !request.executor || !sceneFor(request.sessionWide, request.target)) {
     a.code = Outcome::INVALID_REQUEST;
     return a;
   }
@@ -1058,13 +1072,21 @@ inline Status OperationEngine::describe(
     }
   }
   if (r.terminal && resultVisible) {
+    if (!r.result.empty() && r.reserveStatus) {
+      s.resourceLease = r.reserveStatus();
+      if (!s.resourceLease) {
+        s.code = Outcome::BUSY;
+        return s;
+      }
+    }
     s.resultVisible = true;
     s.result = r.result;
   }
   return s;
 }
 
-inline bool OperationEngine::dispatch(const Key &key)
+inline bool OperationEngine::dispatch(
+    const Key &key, std::optional<SceneId> cleanupScene)
 {
   std::optional<SceneId> scene;
   {
@@ -1073,6 +1095,11 @@ inline bool OperationEngine::dispatch(const Key &key)
     if (!r)
       return false;
     scene = sceneFor(r->sessionWide, r->target);
+    // A view may close while its backend owns preparation/encoding. A wake
+    // retains the original Scene safe-point route for cleanup only, never a
+    // replacement view. Normal queued work still requires a live target.
+    if (!scene && (r->awaitingCleanup || r->phase == Phase::BACKEND))
+      scene = cleanupScene;
     r->dispatched = true;
   }
   std::weak_ptr<bool> alive = m_alive;
@@ -1152,7 +1179,9 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
     auto *r = find(key);
     if (!r || (r->terminal && !r->awaitingCleanup))
       return;
-    if (!r->terminal && auth != Outcome::OK) {
+    if (!r->terminal && !r->committed && auth != Outcome::OK) {
+      // Authority gates mutation, not the already committed sync/cleanup step.
+      // Current read still gates every protected result at status retrieval.
       // Session ended or permission withdrawn before execution.
       cancelRecord(*r,
           auth == Outcome::FORBIDDEN ? Outcome::FORBIDDEN : Outcome::CANCELLED,
@@ -1174,7 +1203,8 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
   }
 
   std::weak_ptr<bool> alive = m_alive;
-  StepContext ctx{scene, abandoned, [this, alive, key] {
+  const auto cleanupScene = sceneFor(sessionWide, target);
+  StepContext ctx{scene, abandoned, [this, alive, key, cleanupScene] {
                     if (!alive.lock())
                       return;
                     bool resume = false;
@@ -1185,8 +1215,16 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
                           && (r->phase == Phase::BACKEND || r->awaitingCleanup);
                     }
                     if (resume)
-                      dispatch(key);
+                      dispatch(key, cleanupScene);
                   }};
+  ctx.isAbandoned = [this, alive, key] {
+    if (!alive.lock())
+      return true;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const auto *r = find(key);
+    return !r || r->terminal.has_value() || r->pendingCancel.has_value()
+        || (r->deadline > 0. && m_clock() >= r->deadline);
+  };
   // Serialized with notify() under the engine lock.
   auto withSink = [this, alive, key](auto &&fn) {
     if (!alive.lock())
@@ -1220,16 +1258,16 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
     std::lock_guard<std::mutex> lock(m_mutex);
     return !m_sink || m_sink->restorationRetained(launchId, batchId);
   };
-  ctx.markRestored = [this, alive](
-                         const std::string &launchId, const std::string &batchId) {
+  ctx.markRestored = [this, alive](const std::string &launchId,
+                         const std::string &batchId) {
     if (!alive.lock())
       return;
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_sink)
       m_sink->restorationRestored(launchId, batchId);
   };
-  ctx.markConflicting = [this, alive](
-                            const std::string &launchId, const std::string &batchId) {
+  ctx.markConflicting = [this, alive](const std::string &launchId,
+                            const std::string &batchId) {
     if (!alive.lock())
       return;
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -1286,6 +1324,8 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
       break;
     case Step::Status::COMPLETE:
       r->result = std::move(step.result);
+      r->resourceLease = std::move(step.resourceLease);
+      r->reserveStatus = std::move(step.reserveStatus);
       if (r->sessionWide)
         r->covered = std::move(step.covered);
       r->phase = Phase::RUNNING;

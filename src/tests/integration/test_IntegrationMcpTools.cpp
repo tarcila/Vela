@@ -13,17 +13,21 @@
 #include "catch.hpp"
 #include "vsr/integration/context/ContextAdapter.hpp"
 // vsr
+#include <SDL3/SDL.h>
 #include "vsr/integration/Integration.hpp"
 #include "vsr/integration/mcp/McpServer.hpp"
 #include "vsr/integration/mcp/tools/EditTools.hpp"
+#include "vsr/integration/mcp/tools/FrameTools.hpp"
 #include "vsr/integration/mcp/tools/LookupTools.hpp"
 #include "vsr/integration/mcp/tools/QueryTools.hpp"
 #include "vsr/integration/mcp/tools/RenderTools.hpp"
 #include "vsr/rendering/index/RenderIndexAllLayers.hpp"
+#include "vsr/rendering/pipeline/ImagePipeline.h"
 #include "vsr/scene/Scene.hpp"
 // anari
 #include <anari/anari_cpp.hpp>
 // std
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
@@ -53,9 +57,9 @@ struct TempDir
   std::string path;
   TempDir()
   {
-    char tmpl[] = "/tmp/vsr-mcp-tools-XXXXXX";
-    REQUIRE(::mkdtemp(tmpl) != nullptr);
-    path = tmpl;
+    const char *tmp = std::getenv("TMPDIR");
+    path = std::string(tmp ? tmp : "/tmp") + "/vsr-mcp-tools-XXXXXX";
+    REQUIRE(::mkdtemp(path.data()) != nullptr);
   }
   ~TempDir()
   {
@@ -208,6 +212,7 @@ struct Fixture
   std::unique_ptr<operations::OperationEngine> engine;
   std::unique_ptr<inspection::Inspector> inspector;
   std::unique_ptr<edit::EditService> edits;
+  std::unique_ptr<edit::TranslationService> translations;
   std::unique_ptr<restore::RestoreService> restores;
   bool hookOk{true};
   TempDir tmp;
@@ -216,7 +221,9 @@ struct Fixture
 
   explicit Fixture(inspection::PageLimits limits = {},
       bool editable = false,
-      bool nodeEdits = false)
+      bool nodeEdits = false,
+      bool preview = false,
+      double previewLifetime = 120.)
   {
     for (int i = 0; i < 5; i++)
       scene.createObject<vsr::scene::Material>("matte")->setParameter(
@@ -250,13 +257,23 @@ struct Fixture
     edits = std::make_unique<edit::EditService>(
         integration, *engine, authority->launchId());
     edits->attachScene(sceneId, *sceneIds);
+    if (preview) {
+      edit::PreviewLimits previewLimits;
+      previewLimits.lifetimeSeconds = previewLifetime;
+      translations = std::make_unique<edit::TranslationService>(
+          integration, *authority, *engine, *edits, previewLimits, [&] {
+            return now;
+          });
+      REQUIRE(translations->attachScene(sceneId, *sceneIds));
+    }
     restores = std::make_unique<restore::RestoreService>(*engine, *edits);
     restores->attachScene(sceneId, *sceneIds);
 
     mcp::Config cfg;
     mcp::tools::addQueryTools(cfg.tools, {*engine, *inspector});
     mcp::tools::addLookupTools(cfg.tools, *engine);
-    mcp::tools::addEditTools(cfg.tools, {ids, *edits, *restores});
+    mcp::tools::addEditTools(
+        cfg.tools, {ids, *edits, *restores, translations.get()});
     const auto st =
         mcp::McpServer::start(cfg, *authority, *engine, dir, server);
     if (!st.ok())
@@ -375,6 +392,10 @@ SCENARIO("MCP effective binding observation polls and replays over loopback",
   bool observed = false;
   f.integration.submit(f.sceneId, [&](vsr::scene::Scene &) {
     ViewRegistration v{"agent", f.sceneId, {true, true}};
+    v.role = ViewRole::INDEPENDENT_AGENT;
+    v.capturePolicy.maxAxis = 1024;
+    v.capturePolicy.maxPixels = 786432;
+    v.capturePolicy.qualityUnits = {"completed_frames"};
     v.observeBinding = [&] {
       REQUIRE(f.integration.inServiceCall());
       observed = true;
@@ -388,6 +409,8 @@ SCENARIO("MCP effective binding observation polls and replays over loopback",
   const auto listedTools = json::write(f.rpc("tools/list", "{}").json);
   CHECK(listedTools.find("vsr_view_info") != std::string::npos);
   CHECK(listedTools.find("vsr_capture\"") == std::string::npos);
+  CHECK(listedTools.find("Host-declared quality units") != std::string::npos);
+  CHECK(listedTools.find("Roles are descriptive") != std::string::npos);
   const std::string args =
       "{\"request_id\":1,\"view_id\":" + std::to_string(view) + "}";
   auto ack = f.tool(s, "vsr_view_info", args);
@@ -405,6 +428,11 @@ SCENARIO("MCP effective binding observation polls and replays over loopback",
   CHECK(result->get("device_private_state")->get("state")->s == "unknown");
   CHECK_FALSE(result->get("capture_policy")->get("exposed")->b);
   CHECK(result->get("view_id")->n == view);
+  CHECK(result->get("role")->s == "independent_agent");
+  CHECK(result->get("name")->s == "agent");
+  CHECK(result->get("capture_policy")->get("max_axis")->n == 1024);
+  CHECK(result->get("capture_policy")->get("quality_units")->a[0].s
+      == "completed_frames");
   CHECK(result->get("scene_id")->n == f.sceneId);
   CHECK(result->get("width")->n == 1280);
   CHECK(result->get("height")->n == 720);
@@ -448,6 +476,12 @@ SCENARIO("MCP effective binding observation polls and replays over loopback",
   REQUIRE(oversized.str("outcome") == "ok");
   CHECK(oversized.result()->get("reason")->s == "representation_unavailable");
   CHECK_FALSE(oversized.result()->get("camera"));
+  f.integration.submit(f.sceneId, [&](vsr::scene::Scene &) {
+    CapturePolicy policy;
+    policy.qualityUnits = {"samples", "completed_frames"};
+    CHECK(f.integration.updateCapturePolicy(view, policy));
+  });
+  f.drain();
   f.tool(s, "vsr_discover", "{\"request_id\":10}");
   f.drain();
   auto discovery = f.status(s, s.id, 10);
@@ -458,6 +492,15 @@ SCENARIO("MCP effective binding observation polls and replays over loopback",
       continue;
     CHECK(item.get("binding_observation")->s == "vsr_view_info");
     CHECK_FALSE(item.get("capture_policy")->get("exposed")->b);
+    if (item.get("id")->n == view) {
+      CHECK(item.get("role")->s == "independent_agent");
+      CHECK(item.get("capture_policy")->get("max_axis")->n == 2048);
+      CHECK(item.get("capture_policy")->get("quality_units")->a.size() == 2);
+      CHECK(item.get("capture_policy_revision")->s
+          != result->get("capture_policy_revision")->s);
+      CHECK(item.get("effective_binding")->get("reason")->s
+          == "representation_unavailable");
+    }
     advertised = true;
   }
   CHECK(advertised);
@@ -679,6 +722,214 @@ SCENARIO("MCP node queries expose row matrices and transform affordances",
   const auto &signedMatrix = items[4].get("local_matrix")->get("data")->a;
   CHECK(std::abs(signedMatrix[0].a[2].n - 4) < 1e-5);
   CHECK(std::abs(signedMatrix[2].a[0].n - 2) < 1e-5);
+}
+
+SCENARIO("MCP client sees omission and inheritance guidance",
+    "[integration][request-guidance]")
+{
+  Fixture f;
+  auto list = f.rpc("tools/list", "{}");
+  bool found = false;
+  for (const auto &tool : list.json.get("result")->get("tools")->a) {
+    if (tool.get("name")->s != "vsr_inspect")
+      continue;
+    found = true;
+    const auto &required = tool.get("inputSchema")->get("required")->a;
+    REQUIRE(required.size() == 2);
+    CHECK(required[0].s == "request_id");
+    CHECK(required[1].s == "scene_id");
+    const auto &description = tool.get("description")->s;
+    for (const char *text : {"Omit unused filters",
+             "name=\"\"",
+             "fresh inspection",
+             "RootDelta",
+             "BodyTop",
+             "sibling",
+             "node origin",
+             "not geometry",
+             "\"kind\":\"objects\"",
+             "\"kind\":\"layers\"",
+             "\"kind\":\"nodes\""})
+      CHECK(description.find(text) != std::string::npos);
+  }
+  CHECK(found);
+}
+
+SCENARIO("MCP inspection diagnostics preserve pre-admission identity",
+    "[integration][request-guidance]")
+{
+  Fixture f;
+  auto s = f.attach();
+  const auto scene = "\"scene_id\":" + std::to_string(f.sceneId);
+  auto bad = f.tool(s,
+      "vsr_inspect",
+      "{\"request_id\":1," + scene
+          + ",\"kind\":\"nodes\",\"object_type\":\"ANARI_SURFACE\"}");
+  REQUIRE(bad.errorCode() == "invalid_request");
+  const auto *data = bad.json.get("error")->get("data");
+  REQUIRE(data->get("details"));
+  const auto &details = data->get("details")->a;
+  REQUIRE(details.size() == 1);
+  CHECK(details[0].get("field")->s == "object_type");
+  CHECK(details[0].get("kind")->s == "nodes");
+  CHECK(details[0].get("reason")->s == "inapplicable_filter");
+  auto corrected = f.tool(
+      s, "vsr_inspect", "{\"request_id\":1," + scene + ",\"kind\":\"nodes\"}");
+  REQUIRE(corrected.errorCode().empty());
+  f.drain();
+  CHECK(f.status(s, s.id, 1).str("outcome") == "ok");
+}
+
+SCENARIO("MCP malformed cursor identifies only its argument",
+    "[integration][request-guidance]")
+{
+  Fixture f;
+  auto s = f.attach();
+  auto bad = f.tool(s,
+      "vsr_inspect",
+      "{\"request_id\":1,\"scene_id\":0,\"cursor\":\"private:credential@0x123\"}");
+  REQUIRE(bad.errorCode() == "invalid_request");
+  const auto *details = bad.json.get("error")->get("data")->get("details");
+  REQUIRE(details);
+  REQUIRE(details->a.size() == 1);
+  CHECK(details->a[0].get("field")->s == "cursor");
+  CHECK(details->a[0].get("reason")->s == "invalid_cursor");
+  CHECK(json::write(bad.json).find("private:credential") == std::string::npos);
+  CHECK(f.engine->highWater(s.id) == 0);
+}
+
+SCENARIO("MCP diagnostics bound known fields without echoing values",
+    "[integration][request-guidance]")
+{
+  Fixture f;
+  auto s = f.attach();
+  for (const char *field : {"kind",
+           "name",
+           "name_contains",
+           "handle",
+           "object_type",
+           "object_subtype",
+           "node_kind",
+           "layer_handle",
+           "parent_handle",
+           "cursor",
+           "page_size"}) {
+    auto bad = f.tool(s,
+        "vsr_inspect",
+        "{\"request_id\":1,\"scene_id\":0," + json::quote(field) + ":null}");
+    REQUIRE(bad.errorCode() == "invalid_request");
+    const auto *details = bad.json.get("error")->get("data")->get("details");
+    REQUIRE(details);
+    REQUIRE(details->a.size() == 1);
+    CHECK(details->a[0].get("field")->s == field);
+    CHECK(details->a[0].get("reason")->s == "invalid_type");
+    CHECK(details->a[0].get("kind")->s
+        == (std::string(field) == "kind" ? "unknown" : "objects"));
+  }
+  for (const char *field : {"request_id", "scene_id"}) {
+    const auto args = std::string(field) == "request_id"
+        ? "{\"request_id\":null,\"scene_id\":0}"
+        : "{\"request_id\":1,\"scene_id\":null}";
+    auto reply = f.tool(s, "vsr_inspect", args);
+    REQUIRE(reply.errorCode() == "invalid_request");
+    const auto &diagnostic =
+        reply.json.get("error")->get("data")->get("details")->a[0];
+    CHECK(diagnostic.get("field")->s == field);
+    CHECK(diagnostic.get("reason")->s == "invalid_type");
+  }
+  std::string bad =
+      "{\"request_id\":1,\"scene_id\":0,\"kind\":\"private-kind\",\"page_size\":0";
+  const auto secret = std::string("credential@0x123") + std::string(4097, 'x');
+  for (const char *field : {"name",
+           "name_contains",
+           "handle",
+           "object_type",
+           "object_subtype",
+           "node_kind",
+           "layer_handle",
+           "parent_handle"})
+    bad += "," + json::quote(field) + ":" + json::quote(secret);
+  auto reply = f.tool(s, "vsr_inspect", bad + "}");
+  REQUIRE(reply.errorCode() == "invalid_request");
+  const auto *details = reply.json.get("error")->get("data")->get("details");
+  REQUIRE(details);
+  CHECK(details->a.size() == 16);
+  CHECK(json::write(*details).size() <= 4096);
+  const auto wire = json::write(reply.json);
+  CHECK(wire.find("credential") == std::string::npos);
+  CHECK(wire.find("0x123") == std::string::npos);
+  CHECK(wire.find("private-kind") == std::string::npos);
+  CHECK(wire.find("hidden") == std::string::npos);
+  for (const auto &entry : details->a) {
+    CHECK(entry.get("kind")->s == "unknown");
+    CHECK(entry.o.size() == 3);
+  }
+  auto placeholder = f.tool(s,
+      "vsr_inspect",
+      "{\"request_id\":1,\"scene_id\":0,\"kind\":\"nodes\",\"handle\":\"00000000000000000000000000000000\"}");
+  REQUIRE(placeholder.errorCode() == "invalid_request");
+  CHECK(placeholder.json.get("error")
+            ->get("data")
+            ->get("details")
+            ->a[0]
+            .get("reason")
+            ->s
+      == "invalid_handle_kind");
+  auto unknown = f.tool(s,
+      "vsr_inspect",
+      "{\"request_id\":1,\"scene_id\":0,\"legacy_unknown\":\"kept-compatible\"}");
+  REQUIRE(unknown.errorCode().empty());
+  f.drain();
+  CHECK(f.status(s, s.id, 1).str("outcome") == "ok");
+}
+
+SCENARIO("MCP minimal filters preserve meaningful empty names",
+    "[integration][request-guidance]")
+{
+  Fixture f;
+  f.scene.getObject<vsr::scene::Material>(0)->setName("");
+  for (int i = 1; i <= 5; ++i)
+    f.scene.getObject<vsr::scene::Material>(i)->setName("named");
+  f.scene.defaultCamera()->setName("named-camera");
+  auto *layer = f.scene.defaultLayer();
+  layer->editableName() = "";
+  layer->root()->value().name() = "named-root";
+  layer->root()->insert_last_child(vsr::scene::LayerNodeData(layer, ""));
+  layer->root()->insert_last_child(vsr::scene::LayerNodeData(layer, "named"));
+  f.scene.signalLayerStructureChanged(layer);
+  auto s = f.attach();
+  std::uint64_t id = 0;
+  for (const char *kind : {"objects", "layers", "nodes"}) {
+    INFO("inspection kind: " << kind);
+    const auto args = "\"scene_id\":0,\"kind\":" + json::quote(kind);
+    auto minimal = f.tool(s,
+        "vsr_inspect",
+        "{\"request_id\":" + std::to_string(++id) + "," + args + "}");
+    REQUIRE(minimal.errorCode().empty());
+    f.drain();
+    auto all = f.status(s, s.id, id);
+    REQUIRE(all.str("outcome") == "ok");
+    const auto total = all.result()->get("items")->a.size();
+    REQUIRE(total > 0);
+    auto empty = f.tool(s,
+        "vsr_inspect",
+        "{\"request_id\":" + std::to_string(++id) + "," + args
+            + ",\"name\":\"\"}");
+    REQUIRE(empty.errorCode().empty());
+    f.drain();
+    auto exact = f.status(s, s.id, id);
+    REQUIRE(exact.str("outcome") == "ok");
+    REQUIRE(exact.result()->get("items")->a.size() == 1);
+    CHECK(
+        exact.result()->get("items")->a[0].get("name")->get("text")->s.empty());
+    auto contains = f.tool(s,
+        "vsr_inspect",
+        "{\"request_id\":" + std::to_string(++id) + "," + args
+            + ",\"name_contains\":\"\",\"cursor\":\"\"}");
+    REQUIRE(contains.errorCode().empty());
+    f.drain();
+    CHECK(f.status(s, s.id, id).result()->get("items")->a.size() == total);
+  }
 }
 
 SCENARIO("MCP node queries parse filters and expose placement records",
@@ -1257,6 +1508,45 @@ struct HelideBackend : render::RenderBackend
   int holdPolls{0};
   bool allowRelease{true};
   int begins{0};
+  // Device selection model: empty candidates opts out (the default).
+  std::vector<std::string> candidates;
+  std::string current{"helide"};
+  bool failSelect{false};
+
+  std::vector<std::string> deviceCandidates() const override
+  {
+    return candidates;
+  }
+  std::string deviceIdentifier() const override
+  {
+    return current;
+  }
+  bool selectDevice(const std::string &id) override
+  {
+    if (failSelect)
+      return false;
+    current = id;
+    return true;
+  }
+  // Camera control model: off by default, like device selection.
+  bool controllable{false};
+  int cameraSets{0};
+  std::array<double, 3> eye{0., 0., 0.};
+  double fovy{0.};
+  bool cameraControllable() const override
+  {
+    return controllable;
+  }
+  bool setCamera(const std::array<double, 3> &position,
+      const std::array<double, 3> &,
+      const std::array<double, 3> &,
+      double fovyDegrees) override
+  {
+    ++cameraSets;
+    eye = position;
+    fovy = fovyDegrees;
+    return true;
+  }
 
   bool begin(std::uint32_t w, std::uint32_t h) override
   {
@@ -1380,12 +1670,13 @@ struct RenderFixture
   activity::ActivityLog log;
   HelideBackend backend;
   std::unique_ptr<render::RenderService> renders;
+  std::unique_ptr<frame::FrameService> frames;
   std::unique_ptr<inspection::Inspector> inspector;
   TempDir tmp;
   descriptor::RuntimeDirectory dir;
   std::unique_ptr<mcp::McpServer> server;
 
-  RenderFixture()
+  RenderFixture(bool exposeFrameTools = false)
   {
     REQUIRE(helide.device != nullptr); // missing helide fails, never skips
     using namespace vsr::scene;
@@ -1457,6 +1748,11 @@ struct RenderFixture
     mcp::tools::addQueryTools(cfg.tools, {*engine, *inspector});
     mcp::tools::addLookupTools(cfg.tools, *engine);
     mcp::tools::addRenderTools(cfg.tools, {*renders, *sync, *engine});
+    if (exposeFrameTools) {
+      frames = std::make_unique<frame::FrameService>(
+          integration, *authority, *engine, [this] { return now; });
+      mcp::tools::addFrameTools(cfg.tools, {*frames, *engine});
+    }
     const auto st =
         mcp::McpServer::start(cfg, *authority, *engine, dir, server);
     if (!st.ok())
@@ -1466,6 +1762,7 @@ struct RenderFixture
   ~RenderFixture()
   {
     server.reset();
+    frames.reset();
     backend.allowRelease = true;
     backend.release();
     renders.reset();
@@ -1522,6 +1819,308 @@ struct RenderFixture
 };
 
 } // namespace
+
+SCENARIO(
+    "MCP presented CPU frames cross the real loopback protocol without legacy rendering",
+    "[integration][presented-frame][mcp]")
+{
+  RenderFixture f(true);
+  auto s = f.attach();
+  vsr::rendering::ImagePipeline pipeline(
+      4, 2, vsr::rendering::ImageStorage::HOST);
+  std::vector<std::uint8_t> naturalPixels;
+  struct HostCopyPass : vsr::rendering::ImageSource
+  {
+    std::vector<std::uint8_t> *pixels{};
+    void render(vsr::rendering::ImageBuffers &b) override
+    {
+      std::memcpy(b.color, pixels->data(), pixels->size());
+    }
+  };
+  auto *copy = pipeline.setSource<HostCopyPass>();
+  copy->pixels = &naturalPixels;
+  identity::ViewRevisionTracker tracker(f.ids, *f.identity);
+  ViewId cpu = INVALID_VIEW_ID;
+  REQUIRE(f.integration.submit(f.sceneId, [&](vsr::scene::Scene &) {
+    ViewRegistration registration;
+    registration.scene = f.sceneId;
+    registration.grants.read =
+        true; // render permission is intentionally absent
+    registration.role = ViewRole::HEADLESS;
+    registration.observeBinding = [&] {
+      EffectiveViewBinding b;
+      b.width = 4;
+      b.height = 2;
+      b.displayWidth = 8.;
+      b.displayHeight = 4.;
+      b.deviceIdentifier = "helide";
+      b.deviceSubtype = "default";
+      b.cameraHandle = f.identity->handleOf(f.camera.data());
+      b.camera.position = {0., 0., 5.};
+      b.camera.fovyDegrees = *f.camera->parameterValueAs<float>("fovy")
+          * (180. / 3.141592653589793);
+      b.rendererSubtype = "default";
+      b.rendererConfigurationRevision = "bound_backend_renderer_1";
+      b.rendererSettingsReason = "backend_defaults_not_observed";
+      b.pipelineSource = "CopyFromNaturalHelide";
+      b.pipelineConfigurationRevision = "1";
+      b.outputColor = "rgba8_srgb";
+      return std::optional<EffectiveViewBinding>(b);
+    };
+    cpu = *f.integration.registerView(std::move(registration));
+    REQUIRE(f.frames->attachView(cpu, *f.identity, tracker));
+  }));
+  f.integration.service();
+  const auto args = [&](std::uint64_t id) {
+    return "{\"request_id\":" + std::to_string(id)
+        + ",\"view_id\":" + std::to_string(cpu) + "}";
+  };
+  CHECK(f.tool(s, "vsr_view_frame", "{\"request_id\":1}").errorCode()
+      == "invalid_request");
+  CHECK(f.engine->highWater(s.id) == 0);
+  REQUIRE(f.tool(s, "vsr_view_frame", args(1)).str("kind") == "view_frame");
+  f.integration.service();
+  auto closed = f.tool(
+      s, "vsr_view_frame_image", "{\"operation_ref\":" + ref(s.id, 1) + "}");
+  REQUIRE(closed.result());
+  CHECK(closed.result()->get("reason")->s == "unexposed_source");
+  CHECK_FALSE(imageItem(closed));
+  REQUIRE(f.frames->setExposed(cpu, true));
+  auto ack = f.tool(s, "vsr_view_frame", args(2));
+  CHECK(ack.str("state") == "pending");
+  f.integration.service();
+  auto preparing = f.tool(
+      s, "vsr_view_frame_image", "{\"operation_ref\":" + ref(s.id, 2) + "}");
+  CHECK(preparing.str("state") == "pending");
+  CHECK_FALSE(imageItem(preparing));
+  CHECK_FALSE(preparing.result());
+  REQUIRE(f.integration.submit(f.sceneId, [&](vsr::scene::Scene &) {
+    auto proof =
+        f.frames->beginProduction(cpu, pipeline, image::RowOrigin::BOTTOM_LEFT);
+    REQUIRE(f.backend.begin(4, 2)); // host's natural producer, not an MCP fetch
+    anari::wait(f.helide.device, f.backend.frame);
+    auto source = f.backend.image();
+    naturalPixels.resize(4 * 2 * 4);
+    std::memcpy(naturalPixels.data(), source.pixels, naturalPixels.size());
+    REQUIRE(f.backend.release());
+    pipeline.render();
+    REQUIRE(f.frames->present(cpu,
+        pipeline,
+        std::move(proof),
+        [](const std::uint32_t *p, std::uint32_t w, std::uint32_t h) {
+          auto *surface =
+              SDL_CreateSurface(w * 2, h * 2, SDL_PIXELFORMAT_RGBA32);
+          REQUIRE(surface);
+          auto *renderer = SDL_CreateSoftwareRenderer(surface);
+          REQUIRE(renderer);
+          auto *texture = SDL_CreateTexture(renderer,
+              SDL_PIXELFORMAT_RGBA32,
+              SDL_TEXTUREACCESS_STREAMING,
+              w,
+              h);
+          REQUIRE(texture);
+          REQUIRE(SDL_UpdateTexture(texture, nullptr, p, w * 4));
+          REQUIRE(SDL_RenderTextureRotated(renderer,
+              texture,
+              nullptr,
+              nullptr,
+              0.,
+              nullptr,
+              SDL_FLIP_VERTICAL));
+          const bool accepted = SDL_RenderPresent(renderer);
+          SDL_DestroyTexture(texture);
+          SDL_DestroyRenderer(renderer);
+          SDL_DestroySurface(surface);
+          return accepted;
+        }));
+  }));
+  f.integration.service();
+  const auto starts = f.renders->backendStarts();
+  CHECK(f.engine->highWater(s.id) == 2); // no second frame request
+  Reply done;
+  for (int i = 0; i < 2000; ++i) {
+    REQUIRE(f.integration.submit(
+        f.sceneId, [&](vsr::scene::Scene &) { f.frames->pump(); }));
+    f.integration.service();
+    done = f.tool(
+        s, "vsr_view_frame_image", "{\"operation_ref\":" + ref(s.id, 2) + "}");
+    if (done.str("state") == "terminal")
+      break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  REQUIRE(done.str("outcome") == "ok");
+  REQUIRE(imageItem(done));
+  CHECK(done.result()->get("image_kind")->s == "presented_frame");
+  CHECK(
+      done.result()->get("rendered_configuration")->get("device_identifier")->s
+      == "helide");
+  const auto png = unbase64(imageItem(done)->get("data")->s);
+  CHECK(be32(png, 16) == 4);
+  CHECK(be32(png, 20) == 2);
+  auto replay = f.tool(s, "vsr_view_frame", args(2));
+  CHECK(replay.flag("replayed"));
+  CHECK(replay.result()->get("frame_identity")->s
+      == done.result()->get("frame_identity")->s);
+  CHECK_FALSE(imageItem(f.tool(
+      s, "vsr_render_image", "{\"operation_ref\":" + ref(s.id, 2) + "}")));
+  CHECK(f.renders->backendStarts() == starts);
+  f.authority->restrict(
+      session::Target::scene(f.sceneId), session::Capability::READ);
+  const auto withdrawn = f.tool(
+      s, "vsr_view_frame_image", "{\"operation_ref\":" + ref(s.id, 2) + "}");
+  CHECK_FALSE(imageItem(withdrawn));
+  CHECK_FALSE(withdrawn.result());
+  REQUIRE(f.integration.submit(f.sceneId,
+      [&](vsr::scene::Scene &) { f.integration.unregisterView(cpu); }));
+  f.integration.service();
+}
+
+SCENARIO(
+    "MCP vsr_select_device overrides a view's render device", "[integration]")
+{
+  RenderFixture f;
+  auto s = f.attach();
+  auto args = [&](std::uint64_t id, const std::string &device) {
+    return "{\"request_id\":" + std::to_string(id)
+        + ",\"view_id\":" + std::to_string(f.viewId)
+        + (device.empty() ? std::string()
+                          : ",\"device_identifier\":\"" + device + "\"")
+        + "}";
+  };
+
+  // A backend without selection rejects every request before admission.
+  CHECK(f.tool(s, "vsr_select_device", args(1, "visrtx")).errorCode()
+      == "invalid_request");
+  CHECK(f.engine->highWater(s.id) == 0);
+
+  f.backend.candidates = {"barney", "visrtx", "helide"};
+
+  // Unlisted identifiers and an empty identifier reject before admission.
+  CHECK(f.tool(s, "vsr_select_device", args(1, "ospray")).errorCode()
+      == "invalid_request");
+  CHECK(f.tool(s,
+             "vsr_select_device",
+             "{\"request_id\":1,\"view_id\":" + std::to_string(f.viewId)
+                 + ",\"device_identifier\":\"\"}")
+            .errorCode()
+      == "invalid_request");
+  CHECK(f.engine->highWater(s.id) == 0);
+
+  // Omitting the identifier only reports; the view revision is unchanged.
+  const auto before = token(f.tracker->revision());
+  f.tool(s, "vsr_select_device", args(1, ""));
+  auto query = f.run(s, "vsr_operation_status", 1);
+  REQUIRE(query.str("outcome") == "ok");
+  CHECK_FALSE(query.result()->get("applied")->b);
+  CHECK(query.result()->get("device_identifier")->s == "helide");
+  CHECK(query.result()->get("candidates")->a.size() == 3);
+  CHECK(token(f.tracker->revision()) == before);
+
+  // A switch commits, advances the view revision and supersedes renders
+  // pinned to the old one.
+  const std::string stale = f.renderArgs(4);
+  f.tool(s, "vsr_select_device", args(2, "visrtx"));
+  auto sw = f.run(s, "vsr_operation_status", 2);
+  REQUIRE(sw.str("outcome") == "ok");
+  CHECK(sw.flag("committed"));
+  CHECK(sw.result()->get("applied")->b);
+  CHECK(sw.result()->get("device_identifier")->s == "visrtx");
+  CHECK(sw.result()->get("previous_device_identifier")->s == "helide");
+  CHECK(f.backend.current == "visrtx");
+  CHECK(token(f.tracker->revision()) != before);
+  f.tool(s, "vsr_render", stale);
+  CHECK(f.run(s, "vsr_operation_status", 4).str("outcome") == "superseded");
+  f.tool(s, "vsr_render", f.renderArgs(5));
+  CHECK(f.run(s, "vsr_render_image", 5).str("outcome") == "ok");
+
+  // A failed switch is ok with applied:false and keeps the device/revision.
+  f.backend.failSelect = true;
+  const auto kept = token(f.tracker->revision());
+  f.tool(s, "vsr_select_device", args(6, "barney"));
+  auto failed = f.run(s, "vsr_operation_status", 6);
+  REQUIRE(failed.str("outcome") == "ok");
+  CHECK_FALSE(failed.flag("committed"));
+  CHECK_FALSE(failed.result()->get("applied")->b);
+  CHECK(failed.result()->get("device_identifier")->s == "visrtx");
+  CHECK(token(f.tracker->revision()) == kept);
+  f.backend.failSelect = false;
+
+  // A view whose backend resources are held rejects busy.
+  f.backend.holdPolls = 1000000;
+  f.backend.allowRelease = false;
+  f.tool(s, "vsr_render", f.renderArgs(7));
+  for (int i = 0; i < 1000 && f.backend.begins < 2; ++i)
+    f.integration.service();
+  REQUIRE(f.backend.begins == 2);
+  CHECK(
+      f.tool(s, "vsr_select_device", args(8, "barney")).errorCode() == "busy");
+  f.backend.allowRelease = true;
+  f.backend.holdPolls = 0;
+  CHECK(f.run(s, "vsr_operation_status", 7).str("outcome") == "ok");
+}
+
+SCENARIO("MCP vsr_set_view_camera poses an independent view's own camera",
+    "[integration]")
+{
+  RenderFixture f;
+  auto s = f.attach();
+  auto args = [&](std::uint64_t id, const std::string &pose) {
+    return "{\"request_id\":" + std::to_string(id)
+        + ",\"view_id\":" + std::to_string(f.viewId) + "," + pose + "}";
+  };
+  const std::string good =
+      "\"position\":[1,2,3],\"direction\":[0,0,-1],\"up\":[0,1,0]";
+
+  // A backend without camera control rejects before admission.
+  CHECK(f.tool(s, "vsr_set_view_camera", args(1, good)).errorCode()
+      == "invalid_request");
+  f.backend.controllable = true;
+
+  // Malformed poses reject before admission: wrong arity, zero or parallel
+  // vectors, out-of-range fovy.
+  for (const auto *bad :
+      {"\"position\":[1,2],\"direction\":[0,0,-1],\"up\":[0,1,0]",
+          "\"position\":[1,2,3],\"direction\":[0,0,0],\"up\":[0,1,0]",
+          "\"position\":[1,2,3],\"direction\":[0,2,0],\"up\":[0,1,0]",
+          "\"position\":[1,2,3],\"direction\":[0,0,-1],\"up\":[0,1,0],"
+          "\"fovy_deg\":180",
+          "\"position\":[1,2,3],\"direction\":[0,0,-1]"})
+    CHECK(f.tool(s, "vsr_set_view_camera", args(1, bad)).errorCode()
+        == "invalid_request");
+  CHECK(f.engine->highWater(s.id) == 0);
+  CHECK(f.backend.cameraSets == 0);
+
+  // A valid pose commits, advances the view revision and supersedes renders
+  // pinned to the old one.
+  const auto before = token(f.tracker->revision());
+  const std::string stale = f.renderArgs(2);
+  f.tool(s, "vsr_set_view_camera", args(1, good + ",\"fovy_deg\":30"));
+  auto done = f.run(s, "vsr_operation_status", 1);
+  REQUIRE(done.str("outcome") == "ok");
+  CHECK(done.flag("committed"));
+  CHECK(done.result()->get("applied")->b);
+  CHECK(done.result()->get("view_revision")->s == token(f.tracker->revision()));
+  CHECK(token(f.tracker->revision()) != before);
+  CHECK(f.backend.cameraSets == 1);
+  CHECK(f.backend.eye == std::array<double, 3>{1., 2., 3.});
+  CHECK(f.backend.fovy == 30.);
+  f.tool(s, "vsr_render", stale);
+  CHECK(f.run(s, "vsr_operation_status", 2).str("outcome") == "superseded");
+  f.tool(s, "vsr_render", f.renderArgs(3));
+  CHECK(f.run(s, "vsr_render_image", 3).str("outcome") == "ok");
+
+  // A view whose backend resources are held rejects busy.
+  f.backend.holdPolls = 1000000;
+  f.backend.allowRelease = false;
+  f.tool(s, "vsr_render", f.renderArgs(4));
+  for (int i = 0; i < 1000 && f.backend.begins < 2; ++i)
+    f.integration.service();
+  REQUIRE(f.backend.begins == 2);
+  CHECK(f.tool(s, "vsr_set_view_camera", args(5, good)).errorCode() == "busy");
+  f.backend.allowRelease = true;
+  f.backend.holdPolls = 0;
+  CHECK(f.run(s, "vsr_operation_status", 4).str("outcome") == "ok");
+}
 
 SCENARIO("MCP render returns PNG image content at view-owned dimensions",
     "[integration]")
@@ -1698,6 +2297,233 @@ SCENARIO("MCP render maps sync_required and busy; resynchronize recovers",
             .errorCode()
       == "forbidden");
   CHECK(f.engine->highWater(s.id) == hw);
+}
+
+SCENARIO("MCP transported translation preview exposes exact nonmutating plans",
+    "[integration][translation-preview][translation-mcp]")
+{
+  Fixture f({}, true, true, true, 2.);
+  auto *layer = f.scene.defaultLayer();
+  auto parent = layer->root()->insert_last_child(vsr::scene::LayerNodeData(
+      layer, vsr::core::math::IDENTITY_MAT4, "wire-preview-parent"));
+  auto local = vsr::core::math::IDENTITY_MAT4;
+  local[3].x = 1;
+  auto child = parent->insert_last_child(
+      vsr::scene::LayerNodeData(layer, local, "wire-preview-child"));
+  auto s = f.attach();
+  auto tools = f.rpc("tools/list", "{}", &s);
+  REQUIRE(tools.json.get("result"));
+  bool found = false;
+  for (const auto &tool : tools.json.get("result")->get("tools")->a) {
+    if (tool.get("name")->s != "vsr_translate_preview")
+      continue;
+    found = true;
+    CHECK(tool.get("description")->s.find("global plans=32")
+        != std::string::npos);
+    CHECK(
+        tool.get("description")->s.find("NOT enumerated") != std::string::npos);
+    CHECK(tool.get("inputSchema")->get("required")->a.size() == 4);
+    CHECK(tool.get("inputSchema")
+              ->get("properties")
+              ->get("selection")
+              ->get("maxItems")
+              ->n
+        == 64);
+  }
+  REQUIRE(found);
+  const auto scene = "\"scene_id\":" + std::to_string(f.sceneId);
+  REQUIRE(
+      f.tool(s,
+           "vsr_inspect",
+           "{\"request_id\":1," + scene + ",\"kind\":\"nodes\"}")
+          .errorCode()
+          .empty());
+  f.drain();
+  auto observed = f.status(s, s.id, 1);
+  REQUIRE(observed.str("outcome") == "ok");
+  std::string selection;
+  for (const auto &item : observed.result()->get("items")->a) {
+    if (item.get("name")->get("text")->s != "wire-preview-parent"
+        && item.get("name")->get("text")->s != "wire-preview-child")
+      continue;
+    if (!selection.empty())
+      selection += ',';
+    selection += "{\"handle\":" + json::quote(item.get("handle")->s)
+        + ",\"node_edit_version\":"
+        + json::quote(item.get("node_edit_version")->s)
+        + ",\"structural_version\":"
+        + json::quote(item.get("structural_version")->s)
+        + ",\"ancestry_version\":"
+        + json::quote(item.get("ancestry_version")->s) + "}";
+  }
+  REQUIRE(!selection.empty());
+  const auto args = "{\"request_id\":2," + scene + ",\"selection\":["
+      + selection + "],\"world_delta\":[2,0,0]}";
+  CHECK(f.tool(s,
+             "vsr_translate_preview",
+             "{\"request_id\":2," + scene
+                 + ",\"selection\":[],\"world_delta\":[2,0,0]}")
+            .errorCode()
+      == "invalid_request");
+  CHECK(f.engine->highWater(s.id) == 1);
+  REQUIRE(f.tool(s, "vsr_translate_preview", args).errorCode().empty());
+  f.drain();
+  auto done = f.status(s, s.id, 2);
+  REQUIRE(done.str("outcome") == "ok");
+  REQUIRE(done.result()->get("roots")->a.size() == 1);
+  REQUIRE(done.result()->get("inherited_selected")->a.size() == 1);
+  CHECK(done.result()->get("roots")->a[0].get("predicted_world_origin")->a[0].n
+      == 2);
+  CHECK(done.result()
+            ->get("inherited_selected")
+            ->a[0]
+            .get("predicted_world_origin")
+            ->a[0]
+            .n
+      == 3);
+  CHECK_FALSE(done.result()->get("batch_ref"));
+  CHECK_FALSE(done.result()->get("restore_eligible"));
+  CHECK(parent->value().getTransform()[3].x == 0);
+  CHECK(child->value().getTransform()[3].x == 1);
+  CHECK(f.edits->restorations().size() == 0);
+  const operations::Credentials credentials{
+      f.authority->launchCredential(), s.id, s.secret};
+  const auto historical = f.engine->status(credentials, {s.id, 2}).result;
+  f.now += 3;
+  f.translations->pump();
+  CHECK(f.translations->retainedCount() == 0);
+  REQUIRE(f.tool(s, "vsr_translate_preview", args).errorCode().empty());
+  CHECK(f.translations->retainedCount()
+      == 0); // retry cannot revive an expired plan
+  CHECK(f.engine->status(credentials, {s.id, 2}).result == historical);
+  f.authority->restrict(
+      session::Target::scene(f.sceneId), session::Capability::READ);
+  auto hidden = f.status(s, s.id, 2);
+  CHECK_FALSE(hidden.result());
+}
+
+SCENARIO("MCP translation commits the retained plan once and restores",
+    "[integration][translation-commit][translation-mcp]")
+{
+  Fixture f({}, true, true, true);
+  auto *layer = f.scene.defaultLayer();
+  auto parent = layer->root()->insert_last_child(vsr::scene::LayerNodeData(
+      layer, vsr::core::math::IDENTITY_MAT4, "commit-parent"));
+  auto local = vsr::core::math::IDENTITY_MAT4;
+  local[3].x = 1;
+  auto child = parent->insert_last_child(
+      vsr::scene::LayerNodeData(layer, local, "commit-child"));
+  auto s = f.attach();
+  const auto scene = "\"scene_id\":" + std::to_string(f.sceneId);
+  REQUIRE(
+      f.tool(s,
+           "vsr_inspect",
+           "{\"request_id\":1," + scene + ",\"kind\":\"nodes\"}")
+          .errorCode()
+          .empty());
+  f.drain();
+  auto inspected = f.status(s, s.id, 1);
+  std::string selection;
+  for (const auto &item : inspected.result()->get("items")->a) {
+    if (item.get("name")->get("text")->s != "commit-parent"
+        && item.get("name")->get("text")->s != "commit-child")
+      continue;
+    if (!selection.empty())
+      selection += ',';
+    selection += "{\"handle\":" + json::quote(item.get("handle")->s)
+        + ",\"node_edit_version\":"
+        + json::quote(item.get("node_edit_version")->s)
+        + ",\"structural_version\":"
+        + json::quote(item.get("structural_version")->s)
+        + ",\"ancestry_version\":"
+        + json::quote(item.get("ancestry_version")->s) + "}";
+  }
+  REQUIRE(
+      f.tool(s,
+           "vsr_translate_preview",
+           "{\"request_id\":2," + scene + ",\"selection\":[" + selection
+               + "],\"world_delta\":[0.1,0,0]}")
+          .errorCode()
+          .empty());
+  f.drain();
+  auto preview = f.status(s, s.id, 2);
+  REQUIRE(preview.result());
+  const auto *pr = preview.result()->get("preview_ref");
+  const auto ref = json::write(*pr);
+  const auto args = "{\"request_id\":3,\"preview_ref\":" + ref + "}";
+  CHECK(
+      f.tool(s, "vsr_translate_commit", "{\"request_id\":3,\"preview_ref\":{}}")
+          .errorCode()
+      == "invalid_request");
+  CHECK(f.engine->highWater(s.id) == 2);
+  REQUIRE(f.tool(s, "vsr_translate_commit", args).errorCode().empty());
+  f.drain();
+  auto committed = f.status(s, s.id, 3);
+  REQUIRE(committed.str("outcome") == "ok");
+  REQUIRE(committed.result()->get("batch_ref"));
+  CHECK(parent->value().getTransform()[3].x == float(0.1));
+  CHECK(child->value().getTransform()[3].x == 1.f);
+  REQUIRE(f.tool(s, "vsr_translate_commit", args).errorCode().empty());
+  f.drain();
+  CHECK(parent->value().getTransform()[3].x == float(0.1));
+  CHECK(f.status(s, s.id, 3).result()->get("batch_ref")->get("batch_id")->s
+      == committed.result()->get("batch_ref")->get("batch_id")->s);
+  CHECK(f.tool(s,
+             "vsr_translate_commit",
+             "{\"request_id\":3,\"preview_ref\":{\"launch_id\":"
+                 + json::quote(pr->get("launch_id")->s)
+                 + ",\"preview_id\":\"00000000000000000000000000000000\","
+                 + scene + "}}")
+            .errorCode()
+      == "request_id_conflict");
+  REQUIRE(
+      f.tool(s,
+           "vsr_inspect",
+           "{\"request_id\":4," + scene
+               + ",\"kind\":\"nodes\",\"name\":\"commit-parent\"}")
+          .errorCode()
+          .empty());
+  f.drain();
+  auto reinspected = f.status(s, s.id, 4);
+  REQUIRE(reinspected.str("outcome") == "ok");
+  REQUIRE(reinspected.result()->get("items")->a.size() == 1);
+  CHECK(reinspected.result()
+            ->get("items")
+            ->a[0]
+            .get("local_matrix")
+            ->get("data")
+            ->a[0]
+            .a[3]
+            .n
+      == Approx(0.1));
+  REQUIRE(
+      f.tool(s,
+           "vsr_translate_commit",
+           "{\"request_id\":5,\"preview_ref\":" + ref + "}")
+          .errorCode()
+          .empty());
+  f.drain();
+  CHECK(f.status(s, s.id, 5).str("outcome") == "outcome_unavailable");
+  const auto *br = committed.result()->get("batch_ref");
+  const auto batch = "{\"launch_id\":" + json::quote(br->get("launch_id")->s)
+      + ",\"batch_id\":" + json::quote(br->get("batch_id")->s) + "}";
+  REQUIRE(
+      f.tool(s,
+           "vsr_restore",
+           "{\"request_id\":6," + scene + ",\"target_batch_ref\":" + batch
+               + "}")
+          .errorCode()
+          .empty());
+  f.drain();
+  CHECK(f.status(s, s.id, 6).str("outcome") == "ok");
+  CHECK(parent->value().getTransform()[3].x == 0.f);
+  CHECK(child->value().getTransform()[3].x == 1.f);
+  f.authority->restrict(
+      session::Target::scene(f.sceneId), session::Capability::READ);
+  auto hidden = f.status(s, s.id, 3);
+  CHECK_FALSE(hidden.result());
+  CHECK(hidden.str("outcome") == "ok");
+  CHECK(hidden.flag("committed"));
 }
 
 SCENARIO("MCP full matrix uses row arrays and structured rejection",

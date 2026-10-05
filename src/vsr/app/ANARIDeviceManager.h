@@ -44,6 +44,22 @@ struct DeviceIdentifier
 };
 
 /*
+ * The Device Identifier to use when nothing has been selected explicitly:
+ * the first VSR_ANARI_LIBRARIES entry; ANARI_LIBRARY when that variable is
+ * unset (or empty) or its first entry is "environment"; otherwise "helide".
+ * The overload takes the two variables' values (nullptr when unset).
+ *
+ * Example:
+ *   // VSR_ANARI_LIBRARIES=barney,visrtx -> "barney"
+ *   // VSR_ANARI_LIBRARIES unset, ANARI_LIBRARY=visrtx -> "visrtx"
+ *   auto id = defaultDeviceIdentifier();
+ */
+constexpr const char *FALLBACK_DEVICE_IDENTIFIER = "helide";
+std::string defaultDeviceIdentifier();
+std::string defaultDeviceIdentifier(
+    const char *vsrAnariLibraries, const char *anariLibrary);
+
+/*
  * Manages the lifecycle of ANARI devices and their associated RenderIndex
  * instances; loads libraries on demand and reference-counts one scene-owned
  * RenderIndex per ANARI device. Devices are named by Device Identifiers

@@ -137,6 +137,85 @@ std::optional<EffectiveViewBinding> Integration::observeViewBinding(
   return observer ? observer() : std::optional<EffectiveViewBinding>{};
 }
 
+std::optional<ViewDescription> Integration::viewDescription(ViewId id) const
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  if (id >= m_views.size() || m_views[id].removed)
+    return {};
+  const auto &v = m_views[id].registration;
+  const auto launch = m_viewIdentities.launch();
+  return ViewDescription{v.name,
+      v.role,
+      "v:" + std::to_string(launch.activation) + "."
+          + std::to_string(launch.nonce) + ":" + std::to_string(id)};
+}
+
+std::optional<CapturePolicyObservation> Integration::capturePolicy(
+    ViewId id) const
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  if (id >= m_views.size() || m_views[id].removed)
+    return {};
+  return CapturePolicyObservation{m_views[id].registration.capturePolicy,
+      m_views[id].policyRevision,
+      m_views[id].framesExposed,
+      m_views[id].frameHostBudgetBytes};
+}
+
+bool Integration::updateFrameSourceExposure(
+    ViewId id, bool exposed, std::uint64_t hostBudgetBytes)
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  if (id >= m_views.size() || m_views[id].removed || !hostBudgetBytes
+      || hostBudgetBytes
+          > m_views[id].registration.capturePolicy.hostBudgetBytes)
+    return false;
+  auto &view = m_views[id];
+  if (view.framesExposed != exposed
+      || view.frameHostBudgetBytes != hostBudgetBytes) {
+    if (view.policyRevision == std::numeric_limits<std::uint64_t>::max())
+      return false;
+    view.framesExposed = exposed;
+    view.frameHostBudgetBytes = hostBudgetBytes;
+    ++view.policyRevision;
+  }
+  return true;
+}
+
+bool Integration::updateCapturePolicy(ViewId id, const CapturePolicy &policy)
+{
+  if (!validCapturePolicy(policy))
+    return false;
+  std::lock_guard<std::mutex> lock(m_mutex);
+  if (id >= m_views.size() || m_views[id].removed
+      || (m_active && m_servicingThread != std::this_thread::get_id()))
+    return false;
+  auto &view = m_views[id];
+  if (capturePolicyJson(view.registration.capturePolicy)
+      != capturePolicyJson(policy)) {
+    if (view.policyRevision == std::numeric_limits<std::uint64_t>::max())
+      return false;
+    view.registration.capturePolicy = policy;
+    if (view.frameHostBudgetBytes > policy.hostBudgetBytes)
+      view.framesExposed = false;
+    ++view.policyRevision;
+  }
+  return true;
+}
+
+bool Integration::sceneSyncConfirmsView(ViewId id) const
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  return id < m_views.size() && !m_views[id].removed
+      && m_views[id].registration.sceneSyncConfirmsBinding;
+}
+
+std::size_t Integration::viewSlotCount() const
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  return m_views.size();
+}
+
 // Registration ///////////////////////////////////////////////////////////////
 
 std::optional<SceneId> Integration::registerScene(
@@ -152,7 +231,8 @@ std::optional<SceneId> Integration::registerScene(
 std::optional<ViewId> Integration::registerView(ViewRegistration registration)
 {
   std::lock_guard<std::mutex> lock(m_mutex);
-  if (registration.scene >= m_scenes.size())
+  if (registration.scene >= m_scenes.size() || registration.name.size() > 256
+      || !validCapturePolicy(registration.capturePolicy))
     return {};
   if (m_active) {
     // Post-activation: host scene work at a safe point only.

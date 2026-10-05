@@ -77,8 +77,10 @@ void buildFixture(vsr::scene::Scene &s,
 
   auto ground = s.createObject<Geometry>(tokens::geometry::triangle);
   auto verts = s.createArray(ANARI_FLOAT32_VEC3, 4);
-  const vsr::math::float3 v[4] = {
-      {-10.f, 0.f, -10.f}, {10.f, 0.f, -10.f}, {10.f, 0.f, 10.f}, {-10.f, 0.f, 10.f}};
+  const vsr::math::float3 v[4] = {{-10.f, 0.f, -10.f},
+      {10.f, 0.f, -10.f},
+      {10.f, 0.f, 10.f},
+      {-10.f, 0.f, 10.f}};
   verts->setData(v, 4);
   auto idx = s.createArray(ANARI_UINT32_VEC3, 2);
   const vsr::math::uint3 tri[2] = {{0, 1, 2}, {0, 2, 3}};
@@ -118,8 +120,7 @@ struct HelideBackend : RenderBackend
     ++begins;
     frame = anari::newObject<anari::Frame>(d);
     anari::setParameter(d, frame, "size", vsr::math::uint2(w, h));
-    anari::setParameter(
-        d, frame, "channel.color", ANARI_UFIXED8_RGBA_SRGB);
+    anari::setParameter(d, frame, "channel.color", ANARI_UFIXED8_RGBA_SRGB);
     anari::setParameter(d, frame, "world", index->world());
     anari::setParameter(d, frame, "renderer", renderer);
     auto cam = index->camera(cameraIndex);
@@ -179,8 +180,8 @@ Decoded decode(const std::vector<std::uint8_t> &png)
 {
   Decoded d;
   int ch = 0;
-  unsigned char *p = stbi_load_from_memory(
-      png.data(), int(png.size()), &d.w, &d.h, &ch, 4);
+  unsigned char *p =
+      stbi_load_from_memory(png.data(), int(png.size()), &d.w, &d.h, &ch, 4);
   REQUIRE(p != nullptr);
   d.rgba.assign(p, p + std::size_t(d.w) * d.h * 4);
   stbi_image_free(p);
@@ -320,6 +321,10 @@ TEST_CASE("A matching render returns a PNG of the view's exact size",
   auto st = f.run(1);
   REQUIRE(st.terminal == Outcome::OK);
   REQUIRE(f.engine->slotsInUse() == 0);
+  CHECK(st.result.find("\"image_kind\":\"independent_render\"")
+      != std::string::npos);
+  CHECK(st.result.find("\"role\":\"unknown\"") != std::string::npos);
+  CHECK(st.result.find("legacy_backend_not_attested") != std::string::npos);
 
   auto r = *f.renders->result(f.ref(1));
   REQUIRE(r.outcome == Outcome::OK);
@@ -333,7 +338,9 @@ TEST_CASE("A matching render returns a PNG of the view's exact size",
 
   // Tolerant content checks: the red sphere is near the image centre, the
   // green ground below it, and the top edge is the black background.
-  auto px = [&](int x, int y) { return &img.rgba[(std::size_t(y) * 64 + x) * 4]; };
+  auto px = [&](int x, int y) {
+    return &img.rgba[(std::size_t(y) * 64 + x) * 4];
+  };
   int red = 0, green = 0;
   for (int y = 0; y < 48; ++y)
     for (int x = 0; x < 64; ++x) {
@@ -379,8 +386,8 @@ TEST_CASE("A matching render returns a PNG of the view's exact size",
   }
 }
 
-TEST_CASE("Mismatched tokens supersede without rendering",
-    "[integration][render]")
+TEST_CASE(
+    "Mismatched tokens supersede without rendering", "[integration][render]")
 {
   Fixture f;
   auto req = f.current();
@@ -407,13 +414,13 @@ TEST_CASE("Mismatched tokens supersede without rendering",
   CHECK(f.renders->result(f.ref(1))->png.empty());
 }
 
-TEST_CASE("A relevant change mid-render prevents success",
-    "[integration][render]")
+TEST_CASE(
+    "A relevant change mid-render prevents success", "[integration][render]")
 {
   Fixture f;
   f.backend.holdPolls = 1;
-  REQUIRE(f.renders->submit(f.creds, f.ref(1), f.current()).code
-      == Outcome::OK);
+  REQUIRE(
+      f.renders->submit(f.creds, f.ref(1), f.current()).code == Outcome::OK);
   f.startRender(1);
   f.sphereMat->setParameter("color", vsr::math::float3(0.1f, 0.1f, 0.9f));
   auto st = f.run(1);
@@ -446,8 +453,8 @@ TEST_CASE("View-owned dimensions are validated before backend work",
 
   // No clamping: a valid 1x1 view renders exactly 1x1.
   f.renders->setDimensions(f.viewId, 1, 1);
-  REQUIRE(f.renders->submit(f.creds, f.ref(1), f.current()).code
-      == Outcome::OK);
+  REQUIRE(
+      f.renders->submit(f.creds, f.ref(1), f.current()).code == Outcome::OK);
   REQUIRE(f.run(1).terminal == Outcome::OK);
   auto img = decode(f.renders->result(f.ref(1))->png);
   CHECK(img.w == 1);
@@ -461,16 +468,16 @@ TEST_CASE("A scene that is not ready returns sync_required with no image",
   SECTION("at start")
   {
     f.states.markNeedsSync(f.sceneId);
-    REQUIRE(f.renders->submit(f.creds, f.ref(1), f.current()).code
-        == Outcome::OK);
+    REQUIRE(
+        f.renders->submit(f.creds, f.ref(1), f.current()).code == Outcome::OK);
     CHECK(f.run(1).terminal == Outcome::SYNC_REQUIRED);
     CHECK(f.backend.begins == 0);
   }
   SECTION("at completion")
   {
     f.backend.holdPolls = 1;
-    REQUIRE(f.renders->submit(f.creds, f.ref(1), f.current()).code
-        == Outcome::OK);
+    REQUIRE(
+        f.renders->submit(f.creds, f.ref(1), f.current()).code == Outcome::OK);
     f.startRender(1);
     f.states.markNeedsSync(f.sceneId);
     CHECK(f.run(1).terminal == Outcome::SYNC_REQUIRED);
@@ -479,19 +486,18 @@ TEST_CASE("A scene that is not ready returns sync_required with no image",
   CHECK(f.log.usage().imageBytes == 0);
 }
 
-TEST_CASE("The 30-second deadline runs from admission",
-    "[integration][render]")
+TEST_CASE("The 30-second deadline runs from admission", "[integration][render]")
 {
   Fixture f;
-  REQUIRE(f.renders->submit(f.creds, f.ref(1), f.current()).code
-      == Outcome::OK);
+  REQUIRE(
+      f.renders->submit(f.creds, f.ref(1), f.current()).code == Outcome::OK);
   f.now += 30.0; // queue wait consumes the deadline
   CHECK(f.run(1).terminal == Outcome::TIMEOUT);
   CHECK(f.backend.begins == 0); // expired queued work never starts
   CHECK(f.engine->slotsInUse() == 0);
 
-  REQUIRE(f.renders->submit(f.creds, f.ref(2), f.current()).code
-      == Outcome::OK);
+  REQUIRE(
+      f.renders->submit(f.creds, f.ref(2), f.current()).code == Outcome::OK);
   f.now += 29.0;
   CHECK(f.run(2).terminal == Outcome::OK);
 }
@@ -502,8 +508,8 @@ TEST_CASE("Cancelled or timed-out renders never succeed from a late image",
   Fixture f;
   f.backend.holdPolls = 3;
   f.backend.allowRelease = false;
-  REQUIRE(f.renders->submit(f.creds, f.ref(1), f.current()).code
-      == Outcome::OK);
+  REQUIRE(
+      f.renders->submit(f.creds, f.ref(1), f.current()).code == Outcome::OK);
   f.startRender(1);
 
   SECTION("cancelled")
@@ -545,8 +551,8 @@ TEST_CASE("Cancelled or timed-out renders never succeed from a late image",
   CHECK((!r || r->png.empty()));
   CHECK(f.log.usage().imageBytes == 0);
 
-  REQUIRE(f.renders->submit(f.creds, f.ref(3), f.current()).code
-      == Outcome::OK);
+  REQUIRE(
+      f.renders->submit(f.creds, f.ref(3), f.current()).code == Outcome::OK);
   CHECK(f.run(3).terminal == Outcome::OK);
 }
 
@@ -555,8 +561,8 @@ TEST_CASE("A success held by a delayed release re-checks the guards",
 {
   Fixture f;
   f.backend.allowRelease = false; // image produced, release refused
-  REQUIRE(f.renders->submit(f.creds, f.ref(1), f.current()).code
-      == Outcome::OK);
+  REQUIRE(
+      f.renders->submit(f.creds, f.ref(1), f.current()).code == Outcome::OK);
   for (int i = 0; i < 100000 && !f.backend.mapped; ++i) {
     f.integration.service();
     f.renders->pump();

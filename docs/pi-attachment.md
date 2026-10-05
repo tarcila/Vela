@@ -18,7 +18,9 @@ a result that was not observed.
   procedure below.
 - **VSR:** a build with `VSR_USE_INTEGRATION` and `VSR_USE_INTEGRATION_MCP`,
   which also builds `vsrMcpProxy` (see [tool documentation](../src/apps/tools/README.md)).
-  Rendering uses a real `helide` device. Install freshly built libraries before
+  Agent rendering uses a real device: `helide` on the headless host; on
+  vsrViewer the first `VSR_ANARI_LIBRARIES` entry, else `ANARI_LIBRARY`,
+  else `helide`, which an agent can change with `vsr_select_device`. Install freshly built libraries before
   testing, because an installed-library search path can override build-tree
   lookup. For example, after configuring those options:
 
@@ -53,7 +55,8 @@ Or open your own scene in the viewer:
 The **descriptor is a JSON connection file created by the application**, not
 something you write yourself. It contains the loopback endpoint and a private
 launch credential. The headless host prints its path; the viewer shows it in
-**Agent Activity**. On Linux it normally looks like:
+**Agent Activity** and logs it as `[vsrViewer] MCP descriptor: <path>` (grep
+the log for `MCP descriptor:`). On Linux it normally looks like:
 
 ```text
 /run/user/1000/vsr/vsr-mcp-0123456789abcdef0123456789abcdef.json

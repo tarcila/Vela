@@ -15,7 +15,7 @@ machine-readable field, and `message` strings are explanatory only.
   | `tools/QueryTools.hpp` | `vsr_discover`, `vsr_inspect` | 103 |
   | `tools/LookupTools.hpp` | `vsr_operation_status`, `vsr_cancel` | 103 |
   | `tools/EditTools.hpp` | `vsr_edit`, `vsr_restore` | 104 |
-  | `tools/RenderTools.hpp` | `vsr_render`, `vsr_render_image`, `vsr_resynchronize` | 105 |
+  | `tools/RenderTools.hpp` | `vsr_render`, `vsr_render_image`, `vsr_select_device`, `vsr_set_view_camera`, `vsr_resynchronize` | 105 |
 
 ## Payload placement
 
@@ -27,6 +27,21 @@ response is a JSON-RPC `error`:
 ```json
 {"error": {"code": -32000, "message": "<explanatory>", "data": {"code": "<frozen code>"}}}
 ```
+
+For `vsr_inspect` and `vsr_discover`, syntax rejection can additionally carry
+`error.data.details`: at most 16 `{field, kind, reason}` entries and at most
+4096 bytes of diagnostic JSON. Fields and reasons come from closed syntax
+vocabularies, and kind is `objects`, `layers`, `nodes`, or `unknown`. No values,
+Scene contents, addresses, or credentials are echoed. Reasons include
+`invalid_type`, `required`, `out_of_range`, `unsupported_value`,
+`inapplicable_filter`, `too_long`, `invalid_handle_syntax`,
+`invalid_handle_kind`, and `invalid_cursor`. Truncation may omit later errors;
+correct the listed fields and retry. Native `Inspector::Built::diagnostics`
+uses the same bounded validation vocabulary. Syntax failures precede admission
+and do not consume the request ID. Current authority and owning-thread checks
+still govern live/stale/foreign handle assessment; those outcomes are not
+converted into pre-admission identity diagnostics. Unknown legacy properties
+remain ignored, not diagnosed or newly rejected.
 
 `error.data.code` is the contract. `error.code` is `-32000`, the
 implementation-defined server-error range, for every semantic outcome. The
@@ -70,6 +85,30 @@ block on a safe point.
 | `vsr_inspect` | `request_id`, `scene_id`, `kind?`, `name?`, `name_contains?`, `handle?`, `object_type?`, `object_subtype?`, `node_kind?`, `layer_handle?`, `parent_handle?`, `page_size?`, `cursor?` | read on `scene_id` | one scene slot, one request ID |
 | `vsr_operation_status` | `operation_ref` | current proof; read on every covered target for payload or foreign records | control gate, no ID |
 | `vsr_cancel` | `operation_ref` (own session only) | current proof | control gate, no ID |
+
+Minimal requests use a fresh request ID and a Scene ID from discovery:
+
+```json
+{"request_id":1,"scene_id":0,"kind":"objects"}
+{"request_id":2,"scene_id":0,"kind":"layers"}
+{"request_id":3,"scene_id":0,"kind":"nodes","name":"RootDelta"}
+```
+
+These IDs/names are illustrative. Omit unused filters: `name: ""` matches
+an exact empty stored name, while `name_contains: ""` matches every name.
+Omitted or empty `cursor` starts the first page. Filters intersect; `handle`
+plus `name` targets that exact node, not traversal to its children.
+`parent_handle` selects direct children. Never invent zero/placeholder handles.
+
+World position means the transformed **node origin**, not a geometry/bounds
+centre. With identity linear transforms, parent `RootDelta` at local x=0 and
+child `BodyTop` at local x=1 have world origins 0 and 1. Moving only the parent
+by +2 makes the origins 2 and 3, leaving child local x=1. Applying +2 separately
+to both local positions instead puts the child at world x=5. Two selected
+sibling roots are moved independently, not by selecting their unselected
+common parent. These examples do not infer assemblies from names. Low-level
+edits still require fresh inspected versions and actual ancestry expectations.
+The same guidance is in the tool descriptions delivered to clients.
 
 Inspection defaults to `kind: "objects"`; `kind: "layers"` and `kind: "nodes"`
 are also supported. Object filters intersect. `name` and
@@ -388,6 +427,8 @@ the authenticated `VSR-Session-ID`.
 | `vsr_render` | `request_id`, `view_id`, `scene_revision`, `view_revision` | render + read on `view_id` | one scene slot, one request ID |
 | `vsr_render_image` | `operation_ref` | as `vsr_operation_status` | control gate, no ID |
 | `vsr_resynchronize` | `request_id`, `scene_id` | read + resynchronize on `scene_id` | one scene slot, one request ID |
+| `vsr_select_device` | `request_id`, `view_id`, optional `device_identifier` | render + read on `view_id` | one scene slot, one request ID |
+| `vsr_set_view_camera` | `request_id`, `view_id`, `position`, `direction`, `up`, optional `fovy_deg` | render + read on `view_id` | one scene slot, one request ID |
 
 - Revision tokens are strings `"<activation>.<nonce>.<domain>.<value>"`
   (decimal unsigned 64-bit fields), exactly as a successful render result
@@ -408,6 +449,28 @@ the authenticated `VSR-Session-ID`.
   `structuredContent.result` is `{width, height, scene_revision,
   view_revision, capture}`. `vsr_operation_status` returns the same status
   object without the image.
+- `vsr_select_device` overrides a render-capable view's device. The
+  identifier must be one of the candidates its backend lists; an unlisted or
+  empty identifier, or a backend that offers no selection, rejects
+  `invalid_request` before admission, and a view whose resources are held
+  rejects `busy`. Omitting `device_identifier` only reports. The result is
+  `{applied, device_identifier, previous_device_identifier, candidates}`. A
+  switch is committed and advances the view revision, so renders pinned to
+  the old one end `superseded`; a switch that fails is terminal `ok` with
+  `applied:false` and keeps the previous device. In vsrViewer the agent view
+  starts on the viewer's default device (first `VSR_ANARI_LIBRARIES` entry,
+  else `ANARI_LIBRARY`, else `helide`) and its candidates are the viewer's
+  device list.
+- `vsr_set_view_camera` poses the private camera of an independent view
+  (vsrViewer's agent view), never a scene camera or an interactive
+  viewport. `position`, `direction` (forward) and `up` are world-space
+  three-number arrays; direction/up need not be normalized but must be
+  non-zero and not parallel; `fovy_deg` (vertical) must lie in (0, 180) and
+  defaults to the current value. Malformed poses or a backend without camera
+  control reject `invalid_request` before admission; a held view rejects
+  `busy`. The result is `{applied, view_revision}`; the pose is committed and
+  supersedes renders pinned to the previous view revision. The pose then
+  replaces automatic bounds framing and survives `vsr_select_device`.
 - `vsr_resynchronize` reports its result as
   `{"ready": bool, "state": "ready"|"needs_sync"|"synchronizing"|"failed"}`.
   A recovery that ran is terminal `ok` even when it failed; failure is

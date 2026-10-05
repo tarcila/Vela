@@ -28,6 +28,14 @@ namespace vsr::integration::mcp::tools {
  * completed render whose image is still retained, one MCP image content item
  * (`image/png`, base64). The image is never a file path.
  *
+ * vsr_select_device: {request_id, view_id, device_identifier?}. Agent
+ * override of a view's render device among the backend's candidates (see
+ * RenderService::submitSelectDevice).
+ *
+ * vsr_set_view_camera: {request_id, view_id, position, direction, up,
+ * fovy_deg?}. Agent pose of an independent view's own camera (see
+ * RenderService::submitSetCamera).
+ *
  * vsr_resynchronize: {request_id, scene_id}. The terminal result is the
  * headless {"ready": bool, "state": "<sync state>"} (ticket 67).
  */
@@ -127,7 +135,10 @@ inline void addRenderTools(std::vector<Tool> &tools, RenderDeps deps)
   renderTool.name = "vsr_render";
   renderTool.description =
       "Render a view pinned to scene/view revision tokens at the view's own "
-      "dimensions; the image is returned by vsr_render_image.";
+      "dimensions; the image is returned by vsr_render_image. This legacy "
+      "independent render is not observation of a presented viewport frame. "
+      "The receipt preserves source role/origin and image-producing configuration "
+      "only when the backend explicitly attests it; otherwise it is unknown.";
   renderTool.inputSchemaJson =
       std::string("{\"type\":\"object\",\"properties\":{") + requestIdSchema()
       + ",\"view_id\":{\"type\":\"integer\",\"minimum\":0},"
@@ -182,6 +193,93 @@ inline void addRenderTools(std::vector<Tool> &tools, RenderDeps deps)
     return r;
   };
   tools.push_back(std::move(imageTool));
+
+  Tool selectTool;
+  selectTool.name = "vsr_select_device";
+  selectTool.description =
+      "Override the render device of a render-capable view. device_identifier "
+      "must be one of the view's host-listed candidates ([subtype@]library); "
+      "omit it to only report the current device and candidates. A switch "
+      "advances the view revision, so re-read it before vsr_render. The "
+      "terminal result is {applied, device_identifier, "
+      "previous_device_identifier, candidates}; a failed switch is ok with "
+      "applied:false and keeps the previous device.";
+  selectTool.inputSchemaJson =
+      std::string("{\"type\":\"object\",\"properties\":{") + requestIdSchema()
+      + ",\"view_id\":{\"type\":\"integer\",\"minimum\":0},"
+        "\"device_identifier\":{\"type\":\"string\",\"minLength\":1}},"
+        "\"required\":[\"request_id\",\"view_id\"]}";
+  selectTool.handler = [deps](const session::Credentials &c,
+                           const json::Value &args) {
+    const auto id = requestIdArg(args.get("request_id"));
+    const auto view = targetIdArg(args, "view_id");
+    std::string device;
+    if (!id || !view || !optionalStringArg(args, "device_identifier", device)
+        || (args.get("device_identifier") && device.empty()))
+      return rejected(Outcome::INVALID_REQUEST);
+    const operations::OperationRef ref{c.sessionId, *id};
+    const auto a = deps.renders.submitSelectDevice(c, ref, {*view, device});
+    if (a.code != Outcome::OK)
+      return rejected(a.code);
+    return statusResult(ref, a.status, a.replayed);
+  };
+  tools.push_back(std::move(selectTool));
+
+  Tool cameraTool;
+  cameraTool.name = "vsr_set_view_camera";
+  cameraTool.description =
+      "Pose the private camera of a render-capable independent view (not a "
+      "scene camera, not an interactive viewport): world-space position, "
+      "direction (forward) and up, with optional vertical fovy_deg in (0,180). "
+      "direction/up need not be normalized but must be non-zero and not "
+      "parallel. Advances the view revision, so re-read it (vsr_view_info) "
+      "before vsr_render. Views without camera control reject "
+      "invalid_request.";
+  const std::string vec3 =
+      "{\"type\":\"array\",\"items\":{\"type\":\"number\"},"
+      "\"minItems\":3,\"maxItems\":3}";
+  cameraTool.inputSchemaJson =
+      std::string("{\"type\":\"object\",\"properties\":{") + requestIdSchema()
+      + ",\"view_id\":{\"type\":\"integer\",\"minimum\":0},"
+        "\"position\":"
+      + vec3 + ",\"direction\":" + vec3 + ",\"up\":" + vec3
+      + ",\"fovy_deg\":{\"type\":\"number\",\"exclusiveMinimum\":0,"
+        "\"exclusiveMaximum\":180}},"
+        "\"required\":[\"request_id\",\"view_id\",\"position\","
+        "\"direction\",\"up\"]}";
+  cameraTool.handler = [deps](const session::Credentials &c,
+                           const json::Value &args) {
+    const auto id = requestIdArg(args.get("request_id"));
+    const auto view = targetIdArg(args, "view_id");
+    auto vecArg = [&](const char *key, std::array<double, 3> &out) {
+      const auto *v = args.get(key);
+      if (!v || v->type != json::Value::Type::ARRAY || v->a.size() != 3)
+        return false;
+      for (int i = 0; i < 3; ++i) {
+        if (!v->a[i].isNumber())
+          return false;
+        out[i] = v->a[i].n;
+      }
+      return true;
+    };
+    render::CameraRequest request;
+    if (!id || !view || !vecArg("position", request.position)
+        || !vecArg("direction", request.direction)
+        || !vecArg("up", request.up))
+      return rejected(Outcome::INVALID_REQUEST);
+    if (const auto *f = args.get("fovy_deg")) {
+      if (!f->isNumber() || !(f->n > 0.) || !(f->n < 180.))
+        return rejected(Outcome::INVALID_REQUEST);
+      request.fovyDegrees = f->n;
+    }
+    request.view = *view;
+    const operations::OperationRef ref{c.sessionId, *id};
+    const auto a = deps.renders.submitSetCamera(c, ref, request);
+    if (a.code != Outcome::OK)
+      return rejected(a.code);
+    return statusResult(ref, a.status, a.replayed);
+  };
+  tools.push_back(std::move(cameraTool));
 
   Tool resync;
   resync.name = "vsr_resynchronize";

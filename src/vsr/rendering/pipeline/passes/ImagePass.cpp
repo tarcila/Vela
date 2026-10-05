@@ -9,6 +9,7 @@
 #endif
 // std
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 #if USE_CUDA
@@ -152,38 +153,55 @@ void memcpy_(void *dst, const void *src, size_t numBytes)
 
 template <typename T>
 static void updateChannelBuffer(
-    T *&buffer, size_t count, bool wanted, bool had, T background)
+    T *&buffer,
+    size_t count,
+    bool wanted,
+    bool had,
+    T background,
+    bool hostStorage)
 {
   if (wanted && had)
     return;
-  detail::free(buffer);
+  if (hostStorage)
+    std::free(buffer);
+  else
+    detail::free(buffer);
   buffer = nullptr;
   if (!wanted)
     return;
-  buffer = detail::allocate<T>(count);
+  buffer = hostStorage ? static_cast<T *>(std::malloc(count * sizeof(T)))
+                       : detail::allocate<T>(count);
   std::fill(buffer, buffer + count, background);
 }
 
 ImageChannels updateImageBuffers(ImageBuffers &b,
     size_t numPixels,
     ImageChannels current,
-    ImageChannels channels)
+    ImageChannels channels,
+    bool hostStorage)
 {
   if (!b.color)
     current = ImageChannels::NONE; // nothing backed yet
   if (numPixels == 0) {
-    freeImageBuffers(b);
+    freeImageBuffers(b, hostStorage);
     return ImageChannels::NONE;
   }
 
   if (!b.color) {
-    b.color = detail::allocate<uint32_t>(numPixels);
+    b.color = hostStorage
+        ? static_cast<uint32_t *>(std::malloc(numPixels * sizeof(uint32_t)))
+        : detail::allocate<uint32_t>(numPixels);
     std::fill(b.color, b.color + numPixels, 0u);
   }
 
   auto update = [&](auto *&buffer, size_t count, ImageChannels c, auto bg) {
     updateChannelBuffer(
-        buffer, count, hasChannels(channels, c), hasChannels(current, c), bg);
+        buffer,
+        count,
+        hasChannels(channels, c),
+        hasChannels(current, c),
+        bg,
+        hostStorage);
   };
 
   update(b.hdrColor, numPixels * 4, ImageChannels::HDR_COLOR, 0.f);
@@ -197,16 +215,22 @@ ImageChannels updateImageBuffers(ImageBuffers &b,
   return channels;
 }
 
-void freeImageBuffers(ImageBuffers &b)
+void freeImageBuffers(ImageBuffers &b, bool hostStorage)
 {
-  detail::free(b.color);
-  detail::free(b.hdrColor);
-  detail::free(b.depth);
-  detail::free(b.objectId);
-  detail::free(b.primitiveId);
-  detail::free(b.instanceId);
-  detail::free(b.albedo);
-  detail::free(b.normal);
+  auto release = [hostStorage](void *ptr) {
+    if (hostStorage)
+      std::free(ptr);
+    else
+      detail::free_(ptr);
+  };
+  release(b.color);
+  release(b.hdrColor);
+  release(b.depth);
+  release(b.objectId);
+  release(b.primitiveId);
+  release(b.instanceId);
+  release(b.albedo);
+  release(b.normal);
 
   const auto stream = b.stream;
   b = {};

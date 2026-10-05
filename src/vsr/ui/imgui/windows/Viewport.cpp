@@ -15,6 +15,7 @@
 // vsr_rendering
 #include "vsr/rendering/view/ManipulatorToVSR.hpp"
 // std
+#include <charconv>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -54,12 +55,179 @@ Viewport::Viewport(
 
 Viewport::~Viewport()
 {
+  // Disconnect the adapter while this viewport and all its passes still live.
+  // Registrations can outlive windows, but may no longer dereference them.
+  m_lifetime.reset();
+  auto disconnect = std::move(m_frameTeardown);
+  if (disconnect)
+    disconnect();
   teardownDevice();
   appContext()->vsr.scene.removeDefragCallback(m_defragToken);
 }
 
+void Viewport::setFrameTeardown(std::function<void()> callback)
+{
+  // Replacing an adapter first disconnects the previous owner. Otherwise its
+  // later destructor could clear the new callbacks/teardown notification.
+  auto previous = std::move(m_frameTeardown);
+  m_frameTeardown = {};
+  if (callback && previous)
+    previous();
+  m_frameTeardown = std::move(callback);
+}
+
+std::weak_ptr<const void> Viewport::lifetime() const
+{
+  return m_lifetime;
+}
+
+std::optional<vsr::rendering::SDLTextureUpload> Viewport::textureUpload() const
+{
+  if (m_bindingTransition.load(std::memory_order_acquire) || !m_outputPass)
+    return {};
+  return m_outputPass->upload();
+}
+
+std::optional<vsr::rendering::SDLTexturePresentation>
+Viewport::displayedTexture() const
+{
+  if (m_bindingTransition.load(std::memory_order_acquire) || !m_outputPass
+      || !m_visible || !BaseViewport::viewport_isActive())
+    return {};
+  return m_outputPass->presentation();
+}
+
+void Viewport::setFrameStateProvider(
+    std::function<vsr::rendering::AnariSceneRenderPass::FrameState()> provider)
+{
+  // Owning thread, outside a device transition. First render starts naturally
+  // on this thread only after setup has published its completed state.
+  {
+    std::lock_guard<std::mutex> lock(m_frameObservationMutex);
+    m_frameStateProvider = provider;
+  }
+  if (!m_bindingTransition.load(std::memory_order_acquire) && m_anariPass)
+    m_anariPass->setFrameStateProvider(std::move(provider));
+}
+
+vsr::rendering::AnariSceneRenderPass::FrameState Viewport::renderedFrameState()
+    const
+{
+  if (m_bindingTransition.load(std::memory_order_acquire) || !m_anariPass)
+    return {};
+  return m_anariPass->frameState();
+}
+
+void Viewport::setFrameObservation(
+    ReadyPixelsProvider acquire, PresentationObserver present)
+{
+  {
+    std::lock_guard<std::mutex> lock(m_frameObservationMutex);
+    m_readyPixelsProvider = acquire;
+    m_presentationObserver = std::move(present);
+  }
+  if (!m_bindingTransition.load(std::memory_order_acquire) && m_outputPass) {
+    auto *anariPass = m_anariPass;
+    m_outputPass->setReadyPixelsProvider(acquire
+            ? vsr::rendering::CopyToSDLTexturePass::ReadyPixelsProvider(
+                  [acquire = std::move(acquire), anariPass](
+                      const std::uint32_t *pixels,
+                      std::uint32_t width,
+                      std::uint32_t height,
+                      const char *path) {
+                    return acquire(pixels,
+                        width,
+                        height,
+                        path,
+                        anariPass ? anariPass->frameState() : FrameState{});
+                  })
+            : vsr::rendering::CopyToSDLTexturePass::ReadyPixelsProvider{});
+  }
+}
+
+std::optional<vsr::rendering::SDLTexturePresentation>
+Viewport::queuedTextureDraw() const
+{
+  if (m_bindingTransition.load(std::memory_order_acquire) || !m_outputPass)
+    return {};
+  return m_outputPass->queuedDraw();
+}
+
+Viewport::FrameState Viewport::presentedFrameState() const
+{
+  return displayedTexture() ? m_outputPass->presentedPixelsState()
+                            : FrameState{};
+}
+
+void Viewport::completePresentation(bool submitted)
+{
+  if (!m_bindingTransition.load(std::memory_order_acquire) && m_outputPass) {
+    const auto before = m_outputPass->presentation();
+    m_outputPass->completePresentation(submitted);
+    const auto after = displayedTexture();
+    PresentationObserver observer;
+    {
+      std::lock_guard<std::mutex> lock(m_frameObservationMutex);
+      observer = m_presentationObserver;
+    }
+    if (observer) {
+      if (!after)
+        observer({}, {});
+      else if (!before || before->identity != after->identity)
+        observer(after, m_outputPass->presentedPixelsState());
+    }
+  }
+}
+
+void Viewport::drawImage(const ImDrawList *, const ImDrawCmd *command)
+{
+  auto *self = static_cast<Viewport *>(command->UserCallbackData);
+  if (!self || self->m_bindingTransition.load(std::memory_order_acquire)
+      || !self->m_outputPass)
+    return;
+  auto *renderer = self->m_app->sdlRenderer();
+  auto *data = ImGui::GetDrawData();
+  if (!renderer || !data)
+    return;
+  // Match the backend's projection: renderer scale, if configured, replaces
+  // ImGui framebuffer scaling rather than multiplying it twice.
+  float rsx = 1.f, rsy = 1.f;
+  if (!SDL_GetRenderScale(renderer, &rsx, &rsy))
+    return;
+  const float sx = rsx == 1.f ? data->FramebufferScale.x : 1.f;
+  const float sy = rsy == 1.f ? data->FramebufferScale.y : 1.f;
+  const float left =
+      std::max(0.f, (command->ClipRect.x - data->DisplayPos.x) * sx);
+  const float top =
+      std::max(0.f, (command->ClipRect.y - data->DisplayPos.y) * sy);
+  const float right = std::min(data->DisplaySize.x * sx,
+      (command->ClipRect.z - data->DisplayPos.x) * sx);
+  const float bottom = std::min(data->DisplaySize.y * sy,
+      (command->ClipRect.w - data->DisplayPos.y) * sy);
+  if (right <= left || bottom <= top)
+    return;
+  self->m_outputPass->draw(
+      {(self->m_imagePosition.x - data->DisplayPos.x) * sx,
+          (self->m_imagePosition.y - data->DisplayPos.y) * sy,
+          self->m_displaySize.x * sx,
+          self->m_displaySize.y * sy},
+      {int(left), int(top), int(right - left), int(bottom - top)},
+      rsx == 1.f ? data->FramebufferScale.x : rsx,
+      rsy == 1.f ? data->FramebufferScale.y : rsy);
+}
+
 void Viewport::buildUI()
 {
+  // The setup worker publishes all pass/binding state before the UI accesses
+  // it. Activation and the first asynchronous render belong to the UI owner,
+  // not the worker: other viewports can still render while the modal is open.
+  if (m_bindingTransition.load(std::memory_order_acquire))
+    return;
+  if (m_activateAfterSetup) {
+    BaseViewport::viewport_setActive(m_device != nullptr);
+    m_activateAfterSetup = false;
+  }
+
   if (BaseViewport::viewport_isActive()) {
     BaseViewport::buildUI();
     if (m_renderingEnabled) {
@@ -90,10 +258,18 @@ void Viewport::buildUI()
       ImGui::SetCursorPos(ImVec2(cursor.x + (avail.x - imageSize.x) * 0.5f,
           cursor.y + (avail.y - imageSize.y) * 0.5f));
     }
-    ImGui::Image((ImTextureID)m_outputPass->getTexture(),
-        imageSize,
-        ImVec2(0, 1),
-        ImVec2(1, 0));
+    m_displaySize = {imageSize.x, imageSize.y};
+    const auto framebufferScale = ImGui::GetIO().DisplayFramebufferScale;
+    m_displayFramebufferScale = {framebufferScale.x, framebufferScale.y};
+    // Keep ImGui layout/input semantics, but draw the same viewport quad via
+    // a checked SDL callback. The generic backend discards draw return values.
+    m_imagePosition = ImGui::GetCursorScreenPos();
+    if (ImGui::IsRectVisible(imageSize)) {
+      auto *list = ImGui::GetWindowDrawList();
+      list->AddCallback(&Viewport::drawImage, this);
+      list->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
+    }
+    ImGui::Dummy(imageSize);
     const ImVec2 rectMin = ImGui::GetItemRectMin();
     const ImVec2 rectMax = ImGui::GetItemRectMax();
     m_imageRectMin = vsr::math::float2(rectMin.x, rectMin.y);
@@ -221,17 +397,11 @@ void Viewport::setLibrary(
 
       BaseViewport::imagePipeline_setup();
 
-      // ensure first frame is rendered before we proceed
+      // Prepare bindings without entering render/wait on the setup worker.
+      // The next owning-thread UI update starts the first frame naturally.
       m_anariPass->setWorld(m_rIdx->world());
       BaseViewport::camera_update(true);
       updateFrame();
-
-      vsr::core::logStatus("[viewport] warming up first frame...");
-
-      m_rIdx->computeDefaultView();
-      if (m_renderingEnabled)
-        m_anariPass->startFirstFrame(true);
-      viewport_setActive(true);
 
       vsr::core::logStatus("[viewport] ...device load complete");
     }
@@ -243,7 +413,13 @@ void Viewport::setLibrary(
       m_deviceChangeCb(m_libName);
   };
 
-  m_app->showTaskModal(updateLibrary, "Loading Device...");
+  m_app->showTaskModal(
+      [this, updateLibrary]() {
+        updateLibrary();
+        m_activateAfterSetup = true;
+        m_bindingTransition.store(false, std::memory_order_release);
+      },
+      "Loading Device...");
 }
 
 void Viewport::setLibraryToDefault()
@@ -266,6 +442,191 @@ size_t Viewport::currentRendererObjectIndex() const
   return m_renderers.current ? m_renderers.current->index() : VSR_INVALID_INDEX;
 }
 
+vsr::scene::CameraRef Viewport::boundCamera() const
+{
+  return m_bindingTransition.load(std::memory_order_acquire) || !m_prevCamera
+      ? vsr::scene::CameraRef{}
+      : m_prevCamera->self();
+}
+
+vsr::scene::RendererRef Viewport::boundRenderer() const
+{
+  return m_bindingTransition.load(std::memory_order_acquire) || !m_prevRenderer
+      ? vsr::scene::RendererRef{}
+      : m_prevRenderer->self();
+}
+
+vsr::rendering::EffectiveView Viewport::effectiveView() const
+{
+  vsr::rendering::EffectiveView result;
+  if (m_bindingTransition.load(std::memory_order_acquire)) {
+    result.unavailableReason = "device_transition";
+    return result;
+  }
+  if (m_customFrameBindingUnknown) {
+    result.unavailableReason = "unsupported_custom_frame_parameters";
+    return result;
+  }
+  if (!m_anariPass || !m_prevCamera || !m_prevRenderer || !m_device) {
+    result.unavailableReason = "missing_bound_source";
+    return result;
+  }
+  const auto size = imagePipeline().dimensions();
+  result.width = size.x;
+  result.height = size.y;
+  result.displayWidth = m_displaySize.x;
+  result.displayHeight = m_displaySize.y;
+  result.displayFramebufferScaleX = m_displayFramebufferScale.x;
+  result.displayFramebufferScaleY = m_displayFramebufferScale.y;
+  result.displayCoordinateUnits = "imgui_logical_units";
+  result.deviceIdentifier = m_libName;
+  if (auto identifier = vsr::app::DeviceIdentifier::parse(m_libName))
+    result.deviceSubtype = identifier->subtype;
+  const auto &camera = *m_prevCamera;
+  result.camera.projection = camera.subtype().str();
+  auto vector = [&](const char *name, std::array<double, 3> &value) {
+    if (auto v = camera.parameterValueAs<vsr::math::float3>(name))
+      value = {v->x, v->y, v->z};
+    else
+      result.unavailableReason = "incomplete_camera_pose";
+  };
+  vector("position", result.camera.position);
+  vector("direction", result.camera.direction);
+  vector("up", result.camera.up);
+  result.camera.aspect = double(size.x) / std::max(1u, size.y);
+  if (result.camera.projection == "perspective") {
+    if (auto fovy = camera.parameterValueAs<float>("fovy"))
+      result.camera.fovyDegrees = vsr::math::degrees(*fovy);
+    else
+      result.unavailableReason = "incomplete_projection";
+  } else if (result.camera.projection == "orthographic") {
+    if (auto height = camera.parameterValueAs<float>("height"))
+      result.camera.projectionSettings.push_back({"height", {*height}, {}});
+    else
+      result.unavailableReason = "incomplete_projection";
+  } else
+    result.unavailableReason = "unsupported_projection";
+  result.rendererSubtype = m_prevRenderer->subtype().str();
+  result.rendererConfigurationRevision = std::to_string(m_bindingGeneration)
+      + ":" + std::to_string(m_prevRenderer->lastParameterChange());
+  const auto &renderer = *m_prevRenderer;
+  result.rendererSettingsReason = "backend_defaults_not_observed";
+  // Bound before copying live strings. The owning-thread frame adapter charges
+  // bounded metadata, not arbitrary renderer-owned parameter storage. Account
+  // conservatively for JSON escaping/numbers without depending on integration.
+  std::size_t settingsAllowance = 16u << 10;
+  if (renderer.numParameters() > 128)
+    result.rendererSettingsReason = "representation_limit";
+  else
+    for (size_t i = 0; i < renderer.numParameters(); ++i) {
+      const auto &parameter = renderer.parameterAt(i);
+      if (!parameter.isEnabled())
+        continue;
+      const auto &value = parameter.value();
+      const auto *name = renderer.parameterNameAt(i);
+      std::size_t nameSize = 0;
+      while (nameSize <= 4096 && name[nameSize])
+        ++nameSize;
+      std::size_t charge = 64 + 4 * 32 + nameSize * 6;
+      if (nameSize > 4096 || charge > settingsAllowance) {
+        result.rendererSettingsReason = "representation_limit";
+        break;
+      }
+      vsr::rendering::EffectiveSetting setting;
+      setting.name.assign(name, nameSize);
+      switch (value.type()) {
+      case ANARI_BOOL:
+        setting.numbers = {value.get<bool>() ? 1. : 0.};
+        break;
+      case ANARI_INT32:
+        setting.numbers = {double(value.get<int>())};
+        break;
+      case ANARI_UINT32:
+        setting.numbers = {double(value.get<uint32_t>())};
+        break;
+      case ANARI_FLOAT32:
+        setting.numbers = {value.get<float>()};
+        break;
+      case ANARI_FLOAT32_VEC2: {
+        const auto v = value.get<vsr::math::float2>();
+        setting.numbers = {v.x, v.y};
+        break;
+      }
+      case ANARI_FLOAT32_VEC3: {
+        const auto v = value.get<vsr::math::float3>();
+        setting.numbers = {v.x, v.y, v.z};
+        break;
+      }
+      case ANARI_FLOAT32_VEC4: {
+        const auto v = value.get<vsr::math::float4>();
+        setting.numbers = {v.x, v.y, v.z, v.w};
+        break;
+      }
+      case ANARI_STRING: {
+        const auto text = value.getStringView();
+        if (text.size() > 4096
+            || text.size() * 6 > settingsAllowance - charge) {
+          result.rendererSettingsReason = "representation_limit";
+          continue;
+        }
+        charge += text.size() * 6;
+        setting.text.assign(text.data(), text.size());
+        break;
+      }
+      default:
+        result.rendererSettingsReason = "unsupported_parameter_type";
+        continue;
+      }
+      settingsAllowance -= charge;
+      result.rendererSettings.push_back(std::move(setting));
+    }
+  result.sourceInstanceGeneration = m_deviceGeneration;
+  result.pipelineSource = "viewer_image_pipeline";
+  result.pipelineConfigurationRevision = std::to_string(m_bindingGeneration);
+  result.pipelineSettings = {
+      {"render_enabled", {double(m_anariPass->isEnabled())}, {}},
+      {"aov", {double(m_visualizeAOV)}, {}},
+      {"depth_range", {m_depthVisualMinimum, m_depthVisualMaximum}, {}},
+      {"edge_invert", {double(m_edgeInvert)}, {}},
+      {"tone_map_operator", {double(m_toneMapOperator)}, {}},
+      {"exposure", {m_toneMapExposure}, {}},
+      {"auto_exposure", {double(m_autoExposureEnabled)}, {}},
+      {"gamma", {m_toneMapGamma}, {}},
+      {"tone_map_enabled", {double(m_toneMapPass->isEnabled())}, {}},
+      {"output_transform_enabled",
+          {double(m_outputTransformPass->isEnabled())},
+          {}},
+      {"outline_enabled", {double(m_outlinePass->isEnabled())}, {}},
+      {"primitive_outline_enabled",
+          {double(m_primitiveOutlinePass->isEnabled())},
+          {}},
+      {"box_outline_enabled",
+          {double(m_worldBounds && m_worldBounds->isShown())},
+          {}},
+      {"resolution_scale", {m_viewport.resolutionScale}, {}},
+      {"implicit_aspect", {double(m_camera.useImplicitAspectRatio)}, {}},
+      {"color_format", {double(m_colorFormat)}, {}}};
+  for (const auto &setting : result.pipelineSettings) {
+    result.pipelineConfigurationRevision += ":" + setting.name;
+    for (double value : setting.numbers) {
+      char buffer[64];
+      const auto converted = std::to_chars(buffer,
+          buffer + sizeof(buffer),
+          value,
+          std::chars_format::general,
+          17);
+      result.pipelineConfigurationRevision +=
+          ":" + std::string(buffer, converted.ptr);
+    }
+  }
+  result.pipelineSettingsReason = "dynamic_pass_state_not_fully_observed";
+  if (m_visualizeAOV == vsr::rendering::AOVType::NONE)
+    result.outputColor = m_colorFormat == ANARI_UFIXED8_RGBA_SRGB
+        ? "rgba8_srgb"
+        : "rgba8_gamma_encoded";
+  return result;
+}
+
 void Viewport::setDeviceChangeCb(ViewportDeviceChangeCb cb)
 {
   m_deviceChangeCb = std::move(cb);
@@ -274,8 +635,10 @@ void Viewport::setDeviceChangeCb(ViewportDeviceChangeCb cb)
 void Viewport::setExternalInstances(
     const anari::Instance *instances, size_t count)
 {
-  if (m_rIdx)
+  if (m_rIdx) {
     m_rIdx->setExternalInstances(instances, count);
+    ++m_bindingGeneration;
+  }
 }
 
 void Viewport::setCustomFrameParameter(
@@ -291,6 +654,8 @@ void Viewport::setCustomFrameParameter(
   auto f = m_anariPass->getFrame();
   anari::setParameter(m_device, f, name, value.type(), value.data());
   anari::commitParameters(m_device, f);
+  m_customFrameBindingUnknown = true;
+  ++m_bindingGeneration;
 }
 
 void Viewport::refreshCurrentDevice()
@@ -396,6 +761,10 @@ void Viewport::imagePipeline_populate(vsr::rendering::ImagePipeline &p)
       m_timeToLoadDevice);
 
   m_anariPass = p.setSource<vsr::rendering::AnariSceneRenderPass>(m_device);
+  {
+    std::lock_guard<std::mutex> lock(m_frameObservationMutex);
+    m_anariPass->setFrameStateProvider(m_frameStateProvider);
+  }
   m_anariPass->setEnabled(m_renderingEnabled);
   m_anariPass->setUseImplicitAspectRatio(m_camera.useImplicitAspectRatio);
 
@@ -425,12 +794,30 @@ void Viewport::imagePipeline_populate(vsr::rendering::ImagePipeline &p)
 
   m_outputPass =
       p.addSink<vsr::rendering::CopyToSDLTexturePass>(m_app->sdlRenderer());
+  ReadyPixelsProvider acquire;
+  {
+    std::lock_guard<std::mutex> lock(m_frameObservationMutex);
+    acquire = m_readyPixelsProvider;
+  }
+  if (acquire)
+    m_outputPass->setReadyPixelsProvider(
+        [acquire = std::move(acquire), anariPass = m_anariPass](
+            const std::uint32_t *pixels,
+            std::uint32_t width,
+            std::uint32_t height,
+            const char *path) {
+          // Device setup can run off-thread. The copied provider rejects that
+          // thread before touching Scene/UI or creating an attestation.
+          return acquire(pixels, width, height, path, anariPass->frameState());
+        });
 
   syncImagePassState();
 }
 
 void Viewport::setRenderingEnabled(bool enabled)
 {
+  if (enabled != m_renderingEnabled)
+    ++m_bindingGeneration;
   m_renderingEnabled = enabled;
   if (m_anariPass) {
     m_anariPass->setEnabled(enabled);
@@ -522,6 +909,20 @@ void Viewport::renderer_resetParameterDefaults()
 
 void Viewport::teardownDevice()
 {
+  m_bindingTransition.store(true, std::memory_order_release);
+  m_activateAfterSetup = false;
+  PresentationObserver observer;
+  {
+    std::lock_guard<std::mutex> lock(m_frameObservationMutex);
+    observer = m_presentationObserver;
+  }
+  if (observer)
+    observer({}, {});
+  ++m_bindingGeneration;
+  ++m_deviceGeneration;
+  m_customFrameBindingUnknown = false;
+  m_displaySize = {0.f, 0.f};
+  m_displayFramebufferScale = {0.f, 0.f};
   const bool pipelineSetup = BaseViewport::imagePipeline_isSetup();
 
   if (pipelineSetup) {
@@ -707,6 +1108,7 @@ void Viewport::syncImagePassState()
   if (!m_anariPass)
     return;
 
+  ++m_bindingGeneration;
   m_anariPass->setColorFormat(m_colorFormat);
 
   if (m_visualizeAOVPass) {
@@ -736,6 +1138,7 @@ void Viewport::updateDisplayPassState()
 {
   if (!m_toneMapPass || !m_outputTransformPass)
     return;
+  ++m_bindingGeneration;
 
   const bool showBeauty = m_visualizeAOV == vsr::rendering::AOVType::NONE;
   if (m_autoExposurePass) {
@@ -887,9 +1290,11 @@ void Viewport::ui_menubar_Viewport()
           0.1f,
           m_depthVisualMinimum,
           1e20f);
-      if (depthRangeChanged)
+      if (depthRangeChanged) {
         m_visualizeAOVPass->setDepthRange(
             m_depthVisualMinimum, m_depthVisualMaximum);
+        ++m_bindingGeneration;
+      }
       ImGui::EndDisabled();
 
       ImGui::BeginDisabled(m_visualizeAOV != vsr::rendering::AOVType::EDGES);
@@ -897,6 +1302,7 @@ void Viewport::ui_menubar_Viewport()
       edgeSettingsChanged |= ImGui::Checkbox("Invert Edges", &m_edgeInvert);
       if (edgeSettingsChanged) {
         m_visualizeAOVPass->setEdgeInvert(m_edgeInvert);
+        ++m_bindingGeneration;
       }
       ImGui::EndDisabled();
 
@@ -917,12 +1323,15 @@ void Viewport::ui_menubar_Viewport()
 
       if (m_autoExposureEnabled) {
         if (ImGui::DragFloat(
-                "Compensation", &m_toneMapExposure, 0.05f, -10.f, 10.f))
+                "Compensation", &m_toneMapExposure, 0.05f, -10.f, 10.f)) {
           m_toneMapPass->setExposure(m_toneMapExposure);
+          ++m_bindingGeneration;
+        }
         ImGui::Text("Current EV: %.2f", m_currentAutoExposure);
       } else if (ImGui::DragFloat(
                      "Exposure", &m_toneMapExposure, 0.05f, -10.f, 10.f)) {
         m_toneMapPass->setExposure(m_toneMapExposure);
+        ++m_bindingGeneration;
       }
 
       ImGui::EndDisabled();
@@ -948,6 +1357,7 @@ void Viewport::ui_menubar_Viewport()
               "Operator", &op, toneMapItems, IM_ARRAYSIZE(toneMapItems))) {
         m_toneMapOperator = static_cast<vsr::rendering::ToneMapOperator>(op);
         m_toneMapPass->setOperator(m_toneMapOperator);
+        ++m_bindingGeneration;
       }
 
       ImGui::EndDisabled();
@@ -963,8 +1373,10 @@ void Viewport::ui_menubar_Viewport()
       ImGui::BeginDisabled(m_colorFormat == ANARI_UFIXED8_RGBA_SRGB
           || m_visualizeAOV != vsr::rendering::AOVType::NONE);
 
-      if (ImGui::DragFloat("Gamma", &m_toneMapGamma, 0.01f, 0.1f, 5.f))
+      if (ImGui::DragFloat("Gamma", &m_toneMapGamma, 0.01f, 0.1f, 5.f)) {
         m_outputTransformPass->setGamma(m_toneMapGamma);
+        ++m_bindingGeneration;
+      }
 
       ImGui::EndDisabled();
       ImGui::Unindent(INDENT_AMOUNT);

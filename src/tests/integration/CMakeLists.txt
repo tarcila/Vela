@@ -10,5 +10,9 @@ file(GLOB VSR_INTEGRATION_TEST_SOURCES CONFIGURE_DEPENDS
 )
 project_add_executable(${VSR_INTEGRATION_TEST_SOURCES})
 project_link_libraries(PRIVATE vsr_integration vsr_scene vsr_rendering vela_ext_catch2)
+if (TARGET vsr_ui_imgui)
+  project_link_libraries(PRIVATE vsr_ui_imgui)
+  target_compile_definitions(${PROJECT_NAME} PRIVATE VSR_TEST_VIEWER_UI)
+endif()
 
 add_test(NAME vsr::integration COMMAND ${PROJECT_NAME} "[integration]")

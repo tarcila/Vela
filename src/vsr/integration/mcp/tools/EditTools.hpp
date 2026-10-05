@@ -6,6 +6,7 @@
 // Header-only: the vsr_integration library globs only top-level sources (see
 // ticket 19).
 
+#include "vsr/integration/edit/Translation.hpp"
 #include "vsr/integration/mcp/tools/ToolSupport.hpp"
 #include "vsr/integration/restore/BatchRestore.hpp"
 // std
@@ -33,6 +34,7 @@ struct EditDeps
   identity::IdentityAuthority &ids; // launch stamp for wire handles
   edit::EditService &edits;
   restore::RestoreService &restores;
+  edit::TranslationService *translations{nullptr}; // explicitly qualified host
 };
 
 namespace detail {
@@ -229,6 +231,13 @@ inline void addEditTools(std::vector<Tool> &tools, EditDeps deps)
   editTool.description =
       "Copy node_edit_version into version and structural_version verbatim for every node entry; world position additionally requires ancestry_version. Object entries keep integer versions and the existing matte color/opacity and directional light color/direction/irradiance allowlist; readable parameters are not automatically writable. Stored camera parameters do not control the viewport or agent capture camera. "
       "World position means the node's local origin, requires ancestry_version from inspection, and converts through finite invertible proposed final ancestors; singular parents reject without fallback. "
+      "Inheritance example with identity linear transforms: RootDelta local x=0 "
+      "and child BodyTop local x=1 have world origins 0 and 1. Moving only the "
+      "parent to local x=2 moves both once to world x=2 and x=3, keeping child "
+      "local x=1. Also adding +2 to the child's local position moves its origin "
+      "twice, to x=5. Selected sibling roots must be edited independently, not "
+      "promoted to an unselected common parent. Names are illustrative; inspect "
+      "actual ancestry rather than guessing an assembly from names. "
       "Atomically apply up to 64 object parameter or explicitly exposed node enabled/local or world position/local rotation/scale/transform edits to one scene. Position and scale are three finite float32-representable numbers. Rotation is an object with named azimuth/elevation/roll degree components, composed about Y then X then Z as in VSR; supplied angles are retained, not wrapped. Rotation/scale require a faithful current cached SRT reconstruction (per-linear-component tolerance 1e-5 times max(1,abs(component))); no shear repair. Signed and zero scales are supported when faithful. Space defaults to local; no world rotation/scale/matrix edits. Only scalar-transform nodes accept transform fields. Different fields group deterministically with one expected version; repeated fields reject. Transform replaces a scalar node's complete local affine matrix (four rows of four finite numbers, column-vector math, last-column translation, exact last row [0,0,0,1]). Shear, reflection and singular affine matrices are supported. Transform cannot combine with position/rotation/scale on the same node but may combine with Boolean enabled. Node entries require target_kind=node, opaque version and structural_version from inspection. Returns a "
       "batch_ref on commit.";
   editTool.inputSchemaJson = std::string("{\"type\":\"object\",\"properties\":{")
@@ -278,6 +287,157 @@ inline void addEditTools(std::vector<Tool> &tools, EditDeps deps)
     return detail::ack(ref, deps.restores.submit(c, ref, std::move(*req)));
   };
   tools.push_back(std::move(restoreTool));
+
+  if (!deps.translations || !deps.translations->valid())
+    return;
+  Tool preview;
+  preview.name = "vsr_translate_preview";
+  const auto &limits = deps.translations->limits();
+  preview.description =
+      "Preview a finite world-space delta of an explicit selection without "
+      "any Scene write, batch or restore eligibility. Inspect fresh node handles "
+      "and copy node_edit_version, structural_version and ancestry_version "
+      "verbatim for EVERY selection entry, including inherited descendants. "
+      "Identical duplicates collapse; conflicting expectations reject. Only "
+      "topmost SELECTED scalar-transform roots are prepared; selecting parent "
+      "and child moves both origins once, leaving child local state unchanged. "
+      "Sibling roots stay independent: no common-parent/piece guessing or "
+      "wrappers. World origin is not bounds/geometry centre. Linear transforms "
+      "are preserved; required singular parents reject without pseudoinverse. "
+      "Poll vsr_operation_status for exact prepared matrices/origins, dependencies "
+      "and preview_ref. Unselected descendants inherit and are NOT enumerated. "
+      "Prepared-reference lookup is separate from historical request replay; "
+      "expiry/eviction never revives a plan. This tool does not commit. "
+      "Limits: selection="
+      + std::to_string(limits.maxSelection)
+      + ", per-session plans=" + std::to_string(limits.perSession)
+      + ", global plans=" + std::to_string(limits.globalCount)
+      + ", aggregate owned bytes=" + std::to_string(limits.aggregateBytes)
+      + ", fixed owner charge="
+      + std::to_string(edit::TranslationService::INFRASTRUCTURE_BYTES)
+      + ", attached sources<=" + std::to_string(limits.globalCount)
+      + ", preparation charge="
+      + std::to_string(edit::TranslationService::PREPARATION_BYTES)
+      + ", each status-copy charge="
+      + std::to_string(2 * edit::TranslationService::RESULT_BYTES)
+      + ", ancestry steps=" + std::to_string(limits.ancestrySteps)
+      + ", selected-effect entries=" + std::to_string(limits.effectEntries)
+      + ", lifetime seconds=" + std::to_string(limits.lifetimeSeconds)
+      + ", deadline seconds=" + std::to_string(limits.deadlineSeconds) + ".";
+  preview.inputSchemaJson = std::string("{\"type\":\"object\",\"properties\":{")
+      + requestIdSchema() + ",\"scene_id\":{\"type\":\"integer\",\"minimum\":0},"
+        "\"world_delta\":{\"type\":\"array\",\"minItems\":3,\"maxItems\":3,"
+        "\"items\":{\"type\":\"number\"}},\"selection\":{\"type\":\"array\","
+        "\"minItems\":1,\"maxItems\":" + std::to_string(limits.maxSelection)
+      + ",\"items\":{\"type\":\"object\",\"properties\":{"
+        "\"handle\":{\"type\":\"string\"},\"node_edit_version\":{\"type\":\"string\"},"
+        "\"structural_version\":{\"type\":\"string\"},\"ancestry_version\":{\"type\":\"string\"}},"
+        "\"required\":[\"handle\",\"node_edit_version\",\"structural_version\",\"ancestry_version\"]}}},"
+        "\"required\":[\"request_id\",\"scene_id\",\"selection\",\"world_delta\"]}";
+  preview.handler = [deps](const session::Credentials &c,
+                        const json::Value &args) {
+    const auto id = requestIdArg(args.get("request_id"));
+    const auto scene = targetIdArg(args, "scene_id");
+    const auto *selection = args.get("selection");
+    const auto *delta = args.get("world_delta");
+    if (!id || !scene || !selection
+        || selection->type != json::Value::Type::ARRAY || selection->a.empty()
+        || selection->a.size() > deps.translations->limits().maxSelection
+        || !delta || delta->type != json::Value::Type::ARRAY
+        || delta->a.size() != 3)
+      return rejected(Outcome::INVALID_REQUEST);
+    edit::TranslationRequest request;
+    request.scene = *scene;
+    for (int i = 0; i < 3; ++i) {
+      if (!delta->a[i].isNumber() || !std::isfinite(delta->a[i].n))
+        return rejected(Outcome::INVALID_REQUEST);
+      request.worldDelta[i] = delta->a[i].n;
+    }
+    // Reuse the exact existing node wire-token parser; do not invent an
+    // alternate interpretation of version/domain/ancestry strings.
+    std::string wire =
+        "{\"scene_id\":" + std::to_string(*scene) + ",\"edits\":[";
+    for (const auto &item : selection->a) {
+      if (!item.isObject())
+        return rejected(Outcome::INVALID_REQUEST);
+      for (const auto *field : {"handle",
+               "node_edit_version",
+               "structural_version",
+               "ancestry_version"}) {
+        const auto *v = item.get(field);
+        if (!v || !v->isString() || v->s.size() > 256)
+          return rejected(Outcome::INVALID_REQUEST);
+      }
+      if (wire.back() != '[')
+        wire += ',';
+      wire +=
+          "{\"target_kind\":\"node\",\"parameter\":\"position\",\"space\":\"world\",\"value\":[0,0,0],"
+          "\"handle\":"
+          + json::quote(item.get("handle")->s)
+          + ",\"version\":" + json::quote(item.get("node_edit_version")->s)
+          + ",\"structural_version\":"
+          + json::quote(item.get("structural_version")->s)
+          + ",\"ancestry_version\":"
+          + json::quote(item.get("ancestry_version")->s) + "}";
+    }
+    wire += "]}";
+    json::Value parsed;
+    if (!json::parse(wire, parsed))
+      return rejected(Outcome::INVALID_REQUEST);
+    auto batch = detail::editBatchArg(parsed, deps.ids.launch());
+    if (!batch)
+      return rejected(Outcome::INVALID_REQUEST);
+    for (const auto &entry : batch->edits)
+      request.selection.push_back({entry.nodeExpected, entry.nodeDependencies});
+    const operations::OperationRef ref{c.sessionId, *id};
+    return detail::ack(
+        ref, deps.translations->submit(c, ref, std::move(request)));
+  };
+  tools.push_back(std::move(preview));
+
+  Tool commit;
+  commit.name = "vsr_translate_commit";
+  commit.description =
+      "Atomically commit the exact retained selection preview, without new "
+      "translation inputs or recomputation. Copy the entire preview_ref from "
+      "vsr_translate_preview and supply a new request_id. Its scene_id is "
+      "routing metadata, not authority; launch/session/Scene/dependencies and "
+      "current read/edit/exposure are rechecked before any write. Stale, "
+      "expired, foreign or consumed plans write nothing. Successful commit "
+      "consumes the preview once; the same admitted request replays historical "
+      "metadata without mutation, while a different request cannot reuse it. "
+      "Poll vsr_operation_status for committed, outcome, exact versions, "
+      "Scene revisions and the normal batch_ref for conditional vsr_restore. "
+      "Later target/ancestor writes conflict even after change-back. "
+      "Cancellation before commit writes nothing; late cancellation or sync "
+      "failure may still be committed, never implicit rollback. Limits and "
+      "the finite deadline are the same as vsr_translate_preview.";
+  commit.inputSchemaJson = std::string("{\"type\":\"object\",\"properties\":{")
+      + requestIdSchema()
+      + ",\"preview_ref\":{\"type\":\"object\",\"properties\":{"
+        "\"launch_id\":{\"type\":\"string\"},\"preview_id\":{\"type\":\"string\"},"
+        "\"scene_id\":{\"type\":\"integer\",\"minimum\":0}},"
+        "\"required\":[\"launch_id\",\"preview_id\",\"scene_id\"]}},"
+        "\"required\":[\"request_id\",\"preview_ref\"]}";
+  commit.handler = [deps](
+                       const session::Credentials &c, const json::Value &args) {
+    const auto id = requestIdArg(args.get("request_id"));
+    const auto *ref = args.get("preview_ref");
+    if (!id || !ref || !ref->isObject())
+      return rejected(Outcome::INVALID_REQUEST);
+    const auto scene = targetIdArg(*ref, "scene_id");
+    const auto *launch = ref->get("launch_id");
+    const auto *previewId = ref->get("preview_id");
+    if (!scene || !launch || !launch->isString() || !previewId
+        || !previewId->isString() || !edit::translation_detail::token(launch->s)
+        || !edit::translation_detail::token(previewId->s))
+      return rejected(Outcome::INVALID_REQUEST);
+    const operations::OperationRef operation{c.sessionId, *id};
+    return detail::ack(operation,
+        deps.translations->submitCommit(
+            c, operation, {launch->s, previewId->s, *scene}));
+  };
+  tools.push_back(std::move(commit));
 }
 
 } // namespace vsr::integration::mcp::tools

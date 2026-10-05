@@ -76,6 +76,39 @@ SCENARIO(
   }
 }
 
+SCENARIO("The default Device Identifier follows the viewer's selection order",
+    "[App]")
+{
+  using vsr::app::defaultDeviceIdentifier;
+
+  GIVEN("VSR_ANARI_LIBRARIES is set")
+  {
+    THEN("its first entry wins over ANARI_LIBRARY")
+    {
+      CHECK(defaultDeviceIdentifier("barney,visrtx", "visrtx") == "barney");
+      CHECK(defaultDeviceIdentifier(",gpu@visrtx,helide", nullptr)
+          == "gpu@visrtx");
+    }
+    THEN("a first entry of 'environment' defers to ANARI_LIBRARY")
+    {
+      CHECK(defaultDeviceIdentifier("environment,helide", "visrtx")
+          == "visrtx");
+      CHECK(defaultDeviceIdentifier("environment", nullptr) == "helide");
+    }
+  }
+
+  GIVEN("VSR_ANARI_LIBRARIES is unset or empty")
+  {
+    THEN("ANARI_LIBRARY is used, else helide")
+    {
+      CHECK(defaultDeviceIdentifier(nullptr, "visrtx") == "visrtx");
+      CHECK(defaultDeviceIdentifier("", "barney") == "barney");
+      CHECK(defaultDeviceIdentifier(",,", "") == "helide");
+      CHECK(defaultDeviceIdentifier(nullptr, nullptr) == "helide");
+    }
+  }
+}
+
 SCENARIO("Device Identifiers name a subtype of an ANARI library", "[App]")
 {
   using vsr::app::DeviceIdentifier;

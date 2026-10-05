@@ -16,8 +16,13 @@ ImagePipeline::ImagePipeline()
 #endif
 }
 
-ImagePipeline::ImagePipeline(int width, int height) : ImagePipeline()
+ImagePipeline::ImagePipeline(int width, int height, ImageStorage storage)
+    : m_storage(storage)
 {
+#ifdef ENABLE_CUDA
+  if (storage != ImageStorage::HOST)
+    cudaStreamCreate(&m_buffers.stream);
+#endif
   setDimensions(width, height);
 }
 
@@ -25,7 +30,8 @@ ImagePipeline::~ImagePipeline()
 {
   cleanup();
 #ifdef ENABLE_CUDA
-  cudaStreamDestroy(m_buffers.stream);
+  if (m_buffers.stream)
+    cudaStreamDestroy(m_buffers.stream);
 #endif
 }
 
@@ -37,6 +43,16 @@ const uint32_t *ImagePipeline::getColorBuffer() const
 vsr::math::uint2 ImagePipeline::dimensions() const
 {
   return m_size;
+}
+
+ImageStorage ImagePipeline::storage() const
+{
+  return m_storage;
+}
+
+std::uint64_t ImagePipeline::production() const
+{
+  return m_production;
 }
 
 const std::vector<ImagePipeline::PassTiming> &ImagePipeline::getPassTimings()
@@ -112,6 +128,7 @@ void ImagePipeline::render()
     s->render(finished);
     timeStage(*s, elapsed(start));
   }
+  ++m_production;
 }
 
 void ImagePipeline::clear()
@@ -153,12 +170,13 @@ void ImagePipeline::updateChannels()
   m_bufferChannels = detail::updateImageBuffers(m_buffers,
       size_t(m_size.x) * size_t(m_size.y),
       m_bufferChannels,
-      channels);
+      channels,
+      m_storage == ImageStorage::HOST);
 }
 
 void ImagePipeline::cleanup()
 {
-  detail::freeImageBuffers(m_buffers);
+  detail::freeImageBuffers(m_buffers, m_storage == ImageStorage::HOST);
   m_bufferChannels = ImageChannels::NONE;
 }
 

@@ -331,7 +331,8 @@ inline SyncState SyncService::state(SceneId scene) const
 inline bool SyncService::viewReady(ViewId view) const
 {
   auto scene = m_integration.sceneOfView(view);
-  return scene && m_states.viewConfirmed(view) && m_states.sceneReady(*scene);
+  return scene && m_integration.sceneSyncConfirmsView(view)
+      && m_states.viewConfirmed(view) && m_states.sceneReady(*scene);
 }
 
 inline ResyncResult SyncService::recover(SceneId scene)
@@ -339,7 +340,9 @@ inline ResyncResult SyncService::recover(SceneId scene)
   ResyncResult r;
   // Fixed for the callback: registration changes are serialized safe-point
   // work and cannot run concurrently.
-  r.views = m_integration.viewsOfScene(scene);
+  for (auto view : m_integration.viewsOfScene(scene))
+    if (m_integration.sceneSyncConfirmsView(view))
+      r.views.push_back(view);
   m_states.beginRecovery(scene);
   bool confirmed = false;
   if (auto cb = m_integration.recoveryCallback(scene)) {

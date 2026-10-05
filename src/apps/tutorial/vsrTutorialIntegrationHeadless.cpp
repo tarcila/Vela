@@ -23,6 +23,7 @@
 #include "vsr/integration/Integration.hpp"
 #include "vsr/integration/activity/Activity.hpp"
 #include "vsr/integration/context/ContextAdapter.hpp"
+#include "vsr/integration/edit/Translation.hpp"
 #include "vsr/integration/identity/Identity.hpp"
 #include "vsr/integration/inspection/Inspection.hpp"
 #include "vsr/integration/render/RevisionRender.hpp"
@@ -155,9 +156,8 @@ struct AgentView : vi::render::RenderBackend
     anari::commitParameters(device, renderer);
 
     pipeline.setDimensions(WIDTH, HEIGHT);
-    pass = pipeline.emplace_back<vsr::rendering::AnariSceneRenderPass>(device);
+    pass = pipeline.setSource<vsr::rendering::AnariSceneRenderPass>(device);
     pass->setRunAsync(false);
-    pass->setEnableDepth(false);
     pass->setCamera(camera);
     pass->setRenderer(renderer);
     return confirm();
@@ -219,9 +219,7 @@ struct AgentView : vi::render::RenderBackend
     if (!confirm())
       return false;
     pipeline.setDimensions(width, height);
-    // The scene pass copies the finished frame and restarts the next one, so
-    // the second render() yields a frame of the current state.
-    pipeline.render();
+    // Synchronous mode renders and publishes the current scene in one call.
     pipeline.render();
     rendered = pipeline.getColorBuffer() != nullptr;
     return rendered;
@@ -235,7 +233,7 @@ struct AgentView : vi::render::RenderBackend
   {
     namespace img = vi::image;
     img::SourceImage src;
-    const auto size = pass->getDimensions();
+    const auto size = pipeline.dimensions();
     src.width = size.x;
     src.height = size.y;
     src.encoding = img::ChannelEncoding::SRGB_UINT8;
@@ -263,6 +261,7 @@ struct Host
   std::unique_ptr<vi::identity::IdentityAuthority> ids;
   std::unique_ptr<vi::identity::SceneIdentity> identity;
   std::unique_ptr<vi::edit::EditService> edits;
+  std::unique_ptr<vi::edit::TranslationService> translations;
   std::unique_ptr<vi::restore::RestoreService> restores;
   std::unique_ptr<vi::sync::SyncService> sync;
   std::unique_ptr<vi::activity::ActivityLog> activity;
@@ -288,6 +287,7 @@ struct Host
       engine->setActivitySink(nullptr);
     sync.reset();
     restores.reset();
+    translations.reset();
     edits.reset();
     identity.reset();
     engine.reset();
@@ -370,6 +370,9 @@ int main(int argc, const char *argv[])
   host->edits = std::make_unique<vi::edit::EditService>(
       integration, *host->engine, host->authority->launchId());
   host->edits->attachScene(*sceneId, *host->identity);
+  host->translations = std::make_unique<vi::edit::TranslationService>(
+      integration, *host->authority, *host->engine, *host->edits);
+  host->translations->attachScene(*sceneId, *host->identity);
   host->restores = std::make_unique<vi::restore::RestoreService>(
       *host->engine, *host->edits);
   host->restores->attachScene(*sceneId, *host->identity);
@@ -401,8 +404,8 @@ int main(int argc, const char *argv[])
   vi::mcp::Config cfg;
   vi::mcp::tools::addQueryTools(cfg.tools, {*host->engine, *host->inspector});
   vi::mcp::tools::addLookupTools(cfg.tools, *host->engine);
-  vi::mcp::tools::addEditTools(
-      cfg.tools, {*host->ids, *host->edits, *host->restores});
+  vi::mcp::tools::addEditTools(cfg.tools,
+      {*host->ids, *host->edits, *host->restores, host->translations.get()});
   vi::mcp::tools::addRenderTools(
       cfg.tools, {*host->renders, *host->sync, *host->engine});
   cfg.log = [](std::string_view line) {
@@ -436,6 +439,7 @@ int main(int argc, const char *argv[])
   // Service integration work and pump pending renders until interrupted.
   while (!g_stop) {
     integration.service();
+    host->translations->pump();
     host->renders->pump();
     if (!g_stop)
       std::this_thread::sleep_for(std::chrono::milliseconds(5));

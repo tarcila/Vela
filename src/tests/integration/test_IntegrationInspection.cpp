@@ -149,6 +149,28 @@ const vsr::integration::mcp::json::Value &parameter(
 
 } // namespace
 
+SCENARIO("native inspection returns bounded syntax diagnostics",
+    "[integration][request-guidance]")
+{
+  Fixture f;
+  PageArgs args;
+  args.kind = "nodes";
+  args.filters.objectSubtype = "matte";
+  auto bad = f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args);
+  REQUIRE(bad.code == Outcome::INVALID_REQUEST);
+  REQUIRE(bad.diagnostics.count == 1);
+  CHECK(bad.diagnostics.entries[0].field == DiagnosticField::OBJECT_SUBTYPE);
+  CHECK(bad.diagnostics.entries[0].reason == DiagnosticReason::INAPPLICABLE);
+  CHECK(f.engine->highWater(f.creds.sessionId) == 0);
+  args.filters.objectSubtype.reset();
+  auto good = f.inspector->makeInspection(f.creds.sessionId, f.sceneId, args);
+  REQUIRE(good.code == Outcome::OK);
+  CHECK(good.diagnostics.count == 0);
+  auto ack = f.submit(std::move(good), 1);
+  REQUIRE(ack.code == Outcome::OK);
+  CHECK(f.drain(1).terminal == Outcome::OK);
+}
+
 SCENARIO("scene bounds never infer a value from missing binding",
     "[integration][bounds]")
 {
@@ -445,6 +467,7 @@ SCENARIO("effective view observation is admitted and capture stays closed",
   bool observed = false;
   f.integration.submit(f.sceneId, [&](vsr::scene::Scene &) {
     ViewRegistration v{"effective", f.sceneId, {true, true}};
+    v.role = ViewRole::INDEPENDENT_AGENT;
     v.observeBinding = [&] {
       REQUIRE(f.integration.inServiceCall());
       observed = true;
@@ -462,6 +485,11 @@ SCENARIO("effective view observation is admitted and capture stays closed",
   CHECK(first.get("camera")->get("position")->a[0].n == 1.);
   CHECK(first.get("camera")->get("aspect")->n == Approx(16. / 9.));
   CHECK(first.get("device_identifier")->s == "default@helide");
+  CHECK(first.get("role")->s == "independent_agent");
+  CHECK(first.get("name")->s == "effective");
+  CHECK(first.get("provenance_kind")->s == "current_effective");
+  CHECK(
+      first.get("rendered_configuration")->get("reason")->s == "not_observed");
   CHECK_FALSE(first.get("capture_policy")->get("exposed")->b);
   CHECK(first.get("capture_policy")->get("quality_units")->a.empty());
   CHECK(first.get("capture_policy")->get("max_pixels")->n == 2073600);
@@ -513,6 +541,36 @@ SCENARIO("effective view observation is admitted and capture stays closed",
       unrelated->parameter("position")->value().get<vsr::core::math::float3>().x
       == 99.f);
   CHECK(f.scene.objectDB().renderer.size() == 0);
+
+  CapturePolicy hostPolicy;
+  hostPolicy.maxAxis = 1024;
+  hostPolicy.maxPixels = 1024 * 768;
+  hostPolicy.qualityUnits = {"completed_frames"};
+  bool accepted = false;
+  f.integration.submit(f.sceneId, [&](vsr::scene::Scene &) {
+    accepted = f.integration.updateCapturePolicy(f.viewId, hostPolicy);
+  });
+  f.integration.service();
+  REQUIRE(accepted);
+  REQUIRE(
+      f.submit(f.inspector->makeViewInfo(f.creds.sessionId, f.viewId), 7).code
+      == Outcome::OK);
+  const auto narrowed = page(f.drain(7));
+  CHECK(narrowed.get("capture_policy")->get("max_axis")->n == 1024);
+  CHECK_FALSE(narrowed.get("capture_policy")->get("exposed")->b);
+  CHECK(narrowed.get("capture_policy_revision")->s
+      != first.get("capture_policy_revision")->s);
+  f.integration.submit(f.sceneId, [&](vsr::scene::Scene &) {
+    CHECK(f.integration.updateCapturePolicy(f.viewId, hostPolicy));
+    hostPolicy.maxPngBytes = 1;
+    CHECK_FALSE(f.integration.updateCapturePolicy(f.viewId, hostPolicy));
+  });
+  f.integration.service();
+  REQUIRE(
+      f.submit(f.inspector->makeViewInfo(f.creds.sessionId, f.viewId), 8).code
+      == Outcome::OK);
+  CHECK(page(f.drain(8)).get("capture_policy_revision")->s
+      == narrowed.get("capture_policy_revision")->s);
 }
 
 SCENARIO("view info reports missing or oversized bindings without payload",

@@ -8,6 +8,9 @@
 #include "vsr/rendering/pick/PickRequest.h"
 // anari
 #include <anari/anari_cpp.hpp>
+// std
+#include <functional>
+#include <memory>
 
 namespace vsr::rendering {
 
@@ -51,6 +54,13 @@ struct AnariSceneRenderPass : public ImageSource, public PickableSource
   void setRunAsync(bool on);
 
   anari::Frame getFrame() const;
+  // Opaque host-owned immutable state captured at each actual ANARI render
+  // start, not at a later poll/composite. A qualified provider must reserve
+  // bounded storage before capture and must not mutate Scene/view/device state.
+  // Missing or failed capture is unknown. No integration wire types here.
+  using FrameState = std::shared_ptr<const void>;
+  void setFrameStateProvider(std::function<FrameState()> provider);
+  FrameState frameState() const;
 
   // PickableSource: one synchronous render of a temporary frame sharing this
   // source's camera, renderer and world; the display frame is untouched.
@@ -66,13 +76,16 @@ struct AnariSceneRenderPass : public ImageSource, public PickableSource
   void updateCameraAspect();
   void restartFrame();
   void render(ImageBuffers &b) override;
-  void copyFrameData();
+  bool copyFrameData();
+  void startFrame();
   void publish(ImageBuffers &b);
 
   ImageBuffers m_buffers; // staging: the latest completed ANARI frame
   ImageChannels m_stagingChannels{ImageChannels::NONE};
   ImageChannels m_frameChannels{ImageChannels::NONE}; // set on m_frame
   ImageChannels m_deviceChannels{ImageChannels::NONE};
+  std::function<FrameState()> m_frameStateProvider;
+  FrameState m_startedState, m_copiedState;
 
   bool m_firstFrame{true};
   // Channels were toggled since the last render: restart the frame once at

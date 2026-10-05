@@ -214,9 +214,10 @@ inline void free(T *ptr)
 ImageChannels updateImageBuffers(ImageBuffers &b,
     size_t numPixels,
     ImageChannels current,
-    ImageChannels channels);
+    ImageChannels channels,
+    bool hostStorage = false);
 // Frees every buffer of 'b', keeping its stream.
-void freeImageBuffers(ImageBuffers &b);
+void freeImageBuffers(ImageBuffers &b, bool hostStorage = false);
 
 } // namespace detail
 

@@ -137,6 +137,7 @@ class Application
   virtual void uiFrameStart();
   virtual void uiRenderStart();
   virtual void uiRenderEnd();
+  virtual void uiRenderBeforePresent();
   virtual void uiFrameEnd();
 
   virtual void uiMainMenuBar();

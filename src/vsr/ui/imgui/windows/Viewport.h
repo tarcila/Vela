@@ -21,12 +21,16 @@
 #include "vsr/rendering/pipeline/passes/ToneMapPass.h"
 #include "vsr/rendering/pipeline/passes/VisualizeAOVPass.h"
 #include "vsr/rendering/pipeline/saveImage.h"
+#include "vsr/rendering/view/EffectiveView.h"
 #include "vsr/rendering/view/Manipulator.hpp"
 // anari
 #include <anari/frontend/anari_enums.h>
 // std
+#include <atomic>
 #include <functional>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 
@@ -42,6 +46,30 @@ struct Viewport : public BaseViewport
   ~Viewport();
 
   void buildUI() override;
+  void completePresentation(bool submitted) override;
+  std::optional<vsr::rendering::SDLTextureUpload> textureUpload() const;
+  std::optional<vsr::rendering::SDLTexturePresentation> displayedTexture()
+      const;
+  void setFrameStateProvider(
+      std::function<vsr::rendering::AnariSceneRenderPass::FrameState()>
+          provider);
+  vsr::rendering::AnariSceneRenderPass::FrameState renderedFrameState() const;
+  using FrameState = vsr::rendering::AnariSceneRenderPass::FrameState;
+  using ReadyPixelsProvider = std::function<FrameState(const std::uint32_t *,
+      std::uint32_t,
+      std::uint32_t,
+      const char *,
+      FrameState)>;
+  using PresentationObserver = std::function<void(
+      std::optional<vsr::rendering::SDLTexturePresentation>, FrameState)>;
+  void setFrameObservation(
+      ReadyPixelsProvider acquire, PresentationObserver present);
+  // Owning-thread teardown notification, before passes/device are destroyed.
+  void setFrameTeardown(std::function<void()> callback);
+  std::weak_ptr<const void> lifetime() const;
+  FrameState presentedFrameState() const;
+  std::optional<vsr::rendering::SDLTexturePresentation> queuedTextureDraw()
+      const;
   void setLibrary(const std::string &libName,
       size_t rendererIndex = VSR_INVALID_INDEX,
       bool resetInitialView = true);
@@ -55,6 +83,12 @@ struct Viewport : public BaseViewport
   void setRenderingEnabled(bool enabled);
   void releaseSceneReferences();
 
+  // Owning viewer thread only. Copies the actual frame-bound references and
+  // applied state, never the newly selected camera/renderer. No ANARI calls.
+  vsr::rendering::EffectiveView effectiveView() const;
+  vsr::scene::CameraRef boundCamera() const;
+  vsr::scene::RendererRef boundRenderer() const;
+
  protected:
   void saveSettings(vsr::core::DataNode &thisWindowRoot) override;
   void loadSettings(vsr::core::DataNode &thisWindowRoot) override;
@@ -63,6 +97,7 @@ struct Viewport : public BaseViewport
 
  private:
   void refreshCurrentDevice();
+  static void drawImage(const ImDrawList *list, const ImDrawCmd *command);
 
   void imagePipeline_populate(vsr::rendering::ImagePipeline &p) override;
 
@@ -97,7 +132,22 @@ struct Viewport : public BaseViewport
 
   // Data /////////////////////////////////////////////////////////////////////
 
+  std::shared_ptr<const void> m_lifetime{std::make_shared<const bool>(true)};
+  std::function<void()> m_frameTeardown;
+  std::uint64_t m_deviceGeneration{1};
   size_t m_defragToken{0};
+  std::atomic<bool> m_bindingTransition{true};
+  bool m_activateAfterSetup{false};
+  std::function<vsr::rendering::AnariSceneRenderPass::FrameState()>
+      m_frameStateProvider;
+  std::mutex m_frameObservationMutex;
+  ReadyPixelsProvider m_readyPixelsProvider;
+  PresentationObserver m_presentationObserver;
+  ImVec2 m_imagePosition{0.f, 0.f};
+  vsr::math::float2 m_displaySize{0.f, 0.f};
+  vsr::math::float2 m_displayFramebufferScale{0.f, 0.f};
+  std::uint64_t m_bindingGeneration{0};
+  bool m_customFrameBindingUnknown{false};
 
   ViewportDeviceChangeCb m_deviceChangeCb;
   float m_timeToLoadDevice{0.f};
