@@ -84,6 +84,29 @@ ImageChannels ImageSource::supportedChannels() const
   return ImageChannels::NONE;
 }
 
+bool operator==(const FrameChannelRequest &a, const FrameChannelRequest &b)
+{
+  return a.deviceName == b.deviceName && a.pixelType == b.pixelType;
+}
+
+const std::vector<FrameChannelRequest> &ImageSource::namedChannels() const
+{
+  return m_namedChannels;
+}
+
+const FrameChannelData *ImageSource::channelResult(std::string_view) const
+{
+  return nullptr;
+}
+
+void ImageSource::setNamedChannels(std::vector<FrameChannelRequest> channels)
+{
+  if (channels == m_namedChannels)
+    return;
+  m_namedChannels = std::move(channels);
+  updateChannels();
+}
+
 ImageChannels ImageSource::channels() const
 {
   return m_channels;
@@ -110,6 +133,11 @@ ImageStageRole ImagePass::role() const
 ImageChannels ImagePass::requiredChannels() const
 {
   return ImageChannels::NONE;
+}
+
+std::vector<FrameChannelRequest> ImagePass::requiredNamedChannels() const
+{
+  return {};
 }
 
 ImageStageRole ImageSink::role() const

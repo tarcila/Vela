@@ -11,6 +11,7 @@ project_sources(PRIVATE
   cpu/downsample.cpp
   cpu/outputTransform.cpp
   cpu/visualizeAOV.cpp
+  cpu/visualizeChannel.cpp
   cpu/boxOutline.cpp
   cpu/outline.cpp
   cpu/clearBuffers.cpp
@@ -43,6 +44,7 @@ if (VSR_USE_CUDA)
     cuda/downsample.cu
     cuda/outputTransform.cu
     cuda/visualizeAOV.cu
+    cuda/visualizeChannel.cu
     cuda/boxOutline.cu
     cuda/outline.cu
     cuda/clearBuffers.cu
