@@ -1,0 +1,248 @@
+{
+  "device": "helide",
+  "client": "Pi 1.0.2 native ToolDefinition / MCP stdio proxy / actual vsrViewer",
+  "fixture": "private glTF literal triangle; importer transform node edited via vsr_edit local position",
+  "expected": {
+    "before": [
+      [
+        -2,
+        -3,
+        -4
+      ],
+      [
+        5,
+        6,
+        7
+      ]
+    ],
+    "after": [
+      [
+        48,
+        -3,
+        -4
+      ],
+      [
+        55,
+        6,
+        7
+      ]
+    ]
+  },
+  "sourceIdentity": "v:1.11799784877328573143:1",
+  "independentAgentIdentity": "v:1.11799784877328573143:0",
+  "pendingBeforeReady": 0,
+  "firstAvailableMs": 30.039401999999995,
+  "staleObservationsAfterEdit": 0,
+  "updatedObservedMs": 28.785435000000007,
+  "cameraUnchanged": true,
+  "historicalReplay": true,
+  "forcedRenderInsideBounds": false,
+  "sceneWrites": 1,
+  "editResult": {
+    "batch_ref": {
+      "launch_id": "941f47ad3b38e5e5e03c2821b8ad5e23",
+      "batch_id": "a705c913f041fa4a25cef4c16acf55e1"
+    },
+    "committed": true,
+    "scene_revision": "2.9837701916521910907.5.8",
+    "versions": [],
+    "node_versions": [
+      {
+        "handle": "000000000000000f000000000000000c",
+        "version": "ne:000000000000000f000000000000000c:4",
+        "structural_version": "ns:000000000000000f000000000000000c:000000000000000a0000000000000008:2",
+        "ancestry_version": "na:000000000000000f000000000000000c:000000000000000a0000000000000008:2:2"
+      }
+    ]
+  },
+  "driverCalls": 17,
+  "driverMaxMs": 6.083719003072474,
+  "driverStatuses": [
+    1
+  ],
+  "heartbeats": 64,
+  "maxHeartbeatGapMs": 16.783899001893587,
+  "observations": 14,
+  "evidence": [
+    {
+      "phase": "before_edit",
+      "min": [
+        -2,
+        -3,
+        -4
+      ],
+      "max": [
+        5,
+        6,
+        7
+      ],
+      "generation": "2",
+      "roundTripMs": 29.08868000000001
+    },
+    {
+      "phase": "before_edit",
+      "min": [
+        -2,
+        -3,
+        -4
+      ],
+      "max": [
+        5,
+        6,
+        7
+      ],
+      "generation": "2",
+      "roundTripMs": 29.56068700000003
+    },
+    {
+      "phase": "before_edit",
+      "min": [
+        -2,
+        -3,
+        -4
+      ],
+      "max": [
+        5,
+        6,
+        7
+      ],
+      "generation": "2",
+      "roundTripMs": 29.205393000000015
+    },
+    {
+      "phase": "before_edit",
+      "min": [
+        -2,
+        -3,
+        -4
+      ],
+      "max": [
+        5,
+        6,
+        7
+      ],
+      "generation": "2",
+      "roundTripMs": 29.31202300000001
+    },
+    {
+      "phase": "before_edit",
+      "min": [
+        -2,
+        -3,
+        -4
+      ],
+      "max": [
+        5,
+        6,
+        7
+      ],
+      "generation": "2",
+      "roundTripMs": 30.416886999999974
+    },
+    {
+      "phase": "before_edit",
+      "min": [
+        -2,
+        -3,
+        -4
+      ],
+      "max": [
+        5,
+        6,
+        7
+      ],
+      "generation": "2",
+      "roundTripMs": 29.56298700000002
+    },
+    {
+      "phase": "after_edit",
+      "min": [
+        48,
+        -3,
+        -4
+      ],
+      "max": [
+        55,
+        6,
+        7
+      ],
+      "generation": "2",
+      "roundTripMs": 28.689096999999947
+    },
+    {
+      "phase": "after_edit",
+      "min": [
+        48,
+        -3,
+        -4
+      ],
+      "max": [
+        55,
+        6,
+        7
+      ],
+      "generation": "2",
+      "roundTripMs": 28.917178000000035
+    },
+    {
+      "phase": "after_edit",
+      "min": [
+        48,
+        -3,
+        -4
+      ],
+      "max": [
+        55,
+        6,
+        7
+      ],
+      "generation": "2",
+      "roundTripMs": 28.818029000000024
+    },
+    {
+      "phase": "after_edit",
+      "min": [
+        48,
+        -3,
+        -4
+      ],
+      "max": [
+        55,
+        6,
+        7
+      ],
+      "generation": "2",
+      "roundTripMs": 29.314859999999953
+    },
+    {
+      "phase": "after_edit",
+      "min": [
+        48,
+        -3,
+        -4
+      ],
+      "max": [
+        55,
+        6,
+        7
+      ],
+      "generation": "2",
+      "roundTripMs": 30.396478000000002
+    },
+    {
+      "phase": "after_edit",
+      "min": [
+        48,
+        -3,
+        -4
+      ],
+      "max": [
+        55,
+        6,
+        7
+      ],
+      "generation": "2",
+      "roundTripMs": 29.57557900000006
+    }
+  ]
+}

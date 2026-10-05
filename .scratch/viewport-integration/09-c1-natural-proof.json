@@ -1,0 +1,838 @@
+{
+  "outcome": "ready-for-human",
+  "blocking_ticket": "10-barney-world-property-qualification",
+  "raw_log_sha256": "fd0f83c4f9dbee70866eb2276d8484ed879c75be507a33b2b4128976d3c97730",
+  "measured_executable_sha256": "69c83f980cf2a20b6103b52910573e0d939a154725d400de20f20c26141e5e2e",
+  "source_note": "Measured before exception-safe device/frame cleanup was added; no probe rerun or driver/source enablement.",
+  "diagnostic": {
+    "cases": 1,
+    "assertions": 448,
+    "failures": 30,
+    "exit": 30
+  },
+  "fixture_combinations": 8,
+  "completed_ordinary_frames": 16,
+  "property_calls": 20,
+  "incorrect_property_calls": 5,
+  "max_property_ms": 18.1303,
+  "max_post_render_property_ms": 0.006436,
+  "inspection_work": {
+    "renders": 0,
+    "resets": 0,
+    "populations": 0
+  },
+  "heartbeat_scope": "Owner-thread ticks immediately before/after property, with measured call gap; not independent GUI/SDL heartbeat qualification.",
+  "interpretation": "Barney scalar passes. Barney one-element transform-array fails after actual completed ordinary frames, with or without an earlier cold query. Helide passes both. No internal driver cache/build cause established.",
+  "queries": [
+    {
+      "device": "helide",
+      "shape": "scalar",
+      "cold_query": "0",
+      "phase": "after_ordinary_frame",
+      "generation": "1",
+      "renders": "1",
+      "query": "1",
+      "success": "1",
+      "ms": "0.001838",
+      "owner_heartbeat": "2->3",
+      "owner_gap_ms": "0.001838",
+      "min": [
+        2.0,
+        3.0,
+        4.0
+      ],
+      "max": [
+        4.0,
+        5.0,
+        6.0
+      ],
+      "expected_min": [
+        2.0,
+        3.0,
+        4.0
+      ],
+      "expected_max": [
+        4.0,
+        5.0,
+        6.0
+      ],
+      "literal_match": true
+    },
+    {
+      "device": "helide",
+      "shape": "scalar",
+      "cold_query": "0",
+      "phase": "after_notified_edit_and_frame",
+      "generation": "1",
+      "renders": "2",
+      "query": "2",
+      "success": "1",
+      "ms": "0.001207",
+      "owner_heartbeat": "5->6",
+      "owner_gap_ms": "0.001207",
+      "min": [
+        49.0,
+        3.0,
+        4.0
+      ],
+      "max": [
+        51.0,
+        5.0,
+        6.0
+      ],
+      "expected_min": [
+        49.0,
+        3.0,
+        4.0
+      ],
+      "expected_max": [
+        51.0,
+        5.0,
+        6.0
+      ],
+      "literal_match": true
+    },
+    {
+      "device": "helide",
+      "shape": "scalar",
+      "cold_query": "1",
+      "phase": "after_population",
+      "generation": "1",
+      "renders": "0",
+      "query": "1",
+      "success": "1",
+      "ms": "1.24513",
+      "owner_heartbeat": "1->2",
+      "owner_gap_ms": "1.24513",
+      "min": [
+        2.0,
+        3.0,
+        4.0
+      ],
+      "max": [
+        4.0,
+        5.0,
+        6.0
+      ],
+      "expected_min": [
+        2.0,
+        3.0,
+        4.0
+      ],
+      "expected_max": [
+        4.0,
+        5.0,
+        6.0
+      ],
+      "literal_match": true
+    },
+    {
+      "device": "helide",
+      "shape": "scalar",
+      "cold_query": "1",
+      "phase": "after_ordinary_frame",
+      "generation": "1",
+      "renders": "1",
+      "query": "2",
+      "success": "1",
+      "ms": "0.000598",
+      "owner_heartbeat": "4->5",
+      "owner_gap_ms": "0.000598",
+      "min": [
+        2.0,
+        3.0,
+        4.0
+      ],
+      "max": [
+        4.0,
+        5.0,
+        6.0
+      ],
+      "expected_min": [
+        2.0,
+        3.0,
+        4.0
+      ],
+      "expected_max": [
+        4.0,
+        5.0,
+        6.0
+      ],
+      "literal_match": true
+    },
+    {
+      "device": "helide",
+      "shape": "scalar",
+      "cold_query": "1",
+      "phase": "after_notified_edit_and_frame",
+      "generation": "1",
+      "renders": "2",
+      "query": "3",
+      "success": "1",
+      "ms": "0.000215",
+      "owner_heartbeat": "7->8",
+      "owner_gap_ms": "0.000215",
+      "min": [
+        49.0,
+        3.0,
+        4.0
+      ],
+      "max": [
+        51.0,
+        5.0,
+        6.0
+      ],
+      "expected_min": [
+        49.0,
+        3.0,
+        4.0
+      ],
+      "expected_max": [
+        51.0,
+        5.0,
+        6.0
+      ],
+      "literal_match": true
+    },
+    {
+      "device": "helide",
+      "shape": "array",
+      "cold_query": "0",
+      "phase": "after_ordinary_frame",
+      "generation": "1",
+      "renders": "1",
+      "query": "1",
+      "success": "1",
+      "ms": "0.000829",
+      "owner_heartbeat": "2->3",
+      "owner_gap_ms": "0.000829",
+      "min": [
+        2.0,
+        3.0,
+        4.0
+      ],
+      "max": [
+        4.0,
+        5.0,
+        6.0
+      ],
+      "expected_min": [
+        2.0,
+        3.0,
+        4.0
+      ],
+      "expected_max": [
+        4.0,
+        5.0,
+        6.0
+      ],
+      "literal_match": true
+    },
+    {
+      "device": "helide",
+      "shape": "array",
+      "cold_query": "0",
+      "phase": "after_notified_edit_and_frame",
+      "generation": "1",
+      "renders": "2",
+      "query": "2",
+      "success": "1",
+      "ms": "0.001182",
+      "owner_heartbeat": "5->6",
+      "owner_gap_ms": "0.001182",
+      "min": [
+        49.0,
+        3.0,
+        4.0
+      ],
+      "max": [
+        51.0,
+        5.0,
+        6.0
+      ],
+      "expected_min": [
+        49.0,
+        3.0,
+        4.0
+      ],
+      "expected_max": [
+        51.0,
+        5.0,
+        6.0
+      ],
+      "literal_match": true
+    },
+    {
+      "device": "helide",
+      "shape": "array",
+      "cold_query": "1",
+      "phase": "after_population",
+      "generation": "1",
+      "renders": "0",
+      "query": "1",
+      "success": "1",
+      "ms": "1.05171",
+      "owner_heartbeat": "1->2",
+      "owner_gap_ms": "1.05171",
+      "min": [
+        2.0,
+        3.0,
+        4.0
+      ],
+      "max": [
+        4.0,
+        5.0,
+        6.0
+      ],
+      "expected_min": [
+        2.0,
+        3.0,
+        4.0
+      ],
+      "expected_max": [
+        4.0,
+        5.0,
+        6.0
+      ],
+      "literal_match": true
+    },
+    {
+      "device": "helide",
+      "shape": "array",
+      "cold_query": "1",
+      "phase": "after_ordinary_frame",
+      "generation": "1",
+      "renders": "1",
+      "query": "2",
+      "success": "1",
+      "ms": "0.000402",
+      "owner_heartbeat": "4->5",
+      "owner_gap_ms": "0.000402",
+      "min": [
+        2.0,
+        3.0,
+        4.0
+      ],
+      "max": [
+        4.0,
+        5.0,
+        6.0
+      ],
+      "expected_min": [
+        2.0,
+        3.0,
+        4.0
+      ],
+      "expected_max": [
+        4.0,
+        5.0,
+        6.0
+      ],
+      "literal_match": true
+    },
+    {
+      "device": "helide",
+      "shape": "array",
+      "cold_query": "1",
+      "phase": "after_notified_edit_and_frame",
+      "generation": "1",
+      "renders": "2",
+      "query": "3",
+      "success": "1",
+      "ms": "0.000256",
+      "owner_heartbeat": "7->8",
+      "owner_gap_ms": "0.000256",
+      "min": [
+        49.0,
+        3.0,
+        4.0
+      ],
+      "max": [
+        51.0,
+        5.0,
+        6.0
+      ],
+      "expected_min": [
+        49.0,
+        3.0,
+        4.0
+      ],
+      "expected_max": [
+        51.0,
+        5.0,
+        6.0
+      ],
+      "literal_match": true
+    },
+    {
+      "device": "barney",
+      "shape": "scalar",
+      "cold_query": "0",
+      "phase": "after_ordinary_frame",
+      "generation": "1",
+      "renders": "1",
+      "query": "1",
+      "success": "1",
+      "ms": "0.005653",
+      "owner_heartbeat": "2->3",
+      "owner_gap_ms": "0.005653",
+      "min": [
+        2.0,
+        3.0,
+        4.0
+      ],
+      "max": [
+        4.0,
+        5.0,
+        6.0
+      ],
+      "expected_min": [
+        2.0,
+        3.0,
+        4.0
+      ],
+      "expected_max": [
+        4.0,
+        5.0,
+        6.0
+      ],
+      "literal_match": true
+    },
+    {
+      "device": "barney",
+      "shape": "scalar",
+      "cold_query": "0",
+      "phase": "after_notified_edit_and_frame",
+      "generation": "1",
+      "renders": "2",
+      "query": "2",
+      "success": "1",
+      "ms": "0.001577",
+      "owner_heartbeat": "5->6",
+      "owner_gap_ms": "0.001577",
+      "min": [
+        49.0,
+        3.0,
+        4.0
+      ],
+      "max": [
+        51.0,
+        5.0,
+        6.0
+      ],
+      "expected_min": [
+        49.0,
+        3.0,
+        4.0
+      ],
+      "expected_max": [
+        51.0,
+        5.0,
+        6.0
+      ],
+      "literal_match": true
+    },
+    {
+      "device": "barney",
+      "shape": "scalar",
+      "cold_query": "1",
+      "phase": "after_population",
+      "generation": "1",
+      "renders": "0",
+      "query": "1",
+      "success": "1",
+      "ms": "18.1303",
+      "owner_heartbeat": "1->2",
+      "owner_gap_ms": "18.1303",
+      "min": [
+        2.0,
+        3.0,
+        4.0
+      ],
+      "max": [
+        4.0,
+        5.0,
+        6.0
+      ],
+      "expected_min": [
+        2.0,
+        3.0,
+        4.0
+      ],
+      "expected_max": [
+        4.0,
+        5.0,
+        6.0
+      ],
+      "literal_match": true
+    },
+    {
+      "device": "barney",
+      "shape": "scalar",
+      "cold_query": "1",
+      "phase": "after_ordinary_frame",
+      "generation": "1",
+      "renders": "1",
+      "query": "2",
+      "success": "1",
+      "ms": "0.00456",
+      "owner_heartbeat": "4->5",
+      "owner_gap_ms": "0.00456",
+      "min": [
+        2.0,
+        3.0,
+        4.0
+      ],
+      "max": [
+        4.0,
+        5.0,
+        6.0
+      ],
+      "expected_min": [
+        2.0,
+        3.0,
+        4.0
+      ],
+      "expected_max": [
+        4.0,
+        5.0,
+        6.0
+      ],
+      "literal_match": true
+    },
+    {
+      "device": "barney",
+      "shape": "scalar",
+      "cold_query": "1",
+      "phase": "after_notified_edit_and_frame",
+      "generation": "1",
+      "renders": "2",
+      "query": "3",
+      "success": "1",
+      "ms": "0.001405",
+      "owner_heartbeat": "7->8",
+      "owner_gap_ms": "0.001405",
+      "min": [
+        49.0,
+        3.0,
+        4.0
+      ],
+      "max": [
+        51.0,
+        5.0,
+        6.0
+      ],
+      "expected_min": [
+        49.0,
+        3.0,
+        4.0
+      ],
+      "expected_max": [
+        51.0,
+        5.0,
+        6.0
+      ],
+      "literal_match": true
+    },
+    {
+      "device": "barney",
+      "shape": "array",
+      "cold_query": "0",
+      "phase": "after_ordinary_frame",
+      "generation": "1",
+      "renders": "1",
+      "query": "1",
+      "success": "1",
+      "ms": "0.005099",
+      "owner_heartbeat": "2->3",
+      "owner_gap_ms": "0.005099",
+      "min": [
+        -1.0,
+        -1.0,
+        -1.0
+      ],
+      "max": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "expected_min": [
+        2.0,
+        3.0,
+        4.0
+      ],
+      "expected_max": [
+        4.0,
+        5.0,
+        6.0
+      ],
+      "literal_match": false
+    },
+    {
+      "device": "barney",
+      "shape": "array",
+      "cold_query": "0",
+      "phase": "after_notified_edit_and_frame",
+      "generation": "1",
+      "renders": "2",
+      "query": "2",
+      "success": "1",
+      "ms": "0.001367",
+      "owner_heartbeat": "5->6",
+      "owner_gap_ms": "0.001367",
+      "min": [
+        -1.0,
+        -1.0,
+        -1.0
+      ],
+      "max": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "expected_min": [
+        49.0,
+        3.0,
+        4.0
+      ],
+      "expected_max": [
+        51.0,
+        5.0,
+        6.0
+      ],
+      "literal_match": false
+    },
+    {
+      "device": "barney",
+      "shape": "array",
+      "cold_query": "1",
+      "phase": "after_population",
+      "generation": "1",
+      "renders": "0",
+      "query": "1",
+      "success": "1",
+      "ms": "18.0057",
+      "owner_heartbeat": "1->2",
+      "owner_gap_ms": "18.0057",
+      "min": [
+        -1.0,
+        -1.0,
+        -1.0
+      ],
+      "max": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "expected_min": [
+        2.0,
+        3.0,
+        4.0
+      ],
+      "expected_max": [
+        4.0,
+        5.0,
+        6.0
+      ],
+      "literal_match": false
+    },
+    {
+      "device": "barney",
+      "shape": "array",
+      "cold_query": "1",
+      "phase": "after_ordinary_frame",
+      "generation": "1",
+      "renders": "1",
+      "query": "2",
+      "success": "1",
+      "ms": "0.006436",
+      "owner_heartbeat": "4->5",
+      "owner_gap_ms": "0.006436",
+      "min": [
+        -1.0,
+        -1.0,
+        -1.0
+      ],
+      "max": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "expected_min": [
+        2.0,
+        3.0,
+        4.0
+      ],
+      "expected_max": [
+        4.0,
+        5.0,
+        6.0
+      ],
+      "literal_match": false
+    },
+    {
+      "device": "barney",
+      "shape": "array",
+      "cold_query": "1",
+      "phase": "after_notified_edit_and_frame",
+      "generation": "1",
+      "renders": "2",
+      "query": "3",
+      "success": "1",
+      "ms": "0.001236",
+      "owner_heartbeat": "7->8",
+      "owner_gap_ms": "0.001236",
+      "min": [
+        -1.0,
+        -1.0,
+        -1.0
+      ],
+      "max": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "expected_min": [
+        49.0,
+        3.0,
+        4.0
+      ],
+      "expected_max": [
+        51.0,
+        5.0,
+        6.0
+      ],
+      "literal_match": false
+    }
+  ],
+  "frames": [
+    {
+      "device": "helide",
+      "shape": "scalar",
+      "cold_query": "0",
+      "renders": "1",
+      "nonbackground_pixels": "10",
+      "complete_ms": "5.7864"
+    },
+    {
+      "device": "helide",
+      "shape": "scalar",
+      "cold_query": "0",
+      "renders": "2",
+      "nonbackground_pixels": "10",
+      "complete_ms": "1.47863"
+    },
+    {
+      "device": "helide",
+      "shape": "scalar",
+      "cold_query": "1",
+      "renders": "1",
+      "nonbackground_pixels": "10",
+      "complete_ms": "0.771674"
+    },
+    {
+      "device": "helide",
+      "shape": "scalar",
+      "cold_query": "1",
+      "renders": "2",
+      "nonbackground_pixels": "10",
+      "complete_ms": "3.79495"
+    },
+    {
+      "device": "helide",
+      "shape": "array",
+      "cold_query": "0",
+      "renders": "1",
+      "nonbackground_pixels": "10",
+      "complete_ms": "1.52809"
+    },
+    {
+      "device": "helide",
+      "shape": "array",
+      "cold_query": "0",
+      "renders": "2",
+      "nonbackground_pixels": "10",
+      "complete_ms": "0.373981"
+    },
+    {
+      "device": "helide",
+      "shape": "array",
+      "cold_query": "1",
+      "renders": "1",
+      "nonbackground_pixels": "10",
+      "complete_ms": "0.500499"
+    },
+    {
+      "device": "helide",
+      "shape": "array",
+      "cold_query": "1",
+      "renders": "2",
+      "nonbackground_pixels": "10",
+      "complete_ms": "0.793834"
+    },
+    {
+      "device": "barney",
+      "shape": "scalar",
+      "cold_query": "0",
+      "renders": "1",
+      "nonbackground_pixels": "31",
+      "complete_ms": "54.5178"
+    },
+    {
+      "device": "barney",
+      "shape": "scalar",
+      "cold_query": "0",
+      "renders": "2",
+      "nonbackground_pixels": "16",
+      "complete_ms": "1.55568"
+    },
+    {
+      "device": "barney",
+      "shape": "scalar",
+      "cold_query": "1",
+      "renders": "1",
+      "nonbackground_pixels": "31",
+      "complete_ms": "7.33804"
+    },
+    {
+      "device": "barney",
+      "shape": "scalar",
+      "cold_query": "1",
+      "renders": "2",
+      "nonbackground_pixels": "16",
+      "complete_ms": "1.54379"
+    },
+    {
+      "device": "barney",
+      "shape": "array",
+      "cold_query": "0",
+      "renders": "1",
+      "nonbackground_pixels": "28",
+      "complete_ms": "25.2621"
+    },
+    {
+      "device": "barney",
+      "shape": "array",
+      "cold_query": "0",
+      "renders": "2",
+      "nonbackground_pixels": "28",
+      "complete_ms": "1.4916"
+    },
+    {
+      "device": "barney",
+      "shape": "array",
+      "cold_query": "1",
+      "renders": "1",
+      "nonbackground_pixels": "28",
+      "complete_ms": "7.44381"
+    },
+    {
+      "device": "barney",
+      "shape": "array",
+      "cold_query": "1",
+      "renders": "2",
+      "nonbackground_pixels": "28",
+      "complete_ms": "1.53135"
+    }
+  ]
+}

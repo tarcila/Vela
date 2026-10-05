@@ -9,7 +9,9 @@ rig = Path("/home/tarcila/Code/ANARI/vela")
 workspace = Path(sys.argv[1]).resolve()
 if workspace.parent != rig or not workspace.name.startswith("viewport-"):
     raise SystemExit("Refusing configuration outside owned viewport workspaces")
-source_cache = rig / "broad-editing/_out/_cmake/CMakeCache.txt"
+# The accepted integration tree is the current verified configuration source;
+# completed older workspaces may legitimately have reclaimed their outputs.
+source_cache = rig / "viewport-integration/_out/_cmake/CMakeCache.txt"
 entries = {}
 for line in source_cache.read_text().splitlines():
     match = re.match(r"([^#/:][^:]*):([^=]+)=(.*)$", line)

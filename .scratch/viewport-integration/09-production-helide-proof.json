@@ -1,0 +1,665 @@
+{
+  "device": "helide",
+  "client": "Pi 1.0.2 native ToolDefinition / MCP stdio proxy / actual vsrViewer",
+  "fixture": "private OBJ literal vertices; no user Scene or controller",
+  "expectedMin": [
+    -2,
+    -3,
+    -4
+  ],
+  "expectedMax": [
+    5,
+    6,
+    7
+  ],
+  "sourceIdentity": "v:1.13363949657578628123:1",
+  "independentAgentIdentity": "v:1.13363949657578628123:0",
+  "cameraUnchanged": true,
+  "historicalReplay": true,
+  "forcedRenderInsideBounds": false,
+  "sceneWrites": 0,
+  "afterEditProductionProof": false,
+  "barneyQualified": false,
+  "driver": [
+    {
+      "durationMs": 0.5131879988766741,
+      "status": 1,
+      "box": [
+        -2,
+        -3,
+        -4,
+        5,
+        6,
+        7
+      ]
+    },
+    {
+      "durationMs": 0.0005069996404927224,
+      "status": 1,
+      "box": [
+        -2,
+        -3,
+        -4,
+        5,
+        6,
+        7
+      ]
+    },
+    {
+      "durationMs": 7.006260999332881,
+      "status": 1,
+      "box": [
+        -2,
+        -3,
+        -4,
+        5,
+        6,
+        7
+      ]
+    },
+    {
+      "durationMs": 0.005050002073403448,
+      "status": 1,
+      "box": [
+        -2,
+        -3,
+        -4,
+        5,
+        6,
+        7
+      ]
+    },
+    {
+      "durationMs": 0.0037240024539642036,
+      "status": 1,
+      "box": [
+        -2,
+        -3,
+        -4,
+        5,
+        6,
+        7
+      ]
+    },
+    {
+      "durationMs": 0.004027999239042401,
+      "status": 1,
+      "box": [
+        -2,
+        -3,
+        -4,
+        5,
+        6,
+        7
+      ]
+    },
+    {
+      "durationMs": 0.004393998096929863,
+      "status": 1,
+      "box": [
+        -2,
+        -3,
+        -4,
+        5,
+        6,
+        7
+      ]
+    },
+    {
+      "durationMs": 0.004772999091073871,
+      "status": 1,
+      "box": [
+        -2,
+        -3,
+        -4,
+        5,
+        6,
+        7
+      ]
+    },
+    {
+      "durationMs": 0.003778000973397866,
+      "status": 1,
+      "box": [
+        -2,
+        -3,
+        -4,
+        5,
+        6,
+        7
+      ]
+    },
+    {
+      "durationMs": 0.003701999958138913,
+      "status": 1,
+      "box": [
+        -2,
+        -3,
+        -4,
+        5,
+        6,
+        7
+      ]
+    },
+    {
+      "durationMs": 0.004260000423528254,
+      "status": 1,
+      "box": [
+        -2,
+        -3,
+        -4,
+        5,
+        6,
+        7
+      ]
+    },
+    {
+      "durationMs": 0.0034420008887536824,
+      "status": 1,
+      "box": [
+        -2,
+        -3,
+        -4,
+        5,
+        6,
+        7
+      ]
+    },
+    {
+      "durationMs": 0.004158999217906967,
+      "status": 1,
+      "box": [
+        -2,
+        -3,
+        -4,
+        5,
+        6,
+        7
+      ]
+    },
+    {
+      "durationMs": 0.003468001523287967,
+      "status": 1,
+      "box": [
+        -2,
+        -3,
+        -4,
+        5,
+        6,
+        7
+      ]
+    },
+    {
+      "durationMs": 0.0041669991333037615,
+      "status": 1,
+      "box": [
+        -2,
+        -3,
+        -4,
+        5,
+        6,
+        7
+      ]
+    }
+  ],
+  "heartbeats": 108,
+  "maxHeartbeatGapMs": 17.818023003201233,
+  "evidence": [
+    {
+      "bounds": {
+        "state": "available",
+        "coverage": "viewport_world",
+        "covered_scene_revision": null,
+        "revision_basis": "observation_only",
+        "source": {
+          "kind": "interactive_viewport",
+          "selection": "primary_live_interactive",
+          "identity": "v:1.13363949657578628123:1",
+          "generation": "2",
+          "device_identifier": "helide",
+          "device_subtype": "default"
+        },
+        "min": [
+          -2,
+          -3,
+          -4
+        ],
+        "max": [
+          5,
+          6,
+          7
+        ],
+        "scene_id": 0,
+        "target": {
+          "kind": "scene",
+          "scene_id": 0
+        },
+        "scene_revision": "2.5628684488636085703.5.6",
+        "inspection_revision": "2.5628684488636085703.5.22",
+        "selection": {
+          "include_disabled": false,
+          "basis": "existing_world_filtering_and_external_instances"
+        }
+      },
+      "roundTripMs": 29.343188000000055
+    },
+    {
+      "bounds": {
+        "state": "available",
+        "coverage": "viewport_world",
+        "covered_scene_revision": null,
+        "revision_basis": "observation_only",
+        "source": {
+          "kind": "interactive_viewport",
+          "selection": "primary_live_interactive",
+          "identity": "v:1.13363949657578628123:1",
+          "generation": "2",
+          "device_identifier": "helide",
+          "device_subtype": "default"
+        },
+        "min": [
+          -2,
+          -3,
+          -4
+        ],
+        "max": [
+          5,
+          6,
+          7
+        ],
+        "scene_id": 0,
+        "target": {
+          "kind": "scene",
+          "scene_id": 0
+        },
+        "scene_revision": "2.5628684488636085703.5.6",
+        "inspection_revision": "2.5628684488636085703.5.22",
+        "selection": {
+          "include_disabled": false,
+          "basis": "existing_world_filtering_and_external_instances"
+        }
+      },
+      "roundTripMs": 30.244424999999865
+    },
+    {
+      "bounds": {
+        "state": "available",
+        "coverage": "viewport_world",
+        "covered_scene_revision": null,
+        "revision_basis": "observation_only",
+        "source": {
+          "kind": "interactive_viewport",
+          "selection": "primary_live_interactive",
+          "identity": "v:1.13363949657578628123:1",
+          "generation": "2",
+          "device_identifier": "helide",
+          "device_subtype": "default"
+        },
+        "min": [
+          -2,
+          -3,
+          -4
+        ],
+        "max": [
+          5,
+          6,
+          7
+        ],
+        "scene_id": 0,
+        "target": {
+          "kind": "scene",
+          "scene_id": 0
+        },
+        "scene_revision": "2.5628684488636085703.5.6",
+        "inspection_revision": "2.5628684488636085703.5.22",
+        "selection": {
+          "include_disabled": false,
+          "basis": "existing_world_filtering_and_external_instances"
+        }
+      },
+      "roundTripMs": 30.10242500000004
+    },
+    {
+      "bounds": {
+        "state": "available",
+        "coverage": "viewport_world",
+        "covered_scene_revision": null,
+        "revision_basis": "observation_only",
+        "source": {
+          "kind": "interactive_viewport",
+          "selection": "primary_live_interactive",
+          "identity": "v:1.13363949657578628123:1",
+          "generation": "2",
+          "device_identifier": "helide",
+          "device_subtype": "default"
+        },
+        "min": [
+          -2,
+          -3,
+          -4
+        ],
+        "max": [
+          5,
+          6,
+          7
+        ],
+        "scene_id": 0,
+        "target": {
+          "kind": "scene",
+          "scene_id": 0
+        },
+        "scene_revision": "2.5628684488636085703.5.6",
+        "inspection_revision": "2.5628684488636085703.5.22",
+        "selection": {
+          "include_disabled": false,
+          "basis": "existing_world_filtering_and_external_instances"
+        }
+      },
+      "roundTripMs": 29.75649899999985
+    },
+    {
+      "bounds": {
+        "state": "available",
+        "coverage": "viewport_world",
+        "covered_scene_revision": null,
+        "revision_basis": "observation_only",
+        "source": {
+          "kind": "interactive_viewport",
+          "selection": "primary_live_interactive",
+          "identity": "v:1.13363949657578628123:1",
+          "generation": "2",
+          "device_identifier": "helide",
+          "device_subtype": "default"
+        },
+        "min": [
+          -2,
+          -3,
+          -4
+        ],
+        "max": [
+          5,
+          6,
+          7
+        ],
+        "scene_id": 0,
+        "target": {
+          "kind": "scene",
+          "scene_id": 0
+        },
+        "scene_revision": "2.5628684488636085703.5.6",
+        "inspection_revision": "2.5628684488636085703.5.22",
+        "selection": {
+          "include_disabled": false,
+          "basis": "existing_world_filtering_and_external_instances"
+        }
+      },
+      "roundTripMs": 30.819929999999886
+    },
+    {
+      "bounds": {
+        "state": "available",
+        "coverage": "viewport_world",
+        "covered_scene_revision": null,
+        "revision_basis": "observation_only",
+        "source": {
+          "kind": "interactive_viewport",
+          "selection": "primary_live_interactive",
+          "identity": "v:1.13363949657578628123:1",
+          "generation": "2",
+          "device_identifier": "helide",
+          "device_subtype": "default"
+        },
+        "min": [
+          -2,
+          -3,
+          -4
+        ],
+        "max": [
+          5,
+          6,
+          7
+        ],
+        "scene_id": 0,
+        "target": {
+          "kind": "scene",
+          "scene_id": 0
+        },
+        "scene_revision": "2.5628684488636085703.5.6",
+        "inspection_revision": "2.5628684488636085703.5.22",
+        "selection": {
+          "include_disabled": false,
+          "basis": "existing_world_filtering_and_external_instances"
+        }
+      },
+      "roundTripMs": 28.041269000000057
+    },
+    {
+      "bounds": {
+        "state": "available",
+        "coverage": "viewport_world",
+        "covered_scene_revision": null,
+        "revision_basis": "observation_only",
+        "source": {
+          "kind": "interactive_viewport",
+          "selection": "primary_live_interactive",
+          "identity": "v:1.13363949657578628123:1",
+          "generation": "2",
+          "device_identifier": "helide",
+          "device_subtype": "default"
+        },
+        "min": [
+          -2,
+          -3,
+          -4
+        ],
+        "max": [
+          5,
+          6,
+          7
+        ],
+        "scene_id": 0,
+        "target": {
+          "kind": "scene",
+          "scene_id": 0
+        },
+        "scene_revision": "2.5628684488636085703.5.6",
+        "inspection_revision": "2.5628684488636085703.5.22",
+        "selection": {
+          "include_disabled": false,
+          "basis": "existing_world_filtering_and_external_instances"
+        }
+      },
+      "roundTripMs": 28.734995000000026
+    },
+    {
+      "bounds": {
+        "state": "available",
+        "coverage": "viewport_world",
+        "covered_scene_revision": null,
+        "revision_basis": "observation_only",
+        "source": {
+          "kind": "interactive_viewport",
+          "selection": "primary_live_interactive",
+          "identity": "v:1.13363949657578628123:1",
+          "generation": "2",
+          "device_identifier": "helide",
+          "device_subtype": "default"
+        },
+        "min": [
+          -2,
+          -3,
+          -4
+        ],
+        "max": [
+          5,
+          6,
+          7
+        ],
+        "scene_id": 0,
+        "target": {
+          "kind": "scene",
+          "scene_id": 0
+        },
+        "scene_revision": "2.5628684488636085703.5.6",
+        "inspection_revision": "2.5628684488636085703.5.22",
+        "selection": {
+          "include_disabled": false,
+          "basis": "existing_world_filtering_and_external_instances"
+        }
+      },
+      "roundTripMs": 30.00944800000002
+    },
+    {
+      "bounds": {
+        "state": "available",
+        "coverage": "viewport_world",
+        "covered_scene_revision": null,
+        "revision_basis": "observation_only",
+        "source": {
+          "kind": "interactive_viewport",
+          "selection": "primary_live_interactive",
+          "identity": "v:1.13363949657578628123:1",
+          "generation": "2",
+          "device_identifier": "helide",
+          "device_subtype": "default"
+        },
+        "min": [
+          -2,
+          -3,
+          -4
+        ],
+        "max": [
+          5,
+          6,
+          7
+        ],
+        "scene_id": 0,
+        "target": {
+          "kind": "scene",
+          "scene_id": 0
+        },
+        "scene_revision": "2.5628684488636085703.5.6",
+        "inspection_revision": "2.5628684488636085703.5.22",
+        "selection": {
+          "include_disabled": false,
+          "basis": "existing_world_filtering_and_external_instances"
+        }
+      },
+      "roundTripMs": 28.66925100000003
+    },
+    {
+      "bounds": {
+        "state": "available",
+        "coverage": "viewport_world",
+        "covered_scene_revision": null,
+        "revision_basis": "observation_only",
+        "source": {
+          "kind": "interactive_viewport",
+          "selection": "primary_live_interactive",
+          "identity": "v:1.13363949657578628123:1",
+          "generation": "2",
+          "device_identifier": "helide",
+          "device_subtype": "default"
+        },
+        "min": [
+          -2,
+          -3,
+          -4
+        ],
+        "max": [
+          5,
+          6,
+          7
+        ],
+        "scene_id": 0,
+        "target": {
+          "kind": "scene",
+          "scene_id": 0
+        },
+        "scene_revision": "2.5628684488636085703.5.6",
+        "inspection_revision": "2.5628684488636085703.5.22",
+        "selection": {
+          "include_disabled": false,
+          "basis": "existing_world_filtering_and_external_instances"
+        }
+      },
+      "roundTripMs": 27.81262599999991
+    },
+    {
+      "bounds": {
+        "state": "available",
+        "coverage": "viewport_world",
+        "covered_scene_revision": null,
+        "revision_basis": "observation_only",
+        "source": {
+          "kind": "interactive_viewport",
+          "selection": "primary_live_interactive",
+          "identity": "v:1.13363949657578628123:1",
+          "generation": "2",
+          "device_identifier": "helide",
+          "device_subtype": "default"
+        },
+        "min": [
+          -2,
+          -3,
+          -4
+        ],
+        "max": [
+          5,
+          6,
+          7
+        ],
+        "scene_id": 0,
+        "target": {
+          "kind": "scene",
+          "scene_id": 0
+        },
+        "scene_revision": "2.5628684488636085703.5.6",
+        "inspection_revision": "2.5628684488636085703.5.22",
+        "selection": {
+          "include_disabled": false,
+          "basis": "existing_world_filtering_and_external_instances"
+        }
+      },
+      "roundTripMs": 27.841413000000102
+    },
+    {
+      "bounds": {
+        "state": "available",
+        "coverage": "viewport_world",
+        "covered_scene_revision": null,
+        "revision_basis": "observation_only",
+        "source": {
+          "kind": "interactive_viewport",
+          "selection": "primary_live_interactive",
+          "identity": "v:1.13363949657578628123:1",
+          "generation": "2",
+          "device_identifier": "helide",
+          "device_subtype": "default"
+        },
+        "min": [
+          -2,
+          -3,
+          -4
+        ],
+        "max": [
+          5,
+          6,
+          7
+        ],
+        "scene_id": 0,
+        "target": {
+          "kind": "scene",
+          "scene_id": 0
+        },
+        "scene_revision": "2.5628684488636085703.5.6",
+        "inspection_revision": "2.5628684488636085703.5.22",
+        "selection": {
+          "include_disabled": false,
+          "basis": "existing_world_filtering_and_external_instances"
+        }
+      },
+      "roundTripMs": 29.19014600000014
+    }
+  ]
+}
