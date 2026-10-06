@@ -363,8 +363,32 @@ write boundaries, and viewer Restore controls.
   stored type's range. Scalars take one value; vectors take arrays of exactly
   the stored component count. Matching `min`/`max` metadata is enforced per
   component, and `COLOR` usage retains `[0,1]`. Parameter `enabled` is
-  preserved and does not restrict value editing. References, object parameter
-  matrices, and all other types are unsupported; edits cannot create parameters.
+  preserved and does not restrict value editing. The five float32 matrices
+  below also accept nested row arrays, selected by the stored type (no caller
+  type tag). References, double matrices, and all other types remain
+  unsupported; edits cannot create parameters.
+
+  | Stored ANARI type | Exact JSON rows × columns |
+  |---|---|
+  | `FLOAT32_MAT2` | 2 × 2 |
+  | `FLOAT32_MAT3` | 3 × 3 |
+  | `FLOAT32_MAT4` | 4 × 4 |
+  | `FLOAT32_MAT2x3` | 2 × 3 |
+  | `FLOAT32_MAT3x4` | 3 × 4 |
+
+  Row r, column c maps to packed index `c*R+r`, not GLM's column-first
+  naming. MAT2x3 `[[1,2,3],[4,5,6]]` packs `[1,4,2,5,3,6]` and multiplies
+  `[7,8,9]` to `[50,122]`. MAT3x4 `[[1,2,3,4],[5,6,7,8],[9,10,11,12]]`
+  packs `[1,5,9,2,6,10,3,7,11,4,8,12]` and multiplies `[1,2,3,1]` to
+  `[18,46,74]`. Flat, ragged, missing or surplus components reject at
+  preparation. Each input is finite binary64 within binary32 range and any
+  matching-type matrix bounds; bounds must be finite and ordered per packed
+  component. Absent/differently typed metadata is ignored. Round once
+  ties-to-even, then check bounds again, without clamping. Existing usage
+  constraints apply; there is no new matrix colour usage. General object
+  matrices may be non-affine and accept no `space` argument. Node placement
+  `transform` still requires the exact affine last row and retains its SRT
+  semantics.
 - Inspection parameter entries expose an `editable` Boolean, typed `min`/`max`
   values and `string_values` when present. `editable` describes value support,
   not permission: readable parameters are not automatically writable, and the
@@ -448,7 +472,10 @@ write boundaries, and viewer Restore controls.
   committed. Node edit/restore results additionally carry `node_versions:
   [{handle, version, structural_version, ancestry_version}]`, with fresh opaque
   tokens in inspection's format. Node-only results keep `versions: []`; no
-  object parameter token is invented. Object-only result shape is unchanged.
+  object parameter token is invented. Matrices use ordinary object `versions`,
+  never a `matrix_versions` field. Committed restore receipts also carry
+  `image_versions: []` for parameter/node batches (including matrices); Image
+  restoration later fills that separate list without changing matrix versioning.
   Restore changes only recorded fields (own enabled flag and/or exact local
   matrix with its cached representation), validates target and structural
   history, and preserves unrelated names, state, and reset defaults. It uses the

@@ -147,9 +147,15 @@ range and `[-(2^53-1), 2^53-1]`; and float32/float64 scalars/vec2/vec3/vec4
 as finite JSON numbers within type range. Vectors require exactly the stored
 component count. Matching `min`/`max` metadata applies per component, and
 `COLOR` usage retains `[0,1]`. Parameter `enabled` is preserved and does not
-restrict value editing. References, matrices, other types, and parameter
-creation are unsupported. Not every readable value is writable: the legacy
-`values` mirror covers generic supported float32 scalar/vec2/vec3/vec4 values,
+restrict value editing. The five stored float32 matrices are also editable:
+MAT2/MAT3/MAT4 use exactly 2×2/3×3/4×4 nested row arrays; MAT2x3/MAT3x4
+use exactly 2×3/3×4 (rows × columns). The stored type selects the shape, with
+packed index `column*rows+row`. Matching matrix bounds apply component-wise
+before and after ties-to-even binary32 conversion. Object matrices may be
+non-affine and accept no `space` argument; node transforms remain affine.
+References, double matrices, other types, and parameter creation are unsupported.
+Not every readable value is writable: the legacy `values` mirror covers generic
+supported float32 scalar/vec2/vec3/vec4 values,
 not exclusive edit authority. Stored camera edits do not control the viewport
 or agent capture camera. Atomicity, versioning, and conditional restore remain
 unchanged; see the [live placement guide](live-placement-editing.md).

@@ -105,7 +105,7 @@ float roundToBinary32(double v);
 // Validate one binary64 against a domain, then round.
 ScalarResult convertScalar(const JsonValue &v, Domain domain);
 
-// References, matrices and opaque storage are deliberately read-only.
+// References, double matrices and opaque storage are deliberately read-only.
 bool isEditableParameter(const scene::Parameter &parameter);
 
 // Validates target and value without mutating the object.
@@ -250,21 +250,37 @@ inline T component(const core::Any &value, std::size_t index)
 }
 
 template <typename T>
-inline PreparedEdit prepareNumeric(
-    const scene::Parameter &p, const JsonValue &value)
+inline PreparedEdit prepareNumeric(const scene::Parameter &p,
+    const JsonValue &value,
+    std::size_t rows = 0,
+    std::size_t columns = 0)
 {
   PreparedEdit result;
   const auto count = anari::componentsOf(p.value().type());
-  if ((count == 1 && value.kind != JsonKind::NUMBER)
+  if (rows) {
+    if (value.kind != JsonKind::ARRAY || value.elements.size() != rows) {
+      result.error = ValueError::INCOMPATIBLE_TYPE;
+      return result;
+    }
+    for (const auto &row : value.elements) {
+      if (row.kind != JsonKind::ARRAY || row.elements.size() != columns) {
+        result.error = ValueError::INCOMPATIBLE_TYPE;
+        return result;
+      }
+    }
+  } else if ((count == 1 && value.kind != JsonKind::NUMBER)
       || (count != 1
           && (value.kind != JsonKind::ARRAY
               || value.elements.size() != count))) {
     result.error = ValueError::INCOMPATIBLE_TYPE;
     return result;
   }
-  T out[4] = {};
+  T out[16] = {}; // largest supported value is FLOAT32_MAT4
   for (std::size_t i = 0; i < count; ++i) {
-    const auto &input = count == 1 ? value : value.elements[i];
+    // ANARI matrix names are rows x columns; metadata uses packed indexing.
+    const auto &input = rows ? value.elements[i % rows].elements[i / rows]
+        : count == 1         ? value
+                             : value.elements[i];
     if (input.kind != JsonKind::NUMBER) {
       result.error = ValueError::INCOMPATIBLE_TYPE;
       return result;
@@ -324,7 +340,9 @@ inline PreparedEdit prepareNumeric(
 inline bool isEditableParameter(const scene::Parameter &p)
 {
   const auto type = p.value().type();
-  if (type == ANARI_BOOL || type == ANARI_STRING)
+  if (type == ANARI_BOOL || type == ANARI_STRING || type == ANARI_FLOAT32_MAT2
+      || type == ANARI_FLOAT32_MAT3 || type == ANARI_FLOAT32_MAT4
+      || type == ANARI_FLOAT32_MAT2x3 || type == ANARI_FLOAT32_MAT3x4)
     return true;
 #define VSR_EDIT_NUMERIC(BASE)                                                 \
   if (type == BASE || type == BASE##_VEC2 || type == BASE##_VEC3               \
@@ -387,6 +405,31 @@ inline PreparedEdit prepareEdit(
   VSR_PREPARE_NUMERIC(ANARI_FLOAT32, float);
   VSR_PREPARE_NUMERIC(ANARI_FLOAT64, double);
 #undef VSR_PREPARE_NUMERIC
+  else if (type
+      == ANARI_FLOAT32_MAT2) return value_detail::prepareNumeric<float>(*p,
+      value,
+      2,
+      2);
+  else if (type
+      == ANARI_FLOAT32_MAT3) return value_detail::prepareNumeric<float>(*p,
+      value,
+      3,
+      3);
+  else if (type
+      == ANARI_FLOAT32_MAT4) return value_detail::prepareNumeric<float>(*p,
+      value,
+      4,
+      4);
+  else if (type
+      == ANARI_FLOAT32_MAT2x3) return value_detail::prepareNumeric<float>(*p,
+      value,
+      2,
+      3);
+  else if (type
+      == ANARI_FLOAT32_MAT3x4) return value_detail::prepareNumeric<float>(*p,
+      value,
+      3,
+      4);
   return result;
 }
 

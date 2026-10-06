@@ -2659,7 +2659,7 @@ SCENARIO("ordinary parameters retain ANARI types and stored values",
   REQUIRE(choices.size() == 2);
   CHECK(choices[0].s == "camera label");
   CHECK(choices[1].s == "other label");
-  CHECK_FALSE(parameter(item, "observedMatrix").get("editable")->b);
+  CHECK(parameter(item, "observedMatrix").get("editable")->b);
 }
 
 SCENARIO("large integers and non-finite components are lossless typed tags",

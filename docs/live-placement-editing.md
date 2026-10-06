@@ -180,17 +180,44 @@ and a value matching its stored type:
 | `STRING` | String without embedded NUL; must match a `string_values` choice when choices are present |
 | Signed/unsigned 8-, 16-, 32-, or 64-bit integer scalar or vec2/vec3/vec4 | Integral JSON number(s) within both the stored type's range and `[-(2^53-1), 2^53-1]` |
 | float32/float64 scalar or vec2/vec3/vec4 | Finite JSON number(s) within the stored type's range |
+| `FLOAT32_MAT2`, `FLOAT32_MAT3`, `FLOAT32_MAT4` | Exactly 2×2, 3×3, or 4×4 nested row arrays |
+| `FLOAT32_MAT2x3`, `FLOAT32_MAT3x4` | Exactly 2×3 or 3×4 nested row arrays (rows × columns) |
 
 Scalars take one value; vectors take arrays of exactly the stored component
 count. Matching `min`/`max` metadata is enforced per component, and `COLOR`
 usage retains the `[0,1]` domain. Parameter `enabled` is preserved by value
 edits and does not restrict them: a disabled parameter's supported value can
-still be edited. References, matrices, and all other stored types are
+still be edited. References, double matrices, and all other stored types are
 unsupported, and edits cannot create parameters. Readable values, including
 lossless integer tags and non-finite read tags, are not automatically writable.
 Stored camera parameter edits do not control the viewport or agent capture
 camera. The existing authority, atomic batch validation, object versioning,
 and conditional restoration rules remain unchanged.
+
+Object matrix input uses the same rows as typed inspection, not flat arrays.
+For R rows, row r / column c is stored at packed index `c*R+r` (column-major).
+For example, `[[1,2,3],[4,5,6]]` is MAT2x3, packs as `[1,4,2,5,3,6]`, and
+multiplies `[7,8,9]` to `[50,122]`. MAT3x4 rows `[1,2,3,4]`, `[5,6,7,8]`,
+`[9,10,11,12]` multiply `[1,2,3,1]` to `[18,46,74]`.
+Every component must be finite binary64 within binary32 range and applicable
+matching-type, finite, ordered `min`/`max` bounds. Differently typed bounds are
+ignored. Conversion rounds once to binary32, ties-to-even, then checks bounds
+again; it never clamps. Existing usage constraints apply component-wise.
+Object matrices can be non-affine and accept **no `space` argument**. This does
+not weaken the node `transform` affine-last-row rule or alter its cached SRT.
+
+For a Sampler's existing `outTransform` MAT4, a red/green swap is:
+
+```json
+{"request_id":2,"scene_id":0,"edits":[{"target_kind":"object","handle":"<sampler.handle>","version":1,"parameter":"outTransform","value":[[0,1,0,0],[1,0,0,0],[0,0,1,0],[0,0,0,1]]}]}
+```
+
+Use the actual inspected handle/version, poll status, and reinspect. This maps
+`[0,1,0,1]` to red `[1,0,0,1]` while preserving neutral `[d,d,d,1]`; adding a
+constant colour offset would not preserve neutrals. Matrices share ordinary
+object versions, mixed atomic batches, historical replay and exact conditional
+restore; no `matrix_versions` receipt exists. Matrix restore uses `versions`
+(and `image_versions: []`), not Image data versions.
 
 ## Preview and commit a selection translation
 
@@ -282,7 +309,7 @@ remains available after client disconnect or **Disable agent edits**. Existing
 
 Object writes are limited to existing parameters with the supported stored
 types and metadata described above; reading a parameter never grants writes.
-There is no parameter creation or object-reference/matrix parameter editing,
+There is no parameter creation, object-reference or double-matrix editing,
 nor new creation/deletion/reparenting, reference replacement, layer activation,
 implicit wrapper, or transform-array element edit.
 Stored scene camera inspection/editing does **not** control the interactive

@@ -241,7 +241,7 @@ inline operations::Request RestoreService::makeRequest(
         + edit::detail::batchRefJson(res.targetBatchRef) + ","
         + edit::detail::commitDetailJson(
             true, res.sceneRevision, res.versions, res.nodeVersions)
-        + "}";
+        + ",\"image_versions\":[]}";
     *slot = std::move(res);
     return step;
   };

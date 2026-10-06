@@ -3430,4 +3430,574 @@ SCENARIO("Fools Mate repeats through loopback MCP and host safe points",
   CHECK(wait(id).str("outcome") != "ok"); // one-way, never redo
 }
 
+namespace {
+
+json::Value inspectMatrixObject(Fixture &f, const Session &s, std::uint64_t id)
+{
+  REQUIRE(
+      f.tool(s,
+           "vsr_inspect",
+           "{\"request_id\":" + std::to_string(id) + ",\"scene_id\":"
+               + std::to_string(f.sceneId) + ",\"name\":\"matrix-sampler\"}")
+          .errorCode()
+          .empty());
+  f.drain();
+  auto st = f.status(s, s.id, id);
+  REQUIRE(st.str("outcome") == "ok");
+  REQUIRE(st.result()->get("items")->a.size() == 1);
+  return st.result()->get("items")->a[0];
+}
+
+std::string objectFields(const json::Value &item)
+{
+  return "\"target_kind\":\"object\",\"handle\":"
+      + json::quote(item.get("handle")->s)
+      + ",\"version\":" + json::write(*item.get("version"));
+}
+
+const json::Value &matrixParameter(const json::Value &item)
+{
+  for (const auto &p : item.get("parameters")->a)
+    if (p.get("name")->s == "outTransform")
+      return p;
+  FAIL("missing inspected outTransform");
+  return item;
+}
+
+std::string matrixEditArgs(Fixture &f,
+    std::uint64_t id,
+    const json::Value &item,
+    const std::string &value)
+{
+  return "{\"request_id\":" + std::to_string(id) + ",\"scene_id\":"
+      + std::to_string(f.sceneId) + ",\"edits\":[{" + objectFields(item)
+      + ",\"parameter\":\"outTransform\",\"value\":" + value + "}]}";
+}
+
+} // namespace
+
+SCENARIO(
+    "MCP object matrices preserve independent multiplication oracles and exact restore",
+    "[integration][object-matrix][mcp]")
+{
+  struct MatrixCase
+  {
+    anari::DataType type;
+    std::size_t rows;
+    std::size_t columns;
+    const char *wire;
+    std::array<float, 4> operand;
+    std::array<float, 4> expected;
+  };
+  const MatrixCase cases[] = {
+      {ANARI_FLOAT32_MAT2, 2, 2, "[[1,2],[3,4]]", {5, 6}, {17, 39}},
+      {ANARI_FLOAT32_MAT3,
+          3,
+          3,
+          "[[1,2,3],[4,5,6],[7,8,10]]",
+          {2, 3, 4},
+          {20, 47, 78}},
+      {ANARI_FLOAT32_MAT4,
+          4,
+          4,
+          "[[1,2,3,4],[5,6,7,8],[9,10,11,12],[13,14,15,16]]",
+          {1, 2, 3, 1},
+          {18, 46, 74, 102}},
+      {ANARI_FLOAT32_MAT2x3, 2, 3, "[[1,2,3],[4,5,6]]", {7, 8, 9}, {50, 122}},
+      {ANARI_FLOAT32_MAT3x4,
+          3,
+          4,
+          "[[1,2,3,4],[5,6,7,8],[9,10,11,12]]",
+          {1, 2, 3, 1},
+          {18, 46, 74}}};
+  for (const auto &test : cases) {
+    INFO(anari::toString(test.type));
+    Fixture f({}, true);
+    auto sampler = f.scene.createObject<vsr::scene::Sampler>("image2D");
+    sampler->setName("matrix-sampler");
+    const float before[16] = {
+        -1, -4, -2, -5, -3, -6, -7, -8, -9, -10, -11, -12, -13, -14, -15, -16};
+    sampler->setParameter("outTransform", test.type, before);
+    auto s = f.attach();
+    const auto item = inspectMatrixObject(f, s, 1);
+    CHECK(matrixParameter(item).get("editable")->b);
+    const auto args = matrixEditArgs(f, 2, item, test.wire);
+    REQUIRE(f.tool(s, "vsr_edit", args).str("state") == "pending");
+    f.drain();
+    auto done = f.status(s, s.id, 2);
+    REQUIRE(done.str("outcome") == "ok");
+    CHECK(done.flag("committed"));
+    REQUIRE(done.result()->get("versions")->a.size() == 1);
+    CHECK_FALSE(done.result()->get("matrix_versions"));
+    const auto after = inspectMatrixObject(f, s, 3);
+    const auto &rows = matrixParameter(after).get("value")->get("data")->a;
+    REQUIRE(rows.size() == test.rows);
+    CHECK(matrixParameter(after).get("value")->get("type")->s
+        == anari::toString(test.type));
+    float packed[16] = {};
+    std::memcpy(packed,
+        sampler->parameter("outTransform")->value().data(),
+        anari::sizeOf(test.type));
+    for (std::size_t r = 0; r < test.rows; ++r) {
+      REQUIRE(rows[r].a.size() == test.columns);
+      double wireProduct = 0;
+      float storedProduct = 0;
+      for (std::size_t c = 0; c < test.columns; ++c) {
+        wireProduct += rows[r].a[c].n * test.operand[c];
+        storedProduct += packed[c * test.rows + r] * test.operand[c];
+      }
+      CHECK(wireProduct == test.expected[r]);
+      CHECK(storedProduct == test.expected[r]);
+    }
+    CHECK(f.tool(s, "vsr_edit", args).flag("replayed"));
+    CHECK(inspectMatrixObject(f, s, 4).get("version")->n
+        == after.get("version")->n);
+    REQUIRE(f.restoreBatch(s, 5, *done.result()->get("batch_ref"))
+            .errorCode()
+            .empty());
+    f.drain();
+    const auto restored = f.status(s, s.id, 5);
+    REQUIRE(restored.str("outcome") == "ok");
+    CHECK(restored.result()->get("versions")->a.size() == 1);
+    const auto final = inspectMatrixObject(f, s, 6);
+    CHECK(json::write(*matrixParameter(final).get("value"))
+        == json::write(*matrixParameter(item).get("value")));
+    CHECK(std::memcmp(before,
+              sampler->parameter("outTransform")->value().data(),
+              anari::sizeOf(test.type))
+        == 0);
+  }
+}
+
+SCENARIO("MCP matrix schema, object space and ordinary restore receipts agree",
+    "[integration][object-matrix][matrix-contract][mcp]")
+{
+  Fixture f({}, true);
+  auto sampler = f.scene.createObject<vsr::scene::Sampler>("image2D");
+  sampler->setName("matrix-sampler");
+  auto s = f.attach();
+  SECTION("schema describes nested numeric rows")
+  {
+    const auto list = f.rpc("tools/list", "{}");
+    bool found = false;
+    for (const auto &tool : list.json.get("result")->get("tools")->a) {
+      if (tool.get("name")->s != "vsr_edit")
+        continue;
+      found = true;
+      const auto &schema = *tool.get("inputSchema")
+                                ->get("properties")
+                                ->get("edits")
+                                ->get("items")
+                                ->get("properties")
+                                ->get("value");
+      REQUIRE(schema.get("anyOf"));
+      bool nestedNumbers = false;
+      for (const auto &choice : schema.get("anyOf")->a) {
+        const auto *items = choice.get("items");
+        nestedNumbers |= items && items->get("items")
+            && items->get("items")->get("type")->s == "number";
+      }
+      CHECK(nestedNumbers);
+    }
+    REQUIRE(found);
+  }
+  const auto item = inspectMatrixObject(f, s, 1);
+  auto args =
+      matrixEditArgs(f, 2, item, "[[0,1,0,0],[1,0,0,0],[0,0,1,0],[0,0,0,1]]");
+  SECTION("object space rejects before consuming the request ID")
+  {
+    auto withSpace = args;
+    withSpace.insert(withSpace.find("\"parameter\""), "\"space\":\"local\",");
+    CHECK(f.tool(s, "vsr_edit", withSpace).errorCode() == "invalid_request");
+    REQUIRE(f.tool(s, "vsr_edit", args).str("state") == "pending");
+    f.drain();
+    CHECK(f.status(s, s.id, 2).str("outcome") == "ok");
+  }
+  SECTION("matrix restore has ordinary versions and no Image versions")
+  {
+    REQUIRE(f.tool(s, "vsr_edit", args).str("state") == "pending");
+    f.drain();
+    const auto done = f.status(s, s.id, 2);
+    REQUIRE(done.str("outcome") == "ok");
+    REQUIRE(f.restoreBatch(s, 3, *done.result()->get("batch_ref"))
+            .errorCode()
+            .empty());
+    f.drain();
+    const auto restored = f.status(s, s.id, 3);
+    REQUIRE(restored.str("outcome") == "ok");
+    REQUIRE(restored.result()->get("image_versions"));
+    CHECK(restored.result()->get("image_versions")->a.empty());
+    CHECK_FALSE(restored.result()->get("matrix_versions"));
+  }
+}
+
+SCENARIO(
+    "MCP Sampler channel swap preserves neutral samples and rejects stale edits",
+    "[integration][object-matrix][mcp]")
+{
+  Fixture f({}, true);
+  auto sampler = f.scene.createObject<vsr::scene::Sampler>("image2D");
+  sampler->setName("matrix-sampler");
+  auto s = f.attach();
+  const auto before = inspectMatrixObject(f, s, 1);
+  const auto args =
+      matrixEditArgs(f, 2, before, "[[0,1,0,0],[1,0,0,0],[0,0,1,0],[0,0,0,1]]");
+  REQUIRE(f.tool(s, "vsr_edit", args).str("state") == "pending");
+  f.drain();
+  const auto edited = f.status(s, s.id, 2);
+  REQUIRE(edited.str("outcome") == "ok");
+  const auto swapped = inspectMatrixObject(f, s, 3);
+  const auto &rows = matrixParameter(swapped).get("value")->get("data")->a;
+  const std::array<std::array<double, 4>, 3> inputs = {
+      {{0, 1, 0, 1}, {0.125, 0.125, 0.125, 1}, {1, 0, 0, 1}}};
+  const std::array<std::array<double, 4>, 3> expected = {
+      {{1, 0, 0, 1}, {0.125, 0.125, 0.125, 1}, {0, 1, 0, 1}}};
+  for (std::size_t i = 0; i < inputs.size(); ++i)
+    for (std::size_t r = 0; r < 4; ++r) {
+      double output = 0;
+      for (std::size_t c = 0; c < 4; ++c)
+        output += rows[r].a[c].n * inputs[i][c];
+      CHECK(output == expected[i][r]);
+    }
+  REQUIRE(
+      f.tool(s,
+           "vsr_edit",
+           matrixEditArgs(
+               f, 4, before, "[[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]"))
+          .errorCode()
+          .empty());
+  f.drain();
+  CHECK(f.status(s, s.id, 4).str("outcome") == "conflict");
+  CHECK_FALSE(f.status(s, s.id, 4).flag("committed"));
+  auto unrelated = f.scene.getObject<vsr::scene::Material>(0);
+  unrelated->setParameter("opacity", 0.75f);
+  sampler->setName("renamed-sampler");
+  REQUIRE(f.restoreBatch(s, 5, *edited.result()->get("batch_ref"))
+          .errorCode()
+          .empty());
+  f.drain();
+  CHECK(f.status(s, s.id, 5).str("outcome") == "ok");
+  CHECK(sampler->name() == "renamed-sampler");
+  CHECK(unrelated->parameter("opacity")->value().get<float>() == 0.75f);
+  CHECK(sampler->parameter("outTransform")->value().get<vsr::math::mat4>()
+      == vsr::math::IDENTITY_MAT4);
+  REQUIRE(f.tool(s, "vsr_edit", args).flag("replayed"));
+  CHECK(sampler->parameter("outTransform")->value().get<vsr::math::mat4>()
+      == vsr::math::IDENTITY_MAT4);
+}
+
+SCENARIO("MCP matrix numeric preparation respects packed metadata and rounding",
+    "[integration][object-matrix][matrix-numeric][mcp]")
+{
+  Fixture f({}, true);
+  auto sampler = f.scene.createObject<vsr::scene::Sampler>("image2D");
+  sampler->setName("matrix-sampler");
+  const float original[6] = {};
+  sampler->setParameter("outTransform", ANARI_FLOAT32_MAT2x3, original);
+  auto *p = sampler->parameter("outTransform");
+  p->setEnabled(false);
+  auto s = f.attach();
+  std::uint64_t id = 0;
+  auto submit = [&](const std::string &value) {
+    const auto item = inspectMatrixObject(f, s, ++id);
+    const auto request = ++id;
+    REQUIRE(f.tool(s, "vsr_edit", matrixEditArgs(f, request, item, value))
+                .str("state")
+        == "pending");
+    f.drain();
+    return f.status(s, s.id, request);
+  };
+  SECTION("matching bounds use packed component indices")
+  {
+    const float bounds[6] = {1, 4, 2, 5, 3, 6};
+    p->setMin(vsr::core::Any(ANARI_FLOAT32_MAT2x3, bounds))
+        .setMax(vsr::core::Any(ANARI_FLOAT32_MAT2x3, bounds));
+    const auto done = submit("[[1,2,3],[4,5,6]]");
+    REQUIRE(done.str("outcome") == "ok");
+    CHECK_FALSE(p->isEnabled());
+    CHECK(std::memcmp(bounds, p->value().data(), sizeof(bounds)) == 0);
+    for (const char *bad : {"[[0,2,3],[4,5,6]]",
+             "[[1,1,3],[4,5,6]]",
+             "[[1,2,2],[4,5,6]]",
+             "[[1,2,3],[3,5,6]]",
+             "[[1,2,3],[4,4,6]]",
+             "[[1,2,3],[4,5,5]]"}) {
+      const auto rejected = submit(bad);
+      CHECK(rejected.str("outcome") == "invalid_request");
+      CHECK(rejected.result()->get("value_error")->s == "out_of_domain");
+      CHECK_FALSE(rejected.flag("committed"));
+      CHECK(std::memcmp(bounds, p->value().data(), sizeof(bounds)) == 0);
+    }
+  }
+  SECTION("differently typed metadata is ignored and round once ties to even")
+  {
+    p->setMin(vsr::core::Any(std::numeric_limits<double>::infinity()))
+        .setMax(vsr::core::Any(-1.f));
+    const auto done = submit(
+        "[[1.000000059604644775390625,1.000000178813934326171875,3.4028234663852886e38],[0,-0,7.006492321624085e-46]]");
+    REQUIRE(done.str("outcome") == "ok");
+    const auto item = inspectMatrixObject(f, s, ++id);
+    const auto &rows = matrixParameter(item).get("value")->get("data")->a;
+    CHECK(rows[0].a[0].n == 1.);
+    CHECK(rows[0].a[1].n == 1.0000002384185791015625);
+    CHECK(rows[0].a[2].n == double(std::numeric_limits<float>::max()));
+    CHECK(rows[1].a[2].n == 0.);
+  }
+  SECTION("matching invalid bounds reject before mutation")
+  {
+    float lower[6] = {0, 0, 0, 0, 0, 0};
+    float upper[6] = {10, 10, 10, 10, 10, 10};
+    for (int kind = 0; kind < 3; ++kind) {
+      lower[4] = kind == 0 ? std::numeric_limits<float>::infinity()
+          : kind == 1      ? 11.f
+                           : 0.f;
+      upper[4] = kind == 2 ? std::numeric_limits<float>::quiet_NaN() : 10.f;
+      p->setMin(vsr::core::Any(ANARI_FLOAT32_MAT2x3, lower))
+          .setMax(vsr::core::Any(ANARI_FLOAT32_MAT2x3, upper));
+      const auto bad = submit("[[1,2,3],[4,5,6]]");
+      CHECK(bad.str("outcome") == "invalid_request");
+      CHECK(bad.result()->get("value_error")->s == "out_of_domain");
+      CHECK_FALSE(bad.flag("committed"));
+      CHECK(std::memcmp(original, p->value().data(), sizeof(original)) == 0);
+    }
+  }
+}
+
+SCENARIO("MCP mixed matrix scalar vector and node batches are atomic",
+    "[integration][object-matrix][matrix-atomic][mcp]")
+{
+  Fixture f({}, true, true);
+  auto sampler = f.scene.createObject<vsr::scene::Sampler>("image2D");
+  sampler->setName("matrix-sampler");
+  auto *layer = f.scene.defaultLayer();
+  auto node = layer->root()->insert_last_child(vsr::scene::LayerNodeData(
+      layer, vsr::math::IDENTITY_MAT4, "matrix-node"));
+  f.scene.signalLayerStructureChanged(layer);
+  auto s = f.attach();
+  std::uint64_t id = 0;
+  auto inspectNode = [&] {
+    const auto request = ++id;
+    REQUIRE(
+        f.tool(s,
+             "vsr_inspect",
+             "{\"request_id\":" + std::to_string(request)
+                 + ",\"scene_id\":" + std::to_string(f.sceneId)
+                 + ",\"kind\":\"nodes\",\"name\":\"matrix-node\"}")
+            .errorCode()
+            .empty());
+    f.drain();
+    const auto st = f.status(s, s.id, request);
+    REQUIRE(st.str("outcome") == "ok");
+    return st.result()->get("items")->a.at(0);
+  };
+  const auto object = f.firstTarget(s, ++id);
+  const auto matrix = inspectMatrixObject(f, s, ++id);
+  const auto placement = inspectNode();
+  const auto nodeTarget = "\"target_kind\":\"node\",\"handle\":"
+      + json::quote(placement.get("handle")->s)
+      + ",\"version\":" + json::quote(placement.get("node_edit_version")->s)
+      + ",\"structural_version\":"
+      + json::quote(placement.get("structural_version")->s);
+  const auto oldValue = sampler->parameter("outTransform")->value();
+  auto material = f.scene.getObject<vsr::scene::Material>(0);
+  const auto oldColor = material->parameter("color")->value();
+  auto args = [&](std::uint64_t request, const std::string &value) {
+    return "{\"request_id\":" + std::to_string(request)
+        + ",\"scene_id\":" + std::to_string(f.sceneId) + ",\"edits\":[{"
+        + object + ",\"parameter\":\"opacity\",\"value\":0.5},{" + nodeTarget
+        + ",\"parameter\":\"position\",\"value\":[4,5,6]},{" + object
+        + ",\"parameter\":\"color\",\"value\":[0.25,0.5,0.75]},{"
+        + objectFields(matrix)
+        + ",\"parameter\":\"outTransform\",\"value\":" + value + "}]}";
+  };
+  for (const char *invalid : {"null",
+           "1",
+           "[1,2,3,4]",
+           "[]",
+           "[[1,0,0,0],[0,1,0],[0,0,1,0],[0,0,0,1]]",
+           "[[1,0,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]",
+           "[[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1],[0,0,0,1]]",
+           "[[1,0,0,0],[0,true,0,0],[0,0,1,0],[0,0,0,1]]",
+           "[[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,3.4028235e38]]"}) {
+    const auto request = ++id;
+    REQUIRE(f.tool(s, "vsr_edit", args(request, invalid)).errorCode().empty());
+    f.drain();
+    const auto bad = f.status(s, s.id, request);
+    CHECK(bad.str("outcome") == "invalid_request");
+    CHECK_FALSE(bad.flag("committed"));
+    CHECK(bad.result()->get("failed_entry")->n == 3);
+    CHECK(material->parameter("color")->value() == oldColor);
+    CHECK(f.opacity0() == 1.f);
+    CHECK(node->value().getTransform() == vsr::math::IDENTITY_MAT4);
+    CHECK(sampler->parameter("outTransform")->value() == oldValue);
+  }
+  SECTION("unsupported stored types never partially write")
+  {
+    const std::uint32_t packed = 0;
+    sampler->setParameter("outTransform", ANARI_UFIXED8_VEC4, &packed);
+    const auto updated = inspectMatrixObject(f, s, ++id);
+    CHECK_FALSE(matrixParameter(updated).get("editable")->b);
+    auto badArgs = args(++id, "[[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]");
+    const auto oldFields = objectFields(matrix);
+    badArgs.replace(
+        badArgs.find(oldFields), oldFields.size(), objectFields(updated));
+    REQUIRE(f.tool(s, "vsr_edit", badArgs).errorCode().empty());
+    f.drain();
+    const auto bad = f.status(s, s.id, id);
+    CHECK(bad.str("outcome") == "invalid_request");
+    CHECK(bad.result()->get("value_error")->s == "unsupported_parameter");
+    CHECK(material->parameter("color")->value() == oldColor);
+    CHECK(f.opacity0() == 1.f);
+    CHECK(node->value().getTransform() == vsr::math::IDENTITY_MAT4);
+  }
+  SECTION("stale expected matrix version rejects the whole batch")
+  {
+    sampler->setParameter("outTransform", oldValue);
+    const auto request = ++id;
+    REQUIRE(
+        f.tool(s,
+             "vsr_edit",
+             args(request, "[[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]"))
+            .errorCode()
+            .empty());
+    f.drain();
+    const auto bad = f.status(s, s.id, request);
+    CHECK(bad.str("outcome") == "conflict");
+    CHECK_FALSE(bad.flag("committed"));
+    CHECK(material->parameter("color")->value() == oldColor);
+    CHECK(f.opacity0() == 1.f);
+    CHECK(node->value().getTransform() == vsr::math::IDENTITY_MAT4);
+  }
+  SECTION("valid mixed batch commits and restores each state exactly")
+  {
+    const auto request = ++id;
+    const auto wire =
+        args(request, "[[0,1,0,0],[1,0,0,0],[0,0,1,0],[0,0,0,1]]");
+    REQUIRE(f.tool(s, "vsr_edit", wire).errorCode().empty());
+    f.drain();
+    const auto done = f.status(s, s.id, request);
+    REQUIRE(done.str("outcome") == "ok");
+    CHECK(done.flag("committed"));
+    CHECK(done.result()->get("versions")->a.size() == 2);
+    CHECK(done.result()->get("node_versions")->a.size() == 1);
+    CHECK(material->parameter("color")->value().get<vsr::math::float3>()
+        == vsr::math::float3(0.25f, 0.5f, 0.75f));
+    CHECK(f.opacity0() == 0.5f);
+    CHECK(node->value().getTransform()[3].xyz() == vsr::math::float3(4, 5, 6));
+    const auto restoreRequest = ++id;
+    REQUIRE(f.restoreBatch(s, restoreRequest, *done.result()->get("batch_ref"))
+            .errorCode()
+            .empty());
+    f.drain();
+    const auto restored = f.status(s, s.id, restoreRequest);
+    REQUIRE(restored.str("outcome") == "ok");
+    CHECK(restored.result()->get("versions")->a.size() == 2);
+    CHECK(restored.result()->get("node_versions")->a.size() == 1);
+    CHECK(restored.result()->get("image_versions")->a.empty());
+    CHECK(material->parameter("color")->value() == oldColor);
+    CHECK(f.opacity0() == 1.f);
+    CHECK(node->value().getTransform() == vsr::math::IDENTITY_MAT4);
+    CHECK(sampler->parameter("outTransform")->value() == oldValue);
+    CHECK(f.tool(s, "vsr_edit", wire).flag("replayed"));
+    CHECK(f.opacity0() == 1.f);
+  }
+}
+
+SCENARIO(
+    "MCP matrix edits obey revocation conflict and committed sync outcomes",
+    "[integration][object-matrix][matrix-authority][mcp]")
+{
+  Fixture f({}, true);
+  auto sampler = f.scene.createObject<vsr::scene::Sampler>("image2D");
+  sampler->setName("matrix-sampler");
+  auto s = f.attach();
+  const auto before = inspectMatrixObject(f, s, 1);
+  const auto oldValue = sampler->parameter("outTransform")->value();
+  const auto args =
+      matrixEditArgs(f, 2, before, "[[0,1,0,0],[1,0,0,0],[0,0,1,0],[0,0,0,1]]");
+  SECTION("Disable agent edits denies initial admission")
+  {
+    f.authority->setAgentEditsDisabled(true);
+    CHECK(f.tool(s, "vsr_edit", args).errorCode() == "forbidden");
+    f.authority->setAgentEditsDisabled(false);
+    REQUIRE(f.tool(s, "vsr_edit", args).str("state") == "pending");
+    f.drain();
+    CHECK(f.status(s, s.id, 2).str("outcome") == "ok");
+  }
+  SECTION("toggle revoked after admission is a terminal noncommit")
+  {
+    REQUIRE(f.tool(s, "vsr_edit", args).str("state") == "pending");
+    f.authority->setAgentEditsDisabled(true);
+    f.drain();
+    const auto rejected = f.status(s, s.id, 2);
+    CHECK(rejected.str("outcome") == "forbidden");
+    CHECK_FALSE(rejected.flag("committed"));
+    CHECK(rejected.flag("result_visible"));
+    CHECK(sampler->parameter("outTransform")->value() == oldValue);
+  }
+  SECTION("EDIT authority revoked after admission is a terminal noncommit")
+  {
+    REQUIRE(f.tool(s, "vsr_edit", args).str("state") == "pending");
+    f.authority->restrict(
+        session::Target::scene(f.sceneId), session::Capability::EDIT);
+    f.drain();
+    const auto rejected = f.status(s, s.id, 2);
+    CHECK(rejected.str("outcome") == "forbidden");
+    CHECK_FALSE(rejected.flag("committed"));
+    CHECK(sampler->parameter("outTransform")->value() == oldValue);
+  }
+  SECTION("postcommit sync failures retain truthful edit and restore receipts")
+  {
+    f.hookOk = false;
+    REQUIRE(f.tool(s, "vsr_edit", args).str("state") == "pending");
+    f.drain();
+    const auto edited = f.status(s, s.id, 2);
+    REQUIRE(edited.str("outcome") == "applied_with_sync_failure");
+    CHECK(edited.flag("committed"));
+    CHECK(edited.isError());
+    CHECK(sampler->parameter("outTransform")->value() != oldValue);
+    REQUIRE(f.restoreBatch(s, 3, *edited.result()->get("batch_ref"))
+            .errorCode()
+            .empty());
+    f.drain();
+    const auto restored = f.status(s, s.id, 3);
+    CHECK(restored.str("outcome") == "applied_with_sync_failure");
+    CHECK(restored.flag("committed"));
+    CHECK(restored.result()->get("versions")->a.size() == 1);
+    CHECK(restored.result()->get("image_versions")->a.empty());
+    CHECK(sampler->parameter("outTransform")->value() == oldValue);
+    REQUIRE(f.restoreBatch(s, 4, *edited.result()->get("batch_ref"))
+            .errorCode()
+            .empty());
+    f.drain();
+    CHECK(f.status(s, s.id, 4).str("outcome") == "already_restored");
+    CHECK(f.tool(s, "vsr_edit", args).flag("replayed"));
+    CHECK(sampler->parameter("outTransform")->value() == oldValue);
+  }
+  SECTION("later writes and change-back permanently conflict with restore")
+  {
+    REQUIRE(f.tool(s, "vsr_edit", args).str("state") == "pending");
+    f.drain();
+    const auto edited = f.status(s, s.id, 2);
+    REQUIRE(edited.str("outcome") == "ok");
+    const auto changed = sampler->parameter("outTransform")->value();
+    sampler->setParameter("outTransform", oldValue);
+    sampler->setParameter("outTransform", changed);
+    REQUIRE(f.restoreBatch(s, 3, *edited.result()->get("batch_ref"))
+            .errorCode()
+            .empty());
+    f.drain();
+    const auto rejected = f.status(s, s.id, 3);
+    CHECK(rejected.str("outcome") == "conflict");
+    CHECK_FALSE(rejected.flag("committed"));
+    CHECK(sampler->parameter("outTransform")->value() == changed);
+    sampler->setParameter("outTransform", oldValue);
+    REQUIRE(f.restoreBatch(s, 4, *edited.result()->get("batch_ref"))
+            .errorCode()
+            .empty());
+    f.drain();
+    CHECK(f.status(s, s.id, 4).str("outcome") == "conflict");
+  }
+}
+
 #endif

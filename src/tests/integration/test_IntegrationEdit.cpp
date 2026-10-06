@@ -309,15 +309,13 @@ TEST_CASE("Generic object validation rejects an entire mixed batch",
     pbr->setParameterObject(parameter, *sampler);
     value = JsonValue::fromNumber(0.5);
   }
-  SECTION("matrix values remain unsupported")
+  SECTION("flat object matrix values remain invalid")
   {
     target = camera.data();
     parameter = "matrix";
     camera->setParameter(parameter, vsr::core::math::IDENTITY_MAT4);
-    value = JsonValue::array({JsonValue::numbers({1, 0, 0, 0}),
-        JsonValue::numbers({0, 1, 0, 0}),
-        JsonValue::numbers({0, 0, 1, 0}),
-        JsonValue::numbers({0, 0, 0, 1})});
+    value =
+        JsonValue::numbers({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1});
   }
   const auto before = target->parameter(parameter)
       ? target->parameter(parameter)->value()

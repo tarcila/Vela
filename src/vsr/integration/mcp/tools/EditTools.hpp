@@ -185,6 +185,8 @@ inline std::optional<edit::EditBatch> editBatchArg(
         entry.hasAncestryVersion = true;
       }
     } else {
+      if (e.get("space"))
+        return {}; // space is node positioning policy, never object value data
       if (!optionalIntArg(e, "version", version) || !version || *version < 0)
         return {};
       entry.expected.object = *handle;
@@ -239,8 +241,17 @@ inline void addEditTools(std::vector<Tool> &tools, EditDeps deps)
       "numbers within both type range and +/-(2^53-1); float32/float64 scalars "
       "and vec2/3/4 as finite JSON numbers within type range. Vectors require "
       "exactly the stored component count. Matching min/max metadata applies "
-      "per component; COLOR usage retains [0,1]. Object references, matrices "
-      "and all other types are unsupported; parameters cannot be created. "
+      "per component; COLOR usage retains [0,1]. FLOAT32_MAT2, MAT3, MAT4, "
+      "MAT2x3 and MAT3x4 take exact nested row arrays of 2x2, 3x3, 4x4, "
+      "2x3 and 3x4 numbers respectively (rows x columns), as inspection emits. "
+      "Row r / column c maps to packed index c*R+r. Components validate finite "
+      "binary64 input, binary32 range and matching-type finite ordered bounds "
+      "before ties-to-even conversion and again afterward. Differently typed "
+      "bounds are ignored. Object matrices may be non-affine and accept no "
+      "space argument; node transforms retain their affine/SRT rules. Matrices "
+      "use ordinary object versions and exact conditional restore, not a new "
+      "matrix receipt. Object references, double matrices and all other types "
+      "are unsupported; parameters cannot be created. "
       "Inspection parameter entries expose editable Boolean, typed min/max "
       "and string_values when present; editable describes value support, not "
       "authority. Parameter enabled is preserved and does not restrict value "
@@ -269,7 +280,13 @@ inline void addEditTools(std::vector<Tool> &tools, EditDeps deps)
         "\"ancestry_version\":{\"type\":\"string\"},"
         "\"space\":{\"enum\":[\"local\",\"world\"]},"
         "\"version\":{\"type\":[\"integer\",\"string\"]},"
-        "\"parameter\":{\"type\":\"string\"},\"value\":{}},"
+        "\"parameter\":{\"type\":\"string\"},\"value\":{\"anyOf\":["
+        "{\"type\":\"number\"},{\"type\":\"boolean\"},{\"type\":\"string\"},"
+        "{\"type\":\"array\",\"items\":{\"type\":\"number\"}},"
+        "{\"type\":\"array\",\"items\":{\"type\":\"array\",\"items\":{\"type\":\"number\"}}},"
+        "{\"type\":\"object\",\"properties\":{\"azimuth\":{\"type\":\"number\"},"
+        "\"elevation\":{\"type\":\"number\"},\"roll\":{\"type\":\"number\"}},"
+        "\"required\":[\"azimuth\",\"elevation\",\"roll\"]}]}},"
         "\"required\":[\"handle\",\"version\",\"parameter\",\"value\"]}}},"
         "\"required\":[\"request_id\",\"scene_id\",\"edits\"]}";
   editTool.handler = [deps](const session::Credentials &c,
