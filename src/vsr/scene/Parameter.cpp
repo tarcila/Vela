@@ -42,24 +42,40 @@ Parameter &Parameter::setValue(const Any &newValue)
 {
   auto oldValue = m_value;
   m_value = newValue;
-  if (m_value.type() == ANARI_STRING && !m_stringValues.empty()) {
-    auto it = std::find(
-        m_stringValues.begin(), m_stringValues.end(), m_value.getString());
-    if (it != m_stringValues.end()) {
-      m_stringSelection =
-          static_cast<int>(std::distance(m_stringValues.begin(), it));
-    } else {
-      logWarning(
-          "'%s' is not a valid value for parameter '%s', valid values are:",
-          m_value.getCStr(),
-          m_name.c_str());
-      for (const auto &val : m_stringValues)
-        logWarning("  '%s'", val.c_str());
-    }
+  if (!selectStringValue()) {
+    logWarning(
+        "'%s' is not a valid value for parameter '%s', valid values are:",
+        m_value.getCStr(),
+        m_name.c_str());
+    for (const auto &val : m_stringValues)
+      logWarning("  '%s'", val.c_str());
   }
   if (m_observer)
     m_observer->parameterChanged(this, oldValue);
   return *this;
+}
+
+Parameter &Parameter::setPreparedValue(Any &&newValue)
+{
+  auto oldValue = std::move(m_value);
+  m_value = std::move(newValue);
+  selectStringValue();
+  if (m_observer)
+    m_observer->parameterChanged(this, oldValue);
+  return *this;
+}
+
+bool Parameter::selectStringValue()
+{
+  if (m_value.type() != ANARI_STRING || m_stringValues.empty())
+    return true;
+  const auto it = std::find(
+      m_stringValues.begin(), m_stringValues.end(), m_value.getStringView());
+  if (it == m_stringValues.end())
+    return false;
+  m_stringSelection =
+      static_cast<int>(std::distance(m_stringValues.begin(), it));
+  return true;
 }
 
 Parameter &Parameter::setMin(const Any &newMin)

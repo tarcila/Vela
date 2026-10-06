@@ -7,8 +7,8 @@
 #include "vsr/core/FlatMap.hpp"
 #include "vsr/core/ObjectPool.hpp"
 #include "vsr/core/ObjectVersion.hpp"
-#include "vsr/core/VSRMath.hpp"
 #include "vsr/core/Token.hpp"
+#include "vsr/core/VSRMath.hpp"
 #include "vsr/scene/Parameter.hpp"
 #include "vsr/scene/UpdateDelegate.hpp"
 // std
@@ -141,6 +141,7 @@ struct Object : public ParameterObserver
   Parameter &parameterAt(size_t i);
   const char *parameterNameAt(size_t i) const;
 
+  void reserveParameterBatch(size_t changes);
   void beginParameterBatch(); // parameter changes are batched, until end
   void endParameterBatch(); // stop batching + flush all parameter changes
 
@@ -230,8 +231,10 @@ constexpr bool isObject()
 std::vector<std::string> getANARIObjectSubtypes(
     anari::Device d, anari::DataType type);
 
-void parseANARIObjectInfo(
-    Object &o, anari::Device d, anari::DataType objectType, const char *subtype);
+void parseANARIObjectInfo(Object &o,
+    anari::Device d,
+    anari::DataType objectType,
+    const char *subtype);
 
 Object parseANARIObjectInfo(
     anari::Device d, anari::DataType type, const char *subtype);

@@ -2607,7 +2607,7 @@ SCENARIO("layer cursors bind identity and every supported policy",
   }
 }
 
-SCENARIO("ordinary read-only parameters retain ANARI types and stored values",
+SCENARIO("ordinary parameters retain ANARI types and stored values",
     "[integration][typed-inspection]")
 {
   Fixture f(0);
@@ -2615,9 +2615,12 @@ SCENARIO("ordinary read-only parameters retain ANARI types and stored values",
   camera->setParameter("observedBool", true);
   const int32_t integer = -27;
   camera->setParameter("observedInt", ANARI_INT32, &integer);
+  camera->parameter("observedInt")->setMin(-30).setMax(10);
   const double real = 1.2345678901234567;
   camera->setParameter("observedDouble", ANARI_FLOAT64, &real);
   camera->setParameter("observedString", "camera label");
+  camera->parameter("observedString")
+      ->setStringValues({"camera label", "other label"});
   camera->setParameter("embeddedNull", std::string("a\0b", 3));
   const float vector[] = {1.25f, -2.5f, 3.75f};
   camera->setParameter("observedVector", ANARI_FLOAT32_VEC3, vector);
@@ -2648,8 +2651,15 @@ SCENARIO("ordinary read-only parameters retain ANARI types and stored values",
   CHECK(rows[0].a[3].n == 4);
   CHECK(rows[2].a[0].n == 9);
   CHECK(rows[3].a[2].n == 15);
-  CHECK_FALSE(findEditableField(
-      camera->type(), camera->subtype(), vsr::core::Token("observedDouble")));
+  CHECK(parameter(item, "observedDouble").get("editable")->b);
+  CHECK(parameter(item, "observedInt").get("min")->get("data")->n == -30);
+  CHECK(parameter(item, "observedInt").get("max")->get("data")->n == 10);
+  const auto &choices =
+      parameter(item, "observedString").get("string_values")->a;
+  REQUIRE(choices.size() == 2);
+  CHECK(choices[0].s == "camera label");
+  CHECK(choices[1].s == "other label");
+  CHECK_FALSE(parameter(item, "observedMatrix").get("editable")->b);
 }
 
 SCENARIO("large integers and non-finite components are lossless typed tags",
@@ -3338,18 +3348,18 @@ SCENARIO(
   l->setParameter("direction", vsr::core::math::float2(30.f, 45.f));
   auto s = f.inspect({256, ""}, 1);
   REQUIRE(*s.terminal == Outcome::OK);
-  CHECK(s.result.find("\"values\":{\"color\":[0.10000000149011612,0.5,1],"
-                      "\"opacity\":0.25}")
+  CHECK(s.result.find("\"color\":[0.10000000149011612,0.5,1]")
       != std::string::npos);
-  CHECK(s.result.find("\"values\":{\"color\":[1,0,0.5],\"irradiance\":2.5,"
-                      "\"direction\":[30,45]}")
-      != std::string::npos);
-  // Only matte materials and directional lights carry values.
+  CHECK(s.result.find("\"opacity\":0.25") != std::string::npos);
+  CHECK(s.result.find("\"color\":[1,0,0.5]") != std::string::npos);
+  CHECK(s.result.find("\"irradiance\":2.5") != std::string::npos);
+  CHECK(s.result.find("\"direction\":[30,45]") != std::string::npos);
+  // Every object with float32 parameters can carry the bounded mirror.
   std::size_t n = 0;
   for (auto p = s.result.find("\"values\""); p != std::string::npos;
       p = s.result.find("\"values\"", p + 1))
     n++;
-  CHECK(n == 3); // plus the scene's default matte material
+  CHECK(n == 4); // plus the default material and camera
 }
 
 SCENARIO("name and metadata changes stale cursors without a full refresh",

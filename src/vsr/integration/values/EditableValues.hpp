@@ -6,15 +6,14 @@
 // vsr_scene
 #include "vsr/core/VSRMath.hpp"
 #include "vsr/scene/Object.hpp"
-#include "vsr/scene/objects/Light.hpp"
-#include "vsr/scene/objects/Material.hpp"
 // std
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
-#include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -23,7 +22,7 @@ namespace vsr::integration {
 using core::Token;
 
 /*
- * The v1 agent edit surface and its deterministic numeric conversion.
+ * Introspection-driven agent edits and deterministic numeric conversion.
  *
  * Input is an already-parsed JSON value: a kind tag plus, for numbers, the
  * parser's correctly rounded binary64. Validation happens entirely on the
@@ -63,19 +62,10 @@ struct JsonValue
   static JsonValue numbers(std::initializer_list<double> v);
 };
 
-enum class EditableField
-{
-  MATTE_COLOR,
-  MATTE_OPACITY,
-  DIRECTIONAL_COLOR,
-  DIRECTIONAL_IRRADIANCE,
-  DIRECTIONAL_DIRECTION
-};
-
 enum class ValueError
 {
   NONE,
-  UNSUPPORTED_PARAMETER, // not on the edit surface for this object/subtype
+  UNSUPPORTED_PARAMETER, // missing parameter or unsupported stored type
   INCOMPATIBLE_TYPE, // wrong JSON kind/arity, or stored parameter type differs
   NON_FINITE,
   OUT_OF_DOMAIN, // includes exceeding the largest finite binary32
@@ -91,17 +81,6 @@ struct Domain
   double max{0.0};
 };
 
-struct FieldSpec
-{
-  EditableField field;
-  anari::DataType objectType;
-  const Token *subtype;
-  const char *parameter;
-  anari::DataType storedType;
-  size_t components;
-  Domain domain;
-};
-
 struct ScalarResult
 {
   ValueError error{ValueError::NONE};
@@ -113,8 +92,7 @@ struct ScalarResult
 struct PreparedEdit
 {
   ValueError error{ValueError::NONE};
-  std::optional<EditableField> field;
-  core::Any value; // FLOAT32, FLOAT32_VEC2 or FLOAT32_VEC3 when ok()
+  core::Any value; // preserves the introspected stored type when ok()
 
   bool ok() const;
 };
@@ -127,10 +105,8 @@ float roundToBinary32(double v);
 // Validate one binary64 against a domain, then round.
 ScalarResult convertScalar(const JsonValue &v, Domain domain);
 
-// The edit surface. Returns nullptr when (object, parameter) is not editable.
-const std::vector<FieldSpec> &editSurface();
-const FieldSpec *findEditableField(
-    anari::DataType objectType, Token subtype, Token parameter);
+// References, matrices and opaque storage are deliberately read-only.
+bool isEditableParameter(const scene::Parameter &parameter);
 
 // Validates target and value without mutating the object.
 PreparedEdit prepareEdit(
@@ -261,113 +237,157 @@ inline ScalarResult convertScalar(const JsonValue &v, Domain domain)
   return r;
 }
 
-inline const std::vector<FieldSpec> &editSurface()
+namespace value_detail {
+
+template <typename T>
+inline T component(const core::Any &value, std::size_t index)
 {
-  constexpr double MAX_F = double(std::numeric_limits<float>::max());
-  static const std::vector<FieldSpec> surface = {
-      {EditableField::MATTE_COLOR,
-          ANARI_MATERIAL,
-          &scene::tokens::material::matte,
-          "color",
-          ANARI_FLOAT32_VEC3,
-          3,
-          {0.0, 1.0}},
-      {EditableField::MATTE_OPACITY,
-          ANARI_MATERIAL,
-          &scene::tokens::material::matte,
-          "opacity",
-          ANARI_FLOAT32,
-          1,
-          {0.0, 1.0}},
-      {EditableField::DIRECTIONAL_COLOR,
-          ANARI_LIGHT,
-          &scene::tokens::light::directional,
-          "color",
-          ANARI_FLOAT32_VEC3,
-          3,
-          {0.0, 1.0}},
-      {EditableField::DIRECTIONAL_IRRADIANCE,
-          ANARI_LIGHT,
-          &scene::tokens::light::directional,
-          "irradiance",
-          ANARI_FLOAT32,
-          1,
-          {0.0, MAX_F}},
-      {EditableField::DIRECTIONAL_DIRECTION,
-          ANARI_LIGHT,
-          &scene::tokens::light::directional,
-          "direction",
-          ANARI_FLOAT32_VEC2,
-          2,
-          {0.0, 360.0}},
-  };
-  return surface;
+  T result;
+  std::memcpy(&result,
+      static_cast<const unsigned char *>(value.data()) + index * sizeof(T),
+      sizeof(T));
+  return result;
 }
 
-inline const FieldSpec *findEditableField(
-    anari::DataType objectType, Token subtype, Token parameter)
+template <typename T>
+inline PreparedEdit prepareNumeric(
+    const scene::Parameter &p, const JsonValue &value)
 {
-  for (const auto &f : editSurface()) {
-    if (f.objectType == objectType && *f.subtype == subtype
-        && parameter == Token(f.parameter))
-      return &f;
+  PreparedEdit result;
+  const auto count = anari::componentsOf(p.value().type());
+  if ((count == 1 && value.kind != JsonKind::NUMBER)
+      || (count != 1
+          && (value.kind != JsonKind::ARRAY
+              || value.elements.size() != count))) {
+    result.error = ValueError::INCOMPATIBLE_TYPE;
+    return result;
   }
-  return nullptr;
+  T out[4] = {};
+  for (std::size_t i = 0; i < count; ++i) {
+    const auto &input = count == 1 ? value : value.elements[i];
+    if (input.kind != JsonKind::NUMBER) {
+      result.error = ValueError::INCOMPATIBLE_TYPE;
+      return result;
+    }
+    const double number = input.number;
+    if (!std::isfinite(number)) {
+      result.error = ValueError::NON_FINITE;
+      return result;
+    }
+    if constexpr (std::is_integral_v<T>) {
+      if (std::trunc(number) != number) {
+        result.error = ValueError::INCOMPATIBLE_TYPE;
+        return result;
+      }
+      // Above this interval JSON binary64 cannot faithfully carry integers.
+      if (std::fabs(number) > 9007199254740991.0
+          || number < double(std::numeric_limits<T>::lowest())
+          || number > double(std::numeric_limits<T>::max())) {
+        result.error = ValueError::OUT_OF_DOMAIN;
+        return result;
+      }
+    }
+    const bool color = (p.usage() & scene::ParameterUsageHint::COLOR) != 0;
+    const double lower = p.hasMin() ? double(component<T>(p.min(), i))
+                                    : double(std::numeric_limits<T>::lowest());
+    const double upper = p.hasMax() ? double(component<T>(p.max(), i))
+                                    : double(std::numeric_limits<T>::max());
+    if (!std::isfinite(lower) || !std::isfinite(upper) || lower > upper
+        || number < lower || number > upper
+        || (color && (number < 0 || number > 1))) {
+      result.error = ValueError::OUT_OF_DOMAIN;
+      return result;
+    }
+    if constexpr (std::is_same_v<T, float>) {
+      const auto converted = convertScalar(input, {lower, upper});
+      if (!converted.ok()) {
+        result.error = converted.error;
+        return result;
+      }
+      out[i] = converted.value;
+    } else {
+      out[i] = static_cast<T>(number);
+    }
+    // Integer bounds are compared exactly after the safe, range-checked cast.
+    if ((p.hasMin() && out[i] < component<T>(p.min(), i))
+        || (p.hasMax() && out[i] > component<T>(p.max(), i))) {
+      result.error = ValueError::OUT_OF_DOMAIN;
+      return result;
+    }
+  }
+  result.value = core::Any(p.value().type(), out);
+  return result;
+}
+
+} // namespace value_detail
+
+inline bool isEditableParameter(const scene::Parameter &p)
+{
+  const auto type = p.value().type();
+  if (type == ANARI_BOOL || type == ANARI_STRING)
+    return true;
+#define VSR_EDIT_NUMERIC(BASE)                                                 \
+  if (type == BASE || type == BASE##_VEC2 || type == BASE##_VEC3               \
+      || type == BASE##_VEC4)                                                  \
+  return true
+  VSR_EDIT_NUMERIC(ANARI_INT8);
+  VSR_EDIT_NUMERIC(ANARI_UINT8);
+  VSR_EDIT_NUMERIC(ANARI_INT16);
+  VSR_EDIT_NUMERIC(ANARI_UINT16);
+  VSR_EDIT_NUMERIC(ANARI_INT32);
+  VSR_EDIT_NUMERIC(ANARI_UINT32);
+  VSR_EDIT_NUMERIC(ANARI_INT64);
+  VSR_EDIT_NUMERIC(ANARI_UINT64);
+  VSR_EDIT_NUMERIC(ANARI_FLOAT32);
+  VSR_EDIT_NUMERIC(ANARI_FLOAT64);
+#undef VSR_EDIT_NUMERIC
+  return false;
 }
 
 inline PreparedEdit prepareEdit(
     const scene::Object &obj, Token parameter, const JsonValue &value)
 {
-  PreparedEdit r;
-  const FieldSpec *spec =
-      findEditableField(obj.type(), obj.subtype(), parameter);
-  const scene::Parameter *p = spec ? obj.parameter(parameter) : nullptr;
-  if (!spec || !p) {
-    r.error = ValueError::UNSUPPORTED_PARAMETER;
-    return r;
+  PreparedEdit result;
+  const auto *p = obj.parameter(parameter);
+  if (!p || !isEditableParameter(*p)) {
+    result.error = ValueError::UNSUPPORTED_PARAMETER;
+    return result;
   }
-  r.field = spec->field;
-  if (p->value().type() != spec->storedType) {
-    r.error = ValueError::INCOMPATIBLE_TYPE;
-    return r;
+  const auto type = p->value().type();
+  if (type == ANARI_BOOL) {
+    if (value.kind != JsonKind::BOOLEAN)
+      result.error = ValueError::INCOMPATIBLE_TYPE;
+    else
+      result.value = core::Any(value.boolean);
+  } else if (type == ANARI_STRING) {
+    if (value.kind != JsonKind::STRING)
+      result.error = ValueError::INCOMPATIBLE_TYPE;
+    else if (value.text.find('\0') != std::string::npos
+        || (!p->stringValues().empty()
+            && std::find(p->stringValues().begin(),
+                   p->stringValues().end(),
+                   value.text)
+                == p->stringValues().end()))
+      result.error = ValueError::OUT_OF_DOMAIN;
+    else
+      result.value = core::Any(value.text);
   }
-
-  float out[3] = {};
-  if (spec->components == 1) {
-    auto s = convertScalar(value, spec->domain);
-    if (!s.ok()) {
-      r.error = s.error;
-      return r;
-    }
-    out[0] = s.value;
-  } else {
-    if (value.kind != JsonKind::ARRAY
-        || value.elements.size() != spec->components) {
-      r.error = ValueError::INCOMPATIBLE_TYPE;
-      return r;
-    }
-    for (size_t i = 0; i < spec->components; i++) {
-      auto s = convertScalar(value.elements[i], spec->domain);
-      if (!s.ok()) {
-        r.error = s.error;
-        return r;
-      }
-      out[i] = s.value;
-    }
-  }
-
-  switch (spec->components) {
-  case 1:
-    r.value = core::Any(out[0]);
-    break;
-  case 2:
-    r.value = core::Any(core::math::float2(out[0], out[1]));
-    break;
-  default:
-    r.value = core::Any(core::math::float3(out[0], out[1], out[2]));
-    break;
-  }
-  return r;
+#define VSR_PREPARE_NUMERIC(BASE, CPP)                                         \
+  else if (type == BASE || type == BASE##_VEC2 || type == BASE##_VEC3          \
+      || type == BASE##_VEC4) return value_detail::prepareNumeric<CPP>(*p,     \
+      value)
+  VSR_PREPARE_NUMERIC(ANARI_INT8, std::int8_t);
+  VSR_PREPARE_NUMERIC(ANARI_UINT8, std::uint8_t);
+  VSR_PREPARE_NUMERIC(ANARI_INT16, std::int16_t);
+  VSR_PREPARE_NUMERIC(ANARI_UINT16, std::uint16_t);
+  VSR_PREPARE_NUMERIC(ANARI_INT32, std::int32_t);
+  VSR_PREPARE_NUMERIC(ANARI_UINT32, std::uint32_t);
+  VSR_PREPARE_NUMERIC(ANARI_INT64, std::int64_t);
+  VSR_PREPARE_NUMERIC(ANARI_UINT64, std::uint64_t);
+  VSR_PREPARE_NUMERIC(ANARI_FLOAT32, float);
+  VSR_PREPARE_NUMERIC(ANARI_FLOAT64, double);
+#undef VSR_PREPARE_NUMERIC
+  return result;
 }
 
 inline core::math::float3 directionFromAngles(

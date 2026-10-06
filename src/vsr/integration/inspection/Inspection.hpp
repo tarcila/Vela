@@ -49,16 +49,17 @@ namespace vsr::integration::inspection {
  * "<activation>.<nonce>.<domain>.<value>", so a first render request can be
  * formed from wire data alone.
  *
- * Inspection items carry "values" for the §8 editable parameters of matte
- * materials and directional lights (addendum 04): numbers are the binary64 of
- * the stored float32; direction is [azimuth, elevation] in degrees.
+ * Inspection items carry a bounded legacy "values" mirror for supported
+ * float32 parameters. Parameter entries advertise generic stored-type
+ * editability, matching-typed bounds and string choices.
  *
  * Each parameter also carries a declared-ANARI-type "value" with an explicit
  * state: available (data), valid (object handle), null, truncated (preview),
  * or unavailable (reason). Integer components outside JSON's safe interval use
  * decimal-string tags; non-finite float components use non_finite tags. Array
  * links/items carry metadata summaries only, never bulk contents. These read
- * representations do not change the editable parameter allowlist.
+ * representations alone do not imply editability: references, matrices and
+ * opaque storage remain read-only.
  *
  * Discovery is session-wide: it needs no capability on any one target, lists
  * only readable targets, and its record covers exactly the listed targets.
@@ -1029,24 +1030,23 @@ class Inspector
     }
   }
 
-  // Current values of the §8 editable parameters, or empty when none apply.
-  static std::string editableValues(const scene::Object &o)
+  // Bounded compatibility mirror; the parameter entries are authoritative.
+  static std::string editableValues(
+      const scene::Object &o, std::size_t budget, std::size_t represented)
   {
     std::string out;
-    for (const auto &f : integration::editSurface()) {
-      if (o.type() != f.objectType || o.subtype() != *f.subtype)
+    for (std::size_t i = 0; i < represented; ++i) {
+      const auto &p = o.parameterAt(i);
+      const auto type = p.value().type();
+      if (type != ANARI_FLOAT32 && type != ANARI_FLOAT32_VEC2
+          && type != ANARI_FLOAT32_VEC3 && type != ANARI_FLOAT32_VEC4)
         continue;
-      const auto *p = o.parameter(Token(f.parameter));
-      if (!p || p->value().type() != f.storedType)
-        continue;
-      std::string e = "[";
-      for (std::size_t c = 0; c < f.components; c++)
-        e += (c ? "," : "") + detail::numericComponent<float>(p->value(), c);
-      e += "]";
-      if (f.components == 1)
-        e = detail::numericComponent<float>(p->value(), 0);
-      out +=
-          (out.empty() ? "" : ",") + detail::jsonString(f.parameter) + ":" + e;
+      const auto entry = (out.empty() ? "" : ",")
+          + detail::jsonString(p.name().str()) + ":"
+          + detail::numericData<float>(p.value());
+      if (entry.size() > budget - out.size())
+        break;
+      out += entry;
     }
     return out;
   }
@@ -1375,7 +1375,27 @@ class Inspector
           + "{\"name\":" + detail::jsonString(par.name().str()) + ",\"type\":"
           + detail::jsonString(anari::toString(par.value().type()))
           + ",\"value\":"
-          + detail::parameterValue(par.value(), scene, ids, m_limits) + "}";
+          + detail::parameterValue(par.value(), scene, ids, m_limits)
+          + ",\"editable\":" + (isEditableParameter(par) ? "true" : "false");
+      if (par.hasMin())
+        e += ",\"min\":"
+            + detail::parameterValue(par.min(), scene, ids, m_limits);
+      if (par.hasMax())
+        e += ",\"max\":"
+            + detail::parameterValue(par.max(), scene, ids, m_limits);
+      if (!par.stringValues().empty()) {
+        e += ",\"string_values\":[";
+        for (const auto &choice : par.stringValues()) {
+          if (e.size() + choice.size() > m_limits.optionalBytes) {
+            // Omit the entire entry rather than advertise a partial enum.
+            e.resize(m_limits.optionalBytes + 1);
+            break;
+          }
+          e += (e.back() == '[' ? "" : ",") + detail::jsonString(choice);
+        }
+        e += "]";
+      }
+      e += "}";
       if (params.size() + e.size() > m_limits.optionalBytes) {
         paramsTruncated = true;
         break;
@@ -1389,7 +1409,11 @@ class Inspector
       params +=
           ",\"parameters_reason\":\"optional_byte_limit\",\"parameters_omitted\":"
           + std::to_string(o->numParameters() - represented);
-    const auto vals = editableValues(*o);
+    const auto vals = editableValues(*o,
+        params.size() + 16 < m_limits.optionalBytes
+            ? m_limits.optionalBytes - params.size() - 16
+            : 0,
+        represented);
     if (!vals.empty())
       params += ",\"values\":{" + vals + "}";
     item += name + params;

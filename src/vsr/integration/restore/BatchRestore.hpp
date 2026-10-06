@@ -427,7 +427,8 @@ inline RestoreResult RestoreService::commit(
   struct Planned
   {
     scene::Object *object;
-    const edit::Change *change;
+    scene::Parameter *parameter;
+    core::Any value;
   };
   std::vector<Planned> plan;
   std::vector<scene::Object *> objects;
@@ -450,15 +451,18 @@ inline RestoreResult RestoreService::commit(
     objects.reserve(record->resultingVersions.size());
     for (auto &c : record->changes) {
       auto *o = ident->resolve(c.object);
-      if (!o || !c.before.valid() || !o->parameter(core::Token(c.parameter))) {
+      auto *parameter = o ? o->parameter(core::Token(c.parameter)) : nullptr;
+      if (!parameter || !c.before.valid()) {
         markConflicting(request.targetBatchRef, ctx);
         res.outcome = Outcome::CONFLICT; // missing/incompatible reference
         return res;
       }
-      plan.push_back({o, &c});
+      plan.push_back({o, parameter, c.before});
       if (std::find(objects.begin(), objects.end(), o) == objects.end())
         objects.push_back(o);
     }
+    for (auto *object : objects)
+      object->reserveParameterBatch(plan.size());
     res.versions.reserve(objects.size());
   } catch (const std::bad_alloc &) {
     res.outcome = Outcome::BUSY;
@@ -471,9 +475,7 @@ inline RestoreResult RestoreService::commit(
   for (auto *o : objects)
     o->beginParameterBatch();
   for (auto &p : plan) {
-    p.object->setParameter(core::Token(p.change->parameter),
-        p.change->before.type(),
-        p.change->before.data());
+    p.parameter->setPreparedValue(std::move(p.value));
   }
   for (std::size_t i = 0; i < nodes.size(); ++i) {
     const auto &c = record->nodeChanges[i];

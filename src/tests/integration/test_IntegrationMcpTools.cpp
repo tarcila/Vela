@@ -31,6 +31,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
@@ -38,6 +39,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 // posix
 #include <arpa/inet.h>
@@ -1319,6 +1321,173 @@ SCENARIO(
   auto denied = f.status(s2, s1.id, 1);
   CHECK(denied.status == 403);
   CHECK(denied.errorCode() == "forbidden");
+}
+
+SCENARIO(
+    "MCP generic edits use inspected object tokens and restore typed values",
+    "[integration][generic-edit][mcp]")
+{
+  Fixture f({}, true);
+  auto pbr = f.scene.createObject<vsr::scene::Material>("physicallyBased");
+  auto camera = f.scene.createObject<vsr::scene::Camera>("perspective");
+  auto point = f.scene.createObject<vsr::scene::Light>("point");
+  pbr->setName("generic-pbr");
+  camera->setName("generic-camera");
+  point->setName("generic-point");
+  const std::int32_t count = 3;
+  camera->setParameter("count", ANARI_INT32, &count);
+  const auto nearBefore = camera->parameter("near")->value();
+  auto s = f.attach();
+  auto inspectTarget = [&](std::uint64_t id, const char *name) {
+    REQUIRE(
+        f.tool(s,
+             "vsr_inspect",
+             "{\"request_id\":" + std::to_string(id)
+                 + ",\"scene_id\":" + std::to_string(f.sceneId)
+                 + ",\"name\":" + json::quote(name) + "}")
+            .errorCode()
+            .empty());
+    f.drain();
+    auto st = f.status(s, s.id, id);
+    REQUIRE(st.str("outcome") == "ok");
+    REQUIRE(st.result());
+    const auto &items = st.result()->get("items")->a;
+    REQUIRE(items.size() == 1);
+    return "\"handle\":" + json::quote(items[0].get("handle")->s)
+        + ",\"version\":"
+        + std::to_string(std::uint64_t(items[0].get("version")->n));
+  };
+  const auto pbrTarget = inspectTarget(1, "generic-pbr");
+  const auto cameraTarget = inspectTarget(2, "generic-camera");
+  const auto pointTarget = inspectTarget(3, "generic-point");
+  auto entry =
+      [](const std::string &target, const char *parameter, const char *value) {
+        return "{" + target + ",\"parameter\":" + json::quote(parameter)
+            + ",\"value\":" + value + "}";
+      };
+  const auto entries = entry(pbrTarget, "roughness", "0.25") + ","
+      + entry(cameraTarget, "near", "2") + ","
+      + entry(cameraTarget, "stereoMode", "\"left\"") + ","
+      + entry(cameraTarget, "count", "-7") + ","
+      + entry(pointTarget, "visible", "false") + ","
+      + entry(pointTarget, "intensity", "7");
+  auto args = [&](std::uint64_t id) {
+    return "{\"request_id\":" + std::to_string(id) + ",\"scene_id\":"
+        + std::to_string(f.sceneId) + ",\"edits\":[" + entries + "]}";
+  };
+  REQUIRE(f.tool(s, "vsr_edit", args(4)).str("state") == "pending");
+  f.drain();
+  const auto edited = f.status(s, s.id, 4);
+  REQUIRE(edited.str("outcome") == "ok");
+  REQUIRE(edited.flag("committed"));
+  REQUIRE(edited.result());
+  REQUIRE(edited.result()->get("batch_ref"));
+  const auto batch = *edited.result()->get("batch_ref");
+  REQUIRE(edited.result()->get("versions")->a.size() == 3);
+  CHECK(*pbr->parameterValueAs<float>("roughness") == 0.25f);
+  CHECK(*camera->parameterValueAs<float>("near") == 2.f);
+  CHECK_FALSE(camera->parameter("near")->isEnabled());
+  CHECK(camera->parameter("stereoMode")->value().getString() == "left");
+  CHECK(camera->parameter("count")->value().type() == ANARI_INT32);
+  CHECK(camera->parameter("count")->value().get<std::int32_t>() == -7);
+  CHECK_FALSE(point->parameter("visible")->value().get<bool>());
+  CHECK(*point->parameterValueAs<float>("intensity") == 7.f);
+  CHECK(f.tool(s, "vsr_edit", args(4)).flag("replayed"));
+  const auto revision = f.sceneIds->sceneRevision();
+  REQUIRE(f.tool(s, "vsr_edit", args(5)).errorCode().empty());
+  f.drain();
+  const auto stale = f.status(s, s.id, 5);
+  CHECK(stale.str("outcome") == "conflict");
+  CHECK_FALSE(stale.flag("committed"));
+  CHECK(f.sceneIds->sceneRevision() == revision);
+  REQUIRE(f.restoreBatch(s, 6, batch).errorCode().empty());
+  f.drain();
+  const auto restored = f.status(s, s.id, 6);
+  REQUIRE(restored.str("outcome") == "ok");
+  CHECK(restored.flag("committed"));
+  CHECK(*pbr->parameterValueAs<float>("roughness") == 1.f);
+  CHECK(camera->parameter("near")->value() == nearBefore);
+  CHECK_FALSE(camera->parameter("near")->isEnabled());
+  CHECK(camera->parameter("stereoMode")->value().getString() == "none");
+  CHECK(camera->parameter("count")->value().type() == ANARI_INT32);
+  CHECK(camera->parameter("count")->value().get<std::int32_t>() == 3);
+  CHECK(point->parameter("visible")->value().get<bool>());
+  CHECK(*point->parameterValueAs<float>("intensity") == 1.f);
+}
+
+SCENARIO(
+    "MCP invalid generic values cannot partially write or create parameters",
+    "[integration][generic-edit][mcp]")
+{
+  Fixture f({}, true);
+  auto s = f.attach();
+  const auto target = f.firstTarget(s, 1);
+  auto camera = f.scene.createObject<vsr::scene::Camera>("perspective");
+  camera->setName("generic-invalid-camera");
+  const std::uint8_t count = 3;
+  camera->setParameter("count", ANARI_UINT8, &count);
+  const std::uint64_t wideCount = 3;
+  camera->setParameter("wideCount", ANARI_UINT64, &wideCount);
+  auto array = f.scene.createArrayProxy(ANARI_FLOAT32, 8);
+  camera->setParameterObject("input", *array);
+  const auto inputBefore = camera->parameter("input")->value();
+  // The camera target is also acquired through the wire inspection API.
+  REQUIRE(
+      f.tool(s,
+           "vsr_inspect",
+           "{\"request_id\":2,\"scene_id\":" + std::to_string(f.sceneId)
+               + ",\"name\":\"generic-invalid-camera\"}")
+          .errorCode()
+          .empty());
+  f.drain();
+  const auto inspected = f.status(s, s.id, 2);
+  REQUIRE(inspected.str("outcome") == "ok");
+  REQUIRE(inspected.result());
+  REQUIRE(inspected.result()->get("items")->a.size() == 1);
+  const auto *item = &inspected.result()->get("items")->a[0];
+  const auto cameraTarget = "\"handle\":" + json::quote(item->get("handle")->s)
+      + ",\"version\":"
+      + std::to_string(std::uint64_t(item->get("version")->n));
+  const auto version =
+      *f.sceneIds->parameterVersion(f.sceneIds->handleOf(camera.data()));
+  const auto revision = f.sceneIds->sceneRevision();
+  std::uint64_t id = 2;
+  for (const auto &bad :
+      std::vector<std::pair<std::string, std::string>>{{"count", "-1"},
+          {"count", "256"},
+          {"count", "1.5"},
+          {"wideCount", "9007199254740992"},
+          {"count", "true"},
+          {"count", "null"},
+          {"count", "[1]"},
+          {"stereoMode", "\"invalid\""},
+          {"stereoMode", "\"left\\u0000right\""},
+          {"input", "0"},
+          {"input", "{\"handle\":\"unsupported\"}"},
+          {"missing", "1"}}) {
+    CAPTURE(bad.first, bad.second);
+    auto ack = f.tool(s,
+        "vsr_edit",
+        "{\"request_id\":" + std::to_string(++id)
+            + ",\"scene_id\":" + std::to_string(f.sceneId) + ",\"edits\":[{"
+            + target + ",\"parameter\":\"opacity\",\"value\":0.5},{"
+            + cameraTarget + ",\"parameter\":" + json::quote(bad.first)
+            + ",\"value\":" + bad.second + "}]}");
+    REQUIRE(ack.errorCode().empty());
+    f.drain();
+    const auto rejected = f.status(s, s.id, id);
+    CHECK(rejected.str("outcome") == "invalid_request");
+    CHECK_FALSE(rejected.flag("committed"));
+    CHECK(f.opacity0() == 1.f);
+    CHECK(camera->parameter("count")->value().get<std::uint8_t>() == 3);
+    CHECK(camera->parameter("wideCount")->value().get<std::uint64_t>() == 3);
+    CHECK(camera->parameter("stereoMode")->value().getString() == "none");
+    CHECK_FALSE(camera->parameter("missing"));
+    CHECK(camera->parameter("input")->value() == inputBefore);
+    CHECK(f.sceneIds->isCurrent(version));
+    CHECK(f.sceneIds->sceneRevision() == revision);
+    CHECK(f.edits->restorations().size() == 0);
+  }
 }
 
 SCENARIO("MCP edit and restore tools carry qualified refs and commit state",

@@ -133,9 +133,25 @@ address individual placements; readable parameters are not automatically writabl
 See the [live placement guide](../../../../docs/live-placement-editing.md) for
 filtered/paged inspection, copying `node_edit_version` into `version`, required
 structural/world ancestry tokens, local/world origin moves, VSR degree rotations,
-full affine matrices, conflicts, and exact one-way Restore. The guide also lists
-the unchanged material/light allowlist and deferred tools. Inspecting a stored
-scene camera does not change the viewport or agent capture camera.
+full affine matrices, conflicts, and exact one-way Restore. Object parameter
+editing uses generic stored-type and introspected-metadata validation, not a
+material/light allowlist. Inspection entries expose an `editable` Boolean,
+typed `min`/`max` values and `string_values` choices when present; these are
+value-support observations, not authority grants.
+
+Existing parameters support stored `BOOL` as JSON Boolean, `STRING` without
+embedded NUL (enum choices enforced), signed/unsigned 8-, 16-, 32-, and 64-bit
+integer scalars/vec2/vec3/vec4 as integral JSON numbers within both type range
+and `[-(2^53-1), 2^53-1]`, and float32/float64 scalars/vec2/vec3/vec4 as
+finite JSON numbers within type range. Vectors require exactly the stored
+component count. Matching `min`/`max` metadata applies per component; `COLOR`
+usage retains `[0,1]`. Parameter `enabled` is preserved and does not restrict
+value editing. References, object parameter matrices, other types, and
+parameter creation are unsupported. The legacy `values` mirror covers generic
+supported float32 scalar/vec2/vec3/vec4 values, not exclusive edit authority.
+Existing authority, atomicity, versioning, and conditional restore are
+unchanged. Editing a stored scene camera does not change the viewport or agent
+capture camera; the guide lists deferred tools.
 
 ## User Color Maps
 

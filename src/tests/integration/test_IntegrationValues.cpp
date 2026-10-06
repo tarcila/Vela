@@ -33,15 +33,6 @@ bool isPositiveZero(float f)
   return bitsOf(f) == 0u;
 }
 
-Domain domainOf(EditableField field)
-{
-  for (const auto &f : editSurface())
-    if (f.field == field)
-      return f.domain;
-  FAIL("field missing from edit surface");
-  return {};
-}
-
 // Field-agnostic scalar checks run against every field's domain.
 void checkCommonScalarRules(Domain d)
 {
@@ -108,18 +99,14 @@ SCENARIO(
 {
   GIVEN("every editable field's domain")
   {
-    for (auto f : {EditableField::MATTE_COLOR,
-             EditableField::MATTE_OPACITY,
-             EditableField::DIRECTIONAL_COLOR,
-             EditableField::DIRECTIONAL_IRRADIANCE,
-             EditableField::DIRECTIONAL_DIRECTION}) {
-      checkCommonScalarRules(domainOf(f));
-    }
+    for (const auto domain :
+        {Domain{0, 1}, Domain{0, FLT_MAX_D}, Domain{0, 360}})
+      checkCommonScalarRules(domain);
   }
 
   GIVEN("the unit-interval domains")
   {
-    const Domain unit = domainOf(EditableField::MATTE_OPACITY);
+    const Domain unit = {0, 1};
     THEN("opacity 1.0000000000000002 rejects instead of rounding to 1")
     {
       CHECK(convertScalar(JsonValue::fromNumber(1.0000000000000002), unit).error
@@ -135,7 +122,7 @@ SCENARIO(
 
   GIVEN("the irradiance domain")
   {
-    const Domain irr = domainOf(EditableField::DIRECTIONAL_IRRADIANCE);
+    const Domain irr = {0, FLT_MAX_D};
     THEN("1e39 rejects")
     {
       CHECK(convertScalar(JsonValue::fromNumber(1e39), irr).error
@@ -203,8 +190,8 @@ SCENARIO("Binary32 rounding is ties-to-even regardless of ambient mode",
   }
 }
 
-SCENARIO("The edit surface is exactly the v1 matte and directional fields",
-    "[integration]")
+SCENARIO(
+    "Object edits validate the introspected type and metadata", "[integration]")
 {
   Fixture fx;
 
@@ -212,23 +199,19 @@ SCENARIO("The edit surface is exactly the v1 matte and directional fields",
   {
     THEN("each maps to an existing parameter with the expected type")
     {
-      REQUIRE(editSurface().size() == 5);
       auto opacity =
           prepareEdit(*fx.matte, "opacity", JsonValue::fromNumber(1));
       REQUIRE(opacity.ok());
-      CHECK(*opacity.field == EditableField::MATTE_OPACITY);
       CHECK(opacity.value.get<float>() == 1.f);
 
       auto mColor =
           prepareEdit(*fx.matte, "color", JsonValue::numbers({0.1, 0, 1}));
       REQUIRE(mColor.ok());
-      CHECK(*mColor.field == EditableField::MATTE_COLOR);
       CHECK(mColor.value.get<float3>() == float3(0.1f, 0.f, 1.f));
 
       auto lColor = prepareEdit(
           *fx.directional, "color", JsonValue::numbers({1, 0.5, 0}));
       REQUIRE(lColor.ok());
-      CHECK(*lColor.field == EditableField::DIRECTIONAL_COLOR);
 
       auto irr = prepareEdit(
           *fx.directional, "irradiance", JsonValue::fromNumber(1e-46));
@@ -238,7 +221,6 @@ SCENARIO("The edit surface is exactly the v1 matte and directional fields",
       auto dir = prepareEdit(
           *fx.directional, "direction", JsonValue::numbers({360, 0.1}));
       REQUIRE(dir.ok());
-      CHECK(*dir.field == EditableField::DIRECTIONAL_DIRECTION);
       CHECK(dir.value.type() == ANARI_FLOAT32_VEC2);
     }
   }
@@ -251,16 +233,15 @@ SCENARIO("The edit surface is exactly the v1 matte and directional fields",
     THEN("they reject without touching the object")
     {
       CHECK(prepareEdit(*fx.matte, "alphaMode", JsonValue::fromNumber(0)).error
-          == ValueError::UNSUPPORTED_PARAMETER);
+          == ValueError::INCOMPATIBLE_TYPE);
       CHECK(prepareEdit(*fx.matte, "nope", JsonValue::fromNumber(0)).error
           == ValueError::UNSUPPORTED_PARAMETER);
-      CHECK(prepareEdit(*fx.pbr, "opacity", JsonValue::fromNumber(0.5)).error
-          == ValueError::UNSUPPORTED_PARAMETER);
-      CHECK(prepareEdit(*fx.point, "color", JsonValue::numbers({1, 1, 1})).error
-          == ValueError::UNSUPPORTED_PARAMETER);
+      CHECK(prepareEdit(*fx.pbr, "opacity", JsonValue::fromNumber(0.5)).ok());
+      CHECK(
+          prepareEdit(*fx.point, "color", JsonValue::numbers({1, 1, 1})).ok());
       CHECK(prepareEdit(*fx.directional, "visible", JsonValue::fromNumber(1))
                 .error
-          == ValueError::UNSUPPORTED_PARAMETER);
+          == ValueError::INCOMPATIBLE_TYPE);
       CHECK(prepareEdit(*fx.directional, "opacity", JsonValue::fromNumber(1))
                 .error
           == ValueError::UNSUPPORTED_PARAMETER);
@@ -298,6 +279,81 @@ SCENARIO("The edit surface is exactly the v1 matte and directional fields",
           == ValueError::UNSUPPORTED_PARAMETER);
     }
   }
+}
+
+TEST_CASE("Generic numeric validation uses stored types and component bounds",
+    "[integration][generic-edit]")
+{
+  Fixture fx;
+  auto &object = *fx.pbr;
+  struct IntegerCase
+  {
+    anari::DataType type;
+    double lower;
+    double upper;
+  };
+  const IntegerCase integers[] = {{ANARI_INT8, -128, 127},
+      {ANARI_UINT8, 0, 255},
+      {ANARI_INT16, -32768, 32767},
+      {ANARI_UINT16, 0, 65535},
+      {ANARI_INT32, -2147483648., 2147483647.},
+      {ANARI_UINT32, 0, 4294967295.},
+      {ANARI_INT64, -9007199254740991., 9007199254740991.},
+      {ANARI_UINT64, 0, 9007199254740991.}};
+  const std::uint64_t zero = 0;
+  for (const auto &test : integers) {
+    INFO(anari::toString(test.type));
+    object.setParameter("custom", test.type, &zero);
+    CHECK(
+        prepareEdit(object, "custom", JsonValue::fromNumber(test.lower)).ok());
+    const auto upper =
+        prepareEdit(object, "custom", JsonValue::fromNumber(test.upper));
+    REQUIRE(upper.ok());
+    CHECK(upper.value.type() == test.type);
+    CHECK(prepareEdit(object, "custom", JsonValue::fromNumber(test.lower - 1))
+              .error
+        == ValueError::OUT_OF_DOMAIN);
+    CHECK(prepareEdit(object, "custom", JsonValue::fromNumber(test.upper + 1))
+              .error
+        == ValueError::OUT_OF_DOMAIN);
+    CHECK(prepareEdit(object, "custom", JsonValue::fromNumber(0.5)).error
+        == ValueError::INCOMPATIBLE_TYPE);
+  }
+  const double components[] = {0, 0, 0, 0};
+  const double lower[] = {-1, 2, 3, 4};
+  const double upper[] = {1, 3, 4, 5};
+  object.setParameter("vector", ANARI_FLOAT64_VEC4, components);
+  object.parameter("vector")
+      ->setMin(vsr::core::Any(ANARI_FLOAT64_VEC4, lower))
+      .setMax(vsr::core::Any(ANARI_FLOAT64_VEC4, upper));
+  CHECK(prepareEdit(object, "vector", JsonValue::numbers({-1, 2, 4, 5})).ok());
+  CHECK(prepareEdit(object, "vector", JsonValue::numbers({0, 1, 3, 4})).error
+      == ValueError::OUT_OF_DOMAIN);
+  CHECK(prepareEdit(object, "vector", JsonValue::numbers({0, 2, 3})).error
+      == ValueError::INCOMPATIBLE_TYPE);
+  object.setParameter("double", 0.0);
+  const double exact = 1.0000000000000002;
+  const auto prepared =
+      prepareEdit(object, "double", JsonValue::fromNumber(exact));
+  REQUIRE(prepared.ok());
+  CHECK(prepared.value.get<double>() == exact);
+  CHECK(prepareEdit(object,
+            "double",
+            JsonValue::fromNumber(std::numeric_limits<double>::infinity()))
+            .error
+      == ValueError::NON_FINITE);
+  CHECK(prepareEdit(object, "roughness", JsonValue::fromNumber(exact)).error
+      == ValueError::OUT_OF_DOMAIN);
+  auto text = JsonValue::ofKind(JsonKind::STRING);
+  text.text = "opaque";
+  CHECK(prepareEdit(object, "alphaMode", text).ok());
+  text.text = "invalid";
+  CHECK(prepareEdit(object, "alphaMode", text).error
+      == ValueError::OUT_OF_DOMAIN);
+  object.setParameter("unbounded", "old");
+  text.text = std::string("a\0b", 3);
+  CHECK(prepareEdit(object, "unbounded", text).error
+      == ValueError::OUT_OF_DOMAIN);
 }
 
 SCENARIO("Direction angles are closed [0,360] and never canonicalized",

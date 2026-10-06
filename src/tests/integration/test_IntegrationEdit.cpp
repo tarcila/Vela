@@ -212,6 +212,181 @@ bool isLowerHex32(const std::string &s)
 
 } // namespace
 
+TEST_CASE("Generic object edits commit PBR camera and point light values",
+    "[integration][generic-edit]")
+{
+  Fixture f;
+  auto pbr = f.scene.createObject<vsr::scene::Material>("physicallyBased");
+  auto camera = f.scene.createObject<vsr::scene::Camera>("perspective");
+  auto point = f.scene.createObject<vsr::scene::Light>("point");
+  REQUIRE_FALSE(camera->parameter("near")->isEnabled());
+  const auto pbrVersion = f.version(pbr.data());
+  const auto cameraVersion = f.version(camera.data());
+  const auto pointVersion = f.version(point.data());
+  f.recorder->parameterSignals = 0;
+  f.recorder->onParameters = [&] {
+    CHECK(*pbr->parameterValueAs<float>("roughness") == 0.25f);
+    CHECK(*pbr->parameterValueAs<float3>("baseColor")
+        == float3(0.2f, 0.4f, 0.6f));
+    CHECK(*camera->parameterValueAs<float3>("position") == float3(-2, 3, 4));
+    CHECK(*camera->parameterValueAs<float>("near") == 2.f);
+    CHECK(*point->parameterValueAs<float>("intensity") == 7.f);
+  };
+  auto r = f.run(1,
+      f.batch({f.entry(pbr.data(), "roughness", JsonValue::fromNumber(0.25)),
+          f.entry(pbr.data(), "baseColor", JsonValue::numbers({0.2, 0.4, 0.6})),
+          f.entry(camera.data(), "position", JsonValue::numbers({-2, 3, 4})),
+          f.entry(camera.data(), "near", JsonValue::fromNumber(2)),
+          f.entry(point.data(), "intensity", JsonValue::fromNumber(7))}));
+  REQUIRE(r.outcome == Outcome::OK);
+  REQUIRE(r.committed);
+  REQUIRE(r.batchRef);
+  REQUIRE(r.versions.size() == 3);
+  for (const auto &v : r.versions)
+    CHECK(f.identity->isCurrent(v));
+  CHECK_FALSE(f.identity->isCurrent(pbrVersion));
+  CHECK_FALSE(f.identity->isCurrent(cameraVersion));
+  CHECK_FALSE(f.identity->isCurrent(pointVersion));
+  CHECK_FALSE(camera->parameter("near")->isEnabled());
+  CHECK(f.recorder->parameterSignals == 3);
+  CHECK(f.hookCalls == 1);
+  CHECK(f.edits->restorations().size() == 1);
+}
+
+TEST_CASE("Generic object validation rejects an entire mixed batch",
+    "[integration][generic-edit]")
+{
+  Fixture f;
+  auto pbr = f.scene.createObject<vsr::scene::Material>("physicallyBased");
+  auto camera = f.scene.createObject<vsr::scene::Camera>("perspective");
+  auto point = f.scene.createObject<vsr::scene::Light>("point");
+  std::string parameter = "baseColor";
+  JsonValue value = JsonValue::numbers({0.5, 1.01, 0.5});
+  const vsr::scene::Object *target = pbr.data();
+  SECTION("COLOR usage supplies implicit bounds without explicit min max")
+  {
+    CHECK_FALSE(pbr->parameter("baseColor")->hasMin());
+    CHECK_FALSE(pbr->parameter("baseColor")->hasMax());
+  }
+  SECTION("stored scalar maximum")
+  {
+    parameter = "roughness";
+    value = JsonValue::fromNumber(1.01);
+  }
+  SECTION("stored vector bounds apply separately to each component")
+  {
+    target = camera.data();
+    parameter = "position";
+    camera->parameter(parameter)
+        ->setMin(float3(-1, 2, 3))
+        .setMax(float3(1, 4, 5));
+    value = JsonValue::numbers({0, 1, 4});
+  }
+  SECTION("string enumeration")
+  {
+    target = camera.data();
+    parameter = "stereoMode";
+    value = JsonValue::ofKind(JsonKind::STRING);
+    value.text = "unsupported-mode";
+  }
+  SECTION("embedded NUL in a string")
+  {
+    target = camera.data();
+    parameter = "label";
+    camera->setParameter(parameter, "before");
+    value = JsonValue::ofKind(JsonKind::STRING);
+    value.text = std::string("bad\0value", 9);
+  }
+  SECTION("missing parameter must not be created")
+  {
+    parameter = "newParameter";
+    value = JsonValue::fromNumber(1);
+  }
+  SECTION("reference values remain unsupported")
+  {
+    parameter = "baseColor";
+    auto sampler = f.scene.createObject<vsr::scene::Sampler>("image2D");
+    pbr->setParameterObject(parameter, *sampler);
+    value = JsonValue::fromNumber(0.5);
+  }
+  SECTION("matrix values remain unsupported")
+  {
+    target = camera.data();
+    parameter = "matrix";
+    camera->setParameter(parameter, vsr::core::math::IDENTITY_MAT4);
+    value = JsonValue::array({JsonValue::numbers({1, 0, 0, 0}),
+        JsonValue::numbers({0, 1, 0, 0}),
+        JsonValue::numbers({0, 0, 1, 0}),
+        JsonValue::numbers({0, 0, 0, 1})});
+  }
+  const auto before = target->parameter(parameter)
+      ? target->parameter(parameter)->value()
+      : vsr::core::Any();
+  const auto version = f.version(target);
+  const auto pointVersion = f.version(point.data());
+  const auto revision = f.identity->sceneRevision();
+  f.recorder->parameterSignals = 0;
+  auto r = f.run(1,
+      f.batch({f.entry(point.data(), "intensity", JsonValue::fromNumber(7)),
+          f.entry(target, parameter, value)}));
+  CHECK(r.outcome == Outcome::INVALID_REQUEST);
+  CHECK_FALSE(r.committed);
+  CHECK_FALSE(r.batchRef);
+  CHECK(*point->parameterValueAs<float>("intensity") == 1.f);
+  if (before.valid()) {
+    REQUIRE(target->parameter(parameter));
+    CHECK(target->parameter(parameter)->value() == before);
+  } else
+    CHECK_FALSE(target->parameter(parameter));
+  CHECK(f.identity->isCurrent(version));
+  CHECK(f.identity->isCurrent(pointVersion));
+  CHECK(f.identity->sceneRevision() == revision);
+  CHECK(f.recorder->parameterSignals == 0);
+  CHECK(f.hookCalls == 0);
+  CHECK(f.edits->restorations().size() == 0);
+}
+
+TEST_CASE("Generic object edits retain stale version and authority gates",
+    "[integration][generic-edit]")
+{
+  Fixture f;
+  auto pbr = f.scene.createObject<vsr::scene::Material>("physicallyBased");
+  auto batch =
+      f.batch({f.entry(pbr.data(), "roughness", JsonValue::fromNumber(0.25))});
+  Outcome expected = Outcome::CONFLICT;
+  SECTION("parameter changed back after inspection")
+  {
+    pbr->setParameter("roughness", 0.5f);
+    pbr->setParameter("roughness", 1.f);
+  }
+  SECTION("edit authority withdrawn after admission")
+  {
+    expected = Outcome::FORBIDDEN;
+  }
+  const auto version = f.version(pbr.data());
+  const auto revision = f.identity->sceneRevision();
+  f.recorder->parameterSignals = 0;
+  REQUIRE(f.submit(1, batch).code == Outcome::OK);
+  if (expected == Outcome::FORBIDDEN)
+    f.authority->restrict(
+        session::Target::scene(f.sceneId), session::Capability::EDIT);
+  while (f.integration.service()) {
+  }
+  const auto status = f.engine->status(f.creds, f.ref(1));
+  CHECK(status.terminal == expected);
+  CHECK_FALSE(status.committed);
+  if (expected == Outcome::CONFLICT) {
+    REQUIRE(f.edits->result(f.ref(1)));
+    CHECK(f.edits->result(f.ref(1))->outcome == expected);
+  }
+  CHECK(*pbr->parameterValueAs<float>("roughness") == 1.f);
+  CHECK(f.identity->isCurrent(version));
+  CHECK(f.identity->sceneRevision() == revision);
+  CHECK(f.recorder->parameterSignals == 0);
+  CHECK(f.hookCalls == 0);
+  CHECK(f.edits->restorations().size() == 0);
+}
+
 namespace {
 PreviewRef translationPreview(Fixture &f,
     TranslationService &service,
@@ -1743,7 +1918,7 @@ TEST_CASE("One invalid mixed entry or preparation failure changes nothing",
     batch.edits[0].value = JsonValue::fromNumber(2);
     CHECK(f.run(1, batch).outcome == Outcome::INVALID_REQUEST);
   }
-  SECTION("object allowlist stays narrow")
+  SECTION("missing object parameter is not created")
   {
     batch.edits[0].parameter = "unsupported";
     CHECK(f.run(1, batch).outcome == Outcome::INVALID_REQUEST);

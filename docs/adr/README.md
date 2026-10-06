@@ -109,6 +109,12 @@ Background and the full audit behind this decision:
 See [`src/vsr/rendering/CONTEXT.md`](../../src/vsr/rendering/CONTEXT.md) for
 the resulting vocabulary.
 
+## Agent integration
+
+| ADR | Decision | Supersedes / revised by |
+| --- | --- | --- |
+| [0044](0044-exchange-agent-images-through-a-launch-scoped-directory.md) | Exchange agent images through a launch-scoped directory | |
+
 ## USD import
 
 | ADR | Decision | Supersedes / revised by |

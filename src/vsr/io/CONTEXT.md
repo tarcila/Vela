@@ -187,6 +187,17 @@ Sampler may be built without it — see ADR 0014 — so "every" is a claim about
 what a Sampler can read, not about every decode in the tree.
 _Avoid_: texture cache
 
+**Image Export**:
+An Export of one Image's texels as a standalone picture, leaving the Image
+unchanged.
+_Avoid_: texture dump, readback
+
+**Image Import**:
+An Import that replaces an existing Image's texels with a standalone picture of
+the same shape, seen by every Sampler bound to that Image. It never creates an
+Image; an importer decoding a file into a new Image is not an Image Import.
+_Avoid_: texture upload, image edit
+
 **Row Order**:
 Which row of a picture a texel array stores first. Decoders declare the Row
 Order their library produced and an Image Source asks for the one its consumer

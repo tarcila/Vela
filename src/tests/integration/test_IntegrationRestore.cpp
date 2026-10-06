@@ -10,9 +10,11 @@
 #include "vsr/integration/restore/BatchRestore.hpp"
 #include "vsr/scene/Scene.hpp"
 // std
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace vsr::integration;
@@ -177,6 +179,125 @@ struct Fixture
 
 } // namespace
 
+TEST_CASE("Generic typed edits restore exact values or conflict as one batch",
+    "[integration][generic-edit][restore]")
+{
+  Fixture fx;
+  auto point = fx.scene.createObject<vsr::scene::Light>("point");
+  auto camera = fx.scene.createObject<vsr::scene::Camera>("perspective");
+  std::string originalLabel(200, 'x');
+  originalLabel[100] = '\0';
+  camera->setParameter("label", "initial");
+  camera->parameter("label")->setValue(vsr::core::Any(originalLabel));
+  const std::int64_t count = -9007199254740991LL;
+  const std::uint16_t bins[3] = {0, 32768, 65535};
+  const double weights[4] = {1.25, -2.5, 3.75, 4.5};
+  camera->setParameter("count", ANARI_INT64, &count);
+  camera->setParameter("bins", ANARI_UINT16_VEC3, bins);
+  const std::uint16_t minBins[3] = {0, 1, 0};
+  const std::uint16_t maxBins[3] = {65535, 32768, 65535};
+  camera->parameter("bins")
+      ->setMin(vsr::core::Any(ANARI_UINT16_VEC3, minBins))
+      .setMax(vsr::core::Any(ANARI_UINT16_VEC3, maxBins));
+  camera->setParameter("weights", ANARI_FLOAT64_VEC4, weights);
+  camera->parameter("count")->setEnabled(false);
+  std::vector<std::pair<std::string, vsr::core::Any>> before;
+  for (const char *name : {"stereoMode", "label", "count", "bins", "weights"})
+    before.emplace_back(name, camera->parameter(name)->value());
+  auto typedEntry =
+      [&](const vsr::scene::Object *o, const char *name, JsonValue value) {
+        return EditEntry{fx.version(o), name, std::move(value)};
+      };
+  auto stringValue = [](const std::string &text) {
+    auto value = JsonValue::ofKind(JsonKind::STRING);
+    value.text = text;
+    return value;
+  };
+  auto visible = JsonValue::ofKind(JsonKind::BOOLEAN);
+  visible.boolean = false;
+  const auto oldCameraVersion = fx.version(camera.data());
+  auto batch = fx.edit(1,
+      {typedEntry(point.data(), "visible", visible),
+          typedEntry(camera.data(), "stereoMode", stringValue("left")),
+          typedEntry(camera.data(), "label", stringValue("edited label")),
+          typedEntry(
+              camera.data(), "count", JsonValue::fromNumber(9007199254740991.)),
+          typedEntry(camera.data(), "bins", JsonValue::numbers({65535, 1, 0})),
+          typedEntry(camera.data(),
+              "weights",
+              JsonValue::numbers({-4.5, 3.75, -2.5, 1.25}))});
+  CHECK_FALSE(point->parameter("visible")->value().get<bool>());
+  CHECK(camera->parameter("stereoMode")->value().getString() == "left");
+  CHECK(camera->parameter("label")->value().getString() == "edited label");
+  CHECK(camera->parameter("count")->value().type() == ANARI_INT64);
+  CHECK(camera->parameter("count")->value().get<std::int64_t>()
+      == 9007199254740991LL);
+  const std::uint16_t editedBins[3] = {65535, 1, 0};
+  const double editedWeights[4] = {-4.5, 3.75, -2.5, 1.25};
+  CHECK(camera->parameter("bins")->value()
+      == vsr::core::Any(ANARI_UINT16_VEC3, editedBins));
+  CHECK(camera->parameter("weights")->value()
+      == vsr::core::Any(ANARI_FLOAT64_VEC4, editedWeights));
+  CHECK_FALSE(camera->parameter("count")->isEnabled());
+  CHECK_FALSE(fx.identity->isCurrent(oldCameraVersion));
+  bool conflict = false;
+  SECTION("successful restore preserves types and disabled state") {}
+  SECTION("newer edit on the affected object blocks the older restore")
+  {
+    fx.edit(2, {typedEntry(camera.data(), "count", JsonValue::fromNumber(5))});
+    conflict = true;
+  }
+  SECTION("string change back still permanently conflicts")
+  {
+    camera->setParameter("stereoMode", "right");
+    camera->setParameter("stereoMode", "left");
+    conflict = true;
+  }
+  SECTION("boolean change back still permanently conflicts")
+  {
+    point->setParameter("visible", true);
+    point->setParameter("visible", false);
+    conflict = true;
+  }
+  const auto currentCount = camera->parameter("count")->value();
+  const auto cameraVersion = fx.version(camera.data());
+  const auto pointVersion = fx.version(point.data());
+  const auto revision = fx.identity->sceneRevision();
+  const auto hooks = fx.hookCalls;
+  auto restored = fx.restore(3, batch);
+  CHECK(restored.outcome == (conflict ? Outcome::CONFLICT : Outcome::OK));
+  CHECK(restored.committed == !conflict);
+  CHECK_FALSE(camera->parameter("count")->isEnabled());
+  if (conflict) {
+    CHECK_FALSE(point->parameter("visible")->value().get<bool>());
+    CHECK(camera->parameter("label")->value().getString() == "edited label");
+    CHECK(camera->parameter("count")->value() == currentCount);
+    CHECK(camera->parameter("bins")->value()
+        == vsr::core::Any(ANARI_UINT16_VEC3, editedBins));
+    CHECK(camera->parameter("weights")->value()
+        == vsr::core::Any(ANARI_FLOAT64_VEC4, editedWeights));
+    CHECK(fx.identity->isCurrent(cameraVersion));
+    CHECK(fx.identity->isCurrent(pointVersion));
+    CHECK(fx.identity->sceneRevision() == revision);
+    CHECK(fx.hookCalls == hooks);
+    CHECK(fx.restores->conflicting(batch));
+  } else {
+    CHECK(point->parameter("visible")->value().get<bool>());
+    for (const auto &p : before)
+      CHECK(camera->parameter(p.first)->value() == p.second);
+    REQUIRE(restored.versions.size() == 2);
+    for (const auto &v : restored.versions)
+      CHECK(fx.identity->isCurrent(v));
+    CHECK_FALSE(fx.identity->isCurrent(cameraVersion));
+    CHECK_FALSE(fx.identity->isCurrent(pointVersion));
+    CHECK(fx.hookCalls == hooks + 1);
+    CHECK(fx.restores->restored(batch));
+  }
+  CHECK_FALSE(fx.restores->eligible(batch));
+  CHECK(fx.restore(4, batch).outcome
+      == (conflict ? Outcome::CONFLICT : Outcome::ALREADY_RESTORED));
+}
+
 SCENARIO("Restoration selects a batch by target_batch_ref", "[integration]")
 {
   Fixture fx;
@@ -209,12 +330,12 @@ SCENARIO("Restoration selects a batch by target_batch_ref", "[integration]")
       REQUIRE(s.result.find("\"scene_revision\":\""
                   + std::to_string(rev.launch.activation) + "."
                   + std::to_string(rev.launch.nonce) + "."
-                  + std::to_string(rev.domain) + "."
-                  + std::to_string(rev.value) + "\"")
+                  + std::to_string(rev.domain) + "." + std::to_string(rev.value)
+                  + "\"")
           != std::string::npos);
       REQUIRE(r.versions.size() == 1);
-      REQUIRE(s.result.find("\"version\":"
-                  + std::to_string(r.versions[0].version) + "}")
+      REQUIRE(s.result.find(
+                  "\"version\":" + std::to_string(r.versions[0].version) + "}")
           != std::string::npos);
     }
     THEN("versions advance, eligibility is consumed and no redo exists")
@@ -315,8 +436,8 @@ SCENARIO("Later changes on an affected object conflict", "[integration]")
   }
 }
 
-SCENARIO("Restoration preparation failure preserves eligibility",
-    "[integration]")
+SCENARIO(
+    "Restoration preparation failure preserves eligibility", "[integration]")
 {
   Fixture fx;
   auto b = fx.edit(1, {fx.entry(fx.matte.data(), "opacity", 0.5)});
@@ -379,8 +500,8 @@ SCENARIO("A fresh session restores an older session's batch", "[integration]")
 
   THEN("the old secret cannot act")
   {
-    auto stale = fx.restores->submit(
-        oldCreds, {oldCreds.sessionId, 2}, fx.target(b));
+    auto stale =
+        fx.restores->submit(oldCreds, {oldCreds.sessionId, 2}, fx.target(b));
     REQUIRE(stale.code == Outcome::INVALID_SESSION_PROOF);
     REQUIRE(fx.restores->eligible(b));
   }
@@ -545,8 +666,7 @@ SCENARIO("Restoration updates the activity log's eligibility", "[integration]")
   }
 }
 
-SCENARIO("A batch the log expired reports outcome_unavailable",
-    "[integration]")
+SCENARIO("A batch the log expired reports outcome_unavailable", "[integration]")
 {
   activity::Limits l;
   l.restorableBatches = 2;

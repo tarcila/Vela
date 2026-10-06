@@ -82,10 +82,14 @@ value below instead uses explicitly named components. Affordances use
 `available` and an optional `reason`; matrix availability is advertised as
 `edit_affordances.matrix`, while its write parameter is `transform`.
 
-Object parameters have declared ANARI types and typed `value` representations;
-the legacy editable `values` projection remains available. Inspect camera,
-renderer, material, geometry, and reference parameters without gaining writes.
-References distinguish valid opaque links, null, and unavailable/dangling state.
+Object parameter entries have declared ANARI types, typed `value`
+representations, an `editable` Boolean, and typed `min`/`max` values and
+`string_values` choices when present. `editable` describes supported value
+editing, not an authority grant. The legacy `values` mirror covers generic
+supported float32 scalar/vec2/vec3/vec4 values; it is not exclusive edit
+authority. Inspect camera, renderer, material, geometry, and reference
+parameters without gaining writes. References distinguish valid opaque links,
+null, and unavailable/dangling state.
 Arrays provide element type, dimensions, and counts, never downloaded contents.
 Large integers use lossless decimal tags and observed non-finite numbers use
 explicit tags. `state`, omission/unavailability reasons, and marked string
@@ -149,9 +153,9 @@ translation occupies the last column. The affine last row must be exactly
 [[1,0,0,3],[0,1,0,4],[0,0,1,5],[0,0,0,1]]
 ```
 
-All edit numbers must be finite binary64 and float32-representable; no clamping
-or non-finite read tags are accepted as write inputs. Full affine matrices may
-contain shear, reflection, or singular linear parts.
+All node edit numbers must be finite binary64 and float32-representable; no
+clamping or non-finite read tags are accepted as write inputs. Full affine
+node matrices may contain shear, reflection, or singular linear parts.
 
 One batch has 1–64 combined entries, possibly mixing supported object and node
 writes in one scene. Object entries default `target_kind` to `object` and use
@@ -162,6 +166,31 @@ Grouping is order-independent: final linear parts precede position conversion,
 and child world positions use final parents even when the child entry comes
 first. One invalid/stale entry prevents all mutation. Preparation is bounded
 (including at most 4096 ancestor steps/batch); exhaustion returns `busy` unchanged.
+
+### Object parameter values
+
+Object edits use generic introspection-driven validation of an **existing**
+parameter's stored type and metadata, not a material/light allowlist. Copy the
+object's inspected `handle` and integer `version`; use the parameter's name
+and a value matching its stored type:
+
+| Stored type | JSON write value |
+|---|---|
+| `BOOL` | Boolean (`true` or `false`) |
+| `STRING` | String without embedded NUL; must match a `string_values` choice when choices are present |
+| Signed/unsigned 8-, 16-, 32-, or 64-bit integer scalar or vec2/vec3/vec4 | Integral JSON number(s) within both the stored type's range and `[-(2^53-1), 2^53-1]` |
+| float32/float64 scalar or vec2/vec3/vec4 | Finite JSON number(s) within the stored type's range |
+
+Scalars take one value; vectors take arrays of exactly the stored component
+count. Matching `min`/`max` metadata is enforced per component, and `COLOR`
+usage retains the `[0,1]` domain. Parameter `enabled` is preserved by value
+edits and does not restrict them: a disabled parameter's supported value can
+still be edited. References, matrices, and all other stored types are
+unsupported, and edits cannot create parameters. Readable values, including
+lossless integer tags and non-finite read tags, are not automatically writable.
+Stored camera parameter edits do not control the viewport or agent capture
+camera. The existing authority, atomic batch validation, object versioning,
+and conditional restoration rules remain unchanged.
 
 ## Preview and commit a selection translation
 
@@ -251,10 +280,11 @@ remains available after client disconnect or **Disable agent edits**. Existing
 
 ## Deliberate boundaries
 
-The object write allowlist remains matte material `color`/`opacity` and
-directional light `color`/`direction`/`irradiance`. Reading other parameters
-never grants writes. There is no new creation/deletion/reparenting, reference
-replacement, layer activation, implicit wrapper, or transform-array element edit.
+Object writes are limited to existing parameters with the supported stored
+types and metadata described above; reading a parameter never grants writes.
+There is no parameter creation or object-reference/matrix parameter editing,
+nor new creation/deletion/reparenting, reference replacement, layer activation,
+implicit wrapper, or transform-array element edit.
 Stored scene camera inspection/editing does **not** control the interactive
 viewport or private offscreen agent camera. Camera/view editing, queen's-eye
 views, capture settings, custom resolution/sample count/denoiser, bounds/path

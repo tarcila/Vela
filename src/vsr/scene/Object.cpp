@@ -472,6 +472,11 @@ const char *Object::parameterNameAt(size_t i) const
   return m_parameters.at_index(i).first.c_str();
 }
 
+void Object::reserveParameterBatch(size_t changes)
+{
+  m_batchedParameters.reserve(m_batchedParameters.size() + changes);
+}
+
 void Object::beginParameterBatch()
 {
   m_inParameterBatch = true;

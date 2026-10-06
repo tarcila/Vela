@@ -374,6 +374,7 @@ struct Planned
   scene::Object *object;
   const EditEntry *entry;
   core::Any value;
+  scene::Parameter *parameter;
 };
 
 struct PlannedNode
@@ -637,7 +638,7 @@ inline void RestorationStore::expireUnless(
 inline std::size_t restorationBytes(const RestorationRecord &record)
 {
   auto anyBytes = [](const core::Any &a) {
-    return a.type() == ANARI_STRING ? a.getString().size() : std::size_t(0);
+    return a.type() == ANARI_STRING ? a.getStringView().size() : std::size_t(0);
   };
   std::size_t n = sizeof(RestorationRecord) + record.ref.launchId.size()
       + record.ref.batchId.size()
@@ -1146,7 +1147,10 @@ inline EditResult EditService::prepare(const EditBatch &batch,
           res.valueError = p.error;
           return res;
         }
-        plan.push_back({o, &e, p.value});
+        plan.push_back({o,
+            &e,
+            std::move(p.value),
+            o->parameter(core::Token(e.parameter))});
       }
       ++index;
     }
@@ -1315,12 +1319,14 @@ inline EditResult EditService::commitPrepared(SceneId sceneId,
       Change c;
       c.object = p.entry->expected.object;
       c.parameter = p.entry->parameter;
-      c.before = p.object->parameter(core::Token(p.entry->parameter))->value();
+      c.before = p.parameter->value();
       c.after = p.value;
       record.changes.push_back(std::move(c));
       if (std::find(objects.begin(), objects.end(), p.object) == objects.end())
         objects.push_back(p.object);
     }
+    for (auto *object : objects)
+      object->reserveParameterBatch(plan.size());
     record.resultingVersions.reserve(objects.size());
     auto id = newBatchId();
     if (!id)
@@ -1371,8 +1377,7 @@ inline EditResult EditService::commitPrepared(SceneId sceneId,
   for (auto *o : objects)
     o->beginParameterBatch();
   for (auto &p : plan) {
-    p.object->setParameter(
-        core::Token(p.entry->parameter), p.value.type(), p.value.data());
+    p.parameter->setPreparedValue(std::move(p.value));
   }
   for (auto &p : nodes) {
     if (p.changedTransform)

@@ -69,6 +69,9 @@ struct Parameter
 
   Parameter &setDescription(const char *d);
   Parameter &setValue(const Any &newValue);
+  // Consume a preallocated value without copying strings or logging. The
+  // caller validates edits; restoration may intentionally replay old values.
+  Parameter &setPreparedValue(Any &&newValue);
   Parameter &setMin(const Any &newMin);
   Parameter &setMax(const Any &newMax);
   Parameter &setStringValues(const std::vector<std::string> &sv);
@@ -114,6 +117,7 @@ struct Parameter
   friend struct Scene;
 
   void setObserver(ParameterObserver *o);
+  bool selectStringValue();
 
   ParameterObserver *m_observer{nullptr};
   Token m_name;

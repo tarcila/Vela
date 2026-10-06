@@ -132,6 +132,28 @@ The tools are `vsr_discover`, `vsr_inspect`, `vsr_operation_status`,
 `vsr_resynchronize`. See the [carrier and tool contract](../src/vsr/integration/mcp/README.md)
 for argument schemas, revision tokens, and stable outcome codes.
 
+### Editing object parameters
+
+Object edits validate existing parameters by stored type and introspected
+metadata, not a matte/directional allowlist. Inspection parameter entries
+expose an `editable` Boolean, typed `min`/`max` values and `string_values`
+choices when present. These describe value support, not permission; keep the
+existing scene edit grant and copy fresh object handles and integer versions.
+
+Supported values are stored `BOOL` as JSON Boolean; `STRING` without embedded
+NUL, enforcing enum choices when present; signed/unsigned 8-, 16-, 32-, and
+64-bit integer scalars/vec2/vec3/vec4 as integral JSON numbers within both type
+range and `[-(2^53-1), 2^53-1]`; and float32/float64 scalars/vec2/vec3/vec4
+as finite JSON numbers within type range. Vectors require exactly the stored
+component count. Matching `min`/`max` metadata applies per component, and
+`COLOR` usage retains `[0,1]`. Parameter `enabled` is preserved and does not
+restrict value editing. References, matrices, other types, and parameter
+creation are unsupported. Not every readable value is writable: the legacy
+`values` mirror covers generic supported float32 scalar/vec2/vec3/vec4 values,
+not exclusive edit authority. Stored camera edits do not control the viewport
+or agent capture camera. Atomicity, versioning, and conditional restore remain
+unchanged; see the [live placement guide](live-placement-editing.md).
+
 ### Editing a placement's world position
 
 For complete local/world examples, filters and bounded cursor flow, node versus

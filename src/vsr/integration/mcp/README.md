@@ -350,8 +350,29 @@ write boundaries, and viewer Restore controls.
 
 - `handle` and `version` are copied verbatim from a `vsr_inspect` item
   (`handle` is 32 lowercase hex, domain then serial; the adapter qualifies it
-  with the current launch). `value` is the §8 edit-surface JSON value; the
-  headless value rules accept or reject it at the safe point.
+  with the current launch). `value` is an unwrapped JSON write value; the
+  introspection-driven rules below accept or reject it at the safe point.
+- Object entries omit `target_kind` or use `"object"` and retain integer
+  object versions. Validation is generic and introspection-driven: edits target
+  existing parameters by stored type and metadata, not a matte/directional
+  allowlist. Supported types are `BOOL` as JSON Boolean; `STRING` without
+  embedded NUL, enforcing `string_values` choices when present; signed/unsigned
+  8-, 16-, 32-, and 64-bit integer scalars/vec2/vec3/vec4 as integral JSON
+  numbers within both the stored type's range and `[-(2^53-1), 2^53-1]`; and
+  float32/float64 scalars/vec2/vec3/vec4 as finite JSON numbers within the
+  stored type's range. Scalars take one value; vectors take arrays of exactly
+  the stored component count. Matching `min`/`max` metadata is enforced per
+  component, and `COLOR` usage retains `[0,1]`. Parameter `enabled` is
+  preserved and does not restrict value editing. References, object parameter
+  matrices, and all other types are unsupported; edits cannot create parameters.
+- Inspection parameter entries expose an `editable` Boolean, typed `min`/`max`
+  values and `string_values` when present. `editable` describes value support,
+  not permission: readable parameters are not automatically writable, and the
+  current scene edit grant is still required. The legacy `values` mirror covers
+  generic supported float32 scalar/vec2/vec3/vec4 values, not exclusive edit
+  authority. Stored camera parameter edits do not control the viewport or
+  agent capture camera. Existing object authority, atomicity, versioning, and
+  conditional restoration rules remain unchanged.
 - Node writes require explicit host registration with `SceneRegistration::nodeEdits`
   (or `ContextSceneOptions::nodeEdits`) in addition to the session's scene
   edit grant. Discovery scene items advertise `node_edits_exposed`; existing
