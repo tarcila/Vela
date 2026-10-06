@@ -228,13 +228,18 @@ inline void addRenderTools(std::vector<Tool> &tools, RenderDeps deps)
   Tool cameraTool;
   cameraTool.name = "vsr_set_view_camera";
   cameraTool.description =
-      "Pose the private camera of a render-capable independent view (not a "
-      "scene camera, not an interactive viewport): world-space position, "
+      "Pose exactly the addressed view: an independent camera needs RENDER "
+      "and READ; a supported interactive viewport needs view and Scene READ "
+      "and Allow agent camera control (off each launch), not EDIT or RENDER. "
+      "Interactive moves replace that view's Before agent recovery slot. "
+      "Use world-space position, "
       "direction (forward) and up, with optional vertical fovy_deg in (0,180). "
       "direction/up need not be normalized but must be non-zero and not "
       "parallel. Advances the view revision, so re-read it (vsr_view_info) "
       "before vsr_render. Views without camera control reject "
-      "invalid_request.";
+      "invalid_request/unsupported_view_camera. Disabled viewport control "
+      "rejects camera_control_disabled. Receipts describe effective state, "
+      "not presentation; verify via the addressed viewport's presented frame.";
   const std::string vec3 =
       "{\"type\":\"array\",\"items\":{\"type\":\"number\"},"
       "\"minItems\":3,\"maxItems\":3}";
@@ -246,11 +251,16 @@ inline void addRenderTools(std::vector<Tool> &tools, RenderDeps deps)
       + ",\"fovy_deg\":{\"type\":\"number\",\"exclusiveMinimum\":0,"
         "\"exclusiveMaximum\":180}},"
         "\"required\":[\"request_id\",\"view_id\",\"position\","
-        "\"direction\",\"up\"]}";
+        "\"direction\",\"up\"],\"additionalProperties\":false}";
   cameraTool.handler = [deps](const session::Credentials &c,
                            const json::Value &args) {
     const auto id = requestIdArg(args.get("request_id"));
     const auto view = targetIdArg(args, "view_id");
+    for (const auto &argument : args.o)
+      if (argument.first != "request_id" && argument.first != "view_id"
+          && argument.first != "position" && argument.first != "direction"
+          && argument.first != "up" && argument.first != "fovy_deg")
+        return rejected(Outcome::INVALID_REQUEST);
     auto vecArg = [&](const char *key, std::array<double, 3> &out) {
       const auto *v = args.get(key);
       if (!v || v->type != json::Value::Type::ARRAY || v->a.size() != 3)
@@ -264,8 +274,7 @@ inline void addRenderTools(std::vector<Tool> &tools, RenderDeps deps)
     };
     render::CameraRequest request;
     if (!id || !view || !vecArg("position", request.position)
-        || !vecArg("direction", request.direction)
-        || !vecArg("up", request.up))
+        || !vecArg("direction", request.direction) || !vecArg("up", request.up))
       return rejected(Outcome::INVALID_REQUEST);
     if (const auto *f = args.get("fovy_deg")) {
       if (!f->isNumber() || !(f->n > 0.) || !(f->n < 180.))
@@ -275,8 +284,13 @@ inline void addRenderTools(std::vector<Tool> &tools, RenderDeps deps)
     request.view = *view;
     const operations::OperationRef ref{c.sessionId, *id};
     const auto a = deps.renders.submitSetCamera(c, ref, request);
-    if (a.code != Outcome::OK)
-      return rejected(a.code);
+    if (a.code != Outcome::OK) {
+      auto result = rejected(a.code);
+      if (a.code == Outcome::INVALID_REQUEST
+          && render::validCameraPose(request))
+        result.semanticReason = "unsupported_view_camera";
+      return result;
+    }
     return statusResult(ref, a.status, a.replayed);
   };
   tools.push_back(std::move(cameraTool));

@@ -120,6 +120,7 @@ struct ViewRegistration
   ViewRole role{ViewRole::UNKNOWN};
   CapturePolicy capturePolicy;
   bool sceneSyncConfirmsBinding{true};
+  bool cameraControlSupported{false};
 };
 
 struct SessionTiming
@@ -177,6 +178,11 @@ class Integration
   SceneGrants sceneGrants(SceneId id) const;
   bool nodeEditsExposed(SceneId id) const;
   ViewGrants viewGrants(ViewId id) const;
+  bool cameraControlSupported(ViewId id) const;
+  bool updateCameraControlSupport(ViewId id, bool supported);
+  bool agentCameraControlEnabled() const;
+  // Launch-local host permission, independent of Scene EDIT. Never persist it.
+  void setAgentCameraControlEnabled(bool enabled);
   // The registered normal-synchronization hook; empty while inactive or for
   // unregistered ids.
   SyncHook normalSyncHook(SceneId id) const;
@@ -271,6 +277,7 @@ class Integration
   mutable std::mutex m_mutex;
   std::condition_variable m_workAvailable;
   bool m_active{false};
+  bool m_agentCameraControlEnabled{false};
   bool m_stopRequested{false};
   SessionTiming m_timing;
   std::vector<SceneEntry> m_scenes;

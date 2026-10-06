@@ -60,6 +60,7 @@ struct IntegrationActivityState
   bool active{false};
   bool sessionOwned{false};
   bool agentEditsDisabled{false};
+  bool agentCameraControlEnabled{false};
   std::string descriptorPath;
   std::vector<IntegrationSceneRow> scenes;
   std::vector<IntegrationActivityRow> activity; // oldest first
@@ -94,6 +95,7 @@ class IntegrationActivityModel
   // Local controls (host authority) //
 
   bool setAgentEditsDisabled(bool disabled);
+  bool setAgentCameraControlEnabled(bool enabled);
   // Local whole-session revocation; false when no session was held.
   bool disconnect();
   vsr::integration::operations::LocalAdmission restore(
@@ -124,6 +126,8 @@ inline const IntegrationActivityState &IntegrationActivityModel::refresh()
     authority->expireIfDue();
   s.sessionOwned = authority && authority->hasSession();
   s.agentEditsDisabled = authority && authority->agentEditsDisabled();
+  s.agentCameraControlEnabled =
+      integration && integration->agentCameraControlEnabled();
 
   s.scenes.clear();
   for (auto &[id, name] : m_services.scenes) {
@@ -160,8 +164,8 @@ inline void IntegrationActivityModel::refreshActivity()
     row.id = r.id;
     const auto &e = r.entry;
     if (e.ref)
-      row.reference =
-          e.ref->sessionId.substr(0, 8) + "#" + std::to_string(e.ref->requestId);
+      row.reference = e.ref->sessionId.substr(0, 8) + "#"
+          + std::to_string(e.ref->requestId);
     else if (e.localRef)
       row.reference = "local#" + std::to_string(e.localRef->id);
     row.entry = std::move(r.entry);
@@ -175,6 +179,14 @@ inline bool IntegrationActivityModel::setAgentEditsDisabled(bool disabled)
   if (!m_services.authority)
     return false;
   m_services.authority->setAgentEditsDisabled(disabled);
+  return true;
+}
+
+inline bool IntegrationActivityModel::setAgentCameraControlEnabled(bool enabled)
+{
+  if (!m_services.integration)
+    return false;
+  m_services.integration->setAgentCameraControlEnabled(enabled);
   return true;
 }
 

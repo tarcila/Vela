@@ -112,6 +112,10 @@ void IntegrationActivity::buildConnection(const IntegrationActivityState &s)
   ImGui::Text("Ownership: %s",
       s.sessionOwned ? "client session attached" : "no client session");
 
+  bool cameraEnabled = s.agentCameraControlEnabled;
+  if (ImGui::Checkbox("Allow agent camera control", &cameraEnabled))
+    m_model.setAgentCameraControlEnabled(cameraEnabled);
+
   bool disabled = s.agentEditsDisabled;
   if (ImGui::Checkbox("Disable agent edits", &disabled))
     m_model.setAgentEditsDisabled(disabled);
@@ -148,7 +152,8 @@ void IntegrationActivity::buildConnection(const IntegrationActivityState &s)
 void IntegrationActivity::buildScenes(const IntegrationActivityState &s)
 {
   ImGui::TextUnformatted("Scenes");
-  if (!ImGui::BeginTable("##integration_scenes", 4,
+  if (!ImGui::BeginTable("##integration_scenes",
+          4,
           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
     return;
   ImGui::TableSetupColumn("Scene");
@@ -175,8 +180,9 @@ void IntegrationActivity::buildScenes(const IntegrationActivityState &s)
     if (ImGui::SmallButton("Resynchronize")) {
       auto a = m_model.resynchronize(row.id);
       if (a.code == vi::operations::Outcome::OK)
-        m_pending = PendingLocal{
-            PendingLocal::Kind::RESYNCHRONIZE, a.ref, "resynchronize " + row.name};
+        m_pending = PendingLocal{PendingLocal::Kind::RESYNCHRONIZE,
+            a.ref,
+            "resynchronize " + row.name};
       else
         m_lastLocal = std::string("resynchronize rejected: ")
             + vi::operations::outcomeName(a.code);
@@ -189,8 +195,9 @@ void IntegrationActivity::buildScenes(const IntegrationActivityState &s)
 
 void IntegrationActivity::buildActivity(const IntegrationActivityState &s)
 {
-  ImGui::Text("Activity (%zu records, %zu bytes, %zu restorable, %zu image "
-              "bytes)",
+  ImGui::Text(
+      "Activity (%zu records, %zu bytes, %zu restorable, %zu image "
+      "bytes)",
       s.usage.entries,
       s.usage.bytes,
       s.usage.restorableBatches,
@@ -240,8 +247,7 @@ void IntegrationActivity::buildActivity(const IntegrationActivityState &s)
     ImGui::TableNextColumn();
     // Waiting time and held capacity only; never a claim the backend died.
     if (e.heldSlots > 0 || e.cleanupElapsedSeconds > 0.0)
-      ImGui::Text(
-          "%.1fs / %zu slot(s)", e.cleanupElapsedSeconds, e.heldSlots);
+      ImGui::Text("%.1fs / %zu slot(s)", e.cleanupElapsedSeconds, e.heldSlots);
     else
       ImGui::TextDisabled("-");
 
@@ -257,8 +263,9 @@ void IntegrationActivity::buildActivity(const IntegrationActivityState &s)
       if (ImGui::SmallButton("Restore")) {
         auto a = m_model.restore(e.targets.front().id, *e.batchRef);
         if (a.code == vi::operations::Outcome::OK)
-          m_pending = PendingLocal{
-              PendingLocal::Kind::RESTORE, a.ref, "restore " + e.batchRef->batchId};
+          m_pending = PendingLocal{PendingLocal::Kind::RESTORE,
+              a.ref,
+              "restore " + e.batchRef->batchId};
         else
           m_lastLocal = std::string("restore rejected: ")
               + vi::operations::outcomeName(a.code);
@@ -296,8 +303,7 @@ void IntegrationActivity::pollLocal()
   }
   if (!outcome)
     return; // still queued; serviced at the viewer's safe point
-  m_lastLocal = m_pending->label + ": "
-      + vi::operations::outcomeName(*outcome)
+  m_lastLocal = m_pending->label + ": " + vi::operations::outcomeName(*outcome)
       + (extraOk ? "" : " (views not confirmed)");
   m_pending.reset();
 }

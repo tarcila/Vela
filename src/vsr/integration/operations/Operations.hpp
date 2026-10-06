@@ -90,6 +90,7 @@ enum class Outcome
   UNAUTHENTICATED,
   INVALID_SESSION_PROOF,
   FORBIDDEN,
+  CAMERA_CONTROL_DISABLED,
   INVALID_REQUEST
 };
 
@@ -215,12 +216,15 @@ struct Request
   // filters by capability itself and reports the covered targets in its
   // final Step. Runs on the servicing thread with the first registered scene.
   bool sessionWide{false};
+  bool boundSceneRead{false};
   // Canonical semantic form of the parsed arguments (defaults applied,
   // numbers normalized); identical retries compare equal.
   std::string canonicalArguments;
   // Logical deadline from admission; <= 0 means none.
   double deadlineSeconds{0.0};
   Executor executor;
+  // Fresh admission only, after exact replay. Must not reenter the engine.
+  std::function<Outcome()> admissionGuard;
 };
 
 struct Status
@@ -435,6 +439,7 @@ class OperationEngine
     Target target;
     Capability capability{Capability::READ};
     bool sessionWide{false};
+    bool boundSceneRead{false};
     std::vector<Target> covered; // session-wide only, set on completion
     std::string canonicalArguments;
     double deadlineSeconds{0.0};
@@ -559,6 +564,8 @@ inline const char *outcomeName(Outcome outcome)
     return "invalid_session_proof";
   case Outcome::FORBIDDEN:
     return "forbidden";
+  case Outcome::CAMERA_CONTROL_DISABLED:
+    return "camera_control_disabled";
   case Outcome::INVALID_REQUEST:
     return "invalid_request";
   }
@@ -825,7 +832,7 @@ inline bool OperationEngine::sameRequest(
   return r.kind == q.kind && r.sessionWide == q.sessionWide
       && (r.sessionWide
           || (r.target.kind == q.target.kind && r.target.id == q.target.id))
-      && r.capability == q.capability
+      && r.capability == q.capability && r.boundSceneRead == q.boundSceneRead
       && r.canonicalArguments == q.canonicalArguments
       && r.deadlineSeconds == q.deadlineSeconds;
 }
@@ -860,6 +867,7 @@ inline OperationEngine::Key OperationEngine::admit(
   r.kind = std::move(request.kind);
   r.target = request.target;
   r.capability = request.capability;
+  r.boundSceneRead = request.boundSceneRead;
   r.sessionWide = request.sessionWide;
   r.canonicalArguments = std::move(request.canonicalArguments);
   r.deadlineSeconds = request.deadlineSeconds;
@@ -910,6 +918,14 @@ inline Admission OperationEngine::submit(
                 credentials, request.target, request.capability));
   if (a.code != Outcome::OK)
     return a;
+  if (request.boundSceneRead) {
+    const auto scene = sceneFor(request.target);
+    a.code = scene ? fromSessionCode(m_authority.authorize(
+                         credentials, Target::scene(*scene), Capability::READ))
+                   : Outcome::FORBIDDEN;
+    if (a.code != Outcome::OK)
+      return a;
+  }
   if (ref.sessionId != credentials.sessionId || !validRequestId(ref.requestId)
       || !request.executor || !sceneFor(request.sessionWide, request.target)) {
     a.code = Outcome::INVALID_REQUEST;
@@ -934,6 +950,11 @@ inline Admission OperationEngine::submit(
     if (ref.requestId <= s.highWater) {
       a.code = Outcome::OUTCOME_UNAVAILABLE;
       return a;
+    }
+    if (request.admissionGuard) {
+      a.code = request.admissionGuard();
+      if (a.code != Outcome::OK)
+        return a;
     }
     if (m_slotsInUse >= m_limits.sceneSlots || !reserveRecord()) {
       a.code = Outcome::BUSY;
@@ -1139,6 +1160,7 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
   std::string sessionId;
   Target target;
   Capability capability;
+  bool boundSceneRead = false;
   bool sessionWide = false;
   {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -1154,6 +1176,7 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
     sessionId = r->sessionId;
     target = r->target;
     capability = r->capability;
+    boundSceneRead = r->boundSceneRead;
     sessionWide = r->sessionWide;
   }
 
@@ -1170,6 +1193,12 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
     auth = sessionWide && code == session::Code::FORBIDDEN
         ? Outcome::OK
         : fromSessionCode(code);
+    if (auth == Outcome::OK && boundSceneRead) {
+      const auto scene = sceneFor(target);
+      auth = scene ? fromSessionCode(m_authority.authorizeExecution(
+                         sessionId, Target::scene(*scene), Capability::READ))
+                   : Outcome::FORBIDDEN;
+    }
   }
 
   Executor executor;

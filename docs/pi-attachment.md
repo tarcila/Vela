@@ -160,6 +160,45 @@ not exclusive edit authority. Stored camera edits do not control the viewport
 or agent capture camera. Atomicity, versioning, and conditional restore remain
 unchanged; see the [live placement guide](live-placement-editing.md).
 
+### Controlling and recovering the interactive camera
+
+Enable **Allow agent camera control** in Agent Activity for this launch only.
+It is separate from scene edits and resets off on every launch. Discover the
+actual interactive view ID; `camera_control.supported` and `.enabled` are
+separate facts. Never substitute the independent agent view.
+
+Call `vsr_set_view_camera` with a fresh `request_id`, that `view_id`, world-space
+`position`, forward `direction`, `up`, and optionally vertical `fovy_deg` in
+(0,180). No EDIT or RENDER grant is needed for a supported interactive viewport;
+view and bound-Scene READ still apply. Poll the `set_view_camera` operation.
+Initial permission denial is HTTP 403 / `camera_control_disabled`, with no ID
+consumed; revocation before execution yields a noncommitting terminal outcome.
+The receipt includes effective camera, Scene/view revisions and view identity.
+It is not proof that a new frame has appeared.
+
+Camera Poses has a host-owned **Before agent** entry for each controllable view.
+Successful fresh moves replace only that entry, not a user pose with the same
+name. Ordinary navigation does not clear it. Selecting it restores the previous
+complete controller/camera configuration and advances the view revision without
+creating another slot; retired/rebound identities are unavailable. Recovery is
+local and remains usable when camera permission is off or the agent disconnects.
+
+Use the addressed viewport's presented-frame tools for visual verification,
+only on a qualified binding. Require matching view identity, rendered view
+revision and camera from `anari_render_start`, matching chosen Scene revision,
+and `stale=false`. Poll with fresh IDs for at most 120 seconds. Timeout,
+superseded poses and unavailable bindings are not successful visual acceptance;
+an independent render is not evidence of the user's viewport.
+
+For isolated controller verification after a fresh CPU build/install, run
+`bash scripts/test-viewport-camera.sh build-agent`. It creates a separate
+private configuration/runtime and authenticated Xvfb display, exercises the
+real viewport binding plus orbit/pan/zoom and recovery, and leaves any existing
+viewer/unsaved Scene untouched. Set `VSR_CAMERA_TEST_DISPLAY` if display 93 is
+occupied. This test deliberately does not claim qualified presented-frame
+acceptance. The normal integration suite supplies the loopback permission,
+receipt, replay and failure contracts.
+
 ### Editing a placement's world position
 
 For complete local/world examples, filters and bounded cursor flow, node versus

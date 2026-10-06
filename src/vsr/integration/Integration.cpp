@@ -90,6 +90,34 @@ ViewGrants Integration::viewGrants(ViewId id) const
   return m_views[id].registration.grants;
 }
 
+bool Integration::cameraControlSupported(ViewId id) const
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  return m_active && id < m_views.size() && !m_views[id].removed
+      && m_views[id].registration.cameraControlSupported;
+}
+
+bool Integration::updateCameraControlSupport(ViewId id, bool supported)
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  if (id >= m_views.size() || m_views[id].removed)
+    return false;
+  m_views[id].registration.cameraControlSupported = supported;
+  return true;
+}
+
+bool Integration::agentCameraControlEnabled() const
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  return m_agentCameraControlEnabled;
+}
+
+void Integration::setAgentCameraControlEnabled(bool enabled)
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  m_agentCameraControlEnabled = enabled;
+}
+
 SyncHook Integration::normalSyncHook(SceneId id) const
 {
   std::lock_guard<std::mutex> lock(m_mutex);

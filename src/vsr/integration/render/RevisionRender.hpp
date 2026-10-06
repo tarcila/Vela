@@ -109,6 +109,8 @@ struct RenderBackend
   // current field of view. Called on the servicing thread only while no
   // render holds the backend's resources.
   virtual bool cameraControllable() const;
+  // Current effective pose, required for controllable independent cameras.
+  virtual std::optional<EffectiveCamera> cameraState() const;
   virtual bool setCamera(const std::array<double, 3> &position,
       const std::array<double, 3> &direction,
       const std::array<double, 3> &up,
@@ -139,6 +141,11 @@ inline bool RenderBackend::selectDevice(const std::string &)
 inline bool RenderBackend::cameraControllable() const
 {
   return false;
+}
+
+inline std::optional<EffectiveCamera> RenderBackend::cameraState() const
+{
+  return {};
 }
 
 inline bool RenderBackend::setCamera(const std::array<double, 3> &,
@@ -177,6 +184,25 @@ struct CameraRequest
 // True when `request`'s pose is finite and well-formed (see CameraRequest).
 bool validCameraPose(const CameraRequest &request);
 
+// Host preparation is fallible; install performs only reserved value writes.
+// Notification/synchronization is separate so downstream failure stays
+// committed.
+struct PreparedCameraChange
+{
+  EffectiveCamera effective;
+  std::function<void()> install;
+  std::function<void()> synchronize;
+  std::function<bool()> isCurrent;
+  std::string reason;
+};
+
+struct CameraController
+{
+  virtual ~CameraController() = default;
+  virtual Outcome prepare(
+      const CameraRequest &request, PreparedCameraChange &change) = 0;
+};
+
 struct RenderResult
 {
   Outcome outcome{Outcome::OK};
@@ -207,6 +233,11 @@ class RenderService
       identity::SceneIdentity &scene,
       identity::ViewRevisionTracker &tracker,
       RenderBackend &backend);
+  bool attachCameraController(ViewId view,
+      identity::SceneIdentity &scene,
+      identity::ViewRevisionTracker &tracker,
+      CameraController &controller);
+  void detachView(ViewId view);
   // Host: view-owned dimensions (also advance the view revision).
   void setDimensions(ViewId view, std::uint32_t width, std::uint32_t height);
 
@@ -233,7 +264,8 @@ class RenderService
   // admission when the view's backend offers no camera control or the pose
   // is malformed, and busy while a render holds the view. At the safe point
   // the backend applies it and the view revision advances (pending renders
-  // end superseded). Scene cameras and interactive viewports are untouched.
+  // end superseded). Interactive views use their registered controller,
+  // separate launch permission and bound-Scene READ authority.
   operations::Admission submitSetCamera(
       const operations::Credentials &credentials,
       const OperationRef &ref,
@@ -269,6 +301,7 @@ class RenderService
     identity::SceneIdentity *scene{nullptr};
     identity::ViewRevisionTracker *tracker{nullptr};
     RenderBackend *backend{nullptr};
+    CameraController *controller{nullptr};
     std::uint32_t width{0};
     std::uint32_t height{0};
     Job *holder{nullptr}; // job holding backend resources
@@ -280,7 +313,8 @@ class RenderService
       const DeviceSelectionRequest &request) const;
   operations::Step selectDevice(const DeviceSelectionRequest &request);
   std::optional<Outcome> preAdmission(const CameraRequest &request) const;
-  operations::Step setCamera(const CameraRequest &request);
+  operations::Step setCamera(
+      const CameraRequest &request, operations::StepContext &ctx);
   operations::Request makeRequest(RenderRequest request, JobPtr job);
   operations::Step step(
       const RenderRequest &request, Job &job, operations::StepContext &ctx);
@@ -340,14 +374,41 @@ inline bool RenderService::attachView(ViewId view,
     identity::ViewRevisionTracker &tracker,
     RenderBackend &backend)
 {
-  if (!m_integration.isRegisteredView(view))
+  const auto description = m_integration.viewDescription(view);
+  if (!description || description->role == ViewRole::INTERACTIVE_VIEWPORT)
     return false;
   std::lock_guard<std::mutex> lock(m_mutex);
   auto &v = m_views[view];
   v.scene = &scene;
   v.tracker = &tracker;
   v.backend = &backend;
+  m_integration.updateCameraControlSupport(view, backend.cameraControllable());
   return true;
+}
+
+inline bool RenderService::attachCameraController(ViewId view,
+    identity::SceneIdentity &scene,
+    identity::ViewRevisionTracker &tracker,
+    CameraController &controller)
+{
+  const auto description = m_integration.viewDescription(view);
+  if (!description || description->role != ViewRole::INTERACTIVE_VIEWPORT)
+    return false;
+  std::lock_guard<std::mutex> lock(m_mutex);
+  auto &v = m_views[view];
+  v.scene = &scene;
+  v.tracker = &tracker;
+  v.controller = &controller;
+  m_integration.updateCameraControlSupport(view, true);
+  return true;
+}
+
+inline void RenderService::detachView(ViewId view)
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  auto it = m_views.find(view);
+  if (it != m_views.end() && !it->second.holder)
+    m_views.erase(it);
 }
 
 inline void RenderService::setDimensions(
@@ -714,13 +775,14 @@ inline std::optional<Outcome> RenderService::preAdmission(
   auto it = m_views.find(request.view);
   if (it == m_views.end())
     return Outcome::INVALID_REQUEST;
+  if (!it->second.backend)
+    return Outcome::INVALID_REQUEST;
   const auto candidates = it->second.backend->deviceCandidates();
   if (candidates.empty())
     return Outcome::INVALID_REQUEST; // backend offers no selection
   if (!request.deviceIdentifier.empty()
-      && std::find(candidates.begin(),
-             candidates.end(),
-             request.deviceIdentifier)
+      && std::find(
+             candidates.begin(), candidates.end(), request.deviceIdentifier)
           == candidates.end())
     return Outcome::INVALID_REQUEST;
   if (it->second.holder)
@@ -765,8 +827,7 @@ inline operations::Step RenderService::selectDevice(
   for (const auto &c : v->backend->deviceCandidates())
     candidates += (candidates.empty() ? "" : ",") + jsonString(c);
   s.result = std::string("{\"applied\":") + (applied ? "true" : "false")
-      + ",\"device_identifier\":"
-      + jsonString(v->backend->deviceIdentifier())
+      + ",\"device_identifier\":" + jsonString(v->backend->deviceIdentifier())
       + ",\"previous_device_identifier\":" + jsonString(previous)
       + ",\"candidates\":[" + candidates + "]}";
   return s;
@@ -798,6 +859,19 @@ inline operations::Admission RenderService::submitSelectDevice(
   return m_engine.submit(credentials, ref, std::move(r));
 }
 
+inline std::array<double, 3> normalizedCameraVector(
+    const std::array<double, 3> &v)
+{
+  const double scale =
+      std::max({std::abs(v[0]), std::abs(v[1]), std::abs(v[2])});
+  if (!(scale > 0.) || !std::isfinite(scale))
+    return {};
+  std::array<double, 3> result{v[0] / scale, v[1] / scale, v[2] / scale};
+  const double length = std::hypot(result[0], result[1], result[2]);
+  for (auto &component : result)
+    component /= length;
+  return result;
+}
 
 inline bool validCameraPose(const CameraRequest &request)
 {
@@ -810,19 +884,19 @@ inline bool validCameraPose(const CameraRequest &request)
   if (!finite(request.position) || !finite(request.direction)
       || !finite(request.up) || !std::isfinite(request.fovyDegrees))
     return false;
-  const double d2 = length2(request.direction);
-  const double u2 = length2(request.up);
+  const auto d = normalizedCameraVector(request.direction);
+  const auto u = normalizedCameraVector(request.up);
+  const double d2 = length2(d);
+  const double u2 = length2(u);
   if (!(d2 > 0.) || !(u2 > 0.))
     return false;
-  const auto &d = request.direction;
-  const auto &u = request.up;
   const std::array<double, 3> cross{d[1] * u[2] - d[2] * u[1],
       d[2] * u[0] - d[0] * u[2],
       d[0] * u[1] - d[1] * u[0]};
   // Reject (near-)parallel direction/up: sin^2(angle) below 1e-12.
   if (!(length2(cross) > 1e-12 * d2 * u2))
     return false;
-  return request.fovyDegrees <= 0.
+  return request.fovyDegrees == 0.
       || (request.fovyDegrees > 0. && request.fovyDegrees < 180.);
 }
 
@@ -833,14 +907,18 @@ inline std::optional<Outcome> RenderService::preAdmission(
     return Outcome::INVALID_REQUEST;
   std::lock_guard<std::mutex> lock(m_mutex);
   auto it = m_views.find(request.view);
-  if (it == m_views.end() || !it->second.backend->cameraControllable())
+  if (it == m_views.end()
+      || (!it->second.controller
+          && (!it->second.backend
+              || !it->second.backend->cameraControllable())))
     return Outcome::INVALID_REQUEST;
   if (it->second.holder)
     return Outcome::BUSY;
   return std::nullopt;
 }
 
-inline operations::Step RenderService::setCamera(const CameraRequest &request)
+inline operations::Step RenderService::setCamera(
+    const CameraRequest &request, operations::StepContext &ctx)
 {
   operations::Step s;
   s.status = operations::Step::Status::COMPLETE;
@@ -858,17 +936,129 @@ inline operations::Step RenderService::setCamera(const CameraRequest &request)
     }
     v = &it->second;
   }
-  const bool applied = v->backend->setCamera(
-      request.position, request.direction, request.up, request.fovyDegrees);
-  if (applied) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    v->tracker->notePipelineChanged();
-    s.committed = true;
-  } else
-    s.outcome = Outcome::UNKNOWN;
-  s.result = std::string("{\"applied\":") + (applied ? "true" : "false")
-      + ",\"view_revision\":\"" + detail::revisionText(v->tracker->revision())
-      + "\"}";
+  const auto description = m_integration.viewDescription(request.view);
+  if (description && description->role == ViewRole::INTERACTIVE_VIEWPORT
+      && !m_integration.agentCameraControlEnabled()) {
+    s.outcome = Outcome::CAMERA_CONTROL_DISABLED;
+    s.result = "{\"reason\":\"camera_control_disabled\"}";
+    return s;
+  }
+  PreparedCameraChange change;
+  std::string effectiveJson;
+  std::string viewIdentityJson;
+  auto receipt = [&] {
+    auto appendRevision = [&](const auto &revision) {
+      for (std::uint64_t value : {revision.launch.activation,
+               revision.launch.nonce,
+               revision.domain,
+               revision.value}) {
+        if (s.result.back() != '"')
+          s.result += '.';
+        char buffer[32];
+        const auto converted =
+            std::to_chars(buffer, buffer + sizeof(buffer), value);
+        s.result.append(buffer, converted.ptr);
+      }
+    };
+    s.result.clear();
+    s.result += "{\"applied\":true,\"view_revision\":\"";
+    appendRevision(v->tracker->revision());
+    s.result += "\",\"scene_revision\":\"";
+    appendRevision(v->scene->sceneRevision());
+    s.result += "\",\"view_identity\":";
+    s.result += viewIdentityJson;
+    s.result += ",\"effective_camera\":";
+    s.result += effectiveJson;
+    s.result += '}';
+  };
+  auto cameraJson = [](const EffectiveCamera &camera) {
+    namespace info = inspection::viewinfo;
+    auto vec = [](const std::array<double, 3> &v) {
+      return "[" + info::number(v[0]) + "," + info::number(v[1]) + ","
+          + info::number(v[2]) + "]";
+    };
+    return "{\"position\":" + vec(camera.position)
+        + ",\"direction\":" + vec(normalizedCameraVector(camera.direction))
+        + ",\"up\":" + vec(normalizedCameraVector(camera.up))
+        + ",\"projection\":" + info::jsonString(camera.projection)
+        + ",\"fovy_deg\":" + info::number(camera.fovyDegrees) + "}";
+  };
+  try {
+    viewIdentityJson = inspection::viewinfo::jsonString(
+        description ? description->identity : "");
+    if (v->controller) {
+      s.outcome = v->controller->prepare(request, change);
+      if (s.outcome != Outcome::OK) {
+        s.result = "{\"reason\":"
+            + inspection::viewinfo::jsonString(change.reason) + "}";
+        return s;
+      }
+      effectiveJson = cameraJson(change.effective);
+      s.result.reserve(2048 + effectiveJson.size() + viewIdentityJson.size());
+      if (!m_integration.agentCameraControlEnabled()) {
+        s.outcome = Outcome::CAMERA_CONTROL_DISABLED;
+        s.result = "{\"reason\":\"camera_control_disabled\"}";
+        return s;
+      }
+      if (!m_integration.isRegisteredView(request.view)
+          || !m_integration.cameraControlSupported(request.view)
+          || (change.isCurrent && !change.isCurrent())) {
+        s.outcome = Outcome::INVALID_REQUEST;
+        s.result = "{\"reason\":\"unsupported_view_camera\"}";
+        return s;
+      }
+      if (ctx.isAbandoned && ctx.isAbandoned()) {
+        s.outcome = Outcome::CANCELLED;
+        return s;
+      }
+      // No host input or service reentrancy may intervene in this transaction.
+      change.install();
+      s.committed = true;
+      v->tracker->notePipelineChanged();
+      change.synchronize();
+    } else {
+      if (!v->backend || !v->backend->cameraState()) {
+        s.outcome = Outcome::INVALID_REQUEST;
+        s.result = "{\"reason\":\"unsupported_view_camera\"}";
+        return s;
+      }
+      effectiveJson = cameraJson(*v->backend->cameraState());
+      s.result.reserve(2048 + effectiveJson.size() + viewIdentityJson.size());
+      if (ctx.isAbandoned && ctx.isAbandoned()) {
+        s.outcome = Outcome::CANCELLED;
+        return s;
+      }
+      const bool applied = v->backend->setCamera(request.position,
+          normalizedCameraVector(request.direction),
+          normalizedCameraVector(request.up),
+          request.fovyDegrees);
+      if (!applied) {
+        s.outcome = Outcome::INVALID_REQUEST;
+        s.result = "{\"reason\":\"unsupported_view_camera\"}";
+        return s;
+      }
+      s.committed = true;
+      v->tracker->notePipelineChanged();
+      effectiveJson = cameraJson(*v->backend->cameraState());
+    }
+    if (auto binding = m_integration.observeViewBinding(request.view)) {
+      if (!inspection::viewinfo::validate(*binding)) {
+        v->tracker->observeConfiguration(inspection::viewinfo::bindingJson(
+            *binding, inspection::viewinfo::jsonString));
+        v->tracker->setCamera(binding->cameraHandle);
+        v->tracker->setRenderer(binding->rendererHandle);
+        v->tracker->setDimensions(binding->width, binding->height);
+      }
+    }
+    receipt();
+  } catch (...) {
+    s.outcome =
+        s.committed ? Outcome::APPLIED_WITH_SYNC_FAILURE : Outcome::BUSY;
+    if (s.committed)
+      receipt();
+    else
+      s.result = "{\"reason\":\"resource_limit\"}";
+  }
   return s;
 }
 
@@ -877,11 +1067,14 @@ inline operations::Admission RenderService::submitSetCamera(
     const OperationRef &ref,
     CameraRequest request)
 {
-  if (auto rejected = preAdmission(request)) {
+  if (!validCameraPose(request)) {
     operations::Admission a;
-    a.code = *rejected;
+    a.code = Outcome::INVALID_REQUEST;
     return a;
   }
+  const auto description = m_integration.viewDescription(request.view);
+  const bool interactive =
+      description && description->role == ViewRole::INTERACTIVE_VIEWPORT;
   auto num = [](double x) {
     char buf[32];
     std::snprintf(buf, sizeof(buf), "%.17g", x);
@@ -893,17 +1086,26 @@ inline operations::Admission RenderService::submitSetCamera(
   operations::Request r;
   r.kind = "set_view_camera";
   r.target = session::Target::view(request.view);
-  r.capability = session::Capability::RENDER;
+  r.capability =
+      interactive ? session::Capability::READ : session::Capability::RENDER;
+  r.boundSceneRead = interactive;
+  r.admissionGuard = [this, request, interactive] {
+    if (auto rejected = preAdmission(request))
+      return *rejected;
+    if (interactive && !m_integration.agentCameraControlEnabled())
+      return Outcome::CAMERA_CONTROL_DISABLED;
+    return Outcome::OK;
+  };
   r.canonicalArguments = "set_view_camera;view=" + std::to_string(request.view)
-      + ";position=" + vec(request.position) + ";direction="
-      + vec(request.direction) + ";up=" + vec(request.up)
+      + ";position=" + vec(request.position)
+      + ";direction=" + vec(request.direction) + ";up=" + vec(request.up)
       + ";fovy=" + num(request.fovyDegrees);
   r.deadlineSeconds = RENDER_DEADLINE_SECONDS;
   std::weak_ptr<bool> alive = m_alive;
   r.executor = [this, alive, request](operations::StepContext &ctx) {
     if (!alive.lock() || ctx.abandoned)
       return operations::Step{};
-    return setCamera(request);
+    return setCamera(request, ctx);
   };
   return m_engine.submit(credentials, ref, std::move(r));
 }

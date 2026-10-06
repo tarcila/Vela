@@ -37,6 +37,16 @@ void BaseViewport::buildUI()
     viewport_reshape(requested);
 }
 
+vsr::rendering::Manipulator *BaseViewport::cameraManipulator() const
+{
+  return m_camera.arcball;
+}
+
+vsr::scene::CameraRef BaseViewport::currentCamera() const
+{
+  return m_camera.current ? m_camera.current->self() : vsr::scene::CameraRef{};
+}
+
 void BaseViewport::setManipulator(vsr::rendering::Manipulator *m)
 {
   m_camera.arcball = m ? m : &m_camera.localArcball;

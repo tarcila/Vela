@@ -71,6 +71,8 @@ class Manipulator
  public:
   Manipulator() = default;
 
+  // Restore a complete controller value without rewinding its change token.
+  void setState(const Manipulator &state);
   void setConfig(const CameraPose &p);
   void setConfig(anari::math::float3 center,
       float dist,

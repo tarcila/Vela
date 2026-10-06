@@ -79,6 +79,27 @@ Images/results have a positive policy lifetime (at most120 seconds), at most64
 retained operation-image entries and one concurrent encoder. Cancellation keeps
 its operation slot until owned encoding has drained; it cannot publish an image.
 
+## Camera receipts and freshness
+
+A `vsr_set_view_camera` receipt describes current effective state, not pixels.
+The existing `vsr_view_frame` terminal result carries `state`, `image_kind`,
+`view_id`, `view_identity`, `rendered_view_revision`, `rendered_scene_revision`,
+`current_view_revision`, `current_scene_revision`, `stale`,
+`rendered_view_revision_basis`, and `rendered_configuration.camera`.
+For qualified viewer evidence require `state="available"`,
+`image_kind="presented_frame"`, the addressed identity, the camera receipt's
+exact rendered view revision and matching world-space camera/FOV, the chosen
+post-move Scene revision, `rendered_view_revision_basis="anari_render_start"`,
+and `stale=false`. Presentation time alone proves none of these.
+
+Old presentations can remain available while rendering catches up. Poll with
+fresh request IDs for at most 120 seconds, then report timeout. Historical replay
+is not fresh proof. User navigation or a later camera move supersedes the prior
+receipt; obtain a new target rather than accept an unrelated newer revision.
+Unsupported/unqualified binding evidence remains unavailable/incomplete.
+Camera control does not widen qualification. Independent rendering and effective
+view-info cannot substitute for the explicitly addressed presented frame.
+
 ## Bounds and image semantics
 
 Limits can narrow the existing2048-axis/2073600-pixel/8MiB PNG/12MiB response

@@ -57,6 +57,21 @@ inline std::string identityJson(const ViewDescription &view, Quote quote)
       + ",\"origin\":" + quote(roleName(view.role));
 }
 
+inline std::string cameraControlJson(
+    const Integration &integration, ViewId view, bool renderAllowed)
+{
+  const auto description = integration.viewDescription(view);
+  const bool interactive =
+      description && description->role == ViewRole::INTERACTIVE_VIEWPORT;
+  const bool supported = integration.cameraControlSupported(view);
+  const bool enabled = supported
+      && (interactive ? integration.agentCameraControlEnabled()
+                      : renderAllowed);
+  return std::string("\"camera_control\":{\"supported\":")
+      + (supported ? "true" : "false")
+      + ",\"enabled\":" + (enabled ? "true" : "false") + "}";
+}
+
 inline std::string policyJson()
 {
   return capturePolicyJson(CapturePolicy{});

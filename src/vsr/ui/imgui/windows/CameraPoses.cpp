@@ -27,6 +27,11 @@ namespace vsr::ui::imgui {
 CameraPoses::CameraPoses(Application *app, const char *name) : Window(app, name)
 {}
 
+void CameraPoses::setRecoverySlots(std::vector<RecoverySlot> slots)
+{
+  m_recoverySlots = std::move(slots);
+}
+
 void CameraPoses::buildUI()
 {
   // Check if we have a new pose from rendering thread
@@ -73,6 +78,21 @@ void CameraPoses::buildUI()
   ImGui::Text("Saved Camera Poses:");
 
   if (ImGui::BeginTable("camera poses", 4, flags)) {
+    for (auto &slot : m_recoverySlots) {
+      if (!slot.exists())
+        continue;
+      ImGui::PushID(slot.id.c_str());
+      ImGui::TableNextRow();
+      ImGui::TableSetColumnIndex(0);
+      ImGui::TextUnformatted(slot.name.c_str());
+      ImGui::TableSetColumnIndex(1);
+      if (slot.available()) {
+        if (ImGui::Button(">") && !slot.restore())
+          vsr::core::logWarning("Before agent recovery unavailable");
+      } else
+        ImGui::TextUnformatted("unavailable");
+      ImGui::PopID();
+    }
     for (auto &p : appContext()->view.poses) {
       ImGui::PushID(&p);
 

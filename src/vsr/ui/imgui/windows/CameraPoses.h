@@ -9,8 +9,8 @@
 #include <future>
 #include <mutex>
 #include "vsr/app/Context.h"
-#include "vsr/core/VSRMath.hpp"
 #include "vsr/core/Timer.hpp"
+#include "vsr/core/VSRMath.hpp"
 #include "vsr/rendering/view/CameraPath.h"
 
 namespace vsr::ui::imgui {
@@ -19,9 +19,19 @@ struct Viewport;
 
 struct CameraPoses : public Window
 {
-  CameraPoses(Application *app,
-      const char *name = "Camera Poses");
+  CameraPoses(Application *app, const char *name = "Camera Poses");
   void buildUI() override;
+
+  struct RecoverySlot
+  {
+    std::string id;
+    std::string name;
+    std::function<bool()> exists;
+    std::function<bool()> available;
+    std::function<bool()> restore;
+  };
+  // Host-owned slots are separate from ordinary user poses and never saved.
+  void setRecoverySlots(std::vector<RecoverySlot> slots);
 
  private:
   void buildUI_turntablePopupMenu();
@@ -29,6 +39,7 @@ struct CameraPoses : public Window
   void buildUI_interpolationControls();
   void renderInterpolatedPath();
 
+  std::vector<RecoverySlot> m_recoverySlots;
   vsr::math::float3 m_turntableCenter{0.f, 0.f, 0.f};
   vsr::math::float3 m_turntableAzimuths{0.f, 360.f, 20.f};
   vsr::math::float3 m_turntableElevations{5.f, 45.f, 10.f};

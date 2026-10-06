@@ -119,8 +119,7 @@ struct Fixture
       std::uint64_t id, double v)
   {
     auto token = *identity->parameterVersion(identity->handleOf(matte.data()));
-    edit::EditBatch b{
-        sceneId, {{token, "opacity", JsonValue::fromNumber(v)}}};
+    edit::EditBatch b{sceneId, {{token, "opacity", JsonValue::fromNumber(v)}}};
     auto a = edits->submit(creds, {creds.sessionId, id}, b);
     if (a.code != Outcome::OK)
       return {a.code, std::nullopt};
@@ -144,6 +143,20 @@ struct Fixture
 };
 
 } // namespace
+
+SCENARIO("Viewer camera permission is launch-local and independent of edits",
+    "[integration][camera-control]")
+{
+  Fixture fx;
+  REQUIRE_FALSE(fx.model->refresh().agentCameraControlEnabled);
+  REQUIRE(fx.model->setAgentCameraControlEnabled(true));
+  REQUIRE(fx.model->setAgentEditsDisabled(true));
+  CHECK(fx.model->refresh().agentCameraControlEnabled);
+  REQUIRE(fx.model->setAgentCameraControlEnabled(false));
+  CHECK(fx.model->refresh().agentEditsDisabled);
+  Integration anotherLaunch;
+  CHECK_FALSE(anotherLaunch.agentCameraControlEnabled());
+}
 
 SCENARIO("Viewer model reports connection and activity", "[integration]")
 {

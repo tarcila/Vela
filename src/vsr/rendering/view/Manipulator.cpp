@@ -25,6 +25,13 @@ CameraPose defaultViewForBounds(const vsr::math::box3 &bounds)
   return pose;
 }
 
+void Manipulator::setState(const Manipulator &state)
+{
+  const auto token = m_token;
+  *this = state;
+  m_token = token + 1;
+}
+
 void Manipulator::setConfig(const CameraPose &p)
 {
   m_mode = static_cast<ManipulatorMode>(p.mode);

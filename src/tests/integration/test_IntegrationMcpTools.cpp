@@ -21,6 +21,7 @@
 #include "vsr/integration/mcp/tools/LookupTools.hpp"
 #include "vsr/integration/mcp/tools/QueryTools.hpp"
 #include "vsr/integration/mcp/tools/RenderTools.hpp"
+#include "vsr/integration/render/ControllerCamera.hpp"
 #include "vsr/rendering/index/RenderIndexAllLayers.hpp"
 #include "vsr/rendering/pipeline/ImagePipeline.h"
 #include "vsr/scene/Scene.hpp"
@@ -1701,19 +1702,34 @@ struct HelideBackend : render::RenderBackend
   bool controllable{false};
   int cameraSets{0};
   std::array<double, 3> eye{0., 0., 0.};
-  double fovy{0.};
+  double fovy{60.};
+  std::array<double, 3> cameraDirection{0., 0., -1.};
+  std::array<double, 3> cameraUp{0., 1., 0.};
+  std::optional<EffectiveCamera> cameraState() const override
+  {
+    EffectiveCamera camera;
+    camera.position = eye;
+    camera.direction = cameraDirection;
+    camera.up = cameraUp;
+    camera.fovyDegrees = fovy;
+    camera.projection = "perspective";
+    return camera;
+  }
   bool cameraControllable() const override
   {
     return controllable;
   }
   bool setCamera(const std::array<double, 3> &position,
-      const std::array<double, 3> &,
-      const std::array<double, 3> &,
+      const std::array<double, 3> &direction,
+      const std::array<double, 3> &up,
       double fovyDegrees) override
   {
     ++cameraSets;
     eye = position;
-    fovy = fovyDegrees;
+    cameraDirection = direction;
+    cameraUp = up;
+    if (fovyDegrees > 0.)
+      fovy = fovyDegrees;
     return true;
   }
 
@@ -1817,6 +1833,21 @@ const json::Value *imageItem(const Reply &r)
     if (c.get("type") && c.get("type")->s == "image")
       return &c;
   return nullptr;
+}
+
+struct ThrowCameraNotifications : vsr::scene::EmptyUpdateDelegate
+{
+  bool fail{true};
+  void signalParameterBatchUpdated(const vsr::scene::Object *object,
+      const std::vector<const vsr::scene::Parameter *> &) override;
+};
+
+void ThrowCameraNotifications::signalParameterBatchUpdated(
+    const vsr::scene::Object *object,
+    const std::vector<const vsr::scene::Parameter *> &)
+{
+  if (fail && object->type() == ANARI_CAMERA)
+    throw std::runtime_error("test downstream notification failure");
 }
 
 struct RenderFixture
@@ -2228,6 +2259,229 @@ SCENARIO(
   CHECK(f.run(s, "vsr_operation_status", 7).str("outcome") == "ok");
 }
 
+SCENARIO("MCP moves and recovers the authoritative interactive controller",
+    "[integration][mcp][camera-control]")
+{
+  RenderFixture f;
+  const auto s = f.attach();
+  ViewId view = INVALID_VIEW_ID;
+  f.integration.submit(f.sceneId, [&](vsr::scene::Scene &) {
+    ViewRegistration registration;
+    registration.scene = f.sceneId;
+    registration.role = ViewRole::INTERACTIVE_VIEWPORT;
+    registration.grants = {true, false};
+    view = *f.integration.registerView(registration);
+  });
+  f.integration.service();
+  identity::ViewRevisionTracker tracker(f.ids, *f.identity);
+  vsr::rendering::Manipulator manipulator;
+  manipulator.setConfig({0.f, 0.f, 0.f}, 5.f);
+  render::ControllerCamera controller(
+      *f.identity,
+      tracker,
+      manipulator,
+      [&] { return f.camera.data(); },
+      [&] { return f.integration.isRegisteredView(view); });
+  REQUIRE(f.renders->attachCameraController(
+      view, *f.identity, tracker, controller));
+  auto args = [&](int id, const std::string &extra = "") {
+    return "{\"request_id\":" + std::to_string(id)
+        + ",\"view_id\":" + std::to_string(view)
+        + ",\"position\":[3,2,7],\"direction\":[0,0,-2],\"up\":[0,2,0]" + extra
+        + "}";
+  };
+  CHECK(f.tool(s, "vsr_set_view_camera", args(1)).errorCode()
+      == "camera_control_disabled");
+  f.integration.setAgentCameraControlEnabled(true);
+  CHECK(f.tool(s, "vsr_set_view_camera", args(1, ",\"unknown\":1")).errorCode()
+      == "invalid_request");
+  CHECK(
+      f.tool(s, "vsr_set_view_camera", args(1, ",\"fovy_deg\":30")).str("kind")
+      == "set_view_camera");
+  manipulator.pan({0.2f, 0.f}); // input before the owning-thread commit
+  const auto before = manipulator.eye();
+  const float originalFovy = *f.camera->parameterValueAs<float>("fovy");
+  const auto applied = f.run(s, "vsr_operation_status", 1);
+  REQUIRE(applied.str("outcome") == "ok");
+  CHECK(applied.flag("committed"));
+  REQUIRE(applied.result());
+  CHECK(applied.result()->get("view_identity")->isString());
+  CHECK(applied.result()->get("scene_revision")->isString());
+  const auto *effective = applied.result()->get("effective_camera");
+  REQUIRE(effective);
+  CHECK(effective->get("projection")->s == "perspective");
+  CHECK(effective->get("fovy_deg")->n == Approx(30.));
+  CHECK(effective->get("direction")->a[2].n == Approx(-1.));
+  CHECK(manipulator.eye().x == Approx(3.f));
+  CHECK(manipulator.eye().y == Approx(2.f));
+  CHECK(manipulator.eye().z == Approx(7.f));
+  CHECK(manipulator.distance() == Approx(5.f));
+  CHECK(controller.hasRecovery());
+  manipulator.rotate({0.02f, 0.f});
+  manipulator.pan({0.01f, 0.f});
+  manipulator.zoom(0.01f);
+  CHECK(controller.hasRecovery());
+  const auto movedRevision = tracker.revision();
+  f.integration.setAgentCameraControlEnabled(false);
+  CHECK(f.tool(s, "vsr_set_view_camera", args(1, ",\"fovy_deg\":30"))
+          .flag("replayed"));
+  REQUIRE(controller.restore() == operations::Outcome::OK);
+  CHECK(manipulator.eye().x == Approx(before.x));
+  CHECK(manipulator.eye().z == Approx(before.z));
+  CHECK(f.camera->parameterValueAs<vsr::math::float3>("position")->x
+      == Approx(before.x));
+  CHECK(*f.camera->parameterValueAs<float>("fovy") == originalFovy);
+  CHECK(tracker.revision() != movedRevision);
+
+  f.integration.setAgentCameraControlEnabled(true);
+  REQUIRE(f.tool(s, "vsr_set_view_camera", args(2)).errorCode().empty());
+  f.integration.setAgentCameraControlEnabled(false);
+  const auto revoked = f.run(s, "vsr_operation_status", 2);
+  CHECK(revoked.str("kind") == "set_view_camera");
+  CHECK(revoked.str("outcome") == "camera_control_disabled");
+  CHECK_FALSE(revoked.flag("committed"));
+  CHECK(revoked.isError());
+  CHECK(revoked.result()->get("reason")->s == "camera_control_disabled");
+  CHECK(manipulator.eye().x == Approx(before.x));
+
+  f.integration.setAgentCameraControlEnabled(true);
+  controller.setRecoveryByteLimit(0);
+  REQUIRE(f.tool(s, "vsr_set_view_camera", args(3)).errorCode().empty());
+  const auto busy = f.run(s, "vsr_operation_status", 3);
+  CHECK(busy.str("outcome") == "busy");
+  CHECK_FALSE(busy.flag("committed"));
+  CHECK(manipulator.eye().x == Approx(before.x));
+  CHECK(controller.hasRecovery());
+  controller.setRecoveryByteLimit(64u << 10);
+
+  f.authority->restrict(
+      session::Target::scene(f.sceneId), session::Capability::READ);
+  CHECK(f.tool(s, "vsr_set_view_camera", args(4)).errorCode() == "forbidden");
+  f.authority->relax(
+      session::Target::scene(f.sceneId), session::Capability::READ);
+  REQUIRE(f.tool(s, "vsr_set_view_camera", args(4)).errorCode().empty());
+  f.authority->restrict(
+      session::Target::scene(f.sceneId), session::Capability::READ);
+  CHECK(f.run(s, "vsr_operation_status", 4).str("outcome") == "forbidden");
+  f.authority->relax(
+      session::Target::scene(f.sceneId), session::Capability::READ);
+
+  REQUIRE(f.authority->revokeSession());
+  const auto later = f.attach();
+  const auto historical = f.tool(later,
+      "vsr_operation_status",
+      "{\"operation_ref\":" + ref(s.id, 1) + "}");
+  CHECK(historical.str("kind") == "set_view_camera");
+  CHECK(historical.str("outcome") == "ok");
+  REQUIRE(f.tool(later, "vsr_set_view_camera", args(1)).errorCode().empty());
+  CHECK(
+      f.tool(
+           later, "vsr_cancel", "{\"operation_ref\":" + ref(later.id, 1) + "}")
+          .str("outcome")
+      == "cancelled");
+  f.integration.service();
+  CHECK(manipulator.eye().x == Approx(before.x));
+  REQUIRE(controller.restore() == operations::Outcome::OK);
+  CHECK(manipulator.eye().x == Approx(before.x));
+
+  auto *failure = f.scene.updateDelegate().emplace<ThrowCameraNotifications>();
+  REQUIRE(f.tool(later, "vsr_set_view_camera", args(2, ",\"fovy_deg\":45"))
+          .errorCode()
+          .empty());
+  const auto committedFailure = f.run(later, "vsr_operation_status", 2);
+  CHECK(committedFailure.str("outcome") == "applied_with_sync_failure");
+  CHECK(committedFailure.flag("committed"));
+  REQUIRE(committedFailure.result()->get("effective_camera"));
+  CHECK(committedFailure.result()->get("effective_camera")->get("fovy_deg")->n
+      == Approx(45.));
+  CHECK(manipulator.eye().x == Approx(3.f));
+  failure->fail = false;
+  REQUIRE(controller.restore() == operations::Outcome::OK);
+  CHECK(manipulator.eye().x == Approx(before.x));
+  auto replacement = f.scene.createObject<vsr::scene::Camera>(
+      vsr::scene::tokens::camera::perspective);
+  f.camera = replacement;
+  CHECK_FALSE(controller.recoveryAvailable());
+  CHECK(controller.restore() == operations::Outcome::OUTCOME_UNAVAILABLE);
+}
+
+SCENARIO("MCP interactive camera admission is disabled without consuming ID",
+    "[integration][mcp][camera-control]")
+{
+  RenderFixture f;
+  const auto s = f.attach();
+  f.backend.controllable = true;
+  ViewId view = INVALID_VIEW_ID;
+  f.integration.submit(f.sceneId, [&](vsr::scene::Scene &) {
+    ViewRegistration registration;
+    registration.scene = f.sceneId;
+    registration.role = ViewRole::INTERACTIVE_VIEWPORT;
+    registration.grants = {true, false};
+    view = *f.integration.registerView(registration);
+  });
+  f.integration.service();
+  identity::ViewRevisionTracker tracker(f.ids, *f.identity);
+  vsr::rendering::Manipulator manipulator;
+  render::ControllerCamera controller(
+      *f.identity,
+      tracker,
+      manipulator,
+      [&] { return f.camera.data(); },
+      [] { return true; });
+  REQUIRE(f.renders->attachCameraController(
+      view, *f.identity, tracker, controller));
+  const auto reply = f.tool(s,
+      "vsr_set_view_camera",
+      "{\"request_id\":1,\"view_id\":" + std::to_string(view)
+          + ",\"position\":[0,0,5],\"direction\":[0,0,-1],\"up\":[0,1,0]}");
+  CHECK(reply.status == 403);
+  CHECK(reply.errorCode() == "camera_control_disabled");
+  CHECK(f.engine->slotsInUse() == 0);
+  CHECK(f.engine->highWater(s.id) == 0);
+  REQUIRE(
+      f.tool(s,
+           "vsr_view_info",
+           "{\"request_id\":1,\"view_id\":" + std::to_string(view) + "}")
+          .errorCode()
+          .empty());
+  const auto info = f.run(s, "vsr_operation_status", 1);
+  REQUIRE(info.result());
+  const auto *control = info.result()->get("camera_control");
+  REQUIRE(control);
+  CHECK(control->get("supported")->b);
+  CHECK_FALSE(control->get("enabled")->b);
+  f.integration.setAgentCameraControlEnabled(true);
+  REQUIRE(
+      f.tool(s,
+           "vsr_view_info",
+           "{\"request_id\":2,\"view_id\":" + std::to_string(view) + "}")
+          .errorCode()
+          .empty());
+  const auto enabled = f.run(s, "vsr_operation_status", 2);
+  CHECK(enabled.result()->get("camera_control")->get("enabled")->b);
+}
+
+SCENARIO("MCP camera vectors handle extreme finite magnitudes",
+    "[integration][mcp][camera-control]")
+{
+  RenderFixture f;
+  f.backend.controllable = true;
+  const auto s = f.attach();
+  int id = 0;
+  for (const auto &vectors : {"\"direction\":[0,0,-1e300],\"up\":[0,1e300,0]",
+           "\"direction\":[0,0,-1e-300],\"up\":[0,1e-300,0]"}) {
+    const auto reply = f.tool(s,
+        "vsr_set_view_camera",
+        "{\"request_id\":" + std::to_string(++id)
+            + ",\"view_id\":0,\"position\":[0,0,5]," + std::string(vectors)
+            + "}");
+    CHECK(reply.errorCode().empty());
+    if (reply.errorCode().empty()) {
+      CHECK(f.run(s, "vsr_operation_status", id).str("outcome") == "ok");
+    }
+  }
+}
+
 SCENARIO("MCP vsr_set_view_camera poses an independent view's own camera",
     "[integration]")
 {
@@ -2263,9 +2517,14 @@ SCENARIO("MCP vsr_set_view_camera poses an independent view's own camera",
   // pinned to the old one.
   const auto before = token(f.tracker->revision());
   const std::string stale = f.renderArgs(2);
-  f.tool(s, "vsr_set_view_camera", args(1, good + ",\"fovy_deg\":30"));
+  CHECK(f.tool(s, "vsr_set_view_camera", args(1, good + ",\"fovy_deg\":30"))
+            .str("kind")
+      == "set_view_camera");
   auto done = f.run(s, "vsr_operation_status", 1);
   REQUIRE(done.str("outcome") == "ok");
+  CHECK(done.str("kind") == "set_view_camera");
+  CHECK(f.tool(s, "vsr_set_view_camera", args(1, good + ",\"fovy_deg\":30"))
+          .flag("replayed"));
   CHECK(done.flag("committed"));
   CHECK(done.result()->get("applied")->b);
   CHECK(done.result()->get("view_revision")->s == token(f.tracker->revision()));

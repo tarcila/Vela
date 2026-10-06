@@ -30,6 +30,8 @@ struct BaseViewport : public Window
 
   void buildUI() override;
   void setManipulator(vsr::rendering::Manipulator *m);
+  vsr::rendering::Manipulator *cameraManipulator() const;
+  vsr::scene::CameraRef currentCamera() const;
 
  protected:
   void saveSettings(vsr::core::DataNode &thisWindowRoot) override;
@@ -90,7 +92,8 @@ struct BaseViewport : public Window
     bool active{false};
     vsr::math::int2 size{0, 0};
     vsr::math::int2 renderSize{0, 0};
-    vsr::math::int2 pendingSize{0, 0}; // size requested last frame (resize debounce)
+    vsr::math::int2 pendingSize{
+        0, 0}; // size requested last frame (resize debounce)
     float resolutionScale{1.f};
   } m_viewport;
 

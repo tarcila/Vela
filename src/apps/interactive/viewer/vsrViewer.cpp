@@ -7,6 +7,9 @@
 #include <vsr/ui/imgui/Application.h>
 #include <vsr/ui/imgui/windows/Animations.h>
 #include <vsr/ui/imgui/windows/CameraPoses.h>
+#ifdef VSR_USE_INTEGRATION
+#include <vsr/integration/render/ControllerCamera.hpp>
+#endif
 #include <vsr/ui/imgui/windows/DatabaseEditor.h>
 #include <vsr/ui/imgui/windows/IsosurfaceEditor.h>
 #include <vsr/ui/imgui/windows/LayerTree.h>
@@ -137,8 +140,7 @@ struct AgentView : vsr::integration::render::RenderBackend
   // been posed yet; true when this call posed it.
   bool frameSceneBounds()
   {
-    if (pose || !res.device || !res.index || !res.camera
-        || !res.index->world())
+    if (pose || !res.device || !res.index || !res.camera || !res.index->world())
       return false;
     vsr::math::float3 b[2];
     if (!anariGetProperty(res.device,
@@ -192,12 +194,24 @@ struct AgentView : vsr::integration::render::RenderBackend
     return true;
   }
 
+  std::optional<vsr::integration::EffectiveCamera> cameraState() const override
+  {
+    return binding.camera;
+  }
+
   bool setCamera(const std::array<double, 3> &position,
       const std::array<double, 3> &direction,
       const std::array<double, 3> &up,
       double fovyDegrees) override
   {
     if (!res.device || !res.camera)
+      return false;
+    for (double value : position)
+      if (std::abs(value) > std::numeric_limits<float>::max())
+        return false;
+    const auto nextFovy =
+        fovyDegrees > 0. ? vsr::math::radians(float(fovyDegrees)) : fovy;
+    if (!(nextFovy > 0.f) || !(vsr::math::degrees(nextFovy) < 180.f))
       return false;
     auto f3 = [](const std::array<double, 3> &v) {
       return vsr::math::float3(float(v[0]), float(v[1]), float(v[2]));
@@ -231,8 +245,7 @@ struct AgentView : vsr::integration::render::RenderBackend
 
     r.camera = anari::newObject<anari::Camera>(r.device, "perspective");
     anari::setParameter(r.device, r.camera, "fovy", fovy);
-    anari::setParameter(
-        r.device, r.camera, "position", vsr::math::float3(0.f));
+    anari::setParameter(r.device, r.camera, "position", vsr::math::float3(0.f));
     anari::setParameter(
         r.device, r.camera, "direction", vsr::math::float3(0.f, 0.f, -1.f));
     anari::setParameter(
@@ -247,8 +260,8 @@ struct AgentView : vsr::integration::render::RenderBackend
 
     r.pipeline = std::make_unique<vsr::rendering::ImagePipeline>();
     r.pipeline->setDimensions(WIDTH, HEIGHT);
-    r.pass =
-        r.pipeline->setSource<vsr::rendering::AnariSceneRenderPass>(r.device);
+    r.pass = r.pipeline->setSource<vsr::rendering::AnariSceneRenderPass>(
+        r.device);
     r.pass->setRunAsync(false);
     r.pass->setCamera(r.camera);
     r.pass->setRenderer(r.renderer);
@@ -322,7 +335,8 @@ struct AgentView : vsr::integration::render::RenderBackend
         return false;
     }
     bindDevice();
-    vsr::core::logStatus("[vsrViewer] agent view renders with ANARI device '%s'",
+    vsr::core::logStatus(
+        "[vsrViewer] agent view renders with ANARI device '%s'",
         res.identifier.c_str());
     frameSceneBounds();
     return true;
@@ -556,6 +570,9 @@ class Application : public VSRApplication
     auto *animations = new vsr_ui::Animations(this);
     auto *timeline = new vsr_ui::Timeline(this);
     auto *cameras = new vsr_ui::CameraPoses(this);
+#ifdef VSR_USE_INTEGRATION
+    m_cameraPoses = cameras;
+#endif
     auto *log = new vsr_ui::Log(this);
     auto *dbeditor = new vsr_ui::DatabaseEditor(this);
     auto *oeditor = new vsr_ui::ObjectEditor(this);
@@ -910,6 +927,10 @@ DockSpace         ID=0x80F5B4C5 Window=0x079D3A04 Pos=0,56 Size=3840,2206 Split=
   std::unique_ptr<vsr::integration::context::ViewerExecutionHook> m_serviceHook;
   std::unique_ptr<AgentView> m_agentView;
   std::unique_ptr<vsr::integration::identity::ViewRevisionTracker> m_tracker;
+  vsr_ui::CameraPoses *m_cameraPoses{nullptr};
+  std::vector<std::pair<vsr::integration::ViewId,
+      std::unique_ptr<vsr::integration::render::ControllerCamera>>>
+      m_cameraControllers;
   vsr_ui::Viewport *m_viewport{nullptr};
   vsr_ui::Viewport *m_secondaryViewport{nullptr};
   std::vector<std::pair<vsr::integration::ViewId,
@@ -947,7 +968,8 @@ void Application::setupIntegration()
 
   m_agentView = std::make_unique<AgentView>();
   if (!m_agentView->setup(*ctx)) {
-    vsr::core::logError("[vsrViewer] agent view setup failed (no ANARI device)");
+    vsr::core::logError(
+        "[vsrViewer] agent view setup failed (no ANARI device)");
     teardownIntegration();
     m_agentIntegrationRequested = false;
     return;
@@ -1128,8 +1150,8 @@ void Application::setupIntegration()
     services.descriptorPath = m_mcp->published().path();
     // The path only, never the contents (which carry the launch
     // credential): pass it to vsrMcpProxy as its descriptor argument.
-    vsr::core::logStatus("[vsrViewer] MCP descriptor: %s",
-        services.descriptorPath.c_str());
+    vsr::core::logStatus(
+        "[vsrViewer] MCP descriptor: %s", services.descriptorPath.c_str());
   }
 #endif
 
@@ -1159,12 +1181,10 @@ void Application::registerViewportBindings()
               [id](const auto &entry) { return entry.first == id; }),
           m_pendingFrameSources.end());
       m_integration->unregisterView(id);
+      m_renders->detachView(id);
       m_frames->detachViewer(id);
-      m_viewportTrackers.erase(
-          std::remove_if(m_viewportTrackers.begin(),
-              m_viewportTrackers.end(),
-              [id](const auto &entry) { return entry.first == id; }),
-          m_viewportTrackers.end());
+      // Retain recovery evidence for the retired identity. Its lifetime
+      // predicate refuses restoration, so Camera Poses reports unavailable.
       slot.id = vi::INVALID_VIEW_ID;
     }
     if (!visible || slot.id != vi::INVALID_VIEW_ID)
@@ -1204,9 +1224,39 @@ void Application::registerViewportBindings()
       continue;
     }
     slot.id = *id;
+    auto cameraController = std::make_unique<vi::render::ControllerCamera>(
+        *identity,
+        *tracker,
+        *viewport->cameraManipulator(),
+        [viewport, life = slot.lifetime] {
+          return life.expired() ? nullptr : viewport->boundCamera().data();
+        },
+        [this, viewport, vid = *id, life = slot.lifetime] {
+          return !life.expired() && *viewport->visiblePtr()
+              && m_integration->isRegisteredView(vid)
+              && viewport->boundCamera() == viewport->currentCamera();
+        });
+    m_renders->attachCameraController(
+        *id, *identity, *tracker, *cameraController);
+    m_cameraControllers.emplace_back(*id, std::move(cameraController));
     m_viewportTrackers.emplace_back(*id, std::move(tracker));
     m_pendingFrameSources.emplace_back(*id, viewport);
   }
+  std::vector<vsr_ui::CameraPoses::RecoverySlot> recoverySlots;
+  for (auto &entry : m_cameraControllers) {
+    auto *controller = entry.second.get();
+    const auto description = m_integration->viewDescription(entry.first);
+    recoverySlots.push_back({"before-agent-" + std::to_string(entry.first),
+        "Before agent — " + (description ? description->name : "unavailable"),
+        [controller] { return controller->hasRecovery(); },
+        [controller] { return controller->recoveryAvailable(); },
+        [controller] {
+          const auto outcome = controller->restore();
+          return outcome == vi::operations::Outcome::OK
+              || outcome == vi::operations::Outcome::APPLIED_WITH_SYNC_FAILURE;
+        }});
+  }
+  m_cameraPoses->setRecoverySlots(std::move(recoverySlots));
 }
 
 void Application::teardownIntegration()
@@ -1216,8 +1266,11 @@ void Application::teardownIntegration()
 #ifdef VSR_USE_INTEGRATION_MCP
   m_mcp.reset();
 #endif
+  if (m_cameraPoses)
+    m_cameraPoses->setRecoverySlots({});
   m_serviceHook.reset();
   m_inspector.reset();
+  m_cameraControllers.clear();
   if (m_agentView)
     m_agentView->release();
   m_renders.reset();

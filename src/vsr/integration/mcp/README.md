@@ -64,7 +64,7 @@ form:
 | Field | Presence | Meaning |
 |---|---|---|
 | `operation_ref` | always | `{session_id, request_id}`. It is the complete qualified reference, including when the lookup names an earlier session's record |
-| `kind` | always | Retained operation kind: `discover`, `inspect`, `edit`, `restore`, `render`, `resynchronize`. Preserved for lookups from later sessions |
+| `kind` | always | Retained operation kind: `discover`, `inspect`, `edit`, `restore`, `render`, `select_device`, `set_view_camera`, `resynchronize`. Preserved for lookups from later sessions |
 | `state` | always | `pending` or `terminal` |
 | `progress` | while a slot is held | A frozen non-terminal name (see below). `awaiting_cleanup` can coexist with `state: terminal` |
 | `outcome` | once terminal | A frozen code (see below) |
@@ -520,7 +520,7 @@ the authenticated `VSR-Session-ID`.
 | `vsr_render_image` | `operation_ref` | as `vsr_operation_status` | control gate, no ID |
 | `vsr_resynchronize` | `request_id`, `scene_id` | read + resynchronize on `scene_id` | one scene slot, one request ID |
 | `vsr_select_device` | `request_id`, `view_id`, optional `device_identifier` | render + read on `view_id` | one scene slot, one request ID |
-| `vsr_set_view_camera` | `request_id`, `view_id`, `position`, `direction`, `up`, optional `fovy_deg` | render + read on `view_id` | one scene slot, one request ID |
+| `vsr_set_view_camera` | `request_id`, `view_id`, `position`, `direction`, `up`, optional `fovy_deg` | independent: view RENDER + READ; interactive: view READ + bound-Scene READ + supported/enabled camera control | one scene slot, one request ID |
 
 - Revision tokens are strings `"<activation>.<nonce>.<domain>.<value>"`
   (decimal unsigned 64-bit fields), exactly as a successful render result
@@ -553,16 +553,60 @@ the authenticated `VSR-Session-ID`.
   starts on the viewer's default device (first `VSR_ANARI_LIBRARIES` entry,
   else `ANARI_LIBRARY`, else `helide`) and its candidates are the viewer's
   device list.
-- `vsr_set_view_camera` poses the private camera of an independent view
-  (vsrViewer's agent view), never a scene camera or an interactive
-  viewport. `position`, `direction` (forward) and `up` are world-space
-  three-number arrays; direction/up need not be normalized but must be
-  non-zero and not parallel; `fovy_deg` (vertical) must lie in (0, 180) and
-  defaults to the current value. Malformed poses or a backend without camera
-  control reject `invalid_request` before admission; a held view rejects
-  `busy`. The result is `{applied, view_revision}`; the pose is committed and
-  supersedes renders pinned to the previous view revision. The pose then
-  replaces automatic bounds framing and survives `vsr_select_device`.
+- `vsr_set_view_camera` addresses exactly the discovered view ID, with status
+  kind `set_view_camera` on admission, polling, replay and later-session lookup.
+  Discovery and view-info publish `camera_control: {supported, enabled}`;
+  support is not authority. Independent cameras retain view RENDER + READ
+  policy, automatic-framing replacement and device-switch survival. Interactive
+  viewports require view READ and bound-Scene READ, plus the launch-local
+  **Allow agent camera control** permission in Agent Activity. It defaults off,
+  is never persisted, and is independent of **Disable agent edits**. Neither
+  Scene EDIT nor view RENDER is needed to move a viewport. No view substitution
+  occurs.
+- Camera arguments remain `position` (eye), `direction` (forward), and `up`
+  (world-space three-number arrays), plus optional vertical `fovy_deg` strictly
+  between 0 and 180. Non-unit vectors are accepted; nonfinite, zero, and
+  near-parallel vectors reject without writes. Omitted FOV preserves the
+  current setting; projection never switches. Unrepresentable host poses and
+  unsupported combinations reject `invalid_request/unsupported_view_camera`.
+  Orthographic viewport posing preserves orbit/fixed distance and height,
+  and rejects an explicit perspective FOV. Unknown argument fields reject.
+- Initial disabled-camera admission returns HTTP 403,
+  `error.data.code=camera_control_disabled`, and consumes no request ID.
+  Revocation before the safe-point commit returns HTTP 200 with terminal
+  `camera_control_disabled`, `committed:false`, `result.reason` equal to that
+  code and `isError:true`. Ordinary read/session failures retain their inherited
+  codes. Replay returns the retained receipt even after camera permission is
+  disabled: it never moves the controller or replaces recovery again.
+- At the UI safe point the host prepares the pose and recovery storage, then
+  installs the actual controller, bound camera, recovery slot and revision
+  without intervening user input. Storage failure is `busy/resource_limit`
+  without changes. Downstream notification failures remain committed and report
+  `applied_with_sync_failure`. Receipts add `scene_revision`, `view_identity`
+  and `effective_camera` (`position`, normalized `direction`/`up`, `projection`,
+  `fovy_deg`) to `applied` and `view_revision`. Controllable independent
+  host backends must provide `cameraState()`; missing effective-state support
+  rejects `invalid_request/unsupported_view_camera` without a pose write.
+- Camera Poses lists one internally identified **Before agent** recovery slot
+  per controllable view, separate from user poses (including identically named
+  poses). Each successful fresh move replaces only that view's slot. Rejection,
+  cancellation and replay leave it intact. Navigation does not clear it.
+  Selecting it restores the complete controller and previous camera parameters,
+  including projection/FOV, and advances the view revision without replacing
+  the slot. Retired views or rebound/reused camera identities are unavailable.
+- A receipt describes effective state, not presentation. For actual viewport
+  evidence, the existing `vsr_view_frame` terminal result must have
+  `state=available`, `image_kind=presented_frame`, the addressed `view_id` and
+  `view_identity`, `rendered_view_revision` equal to the receipt revision,
+  matching `rendered_configuration.camera`, `rendered_view_revision_basis`
+  equal to `anari_render_start`, and `stale=false`. Compare
+  `rendered_scene_revision` against the chosen post-move Scene observation;
+  `current_view_revision` and `current_scene_revision` describe current state.
+  Old/delayed frames and historical replay are not fresh proof. Use fresh IDs
+  while polling for at most 120 seconds, then report timeout; later navigation
+  or another move supersedes the target. Unqualified bindings report unavailable,
+  not success. Independent renders are never viewport evidence. See the
+  [frame host contract](../frame/README.md).
 - `vsr_resynchronize` reports its result as
   `{"ready": bool, "state": "ready"|"needs_sync"|"synchronizing"|"failed"}`.
   A recovery that ran is terminal `ok` even when it failed; failure is
@@ -595,6 +639,7 @@ returned as `structuredContent.outcome` of a terminal operation, with
 | `unauthenticated` | E | 401 | Missing or invalid launch credential |
 | `invalid_session_proof` | E | 401 | Missing, wrong or stale session ID/proof, including an old session's proof |
 | `session_expired` | E | 401 | The lease lapsed |
+| `camera_control_disabled` | E, T (`isError:true`) | 403 / 200 | Interactive camera permission off at fresh admission (no ID consumed), or revoked before commit (`committed:false`, `result.reason=camera_control_disabled`) |
 | `forbidden` | E, T | 403 / 200 | E: the capability is absent, the target is not exposed, a foreign record lacks read on a covered target, or the call cancels another session's work. T: permission was withdrawn before the safe point |
 | `occupied` | E | 200 | Attach while a session is held (`vsr/attach` only) |
 | `busy` | E, T | 200 | E: the scene pool or control gate is full, and nothing was admitted or consumed. T: a render view is held (105) |

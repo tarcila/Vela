@@ -78,6 +78,7 @@ struct ToolResult
   std::string structuredJson;
   // Admitted work that ended in a non-ok terminal outcome (MCP tool error).
   bool isError{false};
+  std::string semanticReason;
   inspection::RequestDiagnostics diagnostics;
   std::string diagnosticKind;
   // Optional owned-resource reservation, transferred to the HTTP response so
@@ -274,6 +275,7 @@ inline int httpStatusFor(operations::Outcome o)
   case Outcome::INVALID_SESSION_PROOF:
   case Outcome::SESSION_EXPIRED:
     return 401;
+  case Outcome::CAMERA_CONTROL_DISABLED:
   case Outcome::FORBIDDEN:
     return 403;
   case Outcome::BUSY:
@@ -914,6 +916,9 @@ inline McpServer::HttpResponse McpServer::dispatch(
       const ToolResult r = t.handler(creds, args ? *args : empty);
       if (r.code != Outcome::OK) {
         auto response = outcomeError(id, r.code);
+        if (r.semanticReason == "unsupported_view_camera")
+          response.body.insert(response.body.size() - 3,
+              ",\"reason\":\"unsupported_view_camera\"");
         if (r.diagnostics.count) {
           // All fields/reasons are closed syntax vocabulary. Kind is never
           // echoed unless recognized; no live identity or request values.

@@ -52,6 +52,7 @@ enum class OperationKind
   DISCOVERY,
   INSPECTION,
   RENDER,
+  SET_VIEW_CAMERA,
   EDIT,
   RESTORE,
   RESYNCHRONIZE,
@@ -67,6 +68,8 @@ inline const char *operationKindName(OperationKind k)
     return "inspection";
   case OperationKind::RENDER:
     return "render";
+  case OperationKind::SET_VIEW_CAMERA:
+    return "set_view_camera";
   case OperationKind::EDIT:
     return "edit";
   case OperationKind::RESTORE:
@@ -168,6 +171,7 @@ inline std::vector<Target> coveredTargets(OperationKind kind,
   case OperationKind::DISCOVERY:
   case OperationKind::STATUS_LOOKUP:
     return listed;
+  case OperationKind::SET_VIEW_CAMERA:
   case OperationKind::RENDER: {
     std::vector<Target> t{primary};
     if (auto s = integration.sceneOfView(primary.id))
@@ -293,6 +297,7 @@ inline OperationKind operationKindOf(const std::string &kind)
   for (auto k : {OperationKind::DISCOVERY,
            OperationKind::INSPECTION,
            OperationKind::RENDER,
+           OperationKind::SET_VIEW_CAMERA,
            OperationKind::EDIT,
            OperationKind::RESTORE,
            OperationKind::RESYNCHRONIZE,

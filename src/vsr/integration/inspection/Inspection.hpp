@@ -921,6 +921,7 @@ class Inspector
           + std::to_string(m_limits.defaultItems)
           + ",\"max_page_size\":" + std::to_string(m_limits.maxItems) + "}";
     if (views) {
+      item += "," + viewinfo::cameraControlJson(m_integration, i, caps.render);
       if (auto description = m_integration.viewDescription(i))
         item += "," + viewinfo::identityJson(*description, detail::jsonString);
       const auto policy = m_integration.capturePolicy(i);
@@ -1782,7 +1783,10 @@ inline Built Inspector::makeViewInfo(const std::string &sessionId, ViewId view)
     if (!description)
       return Step{Step::Status::COMPLETE, Outcome::SUPERSEDED};
     const auto identityJson =
-        viewinfo::identityJson(*description, detail::jsonString);
+        viewinfo::identityJson(*description, detail::jsonString) + ","
+        + viewinfo::cameraControlJson(m_integration,
+            view,
+            m_authority.effectiveCapabilities(Target::view(view)).render);
     const auto policy = m_integration.capturePolicy(view);
     const auto policyJson = policy ? capturePolicyJson(policy->policy,
                                          policy->presentedFramesExposed,
