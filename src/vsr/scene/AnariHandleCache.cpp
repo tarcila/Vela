@@ -119,6 +119,10 @@ void AnariHandleCache::insertEmptyHandle(anari::DataType type)
 
 void AnariHandleCache::releaseHandle(anari::DataType type, size_t index)
 {
+  // Reset clears the cache before layer teardown sends use-count callbacks.
+  // An absent or already released handle must not recreate a cache slot.
+  if (!readHandle(type, index))
+    return;
   removeHandle(type, index);
   insertEmptyHandle(type);
 }
@@ -131,42 +135,48 @@ void AnariHandleCache::releaseHandle(const Object *o)
 
 void AnariHandleCache::removeHandle(anari::DataType type, size_t index)
 {
-  auto handle = getHandle(type, index, false);
-  anari::release(device, handle);
+  auto remove = [&](auto &pool) {
+    // ObjectPool::erase requires an occupied, in-bounds slot. A reset may
+    // already have cleared it; a null placeholder still needs to be erased.
+    if (auto slot = pool.at(index)) {
+      anari::release(device, *slot);
+      pool.erase(index);
+    }
+  };
 
   switch (type) {
   case ANARI_SURFACE:
-    surface.erase(index);
+    remove(surface);
     break;
   case ANARI_GEOMETRY:
-    geometry.erase(index);
+    remove(geometry);
     break;
   case ANARI_MATERIAL:
-    material.erase(index);
+    remove(material);
     break;
   case ANARI_SAMPLER:
-    sampler.erase(index);
+    remove(sampler);
     break;
   case ANARI_VOLUME:
-    volume.erase(index);
+    remove(volume);
     break;
   case ANARI_SPATIAL_FIELD:
-    field.erase(index);
+    remove(field);
     break;
   case ANARI_LIGHT:
-    light.erase(index);
+    remove(light);
     break;
   case ANARI_RENDERER:
-    renderer.erase(index);
+    remove(renderer);
     break;
   case ANARI_CAMERA:
-    camera.erase(index);
+    remove(camera);
     break;
   case ANARI_ARRAY:
   case ANARI_ARRAY1D:
   case ANARI_ARRAY2D:
   case ANARI_ARRAY3D:
-    array.erase(index);
+    remove(array);
     break;
   default:
     break; // no-op

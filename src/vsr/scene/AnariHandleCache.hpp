@@ -32,8 +32,10 @@ struct AnariHandleCache
       anari::DataType type, size_t index, bool createIfNotPresent);
   anari::Object getHandle(const Object *o, bool createIfNotPresent);
   void insertEmptyHandle(anari::DataType type);
+  // Release a live handle but preserve its slot. No-op after clear or release.
   void releaseHandle(anari::DataType type, size_t index);
   void releaseHandle(const Object *o);
+  // Remove an occupied slot, including a null placeholder; no-op if absent.
   void removeHandle(anari::DataType type, size_t index);
   void removeHandle(const Object *o);
   void clear();

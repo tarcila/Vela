@@ -104,6 +104,50 @@ vsr::math::mat4 translation(float x)
 
 } // namespace
 
+SCENARIO("Resetting a populated scene releases live layer references safely",
+    "[RenderIndex][Scene][reset]")
+{
+  TestDevice anariDevice;
+  REQUIRE(anariDevice);
+
+  InstancedSphereScene content;
+  auto &scene = content.scene;
+  auto *other = scene.addLayer(Token("other"));
+  auto light = scene.createObject<Light>(tokens::light::directional);
+  auto secondLight = scene.createObject<Light>(tokens::light::directional);
+  scene.insertChildObjectNode(scene.defaultLayer()->root(), light);
+  scene.insertChildObjectNode(other->root(), light);
+  scene.insertChildObjectNode(other->root(), secondLight);
+  REQUIRE(light->useCount(Object::UseKind::LAYER) == 2);
+  REQUIRE(secondLight->useCount(Object::UseKind::LAYER) == 1);
+
+  auto *index =
+      scene.updateDelegate().emplace<vsr::rendering::RenderIndexAllLayers>(
+          scene, Token("helide"), anariDevice.device);
+  index->populate();
+  REQUIRE(worldBoundsMax(anariDevice.device, *index).x == Approx(1.f));
+
+  scene.removeAllObjects();
+  REQUIRE(scene.objectDB().light.empty());
+  REQUIRE(scene.objectDB().surface.empty());
+  scene.removeAllObjects();
+
+  // The same delegate must remain usable after reset, including index reuse
+  // and ordinary last-layer-reference release followed by object removal.
+  for (int i = 0; i < 2; ++i) {
+    auto *layer = scene.addLayer(Token("replacement"));
+    auto replacement = scene.createObject<Light>(tokens::light::directional);
+    REQUIRE(replacement->index() == 0);
+    scene.insertChildObjectNode(layer->root(), replacement);
+    REQUIRE(replacement->useCount(Object::UseKind::LAYER) == 1);
+    scene.removeLayer(layer);
+    REQUIRE(replacement->useCount(Object::UseKind::LAYER) == 0);
+    scene.removeObject(replacement.data());
+    REQUIRE(scene.objectDB().light.empty());
+  }
+  scene.removeAllObjects();
+}
+
 SCENARIO("Rewriting a transform array moves its instances", "[RenderIndex]")
 {
   TestDevice anariDevice;
