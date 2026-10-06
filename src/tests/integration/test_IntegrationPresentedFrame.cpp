@@ -416,6 +416,7 @@ struct FrameSocket
   VSR_NOT_COPYABLE(FrameSocket)
   VSR_NOT_MOVEABLE(FrameSocket)
   int fd{-1};
+  std::string responsePrefix;
 };
 
 FrameSocket::FrameSocket(int descriptor) : fd(descriptor) {}
@@ -442,6 +443,7 @@ struct FrameTransport
       const std::string &tool = "vsr_view_frame_image",
       const std::string &rpcId = "1");
   mcp::json::Value read(FrameSocket &socket, bool complete = true);
+  void awaitImageHeaders(FrameSocket &socket);
   void awaitOwned(std::size_t minimum);
   void awaitReleased(std::size_t maximum);
 };
@@ -507,7 +509,7 @@ int FrameTransport::open(const operations::OperationRef &ref,
 }
 mcp::json::Value FrameTransport::read(FrameSocket &socket, bool complete)
 {
-  std::string response;
+  std::string response = std::move(socket.responsePrefix);
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(15);
   char bytes[65536];
@@ -533,6 +535,32 @@ mcp::json::Value FrameTransport::read(FrameSocket &socket, bool complete)
   if (complete)
     REQUIRE(parsed);
   return json;
+}
+void FrameTransport::awaitImageHeaders(FrameSocket &socket)
+{
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  auto &headers = socket.responsePrefix;
+  while (headers.find("\r\n\r\n") == std::string::npos) {
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now())
+                          .count();
+    REQUIRE(left > 0);
+    pollfd poll{socket.fd, POLLIN, 0};
+    REQUIRE(::poll(&poll, 1, int(left)) > 0);
+    char byte;
+    REQUIRE(::recv(socket.fd, &byte, 1, MSG_DONTWAIT) == 1);
+    headers += byte;
+    REQUIRE(headers.size() <= 4096);
+  }
+  REQUIRE(headers.find("HTTP/1.1 200 OK\r\n") == 0);
+  const std::string lengthHeader = "\r\nContent-Length: ";
+  const auto length = headers.find(lengthHeader);
+  REQUIRE(length != std::string::npos);
+  const auto bodyBytes =
+      std::stoull(headers.substr(length + lengthHeader.size()));
+  REQUIRE(bodyBytes > (7u << 20));
+  REQUIRE(bodyBytes <= 12582912);
 }
 void FrameTransport::awaitOwned(std::size_t minimum)
 {
@@ -1458,6 +1486,10 @@ TEST_CASE(
   {
     FrameSocket slow{transport.open(first)};
     transport.awaitOwned(baseline + (70u << 20));
+    // Reservation precedes encoding and its final authority check. Observe
+    // actual image publication before withdrawal, consuming only headers so
+    // the bounded TCP receive window still backpressures the immutable body.
+    transport.awaitImageHeaders(slow);
     host.pattern->offset = 93;
     host.present(); // natural viewing continues while the client does not read
     const operations::OperationRef pending{
