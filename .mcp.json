@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "vsr": {
+      "type": "stdio",
+      "command": "/home/tarcila/Code/ANARI/vela/pi-integration/.pi/skills/vsr-viewer-agent/mcp-proxy.sh",
+      "args": []
+    }
+  }
+}

@@ -1,9 +1,0 @@
-{
-  "detailed_samples": 53,
-  "whole_process_sampled_heap_peak": 341415416,
-  "conservative_remaining_heap_peak": 126861040,
-  "explicit_encoder_stack_and_guard": 2162688,
-  "sampled_remaining_heap_plus_encoder_mapping": 129023728,
-  "reservation_ceiling": 268435456,
-  "limits": "Sampled residual overcounts owned heap, not total-process memory or an all-time peak proof; static bounds and live lease accounting remain necessary."
-}

@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "vsr": {
-      "command": "/home/tarcila/Code/ANARI/vela/viewport-integration/.pi/skills/vsr-viewer-agent/mcp-proxy.sh",
+      "command": "/home/tarcila/Code/ANARI/vela/pi-integration/.pi/skills/vsr-viewer-agent/mcp-proxy.sh",
       "args": [],
       "exposure": "direct"
     }
