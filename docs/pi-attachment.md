@@ -179,9 +179,10 @@ It is not proof that a new frame has appeared.
 Camera Poses has a host-owned **Before agent** entry for each controllable view.
 Successful fresh moves replace only that entry, not a user pose with the same
 name. Ordinary navigation does not clear it. Selecting it restores the previous
-complete controller/camera configuration and advances the view revision without
-creating another slot; retired/rebound identities are unavailable. Recovery is
-local and remains usable when camera permission is off or the agent disconnects.
+complete controller/camera configuration, including parameter values and enabled
+flags, and advances the view revision without creating another slot.
+Retired/rebound identities are unavailable. Recovery is local and remains usable
+when camera permission is off or the agent disconnects.
 
 Use the addressed viewport's presented-frame tools for visual verification,
 only on a qualified binding. Require matching view identity, rendered view

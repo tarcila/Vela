@@ -3026,6 +3026,14 @@ SCENARIO("MCP vsr_set_view_camera poses an independent view's own camera",
   f.backend.allowRelease = true;
   f.backend.holdPolls = 0;
   CHECK(f.run(s, "vsr_operation_status", 4).str("outcome") == "ok");
+  REQUIRE(f.authority->revokeSession());
+  const auto later = f.attach();
+  const auto historical = f.tool(later,
+      "vsr_operation_status",
+      "{\"operation_ref\":" + ref(s.id, 1) + "}");
+  CHECK(historical.str("kind") == "set_view_camera");
+  CHECK(historical.str("outcome") == "ok");
+  CHECK(f.backend.cameraSets == 1);
 }
 
 SCENARIO("MCP render returns PNG image content at view-owned dimensions",

@@ -626,9 +626,10 @@ the authenticated `VSR-Session-ID`.
   per controllable view, separate from user poses (including identically named
   poses). Each successful fresh move replaces only that view's slot. Rejection,
   cancellation and replay leave it intact. Navigation does not clear it.
-  Selecting it restores the complete controller and previous camera parameters,
-  including projection/FOV, and advances the view revision without replacing
-  the slot. Retired views or rebound/reused camera identities are unavailable.
+  Selecting it restores the complete controller and previous camera parameter
+  values and enabled flags, including projection/FOV, and advances the view
+  revision without replacing the slot. Retired views or rebound/reused camera
+  identities are unavailable.
 - A receipt describes effective state, not presentation. For actual viewport
   evidence, the existing `vsr_view_frame` terminal result must have
   `state=available`, `image_kind=presented_frame`, the addressed `view_id` and

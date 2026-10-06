@@ -35,12 +35,18 @@ class ControllerCamera : public CameraController
   Outcome restore();
 
  private:
+  struct ParameterState
+  {
+    core::Token name;
+    core::Any value;
+    bool enabled{true};
+  };
   struct Snapshot
   {
     rendering::Manipulator controller;
     identity::ObjectHandle camera;
     core::Token projection;
-    std::vector<std::pair<core::Token, core::Any>> parameters;
+    std::vector<ParameterState> parameters;
   };
   identity::SceneIdentity *m_identity{nullptr};
   identity::ViewRevisionTracker *m_tracker{nullptr};
@@ -136,7 +142,7 @@ inline Outcome ControllerCamera::prepare(
     const auto &value = camera->parameterAt(i).value();
     if (value.holdsObject())
       return reject(Outcome::INVALID_REQUEST, "unsupported_view_camera");
-    bytes += sizeof(std::pair<core::Token, core::Any>);
+    bytes += sizeof(ParameterState);
     if (value.type() == ANARI_STRING)
       bytes += value.getStringView().size();
     if (bytes > m_recoveryByteLimit)
@@ -151,18 +157,18 @@ inline Outcome ControllerCamera::prepare(
   before.parameters.reserve(camera->numParameters());
   for (std::size_t i = 0; i < camera->numParameters(); ++i) {
     const auto &p = camera->parameterAt(i);
-    before.parameters.emplace_back(p.name(), p.value());
+    before.parameters.push_back({p.name(), p.value(), p.isEnabled()});
   }
   // Input immediately before this safe point may not yet have flushed the
   // controller's pose to the Scene camera. Recovery captures that input too.
   for (auto &parameter : before.parameters) {
-    if (parameter.first == core::Token("position"))
-      parameter.second =
+    if (parameter.name == core::Token("position"))
+      parameter.value =
           perspective ? m_controller->eye() : m_controller->eye_FixedDistance();
-    else if (parameter.first == core::Token("direction"))
-      parameter.second = m_controller->dir();
-    else if (parameter.first == core::Token("up"))
-      parameter.second = m_controller->up();
+    else if (parameter.name == core::Token("direction"))
+      parameter.value = m_controller->dir();
+    else if (parameter.name == core::Token("up"))
+      parameter.value = m_controller->up();
   }
   std::vector<std::pair<scene::Parameter *, core::Any>> writes;
   auto write = [&](core::Token name, core::Any value) {
@@ -222,14 +228,19 @@ inline Outcome ControllerCamera::restore()
     auto *camera = m_boundCamera();
     auto writes = m_recovery->parameters;
     for (const auto &write : writes) {
-      const auto *parameter = camera->parameter(write.first);
-      if (!parameter || parameter->value().type() != write.second.type())
+      const auto *parameter = camera->parameter(write.name);
+      if (!parameter || parameter->value().type() != write.value.type())
         return Outcome::OUTCOME_UNAVAILABLE;
     }
-    camera->reserveParameterBatch(writes.size());
+    // Value and enabled-state changes each enqueue a notification. Reserve
+    // both before mutation; endParameterBatch coalesces them for consumers.
+    camera->reserveParameterBatch(2 * writes.size());
     camera->beginParameterBatch();
-    for (auto &write : writes)
-      camera->parameter(write.first)->setPreparedValue(std::move(write.second));
+    for (auto &write : writes) {
+      camera->parameter(write.name)
+          ->setPreparedValue(std::move(write.value))
+          .setEnabled(write.enabled);
+    }
     m_controller->setState(m_recovery->controller);
     m_tracker->notePipelineChanged();
     committed = true;

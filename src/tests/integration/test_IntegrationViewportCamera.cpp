@@ -192,6 +192,30 @@ TEST_CASE("Controller recovery is rolling, bounded and per view",
     CHECK(first.eye().x == Approx(3.f));
     CHECK(a.hasRecovery());
   }
+  for (double magnitude : {1e300, 1e-300}) {
+    render::CameraRequest request;
+    request.position = {3., 2., 7.};
+    request.direction = {0., 0., -magnitude};
+    request.up = {0., magnitude, 0.};
+    render::PreparedCameraChange prepared;
+    REQUIRE(a.prepare(request, prepared) == operations::Outcome::OK);
+    CHECK(prepared.effective.direction[2] == Approx(-1.));
+    CHECK(prepared.effective.up[1] == Approx(1.));
+    prepared.install();
+    prepared.synchronize();
+    CHECK(first.eye().x == Approx(3.f));
+  }
+  render::CameraRequest nearlyParallel;
+  nearlyParallel.direction = {0., 0., -1.};
+  nearlyParallel.up = {0., 1e-12, -1.};
+  render::PreparedCameraChange rejected;
+  CHECK(a.prepare(nearlyParallel, rejected)
+      == operations::Outcome::INVALID_REQUEST);
+  CHECK(first.eye().x == Approx(3.f));
+  CHECK(a.hasRecovery());
+  REQUIRE(a.restore() == operations::Outcome::OK);
+  CHECK(first.eye().x == Approx(3.f));
+
   auto orthographic = scene.createObject<vsr::scene::Camera>(
       vsr::scene::tokens::camera::orthographic);
   firstCamera = orthographic;
@@ -201,6 +225,78 @@ TEST_CASE("Controller recovery is rolling, bounded and per view",
   request.fovyDegrees = 30.;
   render::PreparedCameraChange prepared;
   CHECK(a.prepare(request, prepared) == operations::Outcome::INVALID_REQUEST);
+}
+
+TEST_CASE("Controller recovery restores projection values and enabled flags",
+    "[integration][camera-control]")
+{
+  using namespace vsr::integration;
+  for (const auto projection : {vsr::scene::tokens::camera::perspective,
+           vsr::scene::tokens::camera::orthographic}) {
+    CAPTURE(projection.str());
+    vsr::scene::Scene scene;
+    identity::IdentityAuthority ids;
+    identity::SceneIdentity identity(ids, scene);
+    identity::ViewRevisionTracker tracker(ids, identity);
+    auto camera = scene.createObject<vsr::scene::Camera>(projection);
+    vsr::rendering::Manipulator manipulator;
+    manipulator.setConfig({0.f, 0.f, 0.f}, 5.f);
+    const bool perspective =
+        projection == vsr::scene::tokens::camera::perspective;
+    const char *projectionParameter = perspective ? "fovy" : "height";
+    const float originalProjection =
+        perspective ? vsr::math::radians(60.f) : 6.f;
+    camera->parameter(projectionParameter)->setValue(originalProjection);
+    camera->parameter("near")->setValue(0.25f).setEnabled(true);
+    camera->parameter("far")->setValue(400.f).setEnabled(false);
+    camera->parameter("apertureRadius")->setValue(0.125f).setEnabled(false);
+    camera->parameter("stereoMode")->setValue("left").setEnabled(false);
+    render::ControllerCamera controller(
+        identity,
+        tracker,
+        manipulator,
+        [&] { return camera.data(); },
+        [] { return true; });
+    render::CameraRequest request;
+    request.position = {3., 2., 7.};
+    request.fovyDegrees = perspective ? 30. : 0.;
+    render::PreparedCameraChange change;
+    REQUIRE(controller.prepare(request, change) == operations::Outcome::OK);
+    change.install();
+    tracker.notePipelineChanged();
+    change.synchronize();
+    REQUIRE(controller.hasRecovery());
+
+    // Ordinary host edits after the move must not change the saved view.
+    camera->parameter(projectionParameter)->setValue(1.f).setEnabled(false);
+    camera->parameter("near")->setValue(2.f).setEnabled(false);
+    camera->parameter("far")->setValue(200.f).setEnabled(true);
+    camera->parameter("apertureRadius")->setValue(0.5f).setEnabled(true);
+    camera->parameter("stereoMode")->setValue("right").setEnabled(true);
+    camera->parameter("up")->setEnabled(false);
+    manipulator.rotate({0.1f, 0.2f});
+    manipulator.pan({0.1f, 0.f});
+    manipulator.zoom(0.1f);
+    const auto movedRevision = tracker.revision();
+    REQUIRE(controller.restore() == operations::Outcome::OK);
+    CHECK(tracker.revision() != movedRevision);
+    CHECK(controller.hasRecovery());
+    CHECK(camera->subtype() == projection);
+    CHECK(*camera->parameterValueAs<float>(projectionParameter)
+        == originalProjection);
+    CHECK(camera->parameter(projectionParameter)->isEnabled());
+    CHECK(*camera->parameterValueAs<float>("near") == 0.25f);
+    CHECK(camera->parameter("near")->isEnabled());
+    CHECK(*camera->parameterValueAs<float>("far") == 400.f);
+    CHECK_FALSE(camera->parameter("far")->isEnabled());
+    CHECK(*camera->parameterValueAs<float>("apertureRadius") == 0.125f);
+    CHECK_FALSE(camera->parameter("apertureRadius")->isEnabled());
+    CHECK(camera->parameter("stereoMode")->value().getStringView() == "left");
+    CHECK_FALSE(camera->parameter("stereoMode")->isEnabled());
+    CHECK(camera->parameter("up")->isEnabled());
+    CHECK(manipulator.distance() == Approx(5.f));
+    CHECK(manipulator.eye().x == Approx(0.f));
+  }
 }
 
 TEST_CASE("Isolated viewport camera remains usable and recoverable",
