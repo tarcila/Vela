@@ -21,8 +21,11 @@ bool validDuration(double seconds)
 
 } // namespace
 
-Integration::Integration(std::size_t queueCapacity)
-    : m_queueCapacity(queueCapacity ? queueCapacity : DEFAULT_QUEUE_CAPACITY)
+Integration::Integration(
+    std::size_t queueCapacity, std::uint64_t imageWriteCeiling)
+    : m_imageWrites(
+          std::make_shared<scene::ArrayWriteSequence>(imageWriteCeiling)),
+      m_queueCapacity(queueCapacity ? queueCapacity : DEFAULT_QUEUE_CAPACITY)
 {}
 
 Integration::~Integration() = default;
@@ -80,6 +83,29 @@ bool Integration::nodeEditsExposed(SceneId id) const
   return m_active && id < m_scenes.size() && m_scenes[id].registration.nodeEdits
       && m_scenes[id].registration.grants.read
       && m_scenes[id].registration.grants.edit;
+}
+
+bool Integration::imageTrackingAvailable(SceneId id) const
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  return m_active && id < m_scenes.size()
+      && m_scenes[id].registration.serializedArrayWrites
+      && m_scenes[id].imageExchangeAvailable && m_imageWrites->isEnabled();
+}
+
+bool Integration::setImageExchangeAvailable(SceneId id, bool available)
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  if (id >= m_scenes.size() || !m_imageWrites->isOwningThread())
+    return false;
+  m_scenes[id].imageExchangeAvailable = available;
+  return true;
+}
+
+std::shared_ptr<scene::ArrayWriteSequence> Integration::imageWriteSequence()
+    const
+{
+  return m_imageWrites;
 }
 
 ViewGrants Integration::viewGrants(ViewId id) const
@@ -262,6 +288,9 @@ std::optional<SceneId> Integration::registerScene(
   std::lock_guard<std::mutex> lock(m_mutex);
   if (m_active || registration.scene == nullptr)
     return {};
+  if (registration.serializedArrayWrites
+      && !registration.scene->trackImageWrites(m_imageWrites))
+    return {};
   m_scenes.push_back({std::move(registration)});
   return SceneId(m_scenes.size() - 1);
 }
@@ -369,6 +398,12 @@ std::size_t Integration::service()
   std::deque<PendingWork> batch;
   {
     std::lock_guard<std::mutex> lock(m_mutex);
+    // A qualified host has one owner for ordinary writers and transactions.
+    if (!m_imageWrites->isOwningThread()) {
+      for (const auto &entry : m_scenes)
+        if (entry.registration.serializedArrayWrites)
+          return 0;
+    }
     // Exclusive and non-blocking: a nested or concurrent call runs nothing.
     if (m_servicingThread != std::thread::id())
       return 0;
@@ -403,6 +438,12 @@ std::size_t Integration::service()
 
 void Integration::runServiceLoop()
 {
+  if (!m_imageWrites->isOwningThread()) {
+    for (const auto &entry : m_scenes)
+      if (entry.registration.serializedArrayWrites)
+        throw std::runtime_error(
+            "Integration service loop - wrong Image owner");
+  }
   for (;;) {
     {
       std::unique_lock<std::mutex> lock(m_mutex);

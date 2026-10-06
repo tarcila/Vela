@@ -147,6 +147,11 @@ struct Scene
 
   const ObjectDatabase &objectDB() const;
 
+  // Owning thread only. Automatically enrolls current/future eligible Images;
+  // cannot replace an existing launch clock or enroll an outstanding mapping.
+  bool trackImageWrites(const std::shared_ptr<ArrayWriteSequence> &sequence);
+  std::shared_ptr<ArrayWriteSequence> imageWriteSequence() const;
+
   // O(1) dependency observation, separate from UpdateDelegate delivery.
   std::uint64_t dependencyRevision() const;
 
@@ -262,6 +267,7 @@ struct Scene
 
   std::shared_ptr<detail::SceneDependencyState> m_dependencyState;
   ObjectDatabase m_db;
+  std::shared_ptr<ArrayWriteSequence> m_imageWrites;
 
   struct DefaultObjects
   {

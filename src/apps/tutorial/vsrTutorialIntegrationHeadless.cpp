@@ -335,6 +335,7 @@ int main(int argc, const char *argv[])
   options.grants.read = true;
   options.grants.edit = true;
   options.grants.resynchronize = true;
+  options.serializedArrayWrites = true;
   auto *view = &host->view;
   options.normalSyncHook = [view](vi::SceneId) { return view->synchronize(); };
   options.recoveryCallback = [view](vi::SceneId) { return view->recover(); };

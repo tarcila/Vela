@@ -9,18 +9,57 @@
 #include <cstddef>
 #include <cstdio>
 #include <memory>
+#include <optional>
+#include <stdexcept>
+#include <thread>
 
 namespace vsr::scene {
 
+struct Array;
+
+/* Non-owning, relocation-safe identity. Retirement clears the pointer even
+ * when a caller temporarily holds a locked weak reference. */
+struct ArrayLifetime
+{
+  Array *array{nullptr};
+};
+
+/* Owning-thread write admission clock shared by every tracked Image in one
+ * host launch. A smaller ceiling tests exhaustion, never wraps the clock.
+ * Reservations are burned; publication belongs to Array. */
+class ArrayWriteSequence
+{
+ public:
+  explicit ArrayWriteSequence(std::uint64_t ceiling = UINT64_MAX);
+  std::optional<std::uint64_t> reserve();
+  bool isOwningThread() const;
+  bool isEnabled() const;
+  void stopWrites();
+
+ private:
+  std::thread::id m_owner;
+  std::uint64_t m_ceiling;
+  std::uint64_t m_last{0};
+  bool m_enabled{true};
+};
+
 /*
  * Fixed-size typed data buffer that wraps host memory, CUDA device memory, or
- * a proxy placeholder; maps to an ANARI array object and supports 1-3 dimensions.
+ * a proxy placeholder; maps to an ANARI array object and supports 1-3
+ * dimensions.
  *
  * Example:
  *   auto arr = scene.createArray(ANARI_FLOAT32_VEC3, 1024);
  *   auto *ptr = arr->mapAs<float3>();
  *   // fill ptr[0..1023] ...
  *   arr->unmap();
+ *
+ * Mutations, maps, unmaps and deletion belong to the Scene's owning thread,
+ * serialized with integration safe-point transactions. Nested maps and an
+ * unmap without a successful map are API misuse. Retaining a map across a
+ * safe point is permitted; that transaction must observe isMapped() and must
+ * never unmap another writer's map. data() is read-only: raw-pointer writes
+ * outside map/unmap and arbitrary worker-thread writes are unsupported.
  */
 struct Array : public Object
 {
@@ -57,6 +96,11 @@ struct Array : public Object
   bool isHost() const;
   bool isCUDA() const;
   bool isProxy() const;
+  bool isMapped() const;
+  bool isImage() const;
+  std::weak_ptr<ArrayLifetime> lifetime() const;
+  std::optional<std::uint64_t> dataWriteSequence() const;
+  bool trackImageWrites(const std::shared_ptr<ArrayWriteSequence> &sequence);
 
   void convertProxyToHost();
 
@@ -102,7 +146,11 @@ struct Array : public Object
   size_t m_dim0{0};
   size_t m_dim1{0};
   size_t m_dim2{0};
-  mutable bool m_mapped{false};
+  bool m_mapped{false};
+  std::shared_ptr<ArrayLifetime> m_lifetime;
+  std::shared_ptr<ArrayWriteSequence> m_writeSequence;
+  std::uint64_t m_completedWrite{0};
+  std::uint64_t m_reservedWrite{0};
 };
 
 using ArrayRef = ObjectPoolRef<Array>;
@@ -126,7 +174,12 @@ inline const T *Array::dataAs() const
 template <typename T>
 inline void Array::setData(const T *data, size_t size, size_t startOffset)
 {
+  if (startOffset > this->size() || size > this->size() - startOffset
+      || (size && !data))
+    throw std::runtime_error("Array::setData() - invalid range");
   auto *d = mapAs<T>();
+  if (!d)
+    return;
   std::memcpy(d + startOffset, data, size * sizeof(T));
   unmap();
 }

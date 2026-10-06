@@ -54,6 +54,8 @@ struct ImageSource
 struct Image
 {
   vsr::scene::ArrayRef texels;
+  // Weak identity neither pins deletion nor aliases a reused pool index.
+  std::weak_ptr<vsr::scene::ArrayLifetime> lifetime;
   // The picture's dimensions. Kept here rather than read back off the Array,
   // whose shape does not carry them for block-compressed texels: those are
   // the authored block stream rather than a texel grid.
@@ -70,6 +72,7 @@ struct Image
   bool vFlipInSampler{false};
 
   bool blockCompressed() const;
+  vsr::scene::ArrayRef liveTexels() const;
 
   explicit operator bool() const;
 };
@@ -184,9 +187,19 @@ inline bool Image::blockCompressed() const
   return !compressedFormat.empty();
 }
 
+inline vsr::scene::ArrayRef Image::liveTexels() const
+{
+  const auto live = lifetime.lock();
+  auto *array = live ? live->array : nullptr;
+  if (!array || !array->scene())
+    return {};
+  auto ref = array->scene()->getObject<vsr::scene::Array>(array->index());
+  return ref && ref.data() == array ? ref : vsr::scene::ArrayRef{};
+}
+
 inline Image::operator bool() const
 {
-  return texels.valid();
+  return bool(liveTexels());
 }
 
 } // namespace vsr::io

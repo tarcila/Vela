@@ -199,6 +199,22 @@ occupied. This test deliberately does not claim qualified presented-frame
 acceptance. The normal integration suite supplies the loopback permission,
 receipt, replay and failure contracts.
 
+### Inspecting Images
+
+Array items retain format summaries and add actual `mapped` state plus
+`image_info`. Available `image_info` carries an opaque equality-only
+`data_version`, dimensions, ANARI element type, channel count, Color Space and
+`row_order: top_down`. Unsupported/unavailable states carry a reason and omit
+those payload fields. Availability is not write permission, and a mapped Image
+can still be supported. Ordinary host writes advance the completed token;
+inspection and read-only access do not. Sampler image references remain Array
+handles with summaries.
+
+PNG Image Export/Import is not implemented in this tracking slice. Discovery
+reports that truthfully; do not infer file-exchange tools from Array support.
+See [Image tracking](image-data-tracking.md) for host prerequisites and cache
+lifetime semantics.
+
 ### Editing a placement's world position
 
 For complete local/world examples, filters and bounded cursor flow, node versus

@@ -584,6 +584,9 @@ void Scene::removeObject(const Object *_o)
 {
   if (!_o)
     return;
+  if (anari::isArray(_o->type()) && m_imageWrites
+      && !m_imageWrites->isOwningThread())
+    throw std::runtime_error("Scene::removeObject() - wrong Array thread");
 
   auto &o = *_o;
 
@@ -639,6 +642,8 @@ void Scene::removeObject(const Object *_o)
 
 void Scene::removeAllObjects()
 {
+  if (m_imageWrites && !m_imageWrites->isOwningThread())
+    throw std::runtime_error("Scene::removeAllObjects() - wrong Array thread");
   m_updateDelegate.signalRemoveAllObjects();
 
   m_defaultObjects.material.reset();
@@ -1052,6 +1057,8 @@ void Scene::removeDefragCallback(size_t token)
 
 void Scene::defragmentObjectStorage()
 {
+  if (m_imageWrites && !m_imageWrites->isOwningThread())
+    throw std::runtime_error("Scene::defragmentObjectStorage() - wrong thread");
   FlatMap<anari::DataType, std::vector<core::ObjectPoolRemapping>> defrags;
 
   // Defragment object storage and stash whether something happened //
@@ -1131,13 +1138,43 @@ void Scene::cleanupScene()
   defragmentObjectStorage();
 }
 
+bool Scene::trackImageWrites(
+    const std::shared_ptr<ArrayWriteSequence> &sequence)
+{
+  if (!sequence || !sequence->isOwningThread()
+      || (m_imageWrites && m_imageWrites != sequence))
+    return false;
+  bool ready = true;
+  foreach_item_const(m_db.array, [&](const Array *array) {
+    if (array && array->isImage() && array->isMapped())
+      ready = false;
+  });
+  if (!ready)
+    return false;
+  m_imageWrites = sequence;
+  foreach_item(m_db.array, [&](Array *array) {
+    if (array && !array->trackImageWrites(sequence))
+      ready = false;
+  });
+  if (!ready)
+    sequence->stopWrites();
+  return ready;
+}
+
+std::shared_ptr<ArrayWriteSequence> Scene::imageWriteSequence() const
+{
+  return m_imageWrites;
+}
+
 ArrayRef Scene::createArrayImpl(anari::DataType type,
     size_t items0,
     size_t items1,
     size_t items2,
     Array::MemoryKind kind)
 {
-  if (items0 + items1 + items2 == 0) {
+  if (m_imageWrites && !m_imageWrites->isOwningThread())
+    throw std::runtime_error("Scene::createArray() - wrong owning thread");
+  if (items0 == 0 && items1 == 0 && items2 == 0) {
     vsr::core::logWarning("Not creating an array with zero elements");
     return {};
   }
@@ -1155,6 +1192,8 @@ ArrayRef Scene::createArrayImpl(anari::DataType type,
   retval->m_index = retval.index();
 
   retval->setUpdateDelegate(&m_updateDelegate);
+  if (m_imageWrites && !retval->trackImageWrites(m_imageWrites))
+    m_imageWrites->stopWrites();
   m_updateDelegate.signalObjectAdded(retval.data());
 
   return retval;

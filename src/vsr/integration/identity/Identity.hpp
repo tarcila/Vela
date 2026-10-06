@@ -258,6 +258,10 @@ class SceneIdentity
   // that object happened since the token was issued.
   bool isCurrent(const ParameterVersionToken &t) const;
 
+  // Completed texel-write token, separate from parameter versions. Unknown,
+  // retired/reused Arrays and unenrolled identities have no token.
+  std::optional<std::string> imageDataVersion(const ObjectHandle &h) const;
+
   // Revisions //
 
   SceneRevision sceneRevision() const;
@@ -296,6 +300,8 @@ class SceneIdentity
     Key key;
     std::uint64_t parameterVersion{1};
     std::size_t metadataFingerprint{0};
+    std::weak_ptr<scene::ArrayLifetime> arrayLifetime;
+    bool array{false};
   };
 
   struct LayerEntry
@@ -431,6 +437,8 @@ inline std::uint64_t IdentityAuthority::nextDomain(HandleKind kind)
 
 inline std::uint64_t IdentityAuthority::nextSerial()
 {
+  if (!m_nextSerial)
+    std::terminate();
   return m_nextSerial++;
 }
 
@@ -706,7 +714,8 @@ inline ObjectHandle SceneIdentity::handleOf(const scene::Object *o) const
   auto it = m_serialOf.find(Key{normalize(o->type()), o->index()});
   if (it == m_serialOf.end())
     return {};
-  return ObjectHandle{m_authority->launch(), m_domain, it->second};
+  const ObjectHandle handle{m_authority->launch(), m_domain, it->second};
+  return resolve(handle) == o ? handle : ObjectHandle{};
 }
 
 inline scene::Object *SceneIdentity::resolve(const ObjectHandle &h) const
@@ -720,6 +729,11 @@ inline scene::Object *SceneIdentity::resolve(const ObjectHandle &h) const
   // Defensive: never hand back an object that does not own this slot.
   if (!o || normalize(o->type()) != it->second.key.type)
     return nullptr;
+  if (it->second.array) {
+    const auto lifetime = it->second.arrayLifetime.lock();
+    if (!lifetime || lifetime->array != o)
+      return nullptr;
+  }
   return o;
 }
 
@@ -729,6 +743,19 @@ inline std::optional<ParameterVersionToken> SceneIdentity::parameterVersion(
   if (!resolve(h))
     return std::nullopt;
   return ParameterVersionToken{h, m_entries.at(h.serial).parameterVersion};
+}
+
+inline std::optional<std::string> SceneIdentity::imageDataVersion(
+    const ObjectHandle &h) const
+{
+  const auto *array = dynamic_cast<const scene::Array *>(resolve(h));
+  const auto sequence =
+      array ? array->dataWriteSequence() : std::optional<std::uint64_t>{};
+  if (!sequence || !array->isImage())
+    return {};
+  return "image:" + std::to_string(h.launch.activation) + "."
+      + std::to_string(h.launch.nonce) + "." + std::to_string(h.domain) + "."
+      + std::to_string(h.serial) + "." + std::to_string(*sequence);
 }
 
 inline bool SceneIdentity::isCurrent(const ParameterVersionToken &t) const
@@ -841,7 +868,12 @@ inline void SceneIdentity::track(const scene::Object *o)
     m_entries.erase(it->second);
   const auto serial = m_authority->nextSerial();
   m_serialOf[key] = serial;
-  m_entries[serial] = Entry{key, 1, fingerprint(*o)};
+  Entry entry{key, 1, fingerprint(*o), {}, false};
+  if (const auto *array = dynamic_cast<const scene::Array *>(o)) {
+    entry.array = true;
+    entry.arrayLifetime = array->lifetime();
+  }
+  m_entries[serial] = std::move(entry);
   if (!isViewObject(key.type))
     advanceRevision(m_sceneRevision);
   inspectionChanged();

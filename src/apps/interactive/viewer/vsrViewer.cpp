@@ -1032,6 +1032,7 @@ void Application::setupIntegration()
         return false;
       };
   options.grants.resynchronize = true;
+  options.serializedArrayWrites = true;
   auto *view = m_agentView.get();
   options.normalSyncHook = [view](vi::SceneId) { return view->synchronize(); };
   options.recoveryCallback = [view](vi::SceneId) { return view->recover(); };

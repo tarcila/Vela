@@ -22,6 +22,7 @@
 #include "vsr/integration/mcp/tools/QueryTools.hpp"
 #include "vsr/integration/mcp/tools/RenderTools.hpp"
 #include "vsr/integration/render/ControllerCamera.hpp"
+#include "vsr/io/images/ImageCache.hpp"
 #include "vsr/rendering/index/RenderIndexAllLayers.hpp"
 #include "vsr/rendering/pipeline/ImagePipeline.h"
 #include "vsr/scene/Scene.hpp"
@@ -40,6 +41,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 // posix
@@ -181,6 +183,26 @@ bool confirmReady(SceneId)
   return true;
 }
 
+struct WriteFaultObserver : vsr::scene::EmptyUpdateDelegate
+{
+  void signalArrayMapped(const vsr::scene::Array *) override;
+  void signalArrayUnmapped(const vsr::scene::Array *) override;
+  bool failMap{true};
+  bool failUnmap{false};
+};
+
+void WriteFaultObserver::signalArrayMapped(const vsr::scene::Array *)
+{
+  if (failMap)
+    throw std::runtime_error("downstream map failure");
+}
+
+void WriteFaultObserver::signalArrayUnmapped(const vsr::scene::Array *)
+{
+  if (failUnmap)
+    throw std::runtime_error("downstream unmap failure");
+}
+
 struct Session
 {
   std::string id;
@@ -226,7 +248,10 @@ struct Fixture
       bool editable = false,
       bool nodeEdits = false,
       bool preview = false,
-      double previewLifetime = 120.)
+      double previewLifetime = 120.,
+      bool imageWrites = false,
+      std::uint64_t writeLimit = UINT64_MAX)
+      : integration(DEFAULT_QUEUE_CAPACITY, writeLimit)
   {
     for (int i = 0; i < 5; i++)
       scene.createObject<vsr::scene::Material>("matte")->setParameter(
@@ -236,6 +261,7 @@ struct Fixture
     s.scene = &scene;
     s.grants.read = true;
     s.nodeEdits = nodeEdits;
+    s.serializedArrayWrites = imageWrites;
     if (editable) {
       s.grants.edit = true;
       s.normalSyncHook = [this](SceneId) { return hookOk; };
@@ -281,6 +307,18 @@ struct Fixture
         mcp::McpServer::start(cfg, *authority, *engine, dir, server);
     if (!st.ok())
       FAIL("start failed: " << st.reason);
+  }
+
+  Reply inspectArray(const Session &s,
+      std::uint64_t id,
+      const std::string &name = "tracked-image")
+  {
+    tool(s,
+        "vsr_inspect",
+        "{\"request_id\":" + std::to_string(id) + ",\"scene_id\":"
+            + std::to_string(sceneId) + ",\"name\":\"" + name + "\"}");
+    drain();
+    return status(s, s.id, id);
   }
 
   Reply rpc(const std::string &method,
@@ -756,6 +794,379 @@ SCENARIO("MCP client sees omission and inheritance guidance",
       CHECK(description.find(text) != std::string::npos);
   }
   CHECK(found);
+}
+
+SCENARIO("MCP Array inspection reports actual mappings without pixel writes",
+    "[integration][mcp][image-tracking]")
+{
+  Fixture f;
+  auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 1, 1);
+  image->setName("tracked-image");
+  const unsigned char texel[] = {17, 29, 41, 0};
+  image->setData(static_cast<const void *>(texel));
+  auto s = f.attach();
+  auto before = f.inspectArray(s, 1);
+  REQUIRE(before.str("outcome") == "ok");
+  const auto &item = before.result()->get("items")->a.at(0);
+  REQUIRE(item.get("mapped"));
+  CHECK_FALSE(item.get("mapped")->b);
+  REQUIRE(item.get("image_info"));
+  CHECK(item.get("image_info")->get("state")->s == "unavailable");
+  CHECK_FALSE(item.get("image_info")->get("data_version"));
+  image->map();
+  auto mapped = f.inspectArray(s, 2);
+  CHECK(mapped.result()->get("items")->a.at(0).get("mapped")->b);
+  CHECK_THROWS(image->map());
+  CHECK(static_cast<const unsigned char *>(image->data())[0] == 17);
+  image->unmap();
+  CHECK_THROWS(image->unmap());
+}
+
+SCENARIO("MCP automatically tracks completed ordinary Image writes launch-wide",
+    "[integration][mcp][image-tracking]")
+{
+  Fixture f({}, true, false, false, 120., true, 4);
+  auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 1, 1);
+  image->setName("tracked-image");
+  const unsigned char original[] = {17, 29, 41, 0};
+  image->setData(static_cast<const void *>(original));
+  auto second = f.scene.createArray(ANARI_UFIXED8_R_SRGB, 1, 1);
+  second->setName("second-image");
+  auto s = f.attach();
+  auto before = f.inspectArray(s, 1);
+  const auto &info = *before.result()->get("items")->a.at(0).get("image_info");
+  REQUIRE(info.get("state")->s == "available");
+  const auto initial = info.get("data_version")->s;
+  CHECK(info.get("dimensions")->a.size() == 2);
+  CHECK(info.get("dimensions")->a[0].n == 1);
+  CHECK(info.get("dimensions")->a[1].n == 1);
+  CHECK(info.get("element_type")->s == "ANARI_UFIXED8_VEC4");
+  CHECK(info.get("channel_count")->n == 4);
+  CHECK(info.get("color_space")->s == "linear");
+  CHECK(info.get("row_order")->s == "top_down");
+  auto *mapped = static_cast<unsigned char *>(image->map());
+  mapped[0] = 99;
+  auto outstanding = f.inspectArray(s, 2);
+  const auto &mappedItem = outstanding.result()->get("items")->a.at(0);
+  CHECK(mappedItem.get("mapped")->b);
+  CHECK(mappedItem.get("image_info")->get("data_version")->s == initial);
+  auto *other = static_cast<unsigned char *>(second->map());
+  *other = 77;
+  second->unmap();
+  auto completedOther = f.inspectArray(s, 3, "second-image");
+  CHECK(completedOther.result()
+            ->get("items")
+            ->a.at(0)
+            .get("image_info")
+            ->get("color_space")
+            ->s
+      == "srgb");
+  image->unmap();
+  auto completed = f.inspectArray(s, 4);
+  auto next = completed.result()
+                  ->get("items")
+                  ->a.at(0)
+                  .get("image_info")
+                  ->get("data_version")
+                  ->s;
+  CHECK(next != initial);
+  CHECK(static_cast<const unsigned char *>(image->data())[0] == 99);
+  image->setData(static_cast<const void *>(original));
+  auto changedBack = f.inspectArray(s, 5);
+  auto last = changedBack.result()
+                  ->get("items")
+                  ->a.at(0)
+                  .get("image_info")
+                  ->get("data_version")
+                  ->s;
+  CHECK(last != initial);
+  CHECK(last != next);
+  CHECK_THROWS(image->map());
+  CHECK_THROWS(second->map());
+  CHECK_THROWS(image->setData(static_cast<const void *>(original)));
+  vsr::scene::Array replacement(ANARI_UFIXED8_VEC4, 1, 1);
+  CHECK_THROWS(*image = std::move(replacement));
+  auto exhausted = f.inspectArray(s, 6);
+  const auto &exhaustedItem = exhausted.result()->get("items")->a.at(0);
+  CHECK_FALSE(exhaustedItem.get("mapped")->b);
+  CHECK(exhaustedItem.get("image_info")->get("data_version")->s == last);
+  CHECK(static_cast<const unsigned char *>(image->data())[0] == 17);
+  f.scene.getObject<vsr::scene::Material>(0)->setName("unrelated");
+  auto material = f.inspectArray(s, 7, "unrelated");
+  const auto &materialItem = material.result()->get("items")->a.at(0);
+  const auto target = "\"handle\":\"" + materialItem.get("handle")->s
+      + "\",\"version\":"
+      + std::to_string(std::uint64_t(materialItem.get("version")->n));
+  f.editOpacity(s, 8, target, .5);
+  f.drain();
+  CHECK(f.status(s, s.id, 8).flag("committed"));
+  REQUIRE(f.rpc("vsr/detach", "{}", &s).status == 200);
+  auto reconnected = f.attach();
+  auto retained = f.inspectArray(reconnected, 1);
+  CHECK(retained.result()
+            ->get("items")
+            ->a.at(0)
+            .get("image_info")
+            ->get("data_version")
+            ->s
+      == last);
+}
+
+SCENARIO("MCP Images retain cache sharing but retire deleted Array identities",
+    "[integration][mcp][image-tracking]")
+{
+  Fixture f({}, true, false, false, 120., true);
+  auto gap = f.scene.createArray(ANARI_FLOAT32, 1);
+  vsr::io::ImageCache cache(&f.scene);
+  const vsr::io::ImageSource source{
+      "embedded:tracked", vsr::io::ColorSpace::LINEAR};
+  const unsigned char original[] = {17, 29, 41, 0};
+  auto image = cache.acquireDecoded(
+      source, ANARI_UFIXED8_VEC4, 1, 1, vsr::io::RowOrder::TOP_DOWN, original);
+  image.texels->setName("tracked-image");
+  auto sampler = vsr::io::makeImageSampler(cache, image, "first");
+  auto s = f.attach();
+  auto before = f.inspectArray(s, 1);
+  const auto oldHandle =
+      before.result()->get("items")->a.at(0).get("handle")->s;
+  const auto oldVersion = before.result()
+                              ->get("items")
+                              ->a.at(0)
+                              .get("image_info")
+                              ->get("data_version")
+                              ->s;
+  const unsigned char changed[] = {91, 73, 55, 0};
+  image.texels->setData(static_cast<const void *>(changed));
+  auto same = cache.acquireDecoded(
+      source, ANARI_UFIXED8_VEC4, 1, 1, vsr::io::RowOrder::TOP_DOWN, original);
+  CHECK(same.texels == image.texels);
+  CHECK(static_cast<const unsigned char *>(same.texels->data())[0] == 91);
+  f.scene.removeObject(sampler.data());
+  auto rebound = vsr::io::makeImageSampler(cache, cache.find(source), "second");
+  CHECK(rebound->parameterValueAsObject<vsr::scene::Array>("image")
+      == image.texels.data());
+  f.scene.removeObject(rebound.data());
+  auto written = f.inspectArray(s, 2);
+  const auto writtenVersion = written.result()
+                                  ->get("items")
+                                  ->a.at(0)
+                                  .get("image_info")
+                                  ->get("data_version")
+                                  ->s;
+  f.scene.removeObject(gap.data());
+  f.scene.defragmentObjectStorage();
+  image = cache.find(source);
+  REQUIRE(image);
+  CHECK(image.texels.index() == 0);
+  CHECK(static_cast<const unsigned char *>(image.texels->data())[0] == 91);
+  auto relocated = f.inspectArray(s, 3);
+  const auto &relocatedItem = relocated.result()->get("items")->a.at(0);
+  CHECK(relocatedItem.get("handle")->s == oldHandle);
+  CHECK(relocatedItem.get("image_info")->get("data_version")->s
+      == writtenVersion);
+  const auto index = image.texels.index();
+  f.scene.removeObject(image.texels.data());
+  auto replacement = f.scene.createArray(ANARI_UFIXED8_VEC4, 1, 1);
+  REQUIRE(replacement.index() == index);
+  replacement->setName("tracked-image");
+  replacement->setData(static_cast<const void *>(original));
+  CHECK_FALSE(cache.find(source));
+  CHECK_FALSE(vsr::io::makeImageSampler(cache, image, "stale"));
+  auto after = f.inspectArray(s, 4);
+  const auto &item = after.result()->get("items")->a.at(0);
+  CHECK(item.get("handle")->s != oldHandle);
+  CHECK(item.get("image_info")->get("data_version")->s != oldVersion);
+  auto decodedAgain = cache.acquireDecoded(
+      source, ANARI_UFIXED8_VEC4, 1, 1, vsr::io::RowOrder::TOP_DOWN, original);
+  CHECK(decodedAgain.texels != replacement);
+  cache.clear();
+  CHECK_FALSE(cache.find(source));
+  CHECK(
+      static_cast<const unsigned char *>(decodedAgain.texels->data())[0] == 17);
+}
+
+SCENARIO("Image-qualified hosts refuse safe points on another thread",
+    "[integration][mcp][image-tracking]")
+{
+  Fixture f({}, true, false, false, 120., true);
+  auto image = f.scene.createArray(ANARI_UFIXED8, 1, 1);
+  image->setName("tracked-image");
+  const unsigned char original = 31;
+  image->setData(static_cast<const void *>(&original));
+  auto s = f.attach();
+  f.tool(s, "vsr_inspect", "{\"request_id\":1,\"scene_id\":0}");
+  std::size_t serviced = 99;
+  bool refusedWrite = false;
+  std::thread worker([&] {
+    serviced = f.integration.service();
+    try {
+      image->setData(static_cast<const void *>(&original));
+    } catch (const std::runtime_error &) {
+      refusedWrite = true;
+    }
+  });
+  worker.join();
+  CHECK(serviced == 0);
+  CHECK(refusedWrite);
+  f.drain();
+  CHECK(f.status(s, s.id, 1).str("outcome") == "ok");
+  CHECK(static_cast<const unsigned char *>(image->data())[0] == 31);
+}
+
+SCENARIO("MCP Image support fields distinguish formats and host availability",
+    "[integration][mcp][image-tracking]")
+{
+  Fixture f({}, true, false, false, 120., true);
+  auto s = f.attach();
+  std::uint64_t request = 1;
+  for (const auto type : {ANARI_FIXED8,
+           ANARI_FIXED8_VEC2,
+           ANARI_FIXED8_VEC3,
+           ANARI_FIXED8_VEC4,
+           ANARI_UFIXED8,
+           ANARI_UFIXED8_VEC2,
+           ANARI_UFIXED8_VEC3,
+           ANARI_UFIXED8_VEC4,
+           ANARI_UFIXED8_R_SRGB,
+           ANARI_UFIXED8_RA_SRGB,
+           ANARI_UFIXED8_RGB_SRGB,
+           ANARI_UFIXED8_RGBA_SRGB}) {
+    auto image = f.scene.createArray(type, 1, 1);
+    image->setName("tracked-image");
+    auto reply = f.inspectArray(s, request++);
+    const auto &item = reply.result()->get("items")->a.at(0);
+    CHECK(item.get("mapped")->type == json::Value::Type::BOOL);
+    const auto &info = *item.get("image_info");
+    CHECK(info.get("state")->s == "available");
+    CHECK(info.get("channel_count")->n == anari::sizeOf(type));
+    CHECK(info.get("element_type")->s == anari::toString(type));
+    CHECK(info.get("row_order")->s == "top_down");
+    f.scene.removeObject(image.data());
+  }
+  for (const auto type : {ANARI_UINT8,
+           ANARI_FLOAT32,
+           ANARI_ARRAY,
+           ANARI_UFIXED16,
+           ANARI_UNKNOWN}) {
+    auto array = f.scene.createArray(type, 1, 1);
+    array->setName("tracked-image");
+    auto reply = f.inspectArray(s, request++);
+    const auto &item = reply.result()->get("items")->a.at(0);
+    const auto &info = *item.get("image_info");
+    CHECK_FALSE(item.get("mapped")->b);
+    CHECK(info.get("state")->s == "unsupported");
+    CHECK(info.get("reason")->s == "unsupported_image");
+    CHECK(info.o.size() == 2);
+    f.scene.removeObject(array.data());
+  }
+  for (const auto shape : {std::array<std::size_t, 2>{0, 1}, {1, 0}}) {
+    auto array = f.scene.createArray(ANARI_UFIXED8, shape[0], shape[1]);
+    array->setName("tracked-image");
+    auto reply = f.inspectArray(s, request++);
+    CHECK(
+        reply.result()->get("items")->a.at(0).get("image_info")->get("state")->s
+        == "unsupported");
+    f.scene.removeObject(array.data());
+  }
+  auto proxy = f.scene.createArrayProxy(ANARI_UFIXED8_VEC4, 1, 1);
+  proxy->setName("tracked-image");
+  auto unavailableProxy = f.inspectArray(s, request++);
+  CHECK(unavailableProxy.result()
+            ->get("items")
+            ->a.at(0)
+            .get("image_info")
+            ->get("state")
+            ->s
+      == "unsupported");
+  f.scene.removeObject(proxy.data());
+  auto image = f.scene.createArray(ANARI_UFIXED8, 1, 1);
+  image->setName("tracked-image");
+  const unsigned char original = 31;
+  image->setData(static_cast<const void *>(&original));
+  auto before = f.inspectArray(s, request++);
+  const auto initial = before.result()
+                           ->get("items")
+                           ->a.at(0)
+                           .get("image_info")
+                           ->get("data_version")
+                           ->s;
+  REQUIRE(f.integration.setImageExchangeAvailable(f.sceneId, false));
+  auto unavailable = f.inspectArray(s, request++);
+  const auto &info =
+      *unavailable.result()->get("items")->a.at(0).get("image_info");
+  CHECK(info.get("state")->s == "unavailable");
+  CHECK(info.o.size() == 2);
+  image->setData(static_cast<const void *>(&original));
+  REQUIRE(f.rpc("vsr/detach", "{}", &s).status == 200);
+  image->setData(static_cast<const void *>(&original));
+  auto reconnected = f.attach();
+  REQUIRE(f.integration.setImageExchangeAvailable(f.sceneId, true));
+  auto after = f.inspectArray(reconnected, 1);
+  const auto completed = after.result()
+                             ->get("items")
+                             ->a.at(0)
+                             .get("image_info")
+                             ->get("data_version")
+                             ->s;
+  CHECK(completed != initial);
+  auto readOnly = f.inspectArray(reconnected, 2);
+  CHECK(readOnly.result()
+            ->get("items")
+            ->a.at(0)
+            .get("image_info")
+            ->get("data_version")
+            ->s
+      == completed);
+  f.integration.imageWriteSequence()->stopWrites();
+  CHECK_THROWS(image->map());
+  auto stopped = f.inspectArray(reconnected, 3);
+  CHECK(
+      stopped.result()->get("items")->a.at(0).get("image_info")->get("state")->s
+      == "unavailable");
+  CHECK(static_cast<const unsigned char *>(image->data())[0] == 31);
+  const auto listed = f.rpc("tools/list", "{}", &reconnected);
+  for (const auto &tool : listed.json.get("result")->get("tools")->a) {
+    CHECK(tool.get("name")->s != "vsr_image_export");
+    CHECK(tool.get("name")->s != "vsr_image_import");
+  }
+}
+
+SCENARIO("MCP Image reservations burn failures and publish completed writes",
+    "[integration][mcp][image-tracking]")
+{
+  Fixture f({}, true, false, false, 120., true, 2);
+  auto image = f.scene.createArray(ANARI_UFIXED8, 1, 1);
+  image->setName("tracked-image");
+  auto s = f.attach();
+  auto before = f.inspectArray(s, 1);
+  const auto initial = before.result()
+                           ->get("items")
+                           ->a.at(0)
+                           .get("image_info")
+                           ->get("data_version")
+                           ->s;
+  auto *fault = f.scene.updateDelegate().emplace<WriteFaultObserver>();
+  CHECK_THROWS(image->map());
+  auto failed = f.inspectArray(s, 2);
+  const auto &failedItem = failed.result()->get("items")->a.at(0);
+  CHECK_FALSE(failedItem.get("mapped")->b);
+  CHECK(failedItem.get("image_info")->get("data_version")->s == initial);
+  fault->failMap = false;
+  auto *bytes = static_cast<unsigned char *>(image->map());
+  *bytes = 61;
+  const unsigned char candidate = 99;
+  CHECK_THROWS(image->setData(static_cast<const void *>(&candidate)));
+  CHECK(image->isMapped());
+  CHECK(*bytes == 61);
+  fault->failUnmap = true;
+  CHECK_THROWS(image->unmap());
+  auto completed = f.inspectArray(s, 3);
+  const auto &item = completed.result()->get("items")->a.at(0);
+  CHECK_FALSE(item.get("mapped")->b);
+  CHECK(item.get("image_info")->get("data_version")->s != initial);
+  CHECK(static_cast<const unsigned char *>(image->data())[0] == 61);
+  CHECK_THROWS(image->map());
+  f.scene.updateDelegate().erase(fault);
 }
 
 SCENARIO("MCP inspection diagnostics preserve pre-admission identity",

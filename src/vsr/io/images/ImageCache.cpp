@@ -129,7 +129,11 @@ Image ImageCache::acquireDecoded(const ImageSource &source,
 Image ImageCache::find(const ImageSource &source) const
 {
   auto found = m_images.find(keyOf(source));
-  return found == m_images.end() ? Image{} : found->second;
+  if (found == m_images.end())
+    return {};
+  auto image = found->second;
+  image.texels = image.liveTexels();
+  return image.texels && image.texels->scene() == m_scene ? image : Image{};
 }
 
 void ImageCache::clear()
@@ -167,6 +171,7 @@ Image ImageCache::store(
     image.texels->setData(decoded.texels.data());
   }
 
+  image.lifetime = image.texels->lifetime();
   m_images[keyOf(source)] = image;
   return image;
 }
@@ -213,14 +218,15 @@ SamplerRef makeImageSampler(ImageCache &cache,
     const SamplerSettings &settings)
 {
   auto *scene = cache.scene();
-  if (!image || !scene)
+  const auto texels = image.liveTexels();
+  if (!texels || !scene || texels->scene() != scene)
     return {};
 
   auto sampler = scene->createObject<Sampler>(image.blockCompressed()
           ? tokens::sampler::compressedImage2D
           : tokens::sampler::image2D);
 
-  sampler->setParameterObject("image", *image.texels);
+  sampler->setParameterObject("image", *texels);
   if (image.blockCompressed()) {
     sampler->setParameter("format", image.compressedFormat.c_str());
     // Passed untyped because no vector type in the tree maps onto

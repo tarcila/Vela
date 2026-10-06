@@ -11,6 +11,7 @@
 #include "vsr/scene/Scene.hpp"
 // std
 #include <atomic>
+#include <limits>
 #include <stdexcept>
 #if VSR_USE_CUDA
 // cuda
@@ -67,6 +68,34 @@ static void vsrDeleter(const void *_usrPtr, const void *_mem)
   }
 }
 
+ArrayWriteSequence::ArrayWriteSequence(std::uint64_t ceiling)
+    : m_owner(std::this_thread::get_id()), m_ceiling(ceiling)
+{}
+
+std::optional<std::uint64_t> ArrayWriteSequence::reserve()
+{
+  if (!isOwningThread() || !m_enabled || m_last == m_ceiling)
+    return {};
+  return ++m_last;
+}
+
+bool ArrayWriteSequence::isOwningThread() const
+{
+  return m_owner == std::this_thread::get_id();
+}
+
+bool ArrayWriteSequence::isEnabled() const
+{
+  return m_enabled;
+}
+
+void ArrayWriteSequence::stopWrites()
+{
+  if (!isOwningThread())
+    throw std::runtime_error("ArrayWriteSequence - wrong owning thread");
+  m_enabled = false;
+}
+
 // Array definitions //////////////////////////////////////////////////////////
 
 Array::Array(anari::DataType type, size_t items0, Array::MemoryKind kind)
@@ -88,6 +117,8 @@ Array::Array(anari::DataType type,
 
 Array::~Array()
 {
+  if (m_lifetime)
+    m_lifetime->array = nullptr;
   vsrDeleter(m_dataUsageDescriptor, m_data);
 }
 
@@ -143,6 +174,44 @@ bool Array::isProxy() const
   return kind() == MemoryKind::PROXY;
 }
 
+bool Array::isMapped() const
+{
+  return m_mapped;
+}
+
+bool Array::isImage() const
+{
+  const auto t = elementType();
+  const bool fixed = (t >= ANARI_FIXED8 && t <= ANARI_UFIXED8_VEC4)
+      || (t >= ANARI_UFIXED8_R_SRGB && t <= ANARI_UFIXED8_RGBA_SRGB);
+  return isHost() && type() == ANARI_ARRAY2D && dim(0) && dim(1) && fixed
+      && data();
+}
+
+std::weak_ptr<ArrayLifetime> Array::lifetime() const
+{
+  return m_lifetime;
+}
+
+std::optional<std::uint64_t> Array::dataWriteSequence() const
+{
+  return m_writeSequence ? std::optional<std::uint64_t>(m_completedWrite)
+                         : std::optional<std::uint64_t>{};
+}
+
+bool Array::trackImageWrites(
+    const std::shared_ptr<ArrayWriteSequence> &sequence)
+{
+  if (!isImage())
+    return true;
+  if (m_writeSequence == sequence)
+    return true;
+  if (!sequence || m_writeSequence || m_mapped || !sequence->isOwningThread())
+    return false;
+  m_writeSequence = sequence;
+  return true;
+}
+
 void Array::convertProxyToHost()
 {
   if (kind() != MemoryKind::PROXY) {
@@ -151,8 +220,18 @@ void Array::convertProxyToHost()
     return;
   }
 
+  if (scene() && scene()->imageWriteSequence()
+      && !scene()->imageWriteSequence()->isOwningThread())
+    throw std::runtime_error("Array::convertProxyToHost() - wrong thread");
+  auto descriptor = std::make_unique<ArrayUsageDescriptor>();
+  auto *data = std::malloc(size() * elementSize());
+  if (!data && size() && elementSize())
+    throw std::bad_alloc();
   m_kind = MemoryKind::HOST;
-  m_data = std::malloc(size() * elementSize());
+  m_data = data;
+  m_dataUsageDescriptor = descriptor.release();
+  if (scene() && scene()->imageWriteSequence())
+    trackImageWrites(scene()->imageWriteSequence());
 }
 
 void *Array::map()
@@ -162,9 +241,19 @@ void *Array::map()
     return nullptr;
   }
 
-  m_mapped = true;
+  if (m_mapped)
+    throw std::runtime_error("Array::map() - nested mapping is unsupported");
+  if (!m_data)
+    return nullptr;
+  if (m_writeSequence) {
+    const auto reserved = m_writeSequence->reserve();
+    if (!reserved)
+      throw std::runtime_error("Array::map() - Image write admission refused");
+    m_reservedWrite = *reserved;
+  }
   if (auto *ud = updateDelegate(); ud != nullptr)
     ud->signalArrayMapped(this);
+  m_mapped = true;
   return m_data;
 }
 
@@ -193,7 +282,15 @@ void Array::unmap()
     return;
   }
 
+  if (!m_mapped)
+    throw std::runtime_error("Array::unmap() - array is not mapped");
+  if (m_writeSequence && !m_writeSequence->isOwningThread())
+    throw std::runtime_error("Array::unmap() - wrong owning thread");
   m_mapped = false;
+  if (m_writeSequence) {
+    m_completedWrite = m_reservedWrite;
+    m_reservedWrite = 0;
+  }
   if (auto *ud = updateDelegate(); ud != nullptr)
     ud->signalArrayUnmapped(this);
 }
@@ -205,8 +302,13 @@ void Array::setData(const void *data, size_t byteOffset)
     return;
   }
 
-  auto *bytes = (const uint8_t *)data;
-  std::memcpy(map(), bytes + byteOffset, size() * elementSize());
+  if (!data && size())
+    throw std::runtime_error("Array::setData() - null source");
+  auto *bytes = static_cast<const uint8_t *>(data);
+  auto *destination = map();
+  if (!destination)
+    return;
+  std::memcpy(destination, bytes + byteOffset, size() * elementSize());
   unmap();
 }
 
@@ -219,7 +321,10 @@ size_t Array::setData(std::FILE *stream)
     return 0;
   }
 
-  auto r = std::fread(map(), elementSize(), size(), stream);
+  auto *destination = map();
+  if (!destination)
+    return 0;
+  auto r = std::fread(destination, elementSize(), size(), stream);
   unmap();
   return r;
 }
@@ -292,6 +397,14 @@ Array::Array(Array &&o) : Object(std::move(static_cast<Object &&>(o)))
   m_dim1 = o.m_dim1;
   m_dim2 = o.m_dim2;
   m_mapped = o.m_mapped;
+  m_lifetime = std::move(o.m_lifetime);
+  if (m_lifetime)
+    m_lifetime->array = this;
+  m_writeSequence = std::move(o.m_writeSequence);
+  m_completedWrite = o.m_completedWrite;
+  m_reservedWrite = o.m_reservedWrite;
+  o.m_mapped = false;
+  o.m_reservedWrite = 0;
   o.m_data = nullptr;
   o.m_dataUsageDescriptor = nullptr;
 }
@@ -299,6 +412,10 @@ Array::Array(Array &&o) : Object(std::move(static_cast<Object &&>(o)))
 Array &Array::operator=(Array &&o)
 {
   if (this != &o) {
+    if (m_writeSequence && o.type() != ANARI_UNKNOWN)
+      throw std::runtime_error("Array - cannot replace a live tracked Image");
+    if (m_lifetime)
+      m_lifetime->array = nullptr;
     vsrDeleter(m_dataUsageDescriptor, m_data);
     *static_cast<Object *>(this) = std::move(*static_cast<Object *>(&o));
     m_data = o.m_data;
@@ -309,6 +426,14 @@ Array &Array::operator=(Array &&o)
     m_dim1 = o.m_dim1;
     m_dim2 = o.m_dim2;
     m_mapped = o.m_mapped;
+    m_lifetime = std::move(o.m_lifetime);
+    if (m_lifetime)
+      m_lifetime->array = this;
+    m_writeSequence = std::move(o.m_writeSequence);
+    m_completedWrite = o.m_completedWrite;
+    m_reservedWrite = o.m_reservedWrite;
+    o.m_mapped = false;
+    o.m_reservedWrite = 0;
     o.m_data = nullptr;
     o.m_dataUsageDescriptor = nullptr;
   }
@@ -328,8 +453,16 @@ Array::Array(anari::DataType arrayType,
       m_dim1(items1),
       m_dim2(items2)
 {
+  m_lifetime = std::make_shared<ArrayLifetime>();
+  m_lifetime->array = this;
   if (anari::isObject(type) && kind == MemoryKind::CUDA)
     throw std::runtime_error("cannot create CUDA arrays of objects!");
+
+  constexpr auto MAX_SIZE = std::numeric_limits<size_t>::max();
+  if ((items1 && items0 > MAX_SIZE / items1)
+      || (items2 && items0 * items1 > MAX_SIZE / items2)
+      || (elementSize() && size() > MAX_SIZE / elementSize()))
+    throw std::runtime_error("Array - storage size overflow");
 
   if (isEmpty()) {
     logWarning("%s of %s elements created with 0 size",
@@ -338,6 +471,9 @@ Array::Array(anari::DataType arrayType,
     return;
   }
 
+  auto descriptor = kind == MemoryKind::PROXY
+      ? std::unique_ptr<ArrayUsageDescriptor>{}
+      : std::make_unique<ArrayUsageDescriptor>();
   if (kind == MemoryKind::PROXY) {
     m_data = nullptr;
   } else if (kind == MemoryKind::CUDA) {
@@ -348,10 +484,11 @@ Array::Array(anari::DataType arrayType,
 #endif
   } else { // MemoryKind::HOST
     m_data = std::malloc(size() * elementSize());
+    if (!m_data && elementSize())
+      throw std::bad_alloc();
   }
 
-  if (kind != MemoryKind::PROXY)
-    m_dataUsageDescriptor = new ArrayUsageDescriptor();
+  m_dataUsageDescriptor = descriptor.release();
 }
 
 } // namespace vsr::scene

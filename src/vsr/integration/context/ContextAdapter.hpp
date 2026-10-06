@@ -48,6 +48,7 @@ struct ContextSceneOptions
   SyncHook normalSyncHook; // required when grants.edit
   SyncHook recoveryCallback; // required when grants.resynchronize
   bool nodeEdits{false};
+  bool serializedArrayWrites{false};
   rendering::WorldBoundsProvider worldBounds;
 };
 
@@ -109,6 +110,7 @@ inline std::optional<SceneId> registerContextScene(
   r.scene = &ctx.vsr.scene;
   r.grants = options.grants;
   r.nodeEdits = options.nodeEdits;
+  r.serializedArrayWrites = options.serializedArrayWrites;
   r.worldBounds = std::move(options.worldBounds);
   r.normalSyncHook = std::move(options.normalSyncHook);
   r.recoveryCallback = std::move(options.recoveryCallback);

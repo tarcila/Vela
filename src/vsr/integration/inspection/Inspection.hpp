@@ -914,7 +914,13 @@ class Inspector
         + ",\"capabilities\":" + capsJson(caps);
     if (!views)
       item += std::string(",\"node_edits_exposed\":")
-          + (m_integration.nodeEditsExposed(i) ? "true" : "false");
+          + (m_integration.nodeEditsExposed(i) ? "true" : "false")
+          + ",\"image_exchange\":{\"supported\":false,\"enabled\":false,\"reason\":"
+          + detail::jsonString(m_integration.imageTrackingAvailable(i)
+                  ? "not_implemented"
+                  : "host_write_contract_unavailable")
+          + ",\"data_tracking\":"
+          + (m_integration.imageTrackingAvailable(i) ? "true" : "false") + "}";
     if (!views)
       item +=
           ",\"inspection\":{\"kinds\":[\"objects\",\"layers\",\"nodes\"],\"default_page_size\":"
@@ -1418,8 +1424,29 @@ class Inspector
     if (!vals.empty())
       params += ",\"values\":{" + vals + "}";
     item += name + params;
-    if (const auto *array = dynamic_cast<const scene::Array *>(o))
-      item += ",\"summary\":" + detail::arraySummary(*array);
+    if (const auto *array = dynamic_cast<const scene::Array *>(o)) {
+      item += ",\"summary\":" + detail::arraySummary(*array) + ",\"mapped\":"
+          + (array->isMapped() ? "true" : "false") + ",\"image_info\":";
+      const auto version = ids.imageDataVersion(h);
+      if (!array->isImage())
+        item += "{\"state\":\"unsupported\",\"reason\":\"unsupported_image\"}";
+      else if (!m_integration.imageTrackingAvailable(j.target.id) || !version)
+        item +=
+            "{\"state\":\"unavailable\","
+            "\"reason\":\"host_write_contract_unavailable\"}";
+      else {
+        const auto type = array->elementType();
+        const bool srgb =
+            type >= ANARI_UFIXED8_R_SRGB && type <= ANARI_UFIXED8_RGBA_SRGB;
+        item += "{\"state\":\"available\",\"data_version\":"
+            + detail::jsonString(*version) + ",\"dimensions\":["
+            + detail::summaryInteger(array->dim(0)) + ","
+            + detail::summaryInteger(array->dim(1)) + "],\"element_type\":"
+            + detail::jsonString(anari::toString(type)) + ",\"channel_count\":"
+            + std::to_string(array->elementSize()) + ",\"color_space\":\""
+            + (srgb ? "srgb" : "linear") + "\",\"row_order\":\"top_down\"}";
+      }
+    }
     item += "}";
     if (!append(j, item, tooLarge))
       return false;

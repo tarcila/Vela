@@ -293,6 +293,38 @@ historical page rather than observing fresh state.
   needs no host-side token lookup. The discovery page `revision` and cursor
   do not cover `view_revision`; re-discover for a fresh view token.
 
+## Array and Image inspection
+
+Every Array object item retains `summary` and adds `mapped` (mandatory Boolean)
+plus `image_info` (mandatory object). `mapped` is actual outstanding-map state,
+not write authority. Sampler image references keep their existing handle and
+summary representation. No binary contents are included.
+
+`image_info` has one of these shapes:
+
+```json
+{"state":"available","data_version":"<opaque equality-only token>","dimensions":[1,1],"element_type":"ANARI_UFIXED8_VEC4","channel_count":4,"color_space":"linear","row_order":"top_down"}
+{"state":"unsupported","reason":"unsupported_image"}
+{"state":"unavailable","reason":"host_write_contract_unavailable"}
+```
+
+Available requires automatically enrolled, positive, host-resident Array2D
+8-bit fixed-point storage with one through four channels (linear or sRGB).
+It describes support regardless of permission or outstanding mapping. Unsupported
+or unavailable objects omit the available payload, especially `data_version`.
+No fabricated token, conversion or proxy/CUDA materialisation is performed.
+Ordinary completed map/unmap writes advance the token once, including same-value
+writes and change-back; inspection while mapped keeps the previous token.
+Read-only inspection/capture does not allocate a write sequence.
+
+Discovery currently reports `image_exchange` with `supported:false`,
+`enabled:false`, and the separate `data_tracking` prerequisite. Its reason is
+`not_implemented` when tracking is qualified, otherwise
+`host_write_contract_unavailable`. PNG export/import tools and directories are not implemented or
+advertised by this slice. See the [host and mutation contract](../../../../docs/image-data-tracking.md)
+for launch-wide reservations, exhaustion, disconnect/unavailability and
+lifetime-safe cache resolution.
+
 ## Viewport WORLD bounds (ticket 09, partial qualification)
 
 `vsr_bounds({request_id, scene_id})` is an admitted read of an explicitly

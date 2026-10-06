@@ -69,6 +69,11 @@ struct SceneRegistration
   SyncHook normalSyncHook; // required when grants.edit
   SyncHook recoveryCallback; // required when grants.resynchronize
   bool nodeEdits{false}; // explicit exposure, in addition to the edit grant
+  // Host prerequisite, not a grant: every Array writer/deletion is on the
+  // registration/service owning thread, outside integration transactions.
+  // No worker/raw-pointer writes. Current/future Images are auto-enrolled;
+  // disconnect and temporary exchange unavailability never remove tracking.
+  bool serializedArrayWrites{false};
   rendering::WorldBoundsProvider worldBounds;
 };
 
@@ -162,7 +167,8 @@ class Integration
  public:
   // `queueCapacity` bounds submitted work not yet serviced; zero selects
   // DEFAULT_QUEUE_CAPACITY.
-  explicit Integration(std::size_t queueCapacity = DEFAULT_QUEUE_CAPACITY);
+  explicit Integration(std::size_t queueCapacity = DEFAULT_QUEUE_CAPACITY,
+      std::uint64_t imageWriteCeiling = UINT64_MAX);
   ~Integration();
 
   Integration(const Integration &) = delete;
@@ -177,6 +183,11 @@ class Integration
   // Effective ceilings; all-denied while inactive or for unregistered ids.
   SceneGrants sceneGrants(SceneId id) const;
   bool nodeEditsExposed(SceneId id) const;
+  bool imageTrackingAvailable(SceneId id) const;
+  // Owning-thread support withdrawal retains enrollment/history. If tracking
+  // itself fails, stopWrites() on imageWriteSequence() before withdrawing.
+  bool setImageExchangeAvailable(SceneId id, bool available);
+  std::shared_ptr<scene::ArrayWriteSequence> imageWriteSequence() const;
   ViewGrants viewGrants(ViewId id) const;
   bool cameraControlSupported(ViewId id) const;
   bool updateCameraControlSupport(ViewId id, bool supported);
@@ -253,6 +264,7 @@ class Integration
   struct SceneEntry
   {
     SceneRegistration registration;
+    bool imageExchangeAvailable{true};
   };
 
   struct ViewEntry
@@ -273,6 +285,7 @@ class Integration
 
   ActivationResult validate(const SessionTiming &timing) const;
 
+  std::shared_ptr<scene::ArrayWriteSequence> m_imageWrites;
   identity::IdentityAuthority m_viewIdentities;
   mutable std::mutex m_mutex;
   std::condition_variable m_workAvailable;
