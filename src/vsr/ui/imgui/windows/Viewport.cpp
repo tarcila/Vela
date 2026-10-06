@@ -456,6 +456,54 @@ vsr::scene::RendererRef Viewport::boundRenderer() const
       : m_prevRenderer->self();
 }
 
+vsr::rendering::WorldBoundsObservation Viewport::worldBoundsSource() const
+{
+  using namespace vsr::rendering;
+  WorldBoundsObservation result;
+  result.source.generation = m_deviceGeneration;
+  if (m_bindingTransition.load(std::memory_order_acquire)) {
+    result.state = WorldBoundsState::PENDING;
+    result.reason = WorldBoundsReason::SOURCE_TRANSITION;
+    return result;
+  }
+  if (!m_rIdx || !m_device || !m_renderingEnabled) {
+    result.reason = WorldBoundsReason::INACTIVE_SOURCE;
+    return result;
+  }
+  if (m_libName.size() > 128) {
+    result.reason = WorldBoundsReason::INVALID_METADATA;
+    return result;
+  }
+  const auto identifier = vsr::app::DeviceIdentifier::parse(m_libName);
+  // Helide and VisRTX passed literal scalar/array/edit world qualification
+  // (addendum03). Barney failed bounds/latency qualification (ticket 10);
+  // never call that blocking driver, or any other unqualified one.
+  if (!identifier || identifier->subtype != "default"
+      || (identifier->library != "helide" && identifier->library != "visrtx")) {
+    result.reason = WorldBoundsReason::UNQUALIFIED_SOURCE;
+    return result;
+  }
+  // Readiness is the viewport's own first naturally completed frame; asking
+  // never starts one, so a backend's cold initialization stays with rendering.
+  if (!m_anariPass || !m_anariPass->hasCompletedFrame()) {
+    result.state = WorldBoundsState::PENDING;
+    result.reason = WorldBoundsReason::SOURCE_TRANSITION;
+    return result;
+  }
+  result.source.deviceIdentifier = m_libName;
+  result.source.deviceSubtype = identifier->subtype;
+  result.state = WorldBoundsState::AVAILABLE;
+  result.reason = WorldBoundsReason::NONE;
+  return result;
+}
+
+bool Viewport::queryWorldBounds(vsr::math::box3 &out) const
+{
+  const auto source = worldBoundsSource();
+  return source.state == vsr::rendering::WorldBoundsState::AVAILABLE
+      && m_rIdx->queryWorldBounds(out);
+}
+
 vsr::rendering::EffectiveView Viewport::effectiveView() const
 {
   vsr::rendering::EffectiveView result;

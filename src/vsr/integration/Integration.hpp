@@ -8,6 +8,7 @@
 #include "vsr/integration/inspection/CapturePolicy.hpp"
 // vsr_rendering
 #include "vsr/rendering/view/EffectiveView.h"
+#include "vsr/rendering/view/WorldBounds.h"
 // std
 #include <array>
 #include <condition_variable>
@@ -68,6 +69,7 @@ struct SceneRegistration
   SyncHook normalSyncHook; // required when grants.edit
   SyncHook recoveryCallback; // required when grants.resynchronize
   bool nodeEdits{false}; // explicit exposure, in addition to the edit grant
+  rendering::WorldBoundsProvider worldBounds;
 };
 
 // Value-only, owning-thread snapshot of the actual host binding. The adapter
@@ -188,6 +190,7 @@ class Integration
   bool inServiceCall() const;
   // Invokes the explicit host adapter only from submitted safe-point work.
   std::optional<EffectiveViewBinding> observeViewBinding(ViewId id) const;
+  rendering::WorldBoundsProvider worldBoundsProvider(SceneId id) const;
   std::optional<ViewDescription> viewDescription(ViewId id) const;
   std::size_t viewSlotCount() const;
   bool sceneSyncConfirmsView(ViewId id) const;

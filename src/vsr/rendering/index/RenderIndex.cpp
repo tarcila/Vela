@@ -43,7 +43,7 @@ anari::Camera RenderIndex::camera(size_t i)
   return (anari::Camera)m_cache.getHandle(ANARI_CAMERA, i, true);
 }
 
-vsr::math::box3 RenderIndex::worldBounds() const
+bool RenderIndex::queryWorldBounds(vsr::math::box3 &out) const
 {
   vsr::math::box3 bounds;
   if (!anariGetProperty(device(),
@@ -52,7 +52,16 @@ vsr::math::box3 RenderIndex::worldBounds() const
           ANARI_FLOAT32_BOX3,
           &bounds,
           sizeof(bounds),
-          ANARI_WAIT)) {
+          ANARI_WAIT))
+    return false;
+  out = bounds;
+  return true;
+}
+
+vsr::math::box3 RenderIndex::worldBounds() const
+{
+  vsr::math::box3 bounds;
+  if (!queryWorldBounds(bounds)) {
     vsr::core::logWarning(
         "[RenderIndex::worldBounds] anari::World returned no bounds!");
     return {};

@@ -42,6 +42,9 @@ struct RenderIndex : public BaseUpdateDelegate
   // The ANARI world's `bounds` property. An empty box when the device
   // reports none, which defaultViewForBounds() then frames as the unit box.
   vsr::math::box3 worldBounds() const;
+  // Raw property status, no UI fallback. Failure leaves out unchanged.
+  // Uses Frame All's ANARI_WAIT; the driver call is not interruptible.
+  bool queryWorldBounds(vsr::math::box3 &out) const;
   CameraPose computeDefaultView() const;
 
   void logCacheInfo() const;

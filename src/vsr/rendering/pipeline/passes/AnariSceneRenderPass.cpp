@@ -315,6 +315,11 @@ AnariSceneRenderPass::FrameState AnariSceneRenderPass::frameState() const
   return m_copiedState;
 }
 
+bool AnariSceneRenderPass::hasCompletedFrame() const
+{
+  return m_hasCompletedFrame;
+}
+
 void AnariSceneRenderPass::startFrame()
 {
   m_startedState.reset();
@@ -366,6 +371,7 @@ void AnariSceneRenderPass::updateSize()
 
   detail::freeImageBuffers(m_buffers);
   m_copiedState.reset();
+  m_hasCompletedFrame = false;
   m_stagingChannels = ImageChannels::NONE;
   resizeStaging();
 
@@ -429,9 +435,10 @@ void AnariSceneRenderPass::render(ImageBuffers &b)
   }
 
   if (anari::isReady(m_device, m_frame)) {
-    if (copyFrameData())
+    if (copyFrameData()) {
       m_copiedState = m_startedState;
-    else
+      m_hasCompletedFrame = true;
+    } else
       m_copiedState.reset();
     // Only the asynchronous mode keeps a render in flight between calls.
     if (m_runAsync)

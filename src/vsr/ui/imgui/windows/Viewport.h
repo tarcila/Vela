@@ -23,6 +23,7 @@
 #include "vsr/rendering/pipeline/saveImage.h"
 #include "vsr/rendering/view/EffectiveView.h"
 #include "vsr/rendering/view/Manipulator.hpp"
+#include "vsr/rendering/view/WorldBounds.h"
 // anari
 #include <anari/frontend/anari_enums.h>
 // std
@@ -88,6 +89,9 @@ struct Viewport : public BaseViewport
   vsr::rendering::EffectiveView effectiveView() const;
   vsr::scene::CameraRef boundCamera() const;
   vsr::scene::RendererRef boundRenderer() const;
+  // Owner-thread world observation. Identity is supplied by the host.
+  vsr::rendering::WorldBoundsObservation worldBoundsSource() const;
+  bool queryWorldBounds(vsr::math::box3 &out) const;
 
  protected:
   void saveSettings(vsr::core::DataNode &thisWindowRoot) override;

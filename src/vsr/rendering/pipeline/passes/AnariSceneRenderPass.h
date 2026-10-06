@@ -61,6 +61,9 @@ struct AnariSceneRenderPass : public ImageSource, public PickableSource
   using FrameState = std::shared_ptr<const void>;
   void setFrameStateProvider(std::function<FrameState()> provider);
   FrameState frameState() const;
+  // True once this pass copied a naturally completed frame since setup. No
+  // render is started by asking.
+  bool hasCompletedFrame() const;
 
   // PickableSource: one synchronous render of a temporary frame sharing this
   // source's camera, renderer and world; the display frame is untouched.
@@ -88,6 +91,7 @@ struct AnariSceneRenderPass : public ImageSource, public PickableSource
   FrameState m_startedState, m_copiedState;
 
   bool m_firstFrame{true};
+  bool m_hasCompletedFrame{false};
   // Channels were toggled since the last render: restart the frame once at
   // the next render() instead of once per toggle.
   bool m_pendingRestart{false};

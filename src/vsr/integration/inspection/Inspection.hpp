@@ -1636,17 +1636,88 @@ inline Built Inspector::makeBounds(
       job->releaseScratch();
       return Step{Step::Status::COMPLETE, Outcome::INVALID_REQUEST};
     }
-    // No Scene walk, renderer readiness or provider work. Both tokens describe
-    // this same owning-thread safe-point observation, not admission time.
-    const auto result = "{\"state\":\"unavailable\",\"reason\":\"missing_binding\","
-        "\"scene_id\":" + std::to_string(scene)
+    auto readAllowed = [&] {
+      return m_authority.authorizeExecution(
+                 sessionId, Target::scene(scene), session::Capability::READ)
+          == session::Code::OK;
+    };
+    // Identity lookup is a host callback too: recheck before the driver seam.
+    if (!readAllowed()) {
+      job->releaseScratch();
+      return Step{Step::Status::COMPLETE, Outcome::FORBIDDEN};
+    }
+    if (ctx.isAbandoned && ctx.isAbandoned()) {
+      job->releaseScratch();
+      return Step{Step::Status::COMPLETE, Outcome::TIMEOUT};
+    }
+    const auto provider = m_integration.worldBoundsProvider(scene);
+    rendering::WorldBoundsObservation observation;
+    const bool bound = bool(provider.observe);
+    if (bound && provider.isCurrent)
+      observation = provider.observe();
+    else if (bound)
+      observation.reason = rendering::WorldBoundsReason::UNQUALIFIED_SOURCE;
+    // ANARI_WAIT cannot be interrupted. A qualified host owns the finite-call
+    // guarantee; checking the clock here only suppresses late publication.
+    if (!readAllowed()) {
+      job->releaseScratch();
+      return Step{Step::Status::COMPLETE, Outcome::FORBIDDEN};
+    }
+    if (ctx.isAbandoned && ctx.isAbandoned()) {
+      job->releaseScratch();
+      return Step{Step::Status::COMPLETE, Outcome::TIMEOUT};
+    }
+    const char *invalid = bounds::validate(observation);
+    if (!invalid && !observation.source.identity.empty()
+        && !provider.isCurrent(observation.source)) {
+      observation.state = rendering::WorldBoundsState::UNAVAILABLE;
+      observation.reason = rendering::WorldBoundsReason::RETIRED_SOURCE;
+      observation.source = {};
+    }
+    std::string payload = "\"state\":"
+        + detail::jsonString(
+            invalid ? "unavailable" : bounds::stateName(observation.state));
+    const auto *reason =
+        invalid ? invalid : bounds::reasonName(observation.reason);
+    if (reason)
+      payload += ",\"reason\":" + detail::jsonString(reason);
+    if (bound) {
+      payload +=
+          ",\"coverage\":\"viewport_world\","
+          "\"covered_scene_revision\":null,"
+          "\"revision_basis\":\"observation_only\"";
+      if (!invalid && !observation.source.identity.empty()) {
+        const auto &s = observation.source;
+        payload +=
+            ",\"source\":{\"kind\":\"interactive_viewport\","
+            "\"selection\":\"primary_live_interactive\",\"identity\":"
+            + detail::jsonString(s.identity) + ",\"generation\":"
+            + detail::jsonString(std::to_string(s.generation))
+            + ",\"device_identifier\":" + detail::jsonString(s.deviceIdentifier)
+            + ",\"device_subtype\":" + detail::jsonString(s.deviceSubtype)
+            + "}";
+      }
+      if (!invalid
+          && observation.state == rendering::WorldBoundsState::AVAILABLE) {
+        auto vectorJson = [](const auto &v) {
+          return "[" + viewinfo::number(v[0]) + "," + viewinfo::number(v[1])
+              + "," + viewinfo::number(v[2]) + "]";
+        };
+        payload += ",\"min\":" + vectorJson(observation.min)
+            + ",\"max\":" + vectorJson(observation.max);
+      }
+    }
+    const auto result = "{" + payload + ",\"scene_id\":" + std::to_string(scene)
         + ",\"target\":{\"kind\":\"scene\",\"scene_id\":"
         + std::to_string(scene) + "},\"scene_revision\":"
         + detail::jsonString(detail::revisionToken(ids->sceneRevision()))
         + ",\"inspection_revision\":"
         + detail::jsonString(detail::revisionToken(ids->inspectionRevision()))
-        + ",\"selection\":{\"include_disabled\":false,"
-          "\"active_layers_only\":true,\"effectively_enabled_only\":true}}";
+        + (bound
+                ? ",\"selection\":{\"include_disabled\":false,"
+                  "\"basis\":\"existing_world_filtering_and_external_instances\"}}"
+                : ",\"selection\":{\"include_disabled\":false,"
+                  "\"active_layers_only\":true,\"effectively_enabled_only\":true}}");
     job->releaseScratch();
     const auto read = m_authority.authorizeExecution(
         sessionId, Target::scene(scene), session::Capability::READ);

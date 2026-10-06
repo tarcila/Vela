@@ -293,6 +293,50 @@ historical page rather than observing fresh state.
   needs no host-side token lookup. The discovery page `revision` and cursor
   do not cover `view_revision`; re-discover for a fresh view token.
 
+## Viewport WORLD bounds (ticket 09, partial qualification)
+
+`vsr_bounds({request_id, scene_id})` is an admitted read of an explicitly
+registered host provider, not an analytical Scene union. Omitted and explicit
+`include_disabled:false` remain different request identities. Any `node_handle`
+or `include_disabled:true` rejects before admission. Custom hosts without a
+provider retain `unavailable/missing_binding`.
+
+`SceneRegistration::worldBounds` / `ContextSceneOptions::worldBounds` bind the
+external driver seam. `observe` executes only at an authorized owning-thread
+safe point; `isCurrent` checks cached source lifetime/generation without driver
+work. Both callbacks must be supplied, with bounded public metadata and a
+qualified finite servicing story. The shared RenderIndex raw helper preserves
+property failure and leaves its output unchanged; Frame All's warning/framing
+fallback is unchanged and is never used as an inspection result.
+
+Available results contain finite ordered `min`/`max`, `coverage:viewport_world`,
+source kind `interactive_viewport`, opaque identity/generation and actual Device
+Identifier/Subtype. `scene_revision` and `inspection_revision` are observation
+provenance only: `covered_scene_revision:null` and
+`revision_basis:observation_only`. Existing index filtering and external
+instances determine the box, not a certified complete or current CPU Scene
+selection. No camera, view name, pointer, credentials or scan counters are
+returned. Empty requires a provider-proved convention and omits the box;
+malformed/nonfinite/reversed output is unavailable, never inferred empty.
+Pending is explicit source readiness, not background scanning.
+
+The viewer selects the first live visible registered slot in fixed order:
+Viewport, then Secondary View; it never substitutes the independent AgentView.
+Only default-subtype Helide and VisRTX are qualified (literal scalar and
+one-element transform-array instance boxes, before and after ordinary notified
+edits and natural frames). Default barney failed the real transformed-instance
+and cold ANARI_WAIT qualification and returns `unavailable/unqualified_source`,
+as do unknown devices/subtypes. A qualified source is `pending/source_transition`
+until its viewport has copied one naturally completed frame, so a backend's
+cold initialization stays with rendering, never with the query. Neither driver
+documents an empty-world convention (Helide reports +/-inf, VisRTX +/-FLT_MAX),
+so an empty world is `unavailable/invalid_bounds`, never `empty`. World queries do
+not render, reset, acquire a device, populate an index or walk Scene geometry.
+`ANARI_WAIT` is not interruptible by the five-second queue-inclusive operation
+deadline. A post-call deadline check suppresses late publication, not a stalled
+driver. Shared temporary inspection scratch remains at most 8 MiB; retained
+results use existing bounded operation history and replay never re-queries.
+
 ## Tools (ticket 104)
 
 See the [live placement guide](../../../../docs/live-placement-editing.md) for

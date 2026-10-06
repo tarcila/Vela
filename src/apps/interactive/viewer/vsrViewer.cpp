@@ -962,6 +962,53 @@ void Application::setupIntegration()
   options.grants.read = true;
   options.grants.edit = true;
   options.nodeEdits = true;
+  // Primary means the first live visible interactive slot in fixed UI order
+  // (Viewport, then Secondary View), never the independent AgentView.
+  options.worldBounds.observe = [this] {
+    using namespace vsr::rendering;
+    WorldBoundsObservation result;
+    result.reason = WorldBoundsReason::INACTIVE_SOURCE;
+    for (const auto &slot : m_viewportRegistrations) {
+      if (slot.lifetime.expired() || !*slot.viewport->visiblePtr()
+          || slot.id == vsr::integration::INVALID_VIEW_ID)
+        continue;
+      const auto description = m_integration->viewDescription(slot.id);
+      if (!description)
+        continue;
+      result = slot.viewport->worldBoundsSource();
+      if (result.state != WorldBoundsState::AVAILABLE)
+        return result;
+      result.source.identity = description->identity;
+      vsr::math::box3 box;
+      if (!slot.viewport->queryWorldBounds(box)) {
+        result.state = WorldBoundsState::UNAVAILABLE;
+        result.reason = WorldBoundsReason::PROPERTY_UNAVAILABLE;
+      } else {
+        result.min = {box.lower.x, box.lower.y, box.lower.z};
+        result.max = {box.upper.x, box.upper.y, box.upper.z};
+      }
+      return result;
+    }
+    return result;
+  };
+  options.worldBounds.isCurrent =
+      [this](const vsr::rendering::WorldBoundsSource &source) {
+        for (const auto &slot : m_viewportRegistrations) {
+          if (slot.lifetime.expired() || !*slot.viewport->visiblePtr()
+              || slot.id == vsr::integration::INVALID_VIEW_ID)
+            continue;
+          const auto description = m_integration->viewDescription(slot.id);
+          if (!description)
+            continue;
+          const auto current = slot.viewport->worldBoundsSource();
+          return description->identity == source.identity
+              && current.state == vsr::rendering::WorldBoundsState::AVAILABLE
+              && current.source.generation == source.generation
+              && current.source.deviceIdentifier == source.deviceIdentifier
+              && current.source.deviceSubtype == source.deviceSubtype;
+        }
+        return false;
+      };
   options.grants.resynchronize = true;
   auto *view = m_agentView.get();
   options.normalSyncHook = [view](vi::SceneId) { return view->synchronize(); };

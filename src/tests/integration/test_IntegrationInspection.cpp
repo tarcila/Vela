@@ -6,8 +6,11 @@
 // vsr
 #include "vsr/integration/inspection/Inspection.hpp"
 #include "vsr/integration/mcp/Json.hpp"
+#include "vsr/rendering/index/RenderIndexAllLayers.hpp"
 #include "vsr/scene/Scene.hpp"
 // std
+#include <chrono>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <string>
@@ -22,6 +25,40 @@ namespace {
 bool confirmReady(SceneId)
 {
   return true;
+}
+
+struct NaturalWorldDevice
+{
+  ~NaturalWorldDevice();
+  anari::Library library{};
+  anari::Device device{};
+};
+
+NaturalWorldDevice::~NaturalWorldDevice()
+{
+  if (device)
+    anari::release(device, device);
+  if (library)
+    anari::unloadLibrary(library);
+}
+
+struct NaturalWorldFrame
+{
+  ~NaturalWorldFrame();
+  anari::Device device{};
+  anari::Camera camera{};
+  anari::Renderer renderer{};
+  anari::Frame frame{};
+};
+
+NaturalWorldFrame::~NaturalWorldFrame()
+{
+  if (frame)
+    anari::release(device, frame);
+  if (renderer)
+    anari::release(device, renderer);
+  if (camera)
+    anari::release(device, camera);
 }
 
 std::string field(const std::string &json, const std::string &key)
@@ -54,8 +91,10 @@ struct Fixture
   Credentials creds;
   std::uint64_t nextId{1};
 
-  explicit Fixture(
-      int materials = 10, PageLimits limits = {}, bool secondScene = false)
+  explicit Fixture(int materials = 10,
+      PageLimits limits = {},
+      bool secondScene = false,
+      vsr::rendering::WorldBoundsProvider worldBounds = {})
   {
     for (int i = 0; i < materials; i++)
       scene.createObject<vsr::scene::Material>("matte");
@@ -65,6 +104,7 @@ struct Fixture
     s.grants.read = true;
     s.grants.edit = true;
     s.normalSyncHook = confirmReady;
+    s.worldBounds = std::move(worldBounds);
     sceneId = *integration.registerScene(s);
     if (secondScene) {
       s.name = "second";
@@ -215,6 +255,617 @@ SCENARIO("scene bounds never infer a value from missing binding",
            "complete"})
     CHECK_FALSE(result.get(key));
   CHECK(f.inspector->scratch().used() == 0);
+}
+
+SCENARIO("bounds returns the registered world rather than a Scene union",
+    "[integration][bounds][world-bounds]")
+{
+  using namespace vsr::rendering;
+  WorldBoundsObservation observation;
+  observation.state = WorldBoundsState::AVAILABLE;
+  observation.reason = WorldBoundsReason::NONE;
+  observation.source = {"primary-1", 1, "default@helide", "default"};
+  observation.min = {-2., -3., -4.};
+  observation.max = {5., 6., 7.};
+  Fixture f(0,
+      {},
+      false,
+      {[&] { return observation; },
+          [](const WorldBoundsSource &) { return true; }});
+  REQUIRE(
+      f.submit(f.inspector->makeBounds(f.creds.sessionId, f.sceneId), 1).code
+      == Outcome::OK);
+  const auto result = page(f.drain(1));
+  REQUIRE(result.get("state")->s == "available");
+  REQUIRE(result.get("min"));
+  CHECK(result.get("min")->a[0].n == -2.);
+  CHECK(result.get("min")->a[1].n == -3.);
+  CHECK(result.get("min")->a[2].n == -4.);
+  CHECK(result.get("max")->a[0].n == 5.);
+  CHECK(result.get("max")->a[1].n == 6.);
+  CHECK(result.get("max")->a[2].n == 7.);
+  CHECK(result.get("coverage")->s == "viewport_world");
+  CHECK(result.get("covered_scene_revision")->type
+      == mcp::json::Value::Type::NUL);
+  CHECK(result.get("source")->get("identity")->s == "primary-1");
+  CHECK(result.get("source")->get("generation")->s == "1");
+  CHECK(result.get("source")->get("kind")->s == "interactive_viewport");
+  CHECK_FALSE(result.get("selection")->get("active_layers_only"));
+}
+
+SCENARIO("real ANARI worlds supply literal instance bounds without rendering",
+    "[.world-bounds-qualification]")
+{
+  using namespace vsr::rendering;
+  using namespace vsr::scene;
+  const auto libraryName = GENERATE("helide", "barney");
+  struct Device
+  {
+    anari::Library library{};
+    anari::Device device{};
+    ~Device()
+    {
+      if (device)
+        anari::release(device, device);
+      if (library)
+        anari::unloadLibrary(library);
+    }
+  } device;
+  device.library = anari::loadLibrary(libraryName);
+  REQUIRE(device.library);
+  device.device = anari::newDevice(device.library, "default");
+  REQUIRE(device.device);
+  anari::commitParameters(device.device, device.device);
+  RenderIndexAllLayers *index = nullptr;
+  WorldBoundsObservation observation;
+  observation.source = {"primary-world", 1, libraryName, "default"};
+  observation.reason = WorldBoundsReason::NONE;
+  double longestMs = 0.;
+  Fixture f(0,
+      {},
+      false,
+      {[&] {
+         REQUIRE(f.integration.inServiceCall());
+         auto value = observation;
+         vsr::math::box3 box;
+         const auto start = std::chrono::steady_clock::now();
+         const bool success = index->queryWorldBounds(box);
+         const auto ms = std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now() - start)
+                             .count();
+         longestMs = std::max(longestMs, ms);
+         value.state = success ? WorldBoundsState::AVAILABLE
+                               : WorldBoundsState::UNAVAILABLE;
+         value.reason = success ? WorldBoundsReason::NONE
+                                : WorldBoundsReason::PROPERTY_UNAVAILABLE;
+         value.min = {box.lower.x, box.lower.y, box.lower.z};
+         value.max = {box.upper.x, box.upper.y, box.upper.z};
+         return value;
+       },
+          [&](const WorldBoundsSource &s) {
+            return s.generation == observation.source.generation;
+          }});
+  auto geometry = f.scene.createObject<Geometry>("sphere");
+  auto positions = f.scene.createArray(ANARI_FLOAT32_VEC3, 1);
+  const vsr::math::float3 origin(0.f);
+  positions->setData(&origin, 1);
+  geometry->setParameterObject("vertex.position", *positions);
+  geometry->setParameter("radius", 1.f);
+  auto material = f.scene.createObject<Material>("matte");
+  auto surface = f.scene.createSurface("sphere", geometry, material);
+  auto transforms = f.scene.createArray(ANARI_FLOAT32_MAT4, 1);
+  auto matrix = vsr::math::IDENTITY_MAT4;
+  matrix[3] = vsr::math::float4(3.f, 4.f, 5.f, 1.f);
+  transforms->setData(&matrix, 1);
+  auto node = f.scene.insertChildTransformArrayNode(
+      f.scene.defaultLayer()->root(), transforms.data(), "instances");
+  f.scene.insertChildObjectNode(node, surface);
+  index = f.scene.updateDelegate().emplace<RenderIndexAllLayers>(
+      f.scene, vsr::core::Token(libraryName), device.device);
+  index->populate(); // fixture setup only, never inspection
+  const auto cameras = f.scene.objectDB().camera.size();
+  const auto renderers = f.scene.objectDB().renderer.size();
+  auto query = [&](std::uint64_t id) {
+    REQUIRE(
+        f.submit(f.inspector->makeBounds(f.creds.sessionId, f.sceneId), id).code
+        == Outcome::OK);
+    return page(f.drain(id));
+  };
+  const auto before = query(1);
+  REQUIRE(before.get("state")->s == "available");
+  CHECK(before.get("min")->a[0].n == Approx(2.));
+  CHECK(before.get("min")->a[1].n == Approx(3.));
+  CHECK(before.get("min")->a[2].n == Approx(4.));
+  CHECK(before.get("max")->a[0].n == Approx(4.));
+  CHECK(before.get("max")->a[1].n == Approx(5.));
+  CHECK(before.get("max")->a[2].n == Approx(6.));
+  matrix[3] = vsr::math::float4(50.f, 4.f, 5.f, 1.f);
+  transforms->setData(&matrix, 1); // ordinary notified edit, no render/reset
+  const auto after = query(2);
+  REQUIRE(after.get("state")->s == "available");
+  CHECK(after.get("min")->a[0].n == Approx(49.));
+  CHECK(after.get("max")->a[0].n == Approx(51.));
+  CHECK(after.get("min")->a[1].n == Approx(3.));
+  CHECK(after.get("max")->a[2].n == Approx(6.));
+  CHECK(after.get("source")->get("identity")->s == "primary-world");
+  CHECK(after.get("source")->get("device_identifier")->s == libraryName);
+  CHECK(after.get("scene_revision")->s != before.get("scene_revision")->s);
+  CHECK(f.scene.objectDB().camera.size() == cameras);
+  CHECK(f.scene.objectDB().renderer.size() == renderers);
+  CHECK(page(f.drain(1)).get("max")->a[0].n == Approx(4.));
+  for (std::uint64_t id = 3; id < 20; ++id)
+    CHECK(query(id).get("max")->a[0].n == Approx(51.));
+  std::cout << "WORLD_BOUNDS " << libraryName
+            << " max ANARI_WAIT ms=" << longestMs << '\n';
+  CHECK(longestMs
+      < 100.); // measured fixture qualification, not a driver interrupt
+}
+
+namespace {
+
+// Real-driver lifecycle probe shared by the archived barney diagnostic and the
+// scoped Helide/VisRTX qualification. Producer frames are fixture work only.
+void naturalWorldQualification(
+    const char *libraryName, bool arrayShape, bool coldQuery)
+{
+  using namespace vsr::rendering;
+  using namespace vsr::scene;
+  NaturalWorldDevice owner;
+  owner.library = anari::loadLibrary(libraryName);
+  REQUIRE(owner.library);
+  owner.device = anari::newDevice(owner.library, "default");
+  const auto device = owner.device;
+  REQUIRE(device);
+  anari::commitParameters(device, device);
+  // Scene/index and ordinary producer are destroyed before the device.
+  {
+    RenderIndexAllLayers *index = nullptr;
+    std::uint64_t sourceGeneration = 1;
+    unsigned renders = 0;
+    unsigned ownerHeartbeat = 0;
+    unsigned queries = 0;
+    double longestQueryMs = 0.;
+    const char *phase = "after_population";
+    Fixture f(0,
+        {},
+        false,
+        {[&] {
+           REQUIRE(f.integration.inServiceCall());
+           const auto renderCount = renders;
+           const auto heartbeatBefore = ++ownerHeartbeat;
+           vsr::math::box3 box;
+           const auto start = std::chrono::steady_clock::now();
+           const bool success = index->queryWorldBounds(box);
+           const auto ms = std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - start)
+                               .count();
+           longestQueryMs = std::max(longestQueryMs, ms);
+           ++ownerHeartbeat;
+           ++queries;
+           std::cout << "NATURAL_WORLD device=" << libraryName
+                     << " shape=" << (arrayShape ? "array" : "scalar")
+                     << " cold_query=" << coldQuery << " phase=" << phase
+                     << " generation=" << sourceGeneration
+                     << " renders=" << renders << " query=" << queries
+                     << " success=" << success << " ms=" << ms
+                     << " owner_heartbeat=" << heartbeatBefore << "->"
+                     << ownerHeartbeat << " owner_gap_ms=" << ms
+                     << " min=" << box.lower.x << ',' << box.lower.y << ','
+                     << box.lower.z << " max=" << box.upper.x << ','
+                     << box.upper.y << ',' << box.upper.z << std::endl;
+           CHECK(renders == renderCount);
+           WorldBoundsObservation value;
+           value.source = {
+               "natural-world", sourceGeneration, libraryName, "default"};
+           value.state = success ? WorldBoundsState::AVAILABLE
+                                 : WorldBoundsState::UNAVAILABLE;
+           value.reason = success ? WorldBoundsReason::NONE
+                                  : WorldBoundsReason::PROPERTY_UNAVAILABLE;
+           value.min = {box.lower.x, box.lower.y, box.lower.z};
+           value.max = {box.upper.x, box.upper.y, box.upper.z};
+           return value;
+         },
+            [&](const WorldBoundsSource &s) {
+              return s.generation == sourceGeneration;
+            }});
+    auto geometry = f.scene.createObject<Geometry>("sphere");
+    auto positions = f.scene.createArray(ANARI_FLOAT32_VEC3, 1);
+    const vsr::math::float3 origin(0.f);
+    positions->setData(&origin, 1);
+    geometry->setParameterObject("vertex.position", *positions);
+    geometry->setParameter("radius", 1.f);
+    auto material = f.scene.createObject<Material>("matte");
+    auto surface = f.scene.createSurface("sphere", geometry, material);
+    auto matrix = vsr::math::IDENTITY_MAT4;
+    matrix[3] = vsr::math::float4(3.f, 4.f, 5.f, 1.f);
+    ArrayRef transforms;
+    LayerNodeRef node;
+    if (arrayShape) {
+      transforms = f.scene.createArray(ANARI_FLOAT32_MAT4, 1);
+      transforms->setData(&matrix, 1);
+      node = f.scene.insertChildTransformArrayNode(
+          f.scene.defaultLayer()->root(), transforms.data(), "instances");
+    } else {
+      node = f.scene.insertChildTransformNode(
+          f.scene.defaultLayer()->root(), matrix, "scalar");
+    }
+    f.scene.insertChildObjectNode(node, surface);
+    index = f.scene.updateDelegate().emplace<RenderIndexAllLayers>(
+        f.scene, vsr::core::Token(libraryName), device);
+    index->populate(); // sole fixture population; never part of inspection
+
+    auto query = [&](std::uint64_t id, double lowerX, double upperX) {
+      REQUIRE(
+          f.submit(f.inspector->makeBounds(f.creds.sessionId, f.sceneId), id)
+              .code
+          == Outcome::OK);
+      const auto value = page(f.drain(id));
+      REQUIRE(value.get("state")->s == "available");
+      CHECK(value.get("min")->a[0].n == Approx(lowerX));
+      CHECK(value.get("min")->a[1].n == Approx(3.));
+      CHECK(value.get("min")->a[2].n == Approx(4.));
+      CHECK(value.get("max")->a[0].n == Approx(upperX));
+      CHECK(value.get("max")->a[1].n == Approx(5.));
+      CHECK(value.get("max")->a[2].n == Approx(6.));
+      CHECK(value.get("source")->get("generation")->s == "1");
+    };
+    if (coldQuery)
+      query(1, 2., 4.);
+
+    NaturalWorldFrame producer;
+    producer.device = device;
+    producer.camera = anari::newObject<anari::Camera>(device, "perspective");
+    producer.renderer = anari::newObject<anari::Renderer>(device, "default");
+    producer.frame = anari::newObject<anari::Frame>(device);
+    const auto camera = producer.camera;
+    const auto renderer = producer.renderer;
+    const auto frame = producer.frame;
+    REQUIRE(camera);
+    REQUIRE(renderer);
+    REQUIRE(frame);
+    anari::setParameter(
+        device, camera, "position", vsr::math::float3(26.5f, 4.f, -30.f));
+    anari::setParameter(
+        device, camera, "direction", vsr::math::float3(0.f, 0.f, 1.f));
+    anari::setParameter(device, camera, "up", vsr::math::float3(0.f, 1.f, 0.f));
+    anari::setParameter(device, camera, "aspect", 2.f);
+    anari::commitParameters(device, camera);
+    anari::setParameter(
+        device, renderer, "background", vsr::math::float4(0.f, 0.f, 0.f, 1.f));
+    anari::setParameter(device, renderer, "ambientRadiance", 1.f);
+    anari::commitParameters(device, renderer);
+    anari::setParameter(device, frame, "size", vsr::math::uint2(128, 64));
+    anari::setParameter(device, frame, "channel.color", ANARI_FLOAT32_VEC4);
+    anari::setParameter(device, frame, "world", index->world());
+    anari::setParameter(device, frame, "camera", camera);
+    anari::setParameter(device, frame, "renderer", renderer);
+    anari::commitParameters(device, frame);
+    // Ordinary source producer: invoked by fixture lifecycle, not provider.
+    auto ordinaryFrame = [&] {
+      REQUIRE_FALSE(f.integration.inServiceCall());
+      const auto start = std::chrono::steady_clock::now();
+      anari::render(device, frame);
+      anari::wait(device, frame);
+      ++renders;
+      ++ownerHeartbeat;
+      auto output =
+          anari::map<vsr::math::float4>(device, frame, "channel.color");
+      REQUIRE(output.data);
+      CHECK(output.width == 128);
+      CHECK(output.height == 64);
+      CHECK(output.pixelType == ANARI_FLOAT32_VEC4);
+      unsigned nonbackground = 0;
+      for (std::size_t i = 0; i < output.width * output.height; ++i)
+        if (output.data[i].x > 0.f || output.data[i].y > 0.f
+            || output.data[i].z > 0.f)
+          ++nonbackground;
+      anari::unmap(device, frame, "channel.color");
+      std::cout << "NATURAL_FRAME device=" << libraryName
+                << " shape=" << (arrayShape ? "array" : "scalar")
+                << " cold_query=" << coldQuery << " renders=" << renders
+                << " nonbackground_pixels=" << nonbackground << " complete_ms="
+                << std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - start)
+                       .count()
+                << std::endl;
+      CHECK(nonbackground > 0);
+    };
+    ordinaryFrame();
+    phase = "after_ordinary_frame";
+    query(2, 2., 4.); // fresh-world first property query when coldQuery=false
+    matrix[3] = vsr::math::float4(50.f, 4.f, 5.f, 1.f);
+    if (arrayShape)
+      transforms->setData(&matrix, 1);
+    else {
+      node->value().setAsTransform(matrix);
+      f.scene.signalLayerTransformChanged(f.scene.defaultLayer());
+    }
+    ordinaryFrame();
+    phase = "after_notified_edit_and_frame";
+    query(3, 49., 51.);
+    CHECK(renders == 2);
+    CHECK(longestQueryMs < 100.);
+  }
+}
+
+} // namespace
+
+// Archived barney evidence (addendum03): not executed by this work.
+SCENARIO("naturally rendered scalar and array worlds retain literal bounds",
+    "[.world-bounds-natural-qualification]")
+{
+  const auto libraryName = GENERATE("helide", "barney");
+  const bool arrayShape = GENERATE(false, true);
+  const bool coldQuery = GENERATE(false, true);
+  naturalWorldQualification(libraryName, arrayShape, coldQuery);
+}
+
+// Scoped Helide/VisRTX qualification; no barney call. Real GPU for VisRTX.
+SCENARIO("Helide and VisRTX naturally rendered worlds retain literal bounds",
+    "[.world-bounds-hv-qualification]")
+{
+  const auto libraryName = GENERATE("helide", "visrtx");
+  const bool arrayShape = GENERATE(false, true);
+  const bool coldQuery = GENERATE(false, true);
+  naturalWorldQualification(libraryName, arrayShape, coldQuery);
+}
+
+// Records each driver's raw empty-world property. No convention is assumed:
+// a qualified provider never maps it to EMPTY without a documented one.
+SCENARIO("Helide and VisRTX empty worlds expose no proven empty convention",
+    "[.world-bounds-hv-qualification]")
+{
+  using namespace vsr::rendering;
+  const auto libraryName = GENERATE("helide", "visrtx");
+  NaturalWorldDevice owner;
+  owner.library = anari::loadLibrary(libraryName);
+  REQUIRE(owner.library);
+  owner.device = anari::newDevice(owner.library, "default");
+  REQUIRE(owner.device);
+  anari::commitParameters(owner.device, owner.device);
+  {
+    vsr::scene::Scene scene;
+    auto *index = scene.updateDelegate().emplace<RenderIndexAllLayers>(
+        scene, vsr::core::Token(libraryName), owner.device);
+    index->populate(); // fixture setup only
+    vsr::math::box3 box;
+    box.lower = vsr::math::float3(7.f);
+    box.upper = vsr::math::float3(-7.f);
+    const auto start = std::chrono::steady_clock::now();
+    const bool success = index->queryWorldBounds(box);
+    const auto ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start)
+                        .count();
+    std::cout << "EMPTY_WORLD device=" << libraryName << " success=" << success
+              << " ms=" << ms << " min=" << box.lower.x << ',' << box.lower.y
+              << ',' << box.lower.z << " max=" << box.upper.x << ','
+              << box.upper.y << ',' << box.upper.z << std::endl;
+    WorldBoundsObservation value;
+    value.source = {"empty-world", 1, libraryName, "default"};
+    value.state =
+        success ? WorldBoundsState::AVAILABLE : WorldBoundsState::UNAVAILABLE;
+    value.reason = success ? WorldBoundsReason::NONE
+                           : WorldBoundsReason::PROPERTY_UNAVAILABLE;
+    value.min = {box.lower.x, box.lower.y, box.lower.z};
+    value.max = {box.upper.x, box.upper.y, box.upper.z};
+    // Whatever the driver says, the host must never publish it as a box.
+    const char *invalid = bounds::validate(value);
+    CHECK((!success || invalid));
+  }
+}
+
+SCENARIO("world provider values cannot fabricate availability or outlive read",
+    "[integration][bounds][world-bounds]")
+{
+  using namespace vsr::rendering;
+  WorldBoundsObservation observation;
+  observation.state = WorldBoundsState::AVAILABLE;
+  observation.reason = WorldBoundsReason::NONE;
+  observation.source = {"primary-1", 1, "helide", "default"};
+  observation.min = {-2., -3., -4.};
+  observation.max = {5., 6., 7.};
+  bool current = true;
+  std::function<void()> duringObservation;
+  Fixture f(0,
+      {},
+      false,
+      {[&] {
+         REQUIRE(f.integration.inServiceCall());
+         if (duringObservation)
+           duringObservation();
+         return observation;
+       },
+          [&](const WorldBoundsSource &) { return current; }});
+  const char *state = "unavailable";
+  const char *reason = nullptr;
+  bool forbidden = false;
+  SECTION("successful nonfinite output is not empty")
+  {
+    observation.min[0] = -std::numeric_limits<double>::infinity();
+    observation.max[0] = std::numeric_limits<double>::infinity();
+    reason = "invalid_bounds";
+  }
+  SECTION("successful reversed output is not empty")
+  {
+    observation.min[0] = 8.;
+    reason = "invalid_bounds";
+  }
+  SECTION("metadata is bounded before retention")
+  {
+    observation.source.identity.assign(129, 'x');
+    reason = "invalid_metadata";
+  }
+  SECTION("raw property failure")
+  {
+    observation.state = WorldBoundsState::UNAVAILABLE;
+    observation.reason = WorldBoundsReason::PROPERTY_UNAVAILABLE;
+    reason = "property_unavailable";
+  }
+  SECTION("pending is explicit readiness")
+  {
+    observation.state = WorldBoundsState::PENDING;
+    observation.reason = WorldBoundsReason::SOURCE_TRANSITION;
+    state = "pending";
+    reason = "source_transition";
+  }
+  SECTION("empty requires provider declaration, never a synthetic box")
+  {
+    observation.state = WorldBoundsState::EMPTY;
+    state = "empty";
+  }
+  SECTION("retired generation fails at publication")
+  {
+    current = false;
+    reason = "retired_source";
+  }
+  SECTION("read withdrawn inside provider prevents publication")
+  {
+    forbidden = true;
+    duringObservation = [&] {
+      f.authority->restrict(
+          Target::scene(f.sceneId), session::Capability::READ);
+    };
+  }
+  REQUIRE(
+      f.submit(f.inspector->makeBounds(f.creds.sessionId, f.sceneId), 1).code
+      == Outcome::OK);
+  const auto status = f.drain(1);
+  if (forbidden) {
+    CHECK(status.terminal == Outcome::FORBIDDEN);
+    CHECK(status.result.empty());
+    f.authority->relax(Target::scene(f.sceneId), session::Capability::READ);
+    CHECK(f.engine->status(f.creds, {f.creds.sessionId, 1}).result.empty());
+  } else {
+    const auto result = page(status);
+    CHECK(result.get("state")->s == state);
+    if (reason)
+      CHECK(result.get("reason")->s == reason);
+    CHECK_FALSE(result.get("min"));
+    CHECK_FALSE(result.get("max"));
+    CHECK(result.get("covered_scene_revision")->type
+        == mcp::json::Value::Type::NUL);
+    observation.source.generation = 2;
+    observation.min[0] = 99.;
+    CHECK(f.submit(f.inspector->makeBounds(f.creds.sessionId, f.sceneId), 1)
+            .replayed);
+    CHECK(f.drain(1).result == status.result);
+  }
+  CHECK(f.inspector->scratch().used() == 0);
+}
+
+SCENARIO(
+    "world source replacement keeps historical replies and suppresses "
+    "late publication",
+    "[integration][bounds][world-bounds]")
+{
+  using namespace vsr::rendering;
+  WorldBoundsObservation observation;
+  observation.state = WorldBoundsState::AVAILABLE;
+  observation.reason = WorldBoundsReason::NONE;
+  observation.source = {"primary-1", 1, "visrtx", "default"};
+  observation.min = {2., 3., 4.};
+  observation.max = {4., 5., 6.};
+  std::uint64_t currentGeneration = 1;
+  unsigned observations = 0;
+  std::function<void()> duringObservation;
+  Fixture f(0,
+      {},
+      false,
+      {[&] {
+         ++observations;
+         if (duringObservation)
+           duringObservation();
+         return observation;
+       },
+          [&](const WorldBoundsSource &s) {
+            return s.generation == currentGeneration;
+          }});
+  auto query = [&](std::uint64_t id) {
+    REQUIRE(
+        f.submit(f.inspector->makeBounds(f.creds.sessionId, f.sceneId), id).code
+        == Outcome::OK);
+    return f.drain(id);
+  };
+  SECTION("replacement source publishes its own box; history is retained")
+  {
+    const auto first = query(1);
+    REQUIRE(page(first).get("source")->get("generation")->s == "1");
+    observation.source = {"primary-2", 2, "helide", "default"};
+    observation.min[0] = 49.;
+    observation.max[0] = 51.;
+    currentGeneration = 2;
+    const auto second = page(query(2));
+    CHECK(second.get("source")->get("identity")->s == "primary-2");
+    CHECK(second.get("source")->get("generation")->s == "2");
+    CHECK(second.get("source")->get("device_identifier")->s == "helide");
+    CHECK(second.get("min")->a[0].n == 49.);
+    const auto calls = observations;
+    CHECK(f.submit(f.inspector->makeBounds(f.creds.sessionId, f.sceneId), 1)
+            .replayed);
+    CHECK(f.drain(1).result == first.result);
+    CHECK(page(f.drain(1)).get("min")->a[0].n == 2.);
+    CHECK(observations == calls); // retrieval never re-queries the world
+  }
+  SECTION("source retired during the driver call is not published")
+  {
+    duringObservation = [&] { currentGeneration = 2; };
+    const auto result = page(query(1));
+    CHECK(result.get("state")->s == "unavailable");
+    CHECK(result.get("reason")->s == "retired_source");
+    CHECK_FALSE(result.get("source"));
+    CHECK_FALSE(result.get("min"));
+  }
+  SECTION("deadline elapsing during the driver call suppresses the value")
+  {
+    duringObservation = [&] { f.now += 5.; };
+    const auto status = query(1);
+    CHECK(status.terminal == Outcome::TIMEOUT);
+    CHECK(status.result.empty());
+    CHECK(observations == 1);
+  }
+  SECTION("cancel during the driver call suppresses the value")
+  {
+    duringObservation = [&] {
+      f.engine->cancel(f.creds, {f.creds.sessionId, 1});
+    };
+    const auto status = query(1);
+    CHECK(status.terminal != Outcome::OK);
+    CHECK(status.result.empty());
+  }
+  SECTION("deadline before execution never invokes the provider")
+  {
+    REQUIRE(
+        f.submit(f.inspector->makeBounds(f.creds.sessionId, f.sceneId), 1).code
+        == Outcome::OK);
+    f.now += 5.;
+    CHECK(f.drain(1).terminal == Outcome::TIMEOUT);
+    CHECK(observations == 0);
+  }
+  CHECK(f.inspector->scratch().used() == 0);
+}
+
+SCENARIO("partial world binding is unqualified, never observed",
+    "[integration][bounds][world-bounds]")
+{
+  using namespace vsr::rendering;
+  unsigned observations = 0;
+  Fixture f(0, {}, false, {[&] {
+    ++observations;
+    WorldBoundsObservation o;
+    o.state = WorldBoundsState::AVAILABLE;
+    o.reason = WorldBoundsReason::NONE;
+    o.source = {"primary-1", 1, "helide", "default"};
+    o.max = {1., 1., 1.};
+    return o;
+  }});
+  REQUIRE(
+      f.submit(f.inspector->makeBounds(f.creds.sessionId, f.sceneId), 1).code
+      == Outcome::OK);
+  const auto result = page(f.drain(1));
+  CHECK(result.get("state")->s == "unavailable");
+  CHECK(result.get("reason")->s == "unqualified_source");
+  CHECK_FALSE(result.get("min"));
+  CHECK(observations == 0);
 }
 
 SCENARIO("bounds observes safe-point revisions under fixed limits",

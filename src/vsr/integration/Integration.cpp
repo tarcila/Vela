@@ -137,6 +137,16 @@ std::optional<EffectiveViewBinding> Integration::observeViewBinding(
   return observer ? observer() : std::optional<EffectiveViewBinding>{};
 }
 
+rendering::WorldBoundsProvider Integration::worldBoundsProvider(
+    SceneId id) const
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  if (!m_active || m_servicingThread != std::this_thread::get_id()
+      || id >= m_scenes.size())
+    return {};
+  return m_scenes[id].registration.worldBounds;
+}
+
 std::optional<ViewDescription> Integration::viewDescription(ViewId id) const
 {
   std::lock_guard<std::mutex> lock(m_mutex);

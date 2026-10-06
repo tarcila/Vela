@@ -261,14 +261,18 @@ inline void addQueryTools(std::vector<Tool> &tools, QueryDeps deps)
   Tool bounds;
   bounds.name = "vsr_bounds";
   bounds.description =
-      "Observe default-visible scene bounds at a safe point: active layers "
-      "and effectively enabled contributors only. Missing host binding is "
-      "unavailable/missing_binding, not empty geometry. No scans, renderer "
-      "setup or provider work. include_disabled=true and any node_handle "
-      "are unsupported. Fixed work ceilings: 256 node/geometry steps and "
-      "4096 vertex values per slice; 4096 nodes and 1048576 vertex values "
-      "per operation; deadline 5 seconds including queue time; shared "
-      "temporary scratch at most 8 MiB. Value-only results claim no scans.";
+      "Read the host's primary live interactive viewport ANARI WORLD bounds. "
+      "coverage=viewport_world describes existing world filtering and external "
+      "instances, not a complete CPU Scene union or unpublished edits. Scene "
+      "and inspection revisions are observation only; covered Scene revision "
+      "is unknown. Available has finite ordered min/max and opaque source "
+      "identity/generation/device; empty requires a provider-proved convention. "
+      "Unbound hosts return unavailable/missing_binding; pending means explicit "
+      "host readiness. No render, reset, device creation, index population or "
+      "geometry scan. include_disabled=true and any node_handle reject before "
+      "admission. Deadline 5 seconds including queue time; shared temporary "
+      "scratch at most 8 MiB. Qualified host driver queries use ANARI_WAIT, "
+      "which a deadline cannot interrupt. Example: {request_id:1,scene_id:0}.";
   bounds.inputSchemaJson =
       std::string("{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{")
       + requestIdSchema()
