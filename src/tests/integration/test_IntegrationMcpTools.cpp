@@ -822,6 +822,73 @@ SCENARIO("MCP Array inspection reports actual mappings without pixel writes",
   CHECK_THROWS(image->unmap());
 }
 
+SCENARIO("MCP Image mapping invalidates pages without publishing a write",
+    "[integration][mcp][image-tracking][image-map-revision]")
+{
+  Fixture f({}, true, false, false, 120., true);
+  auto image = f.scene.createArray(ANARI_UFIXED8, 1, 1);
+  image->setName("tracked-image");
+  auto second = f.scene.createArray(ANARI_UFIXED8, 1, 1);
+  second->setName("tracked-image");
+  auto s = f.attach();
+  auto page = [&](std::uint64_t request, const std::string &cursor = "") {
+    const auto ack = f.tool(s,
+        "vsr_inspect",
+        "{\"request_id\":" + std::to_string(request)
+            + ",\"scene_id\":" + std::to_string(f.sceneId)
+            + ",\"name\":\"tracked-image\",\"page_size\":1"
+            + (cursor.empty() ? "" : ",\"cursor\":\"" + cursor + "\"") + "}");
+    REQUIRE(ack.errorCode().empty());
+    f.drain();
+    return f.status(s, s.id, request);
+  };
+  auto before = page(1);
+  REQUIRE(before.str("outcome") == "ok");
+  const auto &beforeItem = before.result()->get("items")->a.at(0);
+  const auto initial = beforeItem.get("image_info")->get("data_version")->s;
+  const auto version = beforeItem.get("version")->n;
+  const auto revision =
+      std::stoull(before.result()->get("revision")->s, nullptr, 16);
+  const auto sceneRevision = before.result()->get("scene_revision")->s;
+  const auto cursor = before.result()->get("cursor")->s;
+
+  auto *bytes = static_cast<unsigned char *>(image->map());
+  *bytes = 61;
+  auto mapped = page(2);
+  REQUIRE(mapped.str("outcome") == "ok");
+  const auto &mappedItem = mapped.result()->get("items")->a.at(0);
+  CHECK(mappedItem.get("mapped")->b);
+  CHECK(mappedItem.get("version")->n == version);
+  CHECK(mappedItem.get("image_info")->get("data_version")->s == initial);
+  CHECK(std::stoull(mapped.result()->get("revision")->s, nullptr, 16)
+      == revision + 1);
+  CHECK(mapped.result()->get("scene_revision")->s == sceneRevision);
+  CHECK(page(3, cursor).str("outcome") == "cursor_stale");
+  const auto mappedCursor = mapped.result()->get("cursor")->s;
+  CHECK_THROWS(image->map());
+  auto stillMapped = page(4);
+  CHECK(stillMapped.result()->get("revision")->s
+      == mapped.result()->get("revision")->s);
+
+  image->unmap();
+  auto completed = page(5);
+  REQUIRE(completed.str("outcome") == "ok");
+  const auto &completedItem = completed.result()->get("items")->a.at(0);
+  CHECK_FALSE(completedItem.get("mapped")->b);
+  CHECK(completedItem.get("version")->n == version + 1);
+  CHECK(completedItem.get("image_info")->get("data_version")->s != initial);
+  CHECK(std::stoull(completed.result()->get("revision")->s, nullptr, 16)
+      == revision + 2);
+  const auto separator = sceneRevision.rfind('.') + 1;
+  CHECK(completed.result()->get("scene_revision")->s
+      == sceneRevision.substr(0, separator)
+          + std::to_string(std::stoull(sceneRevision.substr(separator)) + 1));
+  CHECK(static_cast<const unsigned char *>(image->data())[0] == 61);
+  CHECK(page(6, mappedCursor).str("outcome") == "cursor_stale");
+  auto readOnly = page(7);
+  CHECK(json::write(*readOnly.result()) == json::write(*completed.result()));
+}
+
 SCENARIO("MCP automatically tracks completed ordinary Image writes launch-wide",
     "[integration][mcp][image-tracking]")
 {

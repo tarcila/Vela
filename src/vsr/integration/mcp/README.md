@@ -315,7 +315,10 @@ or unavailable objects omit the available payload, especially `data_version`.
 No fabricated token, conversion or proxy/CUDA materialisation is performed.
 Ordinary completed map/unmap writes advance the token once, including same-value
 writes and change-back; inspection while mapped keeps the previous token.
-Read-only inspection/capture does not allocate a write sequence.
+Read-only inspection/capture does not allocate a write sequence. Map admission
+advances only the inspection revision and invalidates existing pagination cursors;
+it is not a completed write or parameter edit. Completed unmap advances inspection,
+Scene and Array parameter versions once and invalidates outstanding cursors again.
 
 Discovery currently reports `image_exchange` with `supported:false`,
 `enabled:false`, and the separate `data_tracking` prerequisite. Its reason is

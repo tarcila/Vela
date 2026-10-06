@@ -468,7 +468,11 @@ class SceneIdentity::Observer : public scene::BaseUpdateDelegate
   {
     m_owner->parameterChanged(o);
   }
-  void signalArrayMapped(const scene::Array *) override {}
+  void signalArrayMapped(const scene::Array *) override
+  {
+    // Outstanding mapping changes inspection, not completed data or parameters.
+    m_owner->inspectionChanged();
+  }
   void signalArrayUnmapped(const scene::Array *a) override
   {
     m_owner->parameterChanged(a);

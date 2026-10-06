@@ -21,8 +21,14 @@ links with summaries, not duplicate Image payloads. No texels are downloaded.
 Availability describes supported storage/tracking, not edit permission or an
 unmapped state. `mapped` observes a real outstanding map on the owning thread.
 Inspection/read-only `data()` access never advances a completed-write token.
-During a map, inspection keeps the previous completed token. Each successful
-map/unmap cycle advances exactly once, even a same-value write or change-back.
+At the owning-thread observer boundary, map admission advances the inspection
+revision and invalidates pagination cursors, without advancing the Scene revision,
+Array parameter version or completed-write token. Completed unmap advances the
+inspection and Scene revisions and Array parameter version once, invalidates
+cursors again, and publishes the reserved token. Nested-map rejection changes none
+of these observations. During a map, inspection keeps the previous completed token.
+Each successful map/unmap cycle advances exactly once, even a same-value write or
+change-back.
 An unmap publishes before downstream notification: notification failure does
 not roll back bytes or pretend the write did not complete.
 
