@@ -12,6 +12,10 @@
 #include <memory_resource>
 #include <string>
 
+namespace vsr::integration::edit {
+class EditService;
+}
+
 namespace vsr::integration::image {
 
 struct ExchangeLimits
@@ -27,12 +31,17 @@ struct ExchangeLimits
   std::pmr::memory_resource *allocator{std::pmr::new_delete_resource()};
   // Owning-thread observation of the existing global activity/restoration pool.
   std::function<std::size_t()> availableGlobalRetention;
+  std::function<bool(const std::string &, const std::string &)>
+      restorationRetained;
 };
 
 /*
  * Local POSIX PNG exchange. Capture runs only at an authorized safe point;
- * filesystem scans and encoding run on owned workers using immutable bytes.
- * No map, write reservation, render slot or undo payload is acquired.
+ * filesystem scans and codecs run on owned workers using immutable bytes.
+ * Export acquires no map, write sequence, render slot or undo payload.
+ * Import is opt-in through attachRestoration(); it shares the normal edit
+ * store and vsr_restore, retaining exact prior samples before any write.
+ * The shipped hosts deliberately have not enabled this unfinished slice.
  * Engine/Integration outlive this service. Destruction joins workers before
  * descriptor-relative cleanup; completed files have no TTL.
  */
@@ -47,6 +56,10 @@ class ImageExchange
   ~ImageExchange();
   VSR_NOT_COPYABLE(ImageExchange)
   void attachScene(SceneId scene, identity::SceneIdentity &identity);
+  // Qualification/continuation seam, not enabled by the shipped hosts yet.
+  // Edits and this service share a launch and owning-thread lifetime.
+  void attachRestoration(edit::EditService &edits);
+  bool importAvailable() const;
   // Empty session selects launch-wide descriptor metadata, not a ledger.
   std::string metadata(SceneId scene, const std::string &sessionId = {}) const;
   std::string unavailableReason(SceneId scene) const;
@@ -56,6 +69,12 @@ class ImageExchange
       const operations::OperationRef &ref,
       SceneId scene,
       identity::ObjectHandle handle);
+  operations::Admission submitImport(const session::Credentials &credentials,
+      const operations::OperationRef &ref,
+      SceneId scene,
+      identity::ObjectHandle handle,
+      std::string dataVersion,
+      std::string fileName);
 
  private:
   struct State;

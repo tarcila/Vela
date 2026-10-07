@@ -61,6 +61,8 @@ class SyncStates
   bool viewConfirmed(ViewId view) const;
   void setTransitionListener(TransitionListener listener);
 
+  // Allocate control state before a mutation's no-fail boundary.
+  void prepareScene(SceneId scene);
   // Ordinary synchronization after an edit/restore commit.
   void beginHook(SceneId scene);
   // Returns true when the operation may report synchronization-ready success:
@@ -213,6 +215,12 @@ inline void SyncStates::mutate(SceneId scene, F &&f)
   }
   if (from != to && listener)
     listener(scene, from, to);
+}
+
+inline void SyncStates::prepareScene(SceneId scene)
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  m_scenes.try_emplace(scene);
 }
 
 inline SyncState SyncStates::state(SceneId scene) const

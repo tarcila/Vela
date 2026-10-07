@@ -21,6 +21,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <memory_resource>
 #include <mutex>
 #include <new>
 #include <optional>
@@ -422,6 +423,25 @@ struct NodeChange
   core::math::mat3 beforeSRT{};
 };
 
+struct ImageSnapshot
+{
+  explicit ImageSnapshot(
+      std::pmr::memory_resource *allocator = std::pmr::new_delete_resource())
+      : bytes(allocator)
+  {}
+  VSR_NOT_COPYABLE(ImageSnapshot)
+  VSR_NOT_MOVEABLE(ImageSnapshot)
+  // One shared physical allocation; copying records never duplicates texels.
+  std::shared_ptr<const void> physicalLease;
+  std::shared_ptr<const void> sessionLease;
+  std::pmr::vector<std::uint8_t> bytes;
+  ObjectHandle handle;
+  std::uint64_t completedWrite{0};
+  std::string batchOrder;
+  std::weak_ptr<const void> registration;
+  scene::Scene *scene{nullptr};
+};
+
 struct RestorationRecord
 {
   BatchRef ref;
@@ -431,6 +451,7 @@ struct RestorationRecord
   std::vector<Change> changes;
   std::vector<ParameterVersionToken> resultingVersions;
   std::vector<NodeChange> nodeChanges;
+  std::shared_ptr<ImageSnapshot> image;
 };
 
 // Bounded restorable-batch store (spec §5: 32 by default). Publishing past
@@ -446,6 +467,12 @@ class RestorationStore
   bool reserve();
   void cancelReservation();
   void publish(RestorationRecord record); // consumes one reservation
+  // Allocate all store/control state before an Image's write boundary.
+  bool prepareImage(RestorationRecord record);
+  void publishImage(const BatchRef &ref);
+  void cancelImage(const BatchRef &ref);
+  std::optional<SceneId> imageScope(const BatchRef &ref) const;
+  void forgetImageScope(const BatchRef &ref);
 
   std::optional<RestorationRecord> find(const BatchRef &ref) const;
   // True once the record was evicted by the retention budget.
@@ -463,6 +490,9 @@ class RestorationStore
   std::size_t m_capacity;
   std::size_t m_reserved{0};
   std::map<std::string, RestorationRecord> m_records;
+  std::map<std::string, RestorationRecord> m_pendingImages;
+  std::map<std::string, SceneId> m_imageScopes;
+  std::vector<std::string> m_imageScopeOrder;
   std::vector<std::string> m_order; // oldest first
   std::set<std::string> m_expired;
   std::vector<std::string> m_expiredOrder; // bounded like activity entries
@@ -518,6 +548,8 @@ class EditService
   std::weak_ptr<const void> lifetime() const;
 
   static std::string canonicalArguments(const EditBatch &batch);
+  // Shared edit/import namespace. Issued identifiers are never recycled.
+  std::optional<std::string> newBatchId();
 
   // Shared by low-level commit and selection preview. Safe-point only;
   // caller owns the batch and keeps its entries alive through preparation.
@@ -540,7 +572,6 @@ class EditService
   EditResult commit(const EditBatch &batch, operations::StepContext &ctx);
   Outcome synchronize(SceneId scene);
   bool fault(FaultStage stage) const;
-  std::optional<std::string> newBatchId();
 
   Integration &m_integration;
   OperationEngine &m_engine;
@@ -600,8 +631,85 @@ inline void RestorationStore::publish(RestorationRecord record)
   m_records[id] = std::move(record);
 }
 
+inline bool RestorationStore::prepareImage(RestorationRecord record)
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  if (!record.image || m_reserved >= m_capacity)
+    return false;
+  const auto id = record.ref.batchId;
+  const auto scopeKey = record.ref.launchId + "/" + id;
+  while (!m_order.empty() && m_records.size() + m_reserved >= m_capacity)
+    expireLocked(m_order.front());
+  // Allocations here may fail; no write has occurred. Rollback the partial
+  // control state before propagating an allocation failure to admission.
+  try {
+    m_order.reserve(m_order.size() + m_capacity + 1);
+    m_imageScopeOrder.reserve(m_imageScopeOrder.size() + 1);
+    m_imageScopes.emplace(scopeKey, record.scene);
+    record.image->batchOrder = id;
+    m_pendingImages.emplace(id, std::move(record));
+    m_imageScopeOrder.push_back(id);
+  } catch (...) {
+    m_pendingImages.erase(id);
+    m_imageScopes.erase(scopeKey);
+    throw;
+  }
+  ++m_reserved;
+  return true;
+}
+
+inline void RestorationStore::publishImage(const BatchRef &ref)
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  const auto it = m_pendingImages.find(ref.batchId);
+  if (it == m_pendingImages.end())
+    return;
+  --m_reserved;
+  m_order.push_back(std::move(it->second.image->batchOrder));
+  m_records.insert(m_pendingImages.extract(it));
+  while (m_imageScopeOrder.size() > 1024) {
+    m_imageScopes.erase(ref.launchId + "/" + m_imageScopeOrder.front());
+    m_imageScopeOrder.erase(m_imageScopeOrder.begin());
+  }
+}
+
+inline void RestorationStore::cancelImage(const BatchRef &ref)
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  if (m_pendingImages.erase(ref.batchId)) {
+    --m_reserved;
+    m_imageScopes.erase(ref.launchId + "/" + ref.batchId);
+    m_imageScopeOrder.erase(
+        std::remove(
+            m_imageScopeOrder.begin(), m_imageScopeOrder.end(), ref.batchId),
+        m_imageScopeOrder.end());
+  }
+}
+
+inline std::optional<SceneId> RestorationStore::imageScope(
+    const BatchRef &ref) const
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  const auto it = m_imageScopes.find(ref.launchId + "/" + ref.batchId);
+  return it == m_imageScopes.end() ? std::optional<SceneId>{}
+                                   : std::optional<SceneId>{it->second};
+}
+
+inline void RestorationStore::forgetImageScope(const BatchRef &ref)
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  m_imageScopes.erase(ref.launchId + "/" + ref.batchId);
+  m_imageScopeOrder.erase(
+      std::remove(
+          m_imageScopeOrder.begin(), m_imageScopeOrder.end(), ref.batchId),
+      m_imageScopeOrder.end());
+}
+
 inline void RestorationStore::expireLocked(std::string id)
 {
+  const auto record = m_records.find(id);
+  if (record != m_records.end())
+    m_imageScopes.erase(record->second.ref.launchId + "/" + id);
   for (auto o = m_order.begin(); o != m_order.end(); ++o)
     if (*o == id) {
       m_order.erase(o);
@@ -644,6 +752,8 @@ inline std::size_t restorationBytes(const RestorationRecord &record)
       + record.ref.batchId.size()
       + record.resultingVersions.capacity() * sizeof(ParameterVersionToken);
   n += record.nodeChanges.capacity() * sizeof(NodeChange);
+  if (record.image)
+    n += record.image->bytes.size();
   for (auto &c : record.changes)
     n += sizeof(Change) + c.parameter.size() + anyBytes(c.before)
         + anyBytes(c.after);

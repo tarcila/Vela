@@ -22,7 +22,8 @@ PUBLIC
 find_package(Threads REQUIRED)
 project_link_libraries(PUBLIC vsr_scene Threads::Threads)
 # PNG deflate via the vendored stb writer; an implementation detail.
-project_link_libraries(PRIVATE $<BUILD_INTERFACE:vela_ext_stb_image>)
+project_link_libraries(PRIVATE $<BUILD_INTERFACE:vela_ext_stb_image>
+  $<BUILD_INTERFACE:vela_ext_zlib>)
 
 # Embedded MCP server (header-only under mcp/); opt-in, no extra dependency.
 if (VSR_USE_INTEGRATION_MCP)

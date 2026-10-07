@@ -3,6 +3,8 @@
 
 // vsr_integration
 #include "vsr/integration/image/ImageExchange.hpp"
+#include "vsr/integration/edit/AgentEdit.hpp"
+#include "vsr/integration/image/PngImport.hpp"
 #include "vsr/integration/mcp/Json.hpp"
 // posix
 #if defined(__linux__)
@@ -72,8 +74,10 @@ struct Bounds
   std::size_t peak{0};
 };
 
-std::optional<Bounds> bounds(
-    std::size_t width, std::size_t height, std::size_t channels)
+std::optional<Bounds> bounds(std::size_t width,
+    std::size_t height,
+    std::size_t channels,
+    bool exporting = true)
 {
   constexpr auto MAX = std::numeric_limits<std::size_t>::max();
   if (!width || !height || !channels || channels > 4 || width > UINT32_MAX
@@ -93,7 +97,7 @@ std::optional<Bounds> bounds(
   // Stored DEFLATE: F + five bytes per 65535-byte block, zlib header/trailer,
   // PNG signature/IHDR/one IDAT/IEND. No compressor allocations or growth.
   const auto actual = b.filtered + 5 * ((b.filtered + 65534) / 65535) + 63;
-  if (actual > b.encoded)
+  if (exporting && actual > b.encoded)
     return {};
   return b;
 }
@@ -324,6 +328,35 @@ std::string bindings(
       + "],\"affected_complete\":" + (complete ? "true" : "false");
 }
 
+struct SessionLedger
+{
+  std::mutex mutex;
+  std::size_t bytes{0};
+};
+struct SessionCharge
+{
+  std::shared_ptr<SessionLedger> ledger;
+  std::size_t bytes{0};
+  ~SessionCharge();
+};
+SessionCharge::~SessionCharge()
+{
+  std::lock_guard<std::mutex> lock(ledger->mutex);
+  ledger->bytes -= bytes;
+}
+
+bool confinedName(const std::string &name)
+{
+  if (name.empty() || name.size() > 128 || name[0] == '.' || name.size() < 5
+      || name.compare(name.size() - 4, 4, ".png"))
+    return false;
+  for (const unsigned char c : name)
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+            || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.'))
+      return false;
+  return true;
+}
+
 struct Usage
 {
   std::size_t files{0};
@@ -342,12 +375,25 @@ struct ImageExchange::State
   };
   struct Job
   {
-    explicit Job(std::pmr::memory_resource *allocator) : pixels(allocator) {}
+    explicit Job(std::pmr::memory_resource *allocator)
+        : pixels(allocator), encoded(allocator)
+    {}
     std::shared_ptr<State> state;
     std::shared_ptr<const void> physicalLease;
     ByteBuffer pixels;
+    ByteBuffer encoded;
     Bounds bound;
+    bool importing{false};
+    bool committed{false};
+    bool notificationFailed{false};
+    bool storePrepared{false};
+    edit::BatchRef batch;
+    std::shared_ptr<edit::ImageSnapshot> snapshot;
+    std::weak_ptr<const void> registration;
+    std::string expectedVersion;
+    std::string sessionId;
     std::size_t width{}, height{}, channels{};
+    anari::DataType elementType{ANARI_UNKNOWN};
     std::string receipt;
     std::string name;
     std::function<bool()> abandoned;
@@ -364,6 +410,7 @@ struct ImageExchange::State
 #endif
     bool start();
     void join();
+    void releaseTransient(bool keepPhysicalLease = false);
     ~Job();
   };
   std::string launchId;
@@ -371,6 +418,9 @@ struct ImageExchange::State
   std::string reason{"unsupported_platform"};
   ExchangeLimits limits;
   std::vector<Source> sources;
+  edit::EditService *edits{nullptr};
+  std::weak_ptr<const void> editsLifetime;
+  std::map<std::string, std::shared_ptr<SessionLedger>> ledgers;
   std::vector<std::weak_ptr<Job>> jobs;
   mutable std::mutex mutex;
   std::mutex fileMutex;
@@ -387,8 +437,10 @@ struct ImageExchange::State
   ~State();
   bool current() const;
   std::string limitsJson(
-      const Bounds *bound = nullptr, bool authenticatedSession = false) const;
+      const Bounds *bound = nullptr, const std::string &sessionId = {}) const;
   Step write(Job &job);
+  Step read(Job &job);
+  void pruneRestorations() const;
   bool fileCurrent(const Job &job) const;
 };
 
@@ -398,7 +450,8 @@ bool ImageExchange::State::Job::start()
   const auto page = ::sysconf(_SC_PAGESIZE);
   if (page <= 0 || WORKER_STACK_BYTES % page || WORKER_GUARD_BYTES % page)
     return false;
-  task = std::packaged_task<Step()>([this] { return state->write(*this); });
+  task = std::packaged_task<Step()>(
+      [this] { return importing ? state->read(*this) : state->write(*this); });
   stack = ::mmap(nullptr,
       WORKER_STACK_BYTES + WORKER_GUARD_BYTES,
       PROT_READ | PROT_WRITE,
@@ -459,7 +512,7 @@ ImageExchange::State::Job::~Job()
 {
   join();
 #if defined(__linux__)
-  if (!retained && !name.empty()) {
+  if (!importing && !retained && !name.empty()) {
     struct stat named{};
     if (::fstatat(state->imagesFd, name.c_str(), &named, AT_SYMLINK_NOFOLLOW)
             == 0
@@ -468,16 +521,32 @@ ImageExchange::State::Job::~Job()
       ::unlinkat(state->imagesFd, name.c_str(), 0);
   }
 #endif
-  // Release physical buffers before either cap-accounting lease. A host
-  // consumer may admit new memory as soon as the lease disappears.
+  if (storePrepared && !state->editsLifetime.expired())
+    state->edits->restorations().cancelImage(batch);
+  snapshot.reset();
+  // Export's physical lease is destroyed after *all* control members, as
+  // well as buffers/stack. Do not release it early in the destructor body.
+  releaseTransient(true);
+}
+
+void ImageExchange::State::Job::releaseTransient(bool keepPhysicalLease)
+{
+  join();
   {
     ByteBuffer empty(pixels.get_allocator().resource());
     pixels.swap(empty);
+    ByteBuffer emptyEncoded(encoded.get_allocator().resource());
+    encoded.swap(emptyEncoded);
   }
-  // physicalLease is declared before every buffer/control member, so its
-  // automatic destruction occurs only after all of them have been freed.
+#if defined(__linux__)
+  task = {};
+#endif
+  future = {};
+  if (!keepPhysicalLease)
+    physicalLease.reset();
   std::lock_guard<std::mutex> lock(state->mutex);
   state->reserved -= bound.peak;
+  bound.peak = 0;
 }
 
 ImageExchange::State::~State()
@@ -556,7 +625,7 @@ bool ImageExchange::State::fileCurrent(const Job &job) const
 }
 
 std::string ImageExchange::State::limitsJson(
-    const Bounds *b, bool authenticatedSession) const
+    const Bounds *b, const std::string &sessionId) const
 {
   std::lock_guard<std::mutex> lock(mutex);
   std::string result = "{\"file_cap\":1024,\"byte_cap\":268435456,\"files_used\":"
@@ -571,10 +640,74 @@ std::string ImageExchange::State::limitsJson(
   if (b)
     result += ",\"max_encoded_file_bytes\":" + std::to_string(b->encoded)
         + ",\"max_codec_work_bytes\":" + std::to_string(b->work);
-  // Before Import exists no session has a retained or pending Image snapshot.
-  if (b || authenticatedSession)
-    result += ",\"available_session_snapshot_bytes\":67108864";
+  if (!sessionId.empty()) {
+    std::size_t used = 0;
+    const auto it = ledgers.find(sessionId);
+    if (it != ledgers.end()) {
+      std::lock_guard<std::mutex> ledgerLock(it->second->mutex);
+      used = it->second->bytes;
+    }
+    result += ",\"available_session_snapshot_bytes\":"
+        + std::to_string(67108864 - std::min<std::size_t>(67108864, used));
+  }
   return result + "}";
+}
+
+Step ImageExchange::State::read(Job &job)
+{
+#if defined(__linux__)
+  if (!current() || !confinedName(job.name))
+    return reject(Outcome::INVALID_REQUEST, "file_rejected");
+  descriptor::detail::Fd file(::openat(imagesFd,
+      job.name.c_str(),
+      O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC));
+  struct stat before{}, after{};
+  if (file.fd < 0 || ::fstat(file.fd, &before) != 0 || !S_ISREG(before.st_mode)
+      || before.st_uid != ::geteuid() || before.st_nlink != 1
+      || before.st_size < 0)
+    return reject(Outcome::INVALID_REQUEST, "file_rejected");
+  if (std::uint64_t(before.st_size) > job.bound.encoded)
+    return reject(Outcome::INVALID_REQUEST, "invalid_png");
+  job.encoded.resize(std::size_t(before.st_size));
+  for (std::size_t offset = 0; offset < job.encoded.size();) {
+    if (job.abandoned())
+      return reject(Outcome::CANCELLED, "resource_limit");
+    const auto count = ::read(file.fd,
+        job.encoded.data() + offset,
+        std::min<std::size_t>(65536, job.encoded.size() - offset));
+    if (count < 0 && errno == EINTR)
+      continue;
+    if (count <= 0)
+      return reject(Outcome::INVALID_REQUEST, "file_rejected");
+    offset += std::size_t(count);
+  }
+  std::uint8_t extra{};
+  if (::read(file.fd, &extra, 1) != 0 || ::fstat(file.fd, &after) != 0
+      || before.st_dev != after.st_dev || before.st_ino != after.st_ino
+      || before.st_size != after.st_size || before.st_uid != after.st_uid
+      || before.st_nlink != after.st_nlink || before.st_mode != after.st_mode
+      || before.st_mtim.tv_sec != after.st_mtim.tv_sec
+      || before.st_mtim.tv_nsec != after.st_mtim.tv_nsec
+      || before.st_ctim.tv_sec != after.st_ctim.tv_sec
+      || before.st_ctim.tv_nsec != after.st_ctim.tv_nsec || !current())
+    return reject(Outcome::INVALID_REQUEST, "file_rejected");
+  const auto decoded = decodePng(job.encoded,
+      job.width,
+      job.height,
+      job.channels,
+      job.pixels,
+      job.abandoned);
+  if (decoded == DecodeResult::INVALID_PNG)
+    return reject(Outcome::INVALID_REQUEST, "invalid_png");
+  if (decoded == DecodeResult::RESOURCE_LIMIT)
+    return reject(Outcome::BUSY, "resource_limit");
+  if (decoded == DecodeResult::CANCELLED)
+    return reject(Outcome::CANCELLED, "resource_limit");
+  return Step{};
+#else
+  (void)job;
+  return reject(Outcome::INVALID_REQUEST, "unsupported_platform");
+#endif
 }
 
 Step ImageExchange::State::write(Job &job)
@@ -689,7 +822,7 @@ Step ImageExchange::State::write(Job &job)
   }
   Step result;
   result.result = "{\"file_name\":" + quote(job.name) + "," + job.receipt
-      + ",\"exchange_limits\":" + limitsJson(&job.bound) + "}";
+      + ",\"exchange_limits\":" + limitsJson(&job.bound, job.sessionId) + "}";
   return result;
 #else
   (void)job;
@@ -862,6 +995,27 @@ ImageExchange::~ImageExchange()
       job->join();
 }
 
+void ImageExchange::attachRestoration(edit::EditService &edits)
+{
+  if (edits.launchId() != m_state->launchId)
+    throw std::runtime_error("Image restoration requires the same launch");
+  m_state->edits = &edits;
+  m_state->editsLifetime = edits.lifetime();
+}
+
+bool ImageExchange::importAvailable() const
+{
+  return m_state->edits && !m_state->editsLifetime.expired();
+}
+
+void ImageExchange::State::pruneRestorations() const
+{
+  if (edits && !editsLifetime.expired() && limits.restorationRetained)
+    edits->restorations().expireUnless([&](const edit::BatchRef &ref) {
+      return limits.restorationRetained(ref.launchId, ref.batchId);
+    });
+}
+
 void ImageExchange::attachScene(
     SceneId scene, identity::SceneIdentity &identity)
 {
@@ -871,6 +1025,7 @@ void ImageExchange::attachScene(
 std::string ImageExchange::metadata(
     SceneId scene, const std::string &sessionId) const
 {
+  m_state->pruneRestorations();
   if (m_state->limits.availableGlobalRetention) {
     const auto available = m_state->limits.availableGlobalRetention();
     std::lock_guard<std::mutex> lock(m_state->mutex);
@@ -881,14 +1036,14 @@ std::string ImageExchange::metadata(
   return std::string("{\"supported\":") + (enabled ? "true" : "false")
       + ",\"enabled\":" + (enabled ? "true" : "false")
       + ",\"export\":" + (enabled ? "true" : "false")
-      + ",\"import\":false,\"data_tracking\":" + (tracking ? "true" : "false")
+      + ",\"import\":" + (enabled && importAvailable() ? "true" : "false")
+      + ",\"data_tracking\":" + (tracking ? "true" : "false")
       + (enabled ? ",\"image_exchange_directory\":" + quote(m_state->path)
                  : ",\"reason\":"
                   + quote(!tracking ? "host_write_contract_unavailable"
                           : m_state->reason.empty() ? "file_rejected"
                                                     : m_state->reason))
-      + ",\"exchange_limits\":"
-      + m_state->limitsJson(nullptr, !sessionId.empty()) + "}";
+      + ",\"exchange_limits\":" + m_state->limitsJson(nullptr, sessionId) + "}";
 }
 
 std::string ImageExchange::unavailableReason(SceneId scene) const
@@ -902,6 +1057,18 @@ std::string ImageExchange::unavailableReason(SceneId scene) const
 
 void ImageExchange::pump()
 {
+  m_state->pruneRestorations();
+  {
+    std::lock_guard<std::mutex> lock(m_state->mutex);
+    for (auto it = m_state->ledgers.begin(); it != m_state->ledgers.end();) {
+      auto ledger = it->second;
+      std::lock_guard<std::mutex> ledgerLock(ledger->mutex);
+      if (!ledger->bytes && ledger.use_count() == 2)
+        it = m_state->ledgers.erase(it);
+      else
+        ++it;
+    }
+  }
   std::vector<std::shared_ptr<State::Job>> ready;
   {
     std::lock_guard<std::mutex> lock(m_state->mutex);
@@ -926,6 +1093,7 @@ operations::Admission ImageExchange::submitExport(
   auto state = m_state;
   auto job = std::make_shared<State::Job>(state->limits.allocator);
   job->state = state;
+  job->sessionId = credentials.sessionId;
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     state->jobs.erase(std::remove_if(state->jobs.begin(),
@@ -1050,6 +1218,299 @@ operations::Admission ImageExchange::submitExport(
       return reject(Outcome::BUSY, "resource_limit");
     } catch (const std::system_error &) {
       return reject(Outcome::BUSY, "resource_limit");
+    }
+  };
+  return m_engine->submit(credentials, ref, std::move(request));
+}
+
+operations::Admission ImageExchange::submitImport(
+    const session::Credentials &credentials,
+    const operations::OperationRef &ref,
+    SceneId scene,
+    identity::ObjectHandle handle,
+    std::string dataVersion,
+    std::string fileName)
+{
+  if (!importAvailable() || dataVersion.empty() || dataVersion.size() > 256
+      || !confinedName(fileName)) {
+    operations::Admission admission;
+    admission.code = Outcome::INVALID_REQUEST;
+    return admission;
+  }
+  auto state = m_state;
+  auto job = std::make_shared<State::Job>(state->limits.allocator);
+  job->state = state;
+  job->importing = true;
+  job->sessionId = credentials.sessionId;
+  job->name = std::move(fileName);
+  job->expectedVersion = std::move(dataVersion);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->jobs.erase(std::remove_if(state->jobs.begin(),
+                          state->jobs.end(),
+                          [](const auto &weak) { return weak.expired(); }),
+        state->jobs.end());
+    state->jobs.push_back(job);
+  }
+  operations::Request request;
+  request.kind = "image_import";
+  request.target = session::Target::scene(scene);
+  request.capability = session::Capability::EDIT;
+  request.boundSceneRead = true;
+  request.deadlineSeconds = 30.;
+  request.canonicalArguments = std::to_string(scene) + ":" + handleName(handle)
+      + ":" + job->expectedVersion + ":" + job->name;
+  request.executor = [state, job, scene, handle, integration = m_integration](
+                         operations::StepContext &ctx) {
+    if (job->committed) {
+      Step result;
+      result.committed = true;
+      try {
+        result.outcome = state->edits->synchronizeCommitted(scene);
+      } catch (...) {
+        result.outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
+      }
+      if (job->notificationFailed)
+        result.outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
+      result.result = std::move(job->receipt);
+      return result;
+    }
+    const auto fail = [&](Outcome outcome, const char *reason) {
+      if (ctx.cancelRestoration)
+        ctx.cancelRestoration();
+      return reject(outcome, reason);
+    };
+    try {
+      // Even rejected live state must wait for bounded worker cleanup before
+      // dropping its owner under the engine lock (worker checks that lock).
+      if (job->future.valid()
+          && job->future.wait_for(std::chrono::seconds(0))
+              != std::future_status::ready) {
+        Step pending;
+        pending.status = Step::Status::BACKEND_PENDING;
+        return pending;
+      }
+      if (ctx.abandoned || ctx.isAbandoned())
+        return Step{};
+      if (state->editsLifetime.expired())
+        return fail(Outcome::BUSY, "resource_limit");
+      identity::SceneIdentity *ids = nullptr;
+      std::weak_ptr<const void> registration;
+      for (const auto &source : state->sources) {
+        if (source.lifetime.expired())
+          continue;
+        if (source.scene == scene) {
+          ids = source.identity;
+          registration = source.lifetime;
+        } else if (auto *foreign = source.identity->resolve(handle))
+          return fail(Outcome::INVALID_REQUEST,
+              dynamic_cast<vsr::scene::Array *>(foreign) ? "foreign_scene"
+                                                         : "invalid_handle");
+      }
+      auto *array = ids
+          ? dynamic_cast<vsr::scene::Array *>(ids->resolve(handle))
+          : nullptr;
+      if (!array || ids->scene() != &ctx.scene)
+        return fail(Outcome::INVALID_REQUEST, "invalid_handle");
+      if (!integration->imageTrackingAvailable(scene))
+        return fail(
+            Outcome::INVALID_REQUEST, "host_write_contract_unavailable");
+      if (!array->isImage())
+        return fail(Outcome::INVALID_REQUEST, "unsupported_image");
+      if (array->isMapped())
+        return fail(Outcome::BUSY, "image_mapped");
+      const auto version = ids->imageDataVersion(handle);
+      if (!version || *version != job->expectedVersion)
+        return fail(Outcome::CONFLICT, "stale_data_version");
+      if (!state->current())
+        return fail(Outcome::INVALID_REQUEST, "file_rejected");
+      if (job->future.valid()) {
+        if (job->future.wait_for(std::chrono::seconds(0))
+            != std::future_status::ready) {
+          Step pending;
+          pending.status = Step::Status::BACKEND_PENDING;
+          return pending;
+        }
+        auto decoded = job->future.get();
+        job->join();
+        if (decoded.outcome != Outcome::OK) {
+          if (ctx.cancelRestoration)
+            ctx.cancelRestoration();
+          return decoded;
+        }
+        if (job->registration.expired() || job->snapshot->scene != &ctx.scene
+            || array->dim(0) != job->width || array->dim(1) != job->height
+            || array->elementSize() != job->channels
+            || array->elementType() != job->elementType)
+          return fail(Outcome::CONFLICT, "stale_data_version");
+        // All fallible control/store/receipt preparation precedes map(), the
+        // sole ordinary write-sequence reservation boundary for this write.
+        job->receipt = "{\"handle\":" + quote(handleName(handle))
+            + ",\"batch_ref\":" + edit::detail::batchRefJson(job->batch) + ","
+            + bindings(*ids, *array) + ",\"restoration_policy\":{"
+              "\"mode\":\"capacity_based\",\"session_snapshot_ceiling_bytes\":67108864,"
+              "\"effective_global_limit_bytes\":"
+            + std::to_string(state->limits.globalRetentionBytes)
+            + ",\"eviction_possible\":true}";
+        job->receipt.reserve(job->receipt.size() + 512);
+        state->edits->syncStates().prepareScene(scene);
+        if (ctx.isAbandoned())
+          return Step{};
+        void *destination = nullptr;
+        try {
+          destination = array->map();
+        } catch (const std::runtime_error &) {
+          return fail(Outcome::BUSY, "resource_limit");
+        }
+        if (!destination)
+          return fail(Outcome::BUSY, "resource_limit");
+        std::memcpy(
+            job->snapshot->bytes.data(), destination, job->bound.texels);
+        std::memcpy(destination, job->pixels.data(), job->bound.texels);
+        job->committed = true;
+        try {
+          array->unmap();
+        } catch (...) {
+          // Array records completedWrite before delegate notification. A
+          // downstream failure cannot turn a completed write into rollback.
+          job->notificationFailed = true;
+        }
+        job->snapshot->completedWrite = *array->dataWriteSequence();
+        state->edits->restorations().publishImage(job->batch);
+        job->storePrepared = false;
+        if (ctx.publishRestoration)
+          ctx.publishRestoration();
+        job->snapshot.reset();
+        job->releaseTransient();
+        const auto revision = ids->sceneRevision();
+        char detail[384];
+        std::snprintf(detail,
+            sizeof(detail),
+            ",\"data_version\":\"image:%llu.%llu.%llu.%llu.%llu\","
+            "\"scene_revision\":\"%llu.%llu.%llu.%llu\"}",
+            (unsigned long long)handle.launch.activation,
+            (unsigned long long)handle.launch.nonce,
+            (unsigned long long)handle.domain,
+            (unsigned long long)handle.serial,
+            (unsigned long long)*array->dataWriteSequence(),
+            (unsigned long long)revision.launch.activation,
+            (unsigned long long)revision.launch.nonce,
+            (unsigned long long)revision.domain,
+            (unsigned long long)revision.value);
+        job->receipt.append(detail); // capacity reserved before map()
+        try {
+          state->edits->syncStates().beginHook(scene);
+        } catch (...) {
+          job->notificationFailed = true;
+        }
+        Step committed;
+        committed.committed = true;
+        committed.status = Step::Status::SYNCHRONIZING;
+        return committed;
+      }
+      auto b =
+          bounds(array->dim(0), array->dim(1), array->elementSize(), false);
+      if (!b || b->texels > std::numeric_limits<std::size_t>::max() - b->peak)
+        return fail(Outcome::BUSY, "resource_limit");
+      b->peak += b->texels; // E + D + W + S, not two physical snapshots.
+      state->pruneRestorations();
+      std::shared_ptr<SessionLedger> ledger;
+      {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        auto &entry = state->ledgers[job->sessionId];
+        if (!entry)
+          entry = std::make_shared<SessionLedger>();
+        ledger = entry;
+      }
+      auto charge = std::make_shared<SessionCharge>();
+      charge->ledger = ledger;
+      bool sessionReserved = false;
+      {
+        std::lock_guard<std::mutex> lock(ledger->mutex);
+        if (b->texels <= 67108864 && ledger->bytes <= 67108864 - b->texels) {
+          ledger->bytes += b->texels;
+          charge->bytes = b->texels;
+          sessionReserved = true;
+        }
+      }
+      if (!sessionReserved)
+        return fail(Outcome::BUSY, "restore_budget_exhausted");
+      job->snapshot =
+          std::make_shared<edit::ImageSnapshot>(state->limits.allocator);
+      job->snapshot->sessionLease = std::move(charge);
+      job->snapshot->handle = handle;
+      job->snapshot->scene = &ctx.scene;
+      job->snapshot->registration = registration;
+      job->registration = registration;
+      const auto batchId = state->edits->newBatchId();
+      if (!batchId)
+        return fail(Outcome::BUSY, "resource_limit");
+      job->batch = {state->launchId, *batchId};
+      if (b->texels > state->limits.globalRetentionBytes
+          || (ctx.reserveRestoration
+              && !ctx.reserveRestoration(
+                  b->texels + sizeof(edit::ImageSnapshot),
+                  state->launchId,
+                  *batchId)))
+        return fail(Outcome::BUSY, "resource_limit");
+      if (ctx.restorationRetained)
+        state->edits->restorations().expireUnless(
+            [&](const edit::BatchRef &ref) {
+              return ctx.restorationRetained(ref.launchId, ref.batchId);
+            });
+      edit::RestorationRecord record;
+      record.ref = job->batch;
+      record.scene = scene;
+      record.image = job->snapshot;
+      if (!state->edits->restorations().prepareImage(std::move(record)))
+        return fail(Outcome::BUSY, "resource_limit");
+      job->storePrepared = true;
+      bool transientReserved = false;
+      {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (b->peak <= state->limits.transientBytes
+            && state->reserved <= state->limits.transientBytes - b->peak) {
+          state->reserved += b->peak;
+          job->bound = *b;
+          transientReserved = true;
+        }
+      }
+      if (!transientReserved)
+        return fail(Outcome::BUSY, "resource_limit");
+      if (state->limits.reservePhysicalMemory) {
+        job->snapshot->physicalLease =
+            state->limits.reservePhysicalMemory(b->texels);
+        if (!job->snapshot->physicalLease)
+          return fail(Outcome::BUSY, "resource_limit");
+        job->physicalLease =
+            state->limits.reservePhysicalMemory(b->peak - b->texels);
+        if (!job->physicalLease)
+          return fail(Outcome::BUSY, "resource_limit");
+      }
+      job->snapshot->bytes.resize(b->texels);
+      job->width = array->dim(0);
+      job->height = array->dim(1);
+      job->channels = array->elementSize();
+      job->elementType = array->elementType();
+      job->abandoned = [state, check = ctx.isAbandoned] {
+        return state->stopping.load() || check();
+      };
+      job->wake = ctx.wake;
+      if (!job->start())
+        return fail(Outcome::BUSY, "resource_limit");
+      Step pending;
+      pending.status = Step::Status::BACKEND_PENDING;
+      return pending;
+    } catch (const std::bad_alloc &) {
+      if (job->committed) {
+        Step committed;
+        committed.committed = true;
+        committed.outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
+        return committed;
+      }
+      return fail(Outcome::BUSY, "resource_limit");
+    } catch (const std::system_error &) {
+      return fail(Outcome::BUSY, "resource_limit");
     }
   };
   return m_engine->submit(credentials, ref, std::move(request));

@@ -1,7 +1,7 @@
 # Export a live Image as a PNG working copy
 
 The integration-enabled viewer and headless tutorial register `vsr_image_export`.
-Image Import is not implemented. A successful export is a read, not an edit,
+Image Import is not exposed by these shipped hosts yet. A successful export is a read, not an edit,
 render, scene save, or original-asset write. It needs current Scene READ, even
 when agent edits are disabled; it does not map the Array, reserve a write
 sequence, change texels, or occupy a presentation/render encoder slot.
@@ -162,6 +162,59 @@ PNG. Import and Image undo are not yet exposed. Host loops must call
 to publish worker completion and release asynchronously cancelled backend slots.
 Destroy the Image service before its engine; keep its allocator alive through
 engine cleanup.
+
+## Import continuation: not a completed host capability
+
+The unfinished Import service can be qualified through
+`ImageExchange::attachRestoration(EditService&)`; the viewer and headless tutorial
+intentionally do not call it. Their descriptors/discovery keep `import:false`,
+and their tool lists still omit `vsr_image_import`. Do not enable this seam in a
+production host until the complete Import acceptance gate is recorded.
+
+The opt-in service submits normal `image_import` operations with Scene READ+EDIT,
+strict handle/data_version/file_name arguments, backend cleanup and historical
+replay. It refills the addressed Array through **one** ordinary `map()`/`unmap()`
+reservation boundary and publishes an Image payload into the shared batch store.
+Existing `vsr_restore` (including host-local recovery) restores prior bytes and
+advances rather than rewinds data_version. It returns `image_versions` separately
+from existing object/node versions. Later ordinary writes, even change-back,
+permanently conflict; open maps remain untouched. Wrong-Scene retained Image
+records reject before consumed/conflicting checks, without consuming eligibility.
+Absent history cannot fabricate foreign-Scene evidence.
+
+Input is opened once relative to the held exchange directory with no-follow,
+nonblocking and close-on-exec flags. Regular-file/effective-user/single-link and
+observed stat/size stability checks precede decoding the private snapshot. The
+same-user process is not a sandbox: finish and close external output before
+submission; adversarial concurrent same-user writes cannot all be detected.
+No decode path reopens by name or decompresses embedded colour profiles.
+
+The bounded zlib decoder validates CRCs, chunk order, target IHDR and the full
+8-bit/noninterlaced channel policy before inflate. It accepts PNG types 0/4/2/6,
+ignores colour/profile ancillary payloads within 65536 bytes without conversion,
+and rejects tRNS/APNG, unsupported critical chunks and malformed streams. Output
+is exactly T raw straight-alpha/top-down bytes. Codec allocations are F+1 filtered
+bytes and a 128 KiB aligned arena supplied through zlib's allocation hooks, plus
+constant controls. IDAT chunks stream from E without concatenation. No growing
+codec/profile allocation or unchecked general-purpose image decode is used.
+Along with the private 512 KiB worker stack/64 KiB guard, this is below W=4F+1 MiB;
+remaining control/TLS ownership still needs the final host allocation audit.
+
+Preparation reserves the originating session's S=T ceiling first, then existing
+shared activity/store capacity, then transient E+D+W+S. S is physically allocated
+once and its lease transfers to retention; E/D/W and transient S accounting are
+released after commit. For a 256x256 RGBA target the conservative bound is
+3,212,800 bytes and the retained snapshot is 262,144 bytes (host lease overhead is
+separate). Session charges survive disconnect, remain attributed to the original
+session, and release on recovery/conflict/global eviction, not PNG deletion.
+Reconnect gets a distinct 64 MiB session ceiling but not a distinct global pool.
+Default activity/store limits remain unchanged. Available capacities are
+observations, never future admission guarantees.
+
+This continuation is **not full Import acceptance**. Production host enablement,
+complete lifecycle/registration/failure and allocation-bound qualification, the
+27 MiB example, schema/documentation completion and an eligible live host Import
+smoke remain required. PNG cleanup and undo retention remain independent.
 
 ## Isolated eligible-Image verification
 

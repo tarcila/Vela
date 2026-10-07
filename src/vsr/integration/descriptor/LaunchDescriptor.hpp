@@ -258,7 +258,8 @@ inline bool validImageExchange(std::string_view text, std::string_view launchId)
       return false;
   const bool enabled = value.get("enabled")->b;
   if (value.get("supported")->b != enabled || value.get("export")->b != enabled
-      || value.get("import")->b || (enabled && !value.get("data_tracking")->b))
+      || (value.get("import")->b && !enabled)
+      || (enabled && !value.get("data_tracking")->b))
     return false;
   if (value.o.size() != 7)
     return false;

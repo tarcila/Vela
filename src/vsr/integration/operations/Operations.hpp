@@ -169,6 +169,9 @@ struct StepContext
   // False once the sink no longer retains the batch as eligible.
   std::function<bool(const std::string &launchId, const std::string &batchId)>
       restorationRetained;
+  // Any retained batch metadata, including consumed/conflicting records.
+  std::function<bool(const std::string &, const std::string &)>
+      restorationKnown;
   // Restoration of batch {launchId, batchId} committed (consumes eligibility)
   // or found it conflicting; both release its retained payload.
   std::function<void(const std::string &launchId, const std::string &batchId)>
@@ -303,6 +306,10 @@ class ActivitySink
   virtual void publishRestoration(Id) {}
   virtual bool restorationRetained(
       const std::string & /*launchId*/, const std::string & /*batchId*/)
+  {
+    return true;
+  }
+  virtual bool restorationKnown(const std::string &, const std::string &)
   {
     return true;
   }
@@ -1030,6 +1037,11 @@ inline void OperationEngine::releaseSlot(Record &r)
     --m_slotsInUse;
   }
   r.awaitingCleanup = false;
+  // Preparation may have reserved recovery before a backend wait. Cancellation,
+  // authority withdrawal and deadlines must release it without executor
+  // destruction calling back into this engine under its record lock.
+  if (!r.committed && m_sink && r.activityId)
+    m_sink->cancelRestoration(*r.activityId);
   r.executor = {};
 }
 
@@ -1290,6 +1302,13 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
       return true;
     std::lock_guard<std::mutex> lock(m_mutex);
     return !m_sink || m_sink->restorationRetained(launchId, batchId);
+  };
+  ctx.restorationKnown = [this, alive](const std::string &launchId,
+                             const std::string &batchId) {
+    if (!alive.lock())
+      return false;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return !m_sink || m_sink->restorationKnown(launchId, batchId);
   };
   ctx.markRestored = [this, alive](const std::string &launchId,
                          const std::string &batchId) {

@@ -53,6 +53,8 @@ enum class OperationKind
   INSPECTION,
   RENDER,
   SET_VIEW_CAMERA,
+  IMAGE_EXPORT,
+  IMAGE_IMPORT,
   EDIT,
   RESTORE,
   RESYNCHRONIZE,
@@ -70,6 +72,10 @@ inline const char *operationKindName(OperationKind k)
     return "render";
   case OperationKind::SET_VIEW_CAMERA:
     return "set_view_camera";
+  case OperationKind::IMAGE_EXPORT:
+    return "image_export";
+  case OperationKind::IMAGE_IMPORT:
+    return "image_import";
   case OperationKind::EDIT:
     return "edit";
   case OperationKind::RESTORE:
@@ -298,6 +304,8 @@ inline OperationKind operationKindOf(const std::string &kind)
            OperationKind::INSPECTION,
            OperationKind::RENDER,
            OperationKind::SET_VIEW_CAMERA,
+           OperationKind::IMAGE_EXPORT,
+           OperationKind::IMAGE_IMPORT,
            OperationKind::EDIT,
            OperationKind::RESTORE,
            OperationKind::RESYNCHRONIZE,
@@ -329,6 +337,8 @@ class EngineActivitySink : public operations::ActivitySink
   void cancelRestoration(Id id) override;
   void publishRestoration(Id id) override;
   bool restorationRetained(
+      const std::string &launchId, const std::string &batchId) override;
+  bool restorationKnown(
       const std::string &launchId, const std::string &batchId) override;
   void restorationRestored(
       const std::string &launchId, const std::string &batchId) override;
@@ -747,6 +757,12 @@ inline bool EngineActivitySink::restorationRetained(
 {
   return m_log.eligibility(BatchRef{launchId, batchId})
       == Eligibility::ELIGIBLE;
+}
+
+inline bool EngineActivitySink::restorationKnown(
+    const std::string &launchId, const std::string &batchId)
+{
+  return m_log.eligibility(BatchRef{launchId, batchId}).has_value();
 }
 
 inline void EngineActivitySink::restorationRestored(

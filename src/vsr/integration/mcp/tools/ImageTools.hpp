@@ -30,7 +30,9 @@ inline void addImageTools(std::vector<Tool> &tools, ImageDeps deps)
       "No gamma conversion, channel expansion or live texel mutation. A replay "
       "returns the original receipt, not proof of current file bytes. Files "
       "have no TTL; remove unneeded PNGs explicitly. PNG cleanup and undo "
-      "retention are separate. Image Import is not implemented.";
+      "retention are separate.";
+  if (!deps.images->importAvailable())
+    tool.description += " Image Import is not implemented.";
   tool.inputSchemaJson = std::string("{\"type\":\"object\",\"properties\":{")
       + requestIdSchema()
       + ",\"scene_id\":{\"type\":\"integer\",\"minimum\":0},"
@@ -56,6 +58,48 @@ inline void addImageTools(std::vector<Tool> &tools, ImageDeps deps)
     return statusResult(ref, admission.status, admission.replayed);
   };
   tools.push_back(std::move(tool));
+  if (!deps.images->importAvailable())
+    return;
+  Tool import;
+  import.name = "vsr_image_import";
+  import.description =
+      "Replace an existing shared Image Array in place with raw PNG samples "
+      "from a confined launch file_name. Requires Scene READ+EDIT and agent "
+      "edits enabled. Supply the inspected equality-only data_version. Shape, "
+      "8-bit channel count and straight alpha must match; no conversion, "
+      "resizing or prior-export provenance. Poll image_import status for fresh "
+      "data_version, scene_revision and normal batch_ref for vsr_restore. "
+      "Recovery is conditional and capacity-based, not permanent. PNG removal "
+      "does not release the undo snapshot; restore/eviction does not remove PNGs.";
+  import.inputSchemaJson = std::string("{\"type\":\"object\",\"properties\":{")
+      + requestIdSchema()
+      + ",\"scene_id\":{\"type\":\"integer\",\"minimum\":0},"
+        "\"handle\":{\"type\":\"string\"},\"data_version\":{\"type\":\"string\"},"
+        "\"file_name\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":128}},"
+        "\"required\":[\"request_id\",\"scene_id\",\"handle\",\"data_version\",\"file_name\"],"
+        "\"additionalProperties\":false}";
+  import.handler = [deps](
+                       const session::Credentials &c, const json::Value &args) {
+    const auto id = requestIdArg(args.get("request_id"));
+    const auto scene = targetIdArg(args, "scene_id");
+    const auto handle =
+        detail::handleArg(args.get("handle"), deps.identities->launch());
+    const auto *version = args.get("data_version"),
+               *file = args.get("file_name");
+    for (const auto &argument : args.o)
+      if (argument.first != "request_id" && argument.first != "scene_id"
+          && argument.first != "handle" && argument.first != "data_version"
+          && argument.first != "file_name")
+        return rejected(operations::Outcome::INVALID_REQUEST);
+    if (!id || !scene || !handle || !version || !version->isString() || !file
+        || !file->isString())
+      return rejected(operations::Outcome::INVALID_REQUEST);
+    const operations::OperationRef ref{c.sessionId, *id};
+    return detail::ack(ref,
+        deps.images->submitImport(
+            c, ref, *scene, *handle, version->s, file->s));
+  };
+  tools.push_back(std::move(import));
 }
 
 } // namespace vsr::integration::mcp::tools

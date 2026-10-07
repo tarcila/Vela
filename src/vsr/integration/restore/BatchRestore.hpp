@@ -65,6 +65,12 @@ struct RestoreRequest
   BatchRef targetBatchRef;
 };
 
+struct ImageVersion
+{
+  identity::ObjectHandle handle;
+  std::string dataVersion;
+};
+
 struct RestoreResult
 {
   Outcome outcome{Outcome::OK};
@@ -73,6 +79,8 @@ struct RestoreResult
   std::optional<SceneRevision> sceneRevision; // resulting, on commit
   std::vector<ParameterVersionToken> versions; // resulting, per object
   std::vector<edit::NodeVersion> nodeVersions;
+  std::vector<ImageVersion> imageVersions;
+  std::string reason;
   // outcome_unavailable because the log/store expired the batch; unknown
   // and wrong-launch references leave this false (addendum 04 §7).
   bool expired{false};
@@ -225,6 +233,8 @@ inline operations::Request RestoreService::makeRequest(
         step.outcome = res.outcome;
         if (res.expired)
           step.result = "{\"reason\":\"expired\"}";
+        else if (!res.reason.empty())
+          step.result = "{\"reason\":\"" + res.reason + "\"}";
         *slot = std::move(res);
         return step;
       }
@@ -234,14 +244,33 @@ inline operations::Request RestoreService::makeRequest(
       return step;
     }
     RestoreResult res = std::move(**committed);
-    res.outcome = m_edits.synchronizeCommitted(shared->scene);
+    Outcome syncOutcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
+    try {
+      syncOutcome = m_edits.synchronizeCommitted(shared->scene);
+    } catch (...) {
+      // Commit/eligibility are already final; host notification failure is
+      // not a noncommitting preparation rejection.
+    }
+    if (res.outcome != Outcome::APPLIED_WITH_SYNC_FAILURE)
+      res.outcome = syncOutcome;
     step.outcome = res.outcome;
     step.committed = true;
     step.result = "{\"target_batch_ref\":"
         + edit::detail::batchRefJson(res.targetBatchRef) + ","
         + edit::detail::commitDetailJson(
             true, res.sceneRevision, res.versions, res.nodeVersions)
-        + ",\"image_versions\":[]}";
+        + ",\"image_versions\":[";
+    for (const auto &image : res.imageVersions) {
+      if (step.result.back() != '[')
+        step.result += ',';
+      step.result += "{\"handle\":\"" + edit::detail::hex64(image.handle.domain)
+          + edit::detail::hex64(image.handle.serial) + "\",\"data_version\":\""
+          + image.dataVersion + "\"}";
+    }
+    step.result += "]";
+    if (res.nodeVersions.empty())
+      step.result += ",\"node_versions\":[]";
+    step.result += ",\"restored\":true}";
     *slot = std::move(res);
     return step;
   };
@@ -341,6 +370,34 @@ inline RestoreResult RestoreService::commit(
     return res;
   }
 
+  // Image scope precedes consumed/conflicting/target checks, after current
+  // authority. Retirement cannot transfer this registration's recovery.
+  const auto imageScope =
+      m_edits.restorations().imageScope(request.targetBatchRef);
+  if (imageScope && ctx.restorationKnown
+      && !ctx.restorationKnown(
+          request.targetBatchRef.launchId, request.targetBatchRef.batchId)) {
+    m_edits.restorations().expireUnless([&](const BatchRef &ref) {
+      return !ctx.restorationRetained
+          || ctx.restorationRetained(ref.launchId, ref.batchId);
+    });
+    res.expired = m_edits.restorations().expired(request.targetBatchRef);
+    m_edits.restorations().forgetImageScope(request.targetBatchRef);
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      const auto key = detail::consumedKey(request.targetBatchRef);
+      m_consumed.erase(key);
+      m_conflicting.erase(key);
+    }
+    res.outcome = Outcome::OUTCOME_UNAVAILABLE;
+    return res;
+  }
+  if (imageScope && *imageScope != request.scene) {
+    res.outcome = Outcome::OUTCOME_UNAVAILABLE;
+    res.reason = "foreign_scene";
+    return res;
+  }
+
   // 1. Select exactly the named record; never fall back to another one. //
 
   if (consumed) {
@@ -371,6 +428,89 @@ inline RestoreResult RestoreService::commit(
         && request.targetBatchRef.launchId == m_edits.launchId()
         && (logExpired
             || m_edits.restorations().expired(request.targetBatchRef));
+    return res;
+  }
+
+  if (record->image) {
+    const auto &snapshot = record->image;
+    auto *array =
+        dynamic_cast<scene::Array *>(ident->resolve(snapshot->handle));
+    if (snapshot->registration.expired() || snapshot->scene != &scene || !array
+        || !array->isImage()) {
+      markConflicting(request.targetBatchRef, ctx);
+      res.outcome = Outcome::CONFLICT;
+      return res;
+    }
+    if (array->isMapped()) {
+      res.outcome = Outcome::BUSY;
+      res.reason = "image_mapped";
+      return res;
+    }
+    if (array->dataWriteSequence() != snapshot->completedWrite
+        || array->size() * array->elementSize() != snapshot->bytes.size()) {
+      markConflicting(request.targetBatchRef, ctx);
+      res.outcome = Outcome::CONFLICT;
+      return res;
+    }
+    std::set<std::string> consumedNode;
+    try {
+      if (fault && fault())
+        throw std::bad_alloc();
+      consumedNode.insert(detail::consumedKey(request.targetBatchRef));
+      res.imageVersions.reserve(1);
+      res.imageVersions.push_back({snapshot->handle, {}});
+      res.imageVersions[0].dataVersion.reserve(256);
+      m_edits.syncStates().prepareScene(request.scene);
+    } catch (const std::bad_alloc &) {
+      res.outcome = Outcome::BUSY;
+      res.reason = "resource_limit";
+      return res;
+    }
+    void *destination = nullptr;
+    try {
+      destination = array->map();
+    } catch (const std::runtime_error &) {
+      res.outcome = Outcome::BUSY;
+      res.reason = "resource_limit";
+      return res;
+    }
+    if (!destination) {
+      res.outcome = Outcome::BUSY;
+      res.reason = "resource_limit";
+      return res;
+    }
+    std::memcpy(destination, snapshot->bytes.data(), snapshot->bytes.size());
+    res.committed = true;
+    try {
+      array->unmap();
+    } catch (...) {
+      res.outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
+    }
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      m_consumed.merge(consumedNode);
+    }
+    m_edits.restorations().release(request.targetBatchRef);
+    if (ctx.markRestored)
+      ctx.markRestored(
+          request.targetBatchRef.launchId, request.targetBatchRef.batchId);
+    const auto &handle = snapshot->handle;
+    char token[192];
+    std::snprintf(token,
+        sizeof(token),
+        "image:%llu.%llu.%llu.%llu.%llu",
+        (unsigned long long)handle.launch.activation,
+        (unsigned long long)handle.launch.nonce,
+        (unsigned long long)handle.domain,
+        (unsigned long long)handle.serial,
+        (unsigned long long)*array->dataWriteSequence());
+    res.imageVersions[0].dataVersion.assign(token);
+    res.sceneRevision = ident->sceneRevision();
+    try {
+      m_edits.syncStates().beginHook(request.scene);
+    } catch (...) {
+      res.outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
+    }
     return res;
   }
 
