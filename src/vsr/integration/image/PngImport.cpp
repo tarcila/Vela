@@ -7,7 +7,6 @@
 #include <zlib.h>
 // std
 #include <algorithm>
-#include <array>
 #include <cstring>
 #include <limits>
 

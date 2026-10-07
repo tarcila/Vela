@@ -44,6 +44,8 @@ constexpr std::size_t WORKER_GUARD_BYTES = 64u << 10;
 constexpr std::size_t IMPORT_CONTROL_BYTES = 32768;
 constexpr std::size_t IMPORT_STORE_BYTES = 4096;
 constexpr std::size_t IMPORT_RESULT_BYTES = 65536;
+constexpr std::size_t IMPORT_OWNER_BYTES =
+    IMPORT_CONTROL_BYTES + 2 * IMPORT_STORE_BYTES + IMPORT_RESULT_BYTES;
 
 std::string quote(const std::string &s)
 {
@@ -1546,9 +1548,13 @@ operations::Admission ImageExchange::submitImport(
             state->limits.reservePhysicalMemory(b->texels);
         if (!job->snapshot->physicalLease)
           return fail(Outcome::BUSY, "resource_limit");
-        job->physicalLease = state->limits.reservePhysicalMemory(b->peak
-            - b->texels - IMPORT_CONTROL_BYTES - 2 * IMPORT_STORE_BYTES
-            - IMPORT_RESULT_BYTES);
+        // peak = E + D + W + S; S has one lease above. Fixed owners borrow
+        // 106496 bytes from W, leaving scratch = peak - S - owners. The
+        // remaining W exceeds F+1 filtered bytes + 128 KiB inflate arena +
+        // 512 KiB stack + 64 KiB guard by 221183 + 3*F bytes. This arithmetic
+        // does not establish a bound on platform TLS allocation.
+        job->physicalLease = state->limits.reservePhysicalMemory(
+            b->peak - b->texels - IMPORT_OWNER_BYTES);
         if (!job->physicalLease)
           return fail(Outcome::BUSY, "resource_limit");
       }

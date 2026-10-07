@@ -296,14 +296,21 @@ inline bool validImageExchange(std::string_view text, std::string_view launchId)
   const auto *complete = limits->get("usage_complete");
   if (!complete || complete->type != Value::Type::BOOL)
     return false;
-  return integer("file_cap", 1024, true) && integer("byte_cap", 268435456, true)
-      && integer("files_used", 9007199254740991.)
-      && integer("bytes_used", 9007199254740991.)
-      && integer("quota_scan_entry_cap", 4096, true)
-      && integer("max_ancillary_bytes", 65536, true)
-      && integer("transient_image_byte_cap", 268435456)
-      && integer("session_snapshot_byte_cap", 67108864, true)
-      && integer("effective_global_retention_byte_cap", 9007199254740991.)
+  constexpr double FILE_CAP = 1024;
+  constexpr double BYTE_CAP = 268435456;
+  constexpr double QUOTA_SCAN_ENTRY_CAP = 4096;
+  constexpr double ANCILLARY_BYTE_CAP = 65536;
+  constexpr double SESSION_SNAPSHOT_BYTE_CAP = 67108864;
+  constexpr double MAX_EXACT_JSON_INTEGER = 9007199254740991.;
+  return integer("file_cap", FILE_CAP, true)
+      && integer("byte_cap", BYTE_CAP, true)
+      && integer("files_used", MAX_EXACT_JSON_INTEGER)
+      && integer("bytes_used", MAX_EXACT_JSON_INTEGER)
+      && integer("quota_scan_entry_cap", QUOTA_SCAN_ENTRY_CAP, true)
+      && integer("max_ancillary_bytes", ANCILLARY_BYTE_CAP, true)
+      && integer("transient_image_byte_cap", BYTE_CAP)
+      && integer("session_snapshot_byte_cap", SESSION_SNAPSHOT_BYTE_CAP, true)
+      && integer("effective_global_retention_byte_cap", MAX_EXACT_JSON_INTEGER)
       && integer("available_global_retention_bytes",
           limits->get("effective_global_retention_byte_cap")
               ? limits->get("effective_global_retention_byte_cap")->n

@@ -248,8 +248,16 @@ observations, never future admission guarantees.
 
 Import partitions the conservative W allowance into independently owned leases:
 32 KiB Job/Engine controls, 4 KiB snapshot/store controls, 4 KiB scope/history
-controls and 64 KiB Activity result capacity; the remaining E/D/W lease covers
-buffers, codec and worker lifetime. The one physical S lease is unchanged. These
+controls and 64 KiB Activity result capacity. Their named total is
+`IMPORT_OWNER_BYTES = 32768 + 2*4096 + 65536 = 106496`, borrowed from W,
+not added to the transient peak. With `peak = E+D+W+S`, the scratch lease is
+`peak - S - IMPORT_OWNER_BYTES`; the one physical S lease is unchanged.
+The remaining work allowance is `W - 106496 = 4*F + 942080`. Subtracting
+`F+1` filtered bytes, the 128 KiB inflate arena, 512 KiB worker stack and
+64 KiB guard leaves exactly `221183 + 3*F` bytes of headroom (at least
+221183 bytes). This proves the partition fits those explicit allocations;
+it is not a bound on platform TLS allocation or process RSS. The remaining
+E/D/W lease still covers buffers, codec and worker lifetime. These
 controls are distinct from logical snapshot/Activity accounting; entry overhead
 remains 256 bytes, with actual result growth reserved before mutation. Result
 storage is bounded to 16 KiB and covered before allocation. Engine Status,
