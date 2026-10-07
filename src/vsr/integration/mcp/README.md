@@ -65,7 +65,7 @@ form:
 | Field | Presence | Meaning |
 |---|---|---|
 | `operation_ref` | always | `{session_id, request_id}`. It is the complete qualified reference, including when the lookup names an earlier session's record |
-| `kind` | always | Retained operation kind: `discover`, `inspect`, `edit`, `restore`, `image_export`, `image_import` (unfinished opt-in service), `render`, `select_device`, `set_view_camera`, `resynchronize`. Preserved for lookups from later sessions |
+| `kind` | always | Retained operation kind: `discover`, `inspect`, `edit`, `restore`, `image_export`, `image_import`, `render`, `select_device`, `set_view_camera`, `resynchronize`. Preserved for lookups from later sessions |
 | `state` | always | `pending` or `terminal` |
 | `progress` | while a slot is held | A frozen non-terminal name (see below). `awaiting_cleanup` can coexist with `state: terminal` |
 | `outcome` | once terminal | A frozen code (see below) |
@@ -371,11 +371,14 @@ Terminal failures use HTTP 200, `structuredContent.outcome`, and `isError:true`;
 initial missing Scene authority uses HTTP 403 / `error.data.code:forbidden`
 without consuming the ID. Raw samples preserve every channel, Color Space and
 top-first row; no gamma/profile chunks or alpha-color destruction occur.
-Import remains absent from the shipped viewer/headless tool lists. An unfinished
-opt-in continuation service uses kind `image_import`, strict arguments
-`request_id`, `scene_id`, `handle`, `data_version`, `file_name`, Scene READ+EDIT,
-normal admission/status/replay and existing `vsr_restore`; it is not enabled by
-those hosts. Its terminal PNG/file/storage errors are `invalid_request` with
+Qualified viewer/headless hosts publish `vsr_image_import`, kind `image_import`,
+with strict required arguments `request_id`, `scene_id`, `handle`, `data_version`,
+`file_name`, Scene READ+EDIT and agent edits enabled. It uses normal
+admission/status/replay and existing `vsr_restore`, not a separate undo tool.
+Success returns `handle`, fresh `data_version`, `scene_revision`, `batch_ref`,
+`affected_samplers`, `affected_users`, `affected_complete` and
+`restoration_policy` (capacity_based, session_snapshot_ceiling_bytes,
+effective_global_limit_bytes, eviction_possible=true). Its terminal PNG/file/storage errors are `invalid_request` with
 `invalid_png`, `file_rejected`, `unsupported_image`, or `foreign_scene`; stale
 versions use `conflict/stale_data_version`, open maps `busy/image_mapped`,
 session pressure `busy/restore_budget_exhausted`, and other capacity pressure
@@ -391,8 +394,10 @@ prepared before mutation; map-notification failure spends the reservation
 without publishing a token, while unmap-notification failure is committed with
 `applied_with_sync_failure`. Retained wrong-Scene
 Image batches return `outcome_unavailable/foreign_scene` before consumed or target
-checks, while absent/evicted history cannot fabricate that evidence. Production
-Import capability publication and complete qualification remain unfinished.
+checks, while absent/evicted history cannot fabricate that evidence. Agent
+Activity exposes the normal local Restore route even after disconnect or
+Disable agent edits. Hosts lacking shared physical and Activity retention
+reservations or the normal RestoreService binding keep Import absent.
 See [PNG exchange](../../../../docs/image-png-exchange.md)
 for every limit field, encoder peak/output proof, Linux confinement and the
 separate explicit PNG-versus-undo cleanup policies.

@@ -378,8 +378,10 @@ int main(int argc, const char *argv[])
   host->translations = std::make_unique<vi::edit::TranslationService>(
       integration, *host->authority, *host->engine, *host->edits);
   host->translations->attachScene(*sceneId, *host->identity);
-  host->restores = std::make_unique<vi::restore::RestoreService>(
-      *host->engine, *host->edits);
+  const auto hostImageMemory = std::make_shared<vsr::rendering::FrameBudget>();
+  host->restores = std::make_unique<vi::restore::RestoreService>(*host->engine,
+      *host->edits,
+      [hostImageMemory] { return hostImageMemory->reserve(65536); });
   host->restores->attachScene(*sceneId, *host->identity);
   host->sync = std::make_unique<vi::sync::SyncService>(
       integration, *host->engine, host->edits->syncStates());
@@ -409,7 +411,6 @@ int main(int argc, const char *argv[])
   const auto runtimeStatus =
       vi::descriptor::openOsRuntimeDirectory(host->runtimeDir);
   vi::image::ExchangeLimits imageLimits;
-  const auto hostImageMemory = std::make_shared<vsr::rendering::FrameBudget>();
   imageLimits.physicalByteCap = hostImageMemory->limit();
   imageLimits.reservePhysicalMemory = [hostImageMemory](std::size_t bytes) {
     return hostImageMemory->reserve(bytes);
@@ -420,12 +421,18 @@ int main(int argc, const char *argv[])
     const auto used = host->activity->usage().bytes;
     return used < cap ? cap - used : 0;
   };
+  imageLimits.restorationRetained = [&host](const std::string &launch,
+                                        const std::string &batch) {
+    return host->activity->eligibility({launch, batch})
+        == vi::activity::Eligibility::ELIGIBLE;
+  };
   host->images = std::make_unique<vi::image::ImageExchange>(integration,
       *host->engine,
       host->authority->launchId(),
       host->runtimeDir,
       imageLimits);
   host->images->attachScene(*sceneId, *host->identity);
+  host->images->attachRestoration(*host->edits, *host->restores);
   host->inspector->setImageExchange(
       [&host](vi::SceneId id, const std::string &sessionId) {
         return host->images->metadata(id, sessionId);

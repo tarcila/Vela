@@ -32,7 +32,7 @@ inline void addImageTools(std::vector<Tool> &tools, ImageDeps deps)
       "have no TTL; remove unneeded PNGs explicitly. PNG cleanup and undo "
       "retention are separate.";
   if (!deps.images->importAvailable())
-    tool.description += " Image Import is not implemented.";
+    tool.description += " Image Import is unavailable on this host.";
   tool.inputSchemaJson = std::string("{\"type\":\"object\",\"properties\":{")
       + requestIdSchema()
       + ",\"scene_id\":{\"type\":\"integer\",\"minimum\":0},"

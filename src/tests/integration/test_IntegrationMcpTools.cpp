@@ -395,7 +395,8 @@ struct Fixture
       bool imageWrites = false,
       std::uint64_t writeLimit = UINT64_MAX,
       image::ExchangeLimits exchangeLimits = {},
-      bool imageImports = false)
+      bool imageImports = false,
+      operations::Limits engineLimits = {})
       : integration(DEFAULT_QUEUE_CAPACITY, writeLimit)
   {
     for (int i = 0; i < 5; i++)
@@ -427,7 +428,7 @@ struct Fixture
     authority =
         session::SessionAuthority::create(integration, [this] { return now; });
     engine = operations::OperationEngine::create(
-        integration, *authority, {}, [this] { return now; });
+        integration, *authority, engineLimits, [this] { return now; });
     if (imageImports) {
       // This fixture is a qualified isolated host, not a physical-lease
       // bypass. Explicit caller-supplied pools remain shared and unchanged.
@@ -8009,6 +8010,407 @@ SCENARIO("Image admission preserves default Activity and store ceilings",
   CHECK_FALSE(store.prepareImage(extra));
   store.cancelImage({"launch", "0"});
   CHECK(store.prepareImage(std::move(extra)));
+}
+
+SCENARIO(
+    "Image peak reserves conservative E+D+W+S and retains one four-MiB snapshot",
+    "[integration][mcp][image-import][image-import-peak]")
+{
+  auto memory = std::make_shared<vsr::rendering::FrameBudget>(40u << 20);
+  const auto baseline = memory->used();
+  auto probe = memory->reserve(1);
+  const auto overhead = memory->used() - baseline - 1;
+  probe.reset();
+  image::ExchangeLimits limits;
+  limits.physicalByteCap = memory->limit();
+  limits.reservePhysicalMemory = [memory](std::size_t bytes) {
+    return memory->reserve(bytes);
+  };
+  bool fits = true;
+  SECTION("production conservative maximum exceeds illustrative 27 MiB")
+  {
+    limits.transientBytes = 27u << 20;
+    fits = false;
+  }
+  SECTION("checked conservative maximum fits exactly")
+  {
+    limits.transientBytes = 34674688;
+  }
+  Fixture f({}, true, false, false, 120., true, UINT64_MAX, limits, true);
+  auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 1024, 1024);
+  image->setName("tracked-image");
+  const std::vector<unsigned char> before(4194304, 71), rows(4195328, 0);
+  image->setData(static_cast<const void *>(before.data()));
+  const auto s = f.attach();
+  const auto item = f.inspectArray(s, 1).result()->get("items")->a.at(0);
+  writeInput(f.exchangePath() + "/agent.png", inputPng(1024, 1024, 6, rows));
+  f.importImage(s,
+      2,
+      item.get("handle")->s,
+      item.get("image_info")->get("data_version")->s,
+      "agent.png");
+  REQUIRE(f.integration.service() > 0);
+  if (fits) {
+    // Independent worked oracle: E=8,456,192, D=S=4,194,304,
+    // W=17,829,888. Public leases expose the single physical S charge.
+    CHECK(memory->used() == baseline + 34674688 + 6 * overhead);
+    json::Value metadata;
+    REQUIRE(json::parse(f.images->metadata(f.sceneId, s.id), metadata));
+    CHECK(metadata.get("exchange_limits")
+              ->get("available_session_snapshot_bytes")
+              ->n
+        == 62914560);
+  }
+  const auto completed = f.await(s, 2);
+  if (fits) {
+    REQUIRE(completed.str("outcome") == "ok");
+    CHECK(memory->used()
+        == baseline + 4194304 + 32768 + 8192 + 65536 + 5 * overhead);
+    f.restoreBatch(s, 3, *completed.result()->get("batch_ref"));
+    REQUIRE(f.await(s, 3).str("outcome") == "ok");
+    CHECK(std::memcmp(image->data(), before.data(), before.size()) == 0);
+  } else {
+    CHECK(completed.str("outcome") == "busy");
+    CHECK(completed.result()->get("reason")->s == "resource_limit");
+    CHECK_FALSE(completed.flag("committed"));
+    CHECK(std::memcmp(image->data(), before.data(), before.size()) == 0);
+    CHECK(f.edits->restorations().size() == 0);
+  }
+}
+
+SCENARIO(
+    "Image copy and Restore slot reservations fail without uncharged owners",
+    "[integration][mcp][image-import][image-import-copy-pressure]")
+{
+  auto memory = std::make_shared<vsr::rendering::FrameBudget>(8u << 20);
+  bool allow = true;
+  image::ExchangeLimits limits;
+  limits.physicalByteCap = memory->limit();
+  limits.reservePhysicalMemory = [memory, &allow](std::size_t bytes) {
+    return allow ? memory->reserve(bytes) : std::shared_ptr<const void>{};
+  };
+  Fixture f({}, true, false, false, 120., true, UINT64_MAX, limits, true);
+  auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 1, 1);
+  image->setName("tracked-image");
+  const unsigned char before[] = {17, 29, 41, 0};
+  image->setData(static_cast<const void *>(before));
+  const auto s = f.attach();
+  const auto item = f.inspectArray(s, 1).result()->get("items")->a.at(0);
+  writeInput(
+      f.exchangePath() + "/agent.png", inputPng(1, 1, 6, {0, 29, 17, 41, 0}));
+  f.importImage(s,
+      2,
+      item.get("handle")->s,
+      item.get("image_info")->get("data_version")->s,
+      "agent.png");
+  const auto imported = f.await(s, 2);
+  REQUIRE(imported.str("outcome") == "ok");
+  const auto batch = *imported.result()->get("batch_ref");
+  const operations::Credentials credentials{
+      f.authority->launchCredential(), s.id, s.secret};
+  const auto held = f.engine->status(credentials, {s.id, 2});
+  const auto entries = f.imageActivity->snapshot();
+  const auto entry =
+      std::find_if(entries.begin(), entries.end(), [](const auto &row) {
+        return row.entry.kind == activity::OperationKind::IMAGE_IMPORT;
+      });
+  REQUIRE(entry != entries.end());
+  f.restoreBatch(s, 3, batch);
+  REQUIRE(f.await(s, 3).str("outcome") == "ok");
+  const auto slot = f.restores->result({s.id, 3});
+  REQUIRE(slot);
+  const auto used = memory->used();
+  const auto sequence = image->dataWriteSequence();
+  allow = false;
+  CHECK_THROWS_AS(operations::Status(held), std::bad_alloc);
+  CHECK_THROWS_AS(activity::Entry(entry->entry), std::bad_alloc);
+  CHECK_THROWS_AS(restore::RestoreResult(*slot), std::bad_alloc);
+  const edit::BatchRef batchRef{
+      batch.get("launch_id")->s, batch.get("batch_id")->s};
+  CHECK(f.restores->submitLocal({f.sceneId, batchRef}).code == Outcome::BUSY);
+  CHECK(memory->used() == used);
+  CHECK(image->dataWriteSequence() == sequence);
+  allow = true;
+  const auto rejected =
+      f.restores->submit({}, {s.id, 4}, {f.sceneId, batchRef});
+  CHECK(rejected.code == Outcome::UNAUTHENTICATED);
+  CHECK(memory->used() == used);
+  const auto admitted = f.restores->submitLocal({f.sceneId, batchRef});
+  REQUIRE(admitted.code == Outcome::OK);
+  f.drain();
+  CHECK(f.restores->resultLocal(admitted.ref)->outcome
+      == Outcome::ALREADY_RESTORED);
+}
+
+SCENARIO("Restore histories bound rejected and cancelled slot ownership",
+    "[integration][mcp][image-import][image-import-slots]")
+{
+  auto memory = std::make_shared<vsr::rendering::FrameBudget>(160u << 20);
+  const auto baseline = memory->used();
+  auto probe = memory->reserve(1);
+  const auto overhead = memory->used() - baseline - 1;
+  probe.reset();
+  image::ExchangeLimits limits;
+  limits.physicalByteCap = memory->limit();
+  limits.reservePhysicalMemory = [memory](std::size_t bytes) {
+    return memory->reserve(bytes);
+  };
+  {
+    Fixture f({}, true, false, false, 120., true, UINT64_MAX, limits, true);
+    const auto s = f.attach();
+    const operations::Credentials credentials{
+        f.authority->launchCredential(), s.id, s.secret};
+    const restore::RestoreRequest absent{
+        f.sceneId, {f.authority->launchId(), "absent"}};
+    bool local = false;
+    SECTION("external slots") {}
+    SECTION("local slots")
+    {
+      local = true;
+    }
+    operations::LocalRef firstLocal;
+    for (unsigned i = 1; i <= 1050; ++i) {
+      if (local) {
+        const auto admitted = f.restores->submitLocal(absent);
+        REQUIRE(admitted.code == Outcome::OK);
+        if (i == 1) {
+          firstLocal = admitted.ref;
+          REQUIRE(f.engine->cancelLocal(admitted.ref).code == Outcome::OK);
+        }
+      } else {
+        REQUIRE(f.restores->submit(credentials, {s.id, i}, absent).code
+            == Outcome::OK);
+        if (i == 1)
+          REQUIRE(f.engine->cancel(credentials, {s.id, i}).code == Outcome::OK);
+      }
+      f.drain();
+      if (i > 1024)
+        CHECK(memory->used() == baseline + 2048 * (65536 + overhead));
+    }
+    if (local) {
+      CHECK_FALSE(f.restores->resultLocal(firstLocal));
+    } else {
+      CHECK_FALSE(f.restores->result({s.id, 1}));
+      REQUIRE(f.restores->result({s.id, 1050}));
+      CHECK(f.restores->result({s.id, 1050})->outcome
+          == Outcome::OUTCOME_UNAVAILABLE);
+    }
+  }
+  CHECK(memory->used() == baseline);
+}
+
+static std::string imageHandleText(identity::ObjectHandle handle)
+{
+  char text[33];
+  std::snprintf(text,
+      sizeof(text),
+      "%016llx%016llx",
+      (unsigned long long)handle.domain,
+      (unsigned long long)handle.serial);
+  return text;
+}
+
+SCENARIO("Image Import distinguishes foreign, unknown and wrong-kind targets",
+    "[integration][mcp][image-import][image-import-identity]")
+{
+  Fixture f({}, true, false, false, 120., true, UINT64_MAX, {}, true);
+  identity::SceneIdentity other(f.ids, f.hidden);
+  f.images->attachScene(f.hiddenId, other);
+  auto foreign = f.hidden.createArray(ANARI_UFIXED8_VEC4, 1, 1);
+  auto material = f.scene.createObject<vsr::scene::Material>("matte");
+  auto handle = other.handleOf(foreign.data());
+  std::string reason = "foreign_scene";
+  SECTION("authorized foreign Array") {}
+  SECTION("unknown identity")
+  {
+    handle.serial += 100000;
+    reason = "invalid_handle";
+  }
+  SECTION("wrong-kind object")
+  {
+    handle = f.sceneIds->handleOf(material.data());
+    reason = "invalid_handle";
+  }
+  const auto s = f.attach();
+  f.importImage(s, 1, imageHandleText(handle), "unknown-version", "absent.png");
+  const auto rejected = f.await(s, 1);
+  REQUIRE(rejected.str("outcome") == "invalid_request");
+  CHECK(rejected.result()->get("reason")->s == reason);
+  CHECK_FALSE(rejected.flag("committed"));
+  CHECK(f.edits->restorations().size() == 0);
+}
+
+SCENARIO(
+    "Image Import accepts cross-handle export without crossing cache keys or Scenes",
+    "[integration][mcp][image-import][image-import-cross-cache]")
+{
+  Fixture f({}, true, false, false, 120., true, UINT64_MAX, {}, true);
+  vsr::io::ImageCache cache(&f.scene), otherCache(&f.hidden);
+  const vsr::io::ImageSource source{
+      "embedded:shared", vsr::io::ColorSpace::LINEAR};
+  const vsr::io::ImageSource otherKey{
+      "embedded:other", vsr::io::ColorSpace::LINEAR};
+  const unsigned char before[] = {17, 29, 41, 0}, after[] = {29, 17, 41, 0};
+  auto target = cache.acquireDecoded(
+      source, ANARI_UFIXED8_VEC4, 1, 1, vsr::io::RowOrder::TOP_DOWN, before);
+  auto different = cache.acquireDecoded(
+      otherKey, ANARI_UFIXED8_VEC4, 1, 1, vsr::io::RowOrder::TOP_DOWN, after);
+  auto foreign = otherCache.acquireDecoded(
+      source, ANARI_UFIXED8_VEC4, 1, 1, vsr::io::RowOrder::TOP_DOWN, before);
+  const auto targetHandle = f.sceneIds->handleOf(target.texels.data());
+  const auto sourceHandle = f.sceneIds->handleOf(different.texels.data());
+  const auto s = f.attach();
+  f.exportImage(s, 1, imageHandleText(sourceHandle));
+  const auto exported = f.await(s, 1);
+  REQUIRE(exported.str("outcome") == "ok");
+  const auto version = *f.sceneIds->imageDataVersion(targetHandle);
+  f.importImage(s,
+      2,
+      imageHandleText(targetHandle),
+      version,
+      exported.result()->get("file_name")->s);
+  const auto imported = f.await(s, 2);
+  REQUIRE(imported.str("outcome") == "ok");
+  CHECK(std::memcmp(target.texels->data(), after, 4) == 0);
+  CHECK(std::memcmp(foreign.texels->data(), before, 4) == 0);
+  CHECK(std::memcmp(different.texels->data(), after, 4) == 0);
+  CHECK(cache
+            .acquireDecoded(source,
+                ANARI_UFIXED8_VEC4,
+                1,
+                1,
+                vsr::io::RowOrder::TOP_DOWN,
+                before)
+            .texels
+      == target.texels);
+  f.restoreBatch(s, 3, *imported.result()->get("batch_ref"));
+  REQUIRE(f.await(s, 3).str("outcome") == "ok");
+  CHECK(std::memcmp(target.texels->data(), before, 4) == 0);
+  CHECK(std::memcmp(foreign.texels->data(), before, 4) == 0);
+  CHECK(std::memcmp(different.texels->data(), after, 4) == 0);
+}
+
+SCENARIO(
+    "Image binding and filesystem incompleteness remain independent on Import",
+    "[integration][mcp][image-import][image-import-incomplete]")
+{
+  Fixture f({}, true, false, false, 120., true, UINT64_MAX, {}, true);
+  auto image = f.scene.createArray(ANARI_UFIXED8, 1, 1);
+  image->setName("tracked-image");
+  const unsigned char before = 17;
+  image->setData(static_cast<const void *>(&before));
+  bool bindingComplete = true;
+  SECTION("binding cap alone")
+  {
+    bindingComplete = false;
+    for (unsigned i = 0; i < 300; ++i)
+      f.scene.createObject<vsr::scene::Sampler>("image2D")->setParameterObject(
+          "image", *image);
+  }
+  SECTION("quota scan cap alone")
+  {
+    for (unsigned i = 0; i < 4100; ++i)
+      writeInput(f.exchangePath() + "/extra-" + std::to_string(i), {});
+  }
+  const auto s = f.attach();
+  const auto item = f.inspectArray(s, 1).result()->get("items")->a.at(0);
+  const auto handle = item.get("handle")->s;
+  writeInput(f.exchangePath() + "/agent.png", inputPng(1, 1, 0, {0, 29}));
+  f.importImage(s,
+      2,
+      handle,
+      item.get("image_info")->get("data_version")->s,
+      "agent.png");
+  const auto imported = f.await(s, 2);
+  REQUIRE(imported.str("outcome") == "ok");
+  CHECK(imported.result()->get("affected_complete")->b == bindingComplete);
+  CHECK(*static_cast<const unsigned char *>(image->data()) == 29);
+  f.exportImage(s, 3, handle);
+  const auto exported = f.await(s, 3);
+  if (bindingComplete) {
+    CHECK(exported.str("outcome") == "busy");
+    CHECK(exported.result()->get("reason")->s == "resource_limit");
+    json::Value metadata;
+    REQUIRE(json::parse(f.images->metadata(f.sceneId, s.id), metadata));
+    CHECK_FALSE(metadata.get("exchange_limits")->get("usage_complete")->b);
+  } else {
+    REQUIRE(exported.str("outcome") == "ok");
+    CHECK_FALSE(exported.result()->get("affected_complete")->b);
+    CHECK(exported.result()->get("exchange_limits")->get("usage_complete")->b);
+  }
+}
+
+SCENARIO("Engine and Activity evict Image owners independently",
+    "[integration][mcp][image-import][image-import-eviction]")
+{
+  operations::Limits engineLimits;
+  engineLimits.statusRecords = 2;
+  Fixture f(
+      {}, true, false, false, 120., true, UINT64_MAX, {}, true, engineLimits);
+  auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 1, 1);
+  image->setName("tracked-image");
+  const unsigned char before[] = {17, 29, 41, 0};
+  image->setData(static_cast<const void *>(before));
+  const auto s = f.attach();
+  const auto item = f.inspectArray(s, 1).result()->get("items")->a.at(0);
+  writeInput(
+      f.exchangePath() + "/agent.png", inputPng(1, 1, 6, {0, 29, 17, 41, 0}));
+  f.importImage(s,
+      2,
+      item.get("handle")->s,
+      item.get("image_info")->get("data_version")->s,
+      "agent.png");
+  const auto imported = f.await(s, 2);
+  REQUIRE(imported.str("outcome") == "ok");
+  const auto batchJson = *imported.result()->get("batch_ref");
+  const edit::BatchRef batch{
+      batchJson.get("launch_id")->s, batchJson.get("batch_id")->s};
+  SECTION("Engine evicts while Activity keeps recovery")
+  {
+    f.engine->setActivitySink(nullptr);
+    const operations::Credentials credentials{
+        f.authority->launchCredential(), s.id, s.secret};
+    for (unsigned i = 3; i < 5; ++i) {
+      operations::Request request;
+      request.kind = "inspect";
+      request.target = session::Target::scene(f.sceneId);
+      request.executor = [](operations::StepContext &) {
+        return operations::Step{};
+      };
+      REQUIRE(f.engine->submit(credentials, {s.id, i}, std::move(request)).code
+          == Outcome::OK);
+      f.drain();
+    }
+    CHECK(f.engine->status(credentials, {s.id, 2}).code
+        == Outcome::OUTCOME_UNAVAILABLE);
+    CHECK(
+        f.imageActivity->eligibility(batch) == activity::Eligibility::ELIGIBLE);
+    f.engine->setActivitySink(f.imageActivitySink.get());
+    const auto local = f.restores->submitLocal({f.sceneId, batch});
+    REQUIRE(local.code == Outcome::OK);
+    f.drain();
+    REQUIRE(f.restores->resultLocal(local.ref)->outcome == Outcome::OK);
+    CHECK(std::memcmp(image->data(), before, 4) == 0);
+  }
+  SECTION("Activity evicts while Engine keeps receipt")
+  {
+    for (unsigned i = 0; i < 1024; ++i)
+      REQUIRE(f.imageActivity->append(activity::Entry{}));
+    CHECK(
+        f.imageActivity->eligibility(batch) != activity::Eligibility::ELIGIBLE);
+    CHECK(f.status(s, s.id, 2).str("outcome") == "ok");
+    json::Value metadata;
+    REQUIRE(json::parse(f.images->metadata(f.sceneId, s.id), metadata));
+    CHECK(metadata.get("exchange_limits")
+              ->get("available_session_snapshot_bytes")
+              ->n
+        == 67108864);
+    const auto local = f.restores->submitLocal({f.sceneId, batch});
+    REQUIRE(local.code == Outcome::OK);
+    f.drain();
+    CHECK(f.restores->resultLocal(local.ref)->outcome
+        == Outcome::OUTCOME_UNAVAILABLE);
+  }
 }
 
 #endif

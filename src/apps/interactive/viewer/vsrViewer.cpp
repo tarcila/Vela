@@ -1083,8 +1083,10 @@ void Application::setupIntegration()
   m_translations = std::make_unique<vi::edit::TranslationService>(
       *m_integration, *m_authority, *m_engine, *m_edits);
   m_translations->attachScene(*sceneId, *m_identity);
-  m_restores =
-      std::make_unique<vi::restore::RestoreService>(*m_engine, *m_edits);
+  const auto hostImageMemory = std::make_shared<vsr::rendering::FrameBudget>();
+  m_restores = std::make_unique<vi::restore::RestoreService>(*m_engine,
+      *m_edits,
+      [hostImageMemory] { return hostImageMemory->reserve(65536); });
   m_restores->attachScene(*sceneId, *m_identity);
   m_sync = std::make_unique<vi::sync::SyncService>(
       *m_integration, *m_engine, m_edits->syncStates());
@@ -1103,7 +1105,6 @@ void Application::setupIntegration()
     return;
   }
   m_renders->setDimensions(*viewId, AgentView::WIDTH, AgentView::HEIGHT);
-  const auto hostImageMemory = std::make_shared<vsr::rendering::FrameBudget>();
   m_frames = std::make_unique<vi::frame::FrameService>(*m_integration,
       *m_authority,
       *m_engine,
@@ -1154,12 +1155,18 @@ void Application::setupIntegration()
     const auto used = m_activity->usage().bytes;
     return used < cap ? cap - used : 0;
   };
+  imageLimits.restorationRetained = [this](const std::string &launch,
+                                        const std::string &batch) {
+    return m_activity->eligibility({launch, batch})
+        == vi::activity::Eligibility::ELIGIBLE;
+  };
   m_images = std::make_unique<vi::image::ImageExchange>(*m_integration,
       *m_engine,
       m_authority->launchId(),
       m_runtimeDir,
       imageLimits);
   m_images->attachScene(*sceneId, *m_identity);
+  m_images->attachRestoration(*m_edits, *m_restores);
   m_inspector->setImageExchange(
       [this](vi::SceneId id, const std::string &sessionId) {
         return m_images->metadata(id, sessionId);

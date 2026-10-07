@@ -1,13 +1,13 @@
-# Export a live Image as a PNG working copy
+# Export, Import and restore live Image PNG working copies
 
-The integration-enabled viewer and headless tutorial register `vsr_image_export`.
-Image Import is not exposed by these shipped hosts yet. A successful export is a read, not an edit,
+The qualified integration-enabled viewer and headless tutorial register
+`vsr_image_export` and recoverable `vsr_image_import`. A successful export is a read, not an edit,
 render, scene save, or original-asset write. It needs current Scene READ, even
 when agent edits are disabled; it does not map the Array, reserve a write
 sequence, change texels, or occupy a presentation/render encoder slot.
 
 Discover the Scene and its `image_exchange` observation. On qualified Linux
-hosts it reports `supported`, `enabled`, `export`, `import:false`,
+hosts it reports `supported`, `enabled`, `export`, `import`,
 `data_tracking`, `image_exchange_directory`, and `exchange_limits`.
 Unsupported platforms or unsafe runtime directories fail closed. The strict
 v1 connection descriptor has optional `image_exchange` launch metadata with
@@ -157,27 +157,35 @@ permission failures cannot be promised successful cleanup.
 
 PNG and undo retention are separate: deleting a PNG does not free a retained
 Image undo snapshot, and restoring/evicting an undo batch does not delete its
-PNG. Import and Image undo are not yet exposed. Host loops must call
+PNG. Host loops must call
 `ImageExchange::pump()` regularly on the owning thread, as they do for rendering,
 to publish worker completion and release asynchronously cancelled backend slots.
 Destroy the Image service before its engine; keep its allocator alive through
 engine cleanup.
 
-## Import continuation: not a completed host capability
+## Recoverable Import
 
-The unfinished Import service can be qualified through
-`ImageExchange::attachRestoration(EditService&, RestoreService&)`; the viewer and headless tutorial
-intentionally do not call it. Their descriptors/discovery keep `import:false`,
-and their tool lists still omit `vsr_image_import`. Do not enable this seam in a
-production host until the complete Import acceptance gate is recorded. Merely
-attaching the edit store is insufficient: Import stays absent unless the host
-also supplies its physical reservation and authoritative global retention and
-availability callbacks, and binds the same normal RestoreService with a bounded
-result reservation. RestoreService accepts that reservation as its optional
-constructor argument; it must use the existing host pool, not a separate or
-larger pool. These prerequisites alone do not certify complete host acceptance.
+The viewer and headless tutorial bind
+`ImageExchange::attachRestoration(EditService&, RestoreService&)` to their
+existing shared FrameBudget and authoritative Activity retention/availability
+callbacks. Import stays absent on hosts lacking any of these prerequisites or
+normal RestoreService's bounded result reservation. The optional RestoreService
+constructor reservation uses the same host pool, never a separate or larger
+pool. Default logical retention and physical limits are not raised.
 
-The opt-in service submits normal `image_import` operations with Scene READ+EDIT,
+Call `vsr_image_import` with `request_id`, `scene_id`, the Array `handle`, its
+inspected `data_version`, and a confined PNG `file_name`. No prior export is
+required. Finish and close externally processed files before submission.
+Poll normal `image_import` status for `handle`, fresh `data_version`,
+`scene_revision`, shared-namespace `batch_ref`, bounded `affected_samplers`,
+`affected_users`, `affected_complete`, and `restoration_policy`.
+Call `vsr_restore` with `request_id`, the same `scene_id` and
+`target_batch_ref`; do not supply a data version. Agent Activity shows the
+eligible Image batch with its normal local Restore action, which remains
+available after disconnect or Disable agent edits. Recovery is one-way and
+capacity-based, not permanent or time-based.
+
+The service submits normal `image_import` operations with Scene READ+EDIT,
 strict handle/data_version/file_name arguments, backend cleanup and historical
 replay. It refills the addressed Array through **one** ordinary `map()`/`unmap()`
 reservation boundary and publishes an Image payload into the shared batch store.
@@ -222,7 +230,7 @@ chunks must still precede PLTE/IDAT; bad zlib trailers, dictionary-dependent
 streams, concatenated streams and noncontiguous IDAT are rejected. No growing
 codec/profile allocation or unchecked general-purpose image decode is used.
 Along with the private 512 KiB worker stack/64 KiB guard, this is below W=4F+1 MiB;
-remaining control/TLS ownership still needs the final host allocation audit.
+the partitioned owner reservations below cover the remaining controls.
 
 Preparation reserves the originating session's S=T ceiling first, then existing
 shared activity/store capacity, then transient E+D+W+S. S is physically allocated
@@ -257,13 +265,16 @@ counter instead of an unbounded issued-ID journal. Copy-held reservations can
 outlive Engine/Activity eviction or host teardown; they release when those
 copies die, not when the original operation completes.
 
-This continuation is **not full Import acceptance**. Production host enablement,
-complete control/result physical-ownership and retention-pressure qualification,
-the 27 MiB example, final host schema/discovery publication and an eligible live
-host Import smoke remain required. Focused loopback coverage now additionally
-checks exact encoded/ancillary boundaries, Import despite exceeded export disk
-quota, session-before-global rejection, notification failures, registration
-retirement/replacement, and the unchanged default activity/store ceilings. PNG cleanup and undo retention remain independent.
+The spec's illustrative E=2 MiB, D=4 MiB, W=17 MiB, S=4 MiB needs
+27 MiB transient and 4 MiB retained, not 31 MiB or two snapshots. Production
+admission reserves the conservative target-dependent E and W maxima, not that
+example's smaller E: for 1024x1024 RGBA it reserves 34,674,688 bytes plus host
+lease overhead and retains exactly 4,194,304 snapshot bytes. A 27 MiB
+configured transient ceiling correctly rejects that conservative reservation.
+Loopback qualification measures the public physical pool and independent
+session ledger across transfer, pressure, rejection, cancellation, recovery,
+result copies, eviction and teardown. PNG cleanup and undo retention remain
+independent.
 
 ## Isolated eligible-Image verification
 
@@ -273,5 +284,13 @@ It creates a private authenticated Xvfb, runtime/configuration and asymmetric
 Helide, and exercises authenticated discovery, Array inspection, export,
 independent CRC/zlib/sample checks, deleted-file historical replay and normal
 shutdown cleanup. It does not attach to an existing viewer or alter Pi config.
-Import, Image undo and whole-feature chess/presented-camera acceptance are not
-part of this export-only check.
+Add `--import` to verify external raw-channel processing, two shared Samplers,
+Import, deleted-input replay and exact normal Restore with fresh image_versions.
+The UI-model suite verifies Agent Activity's disconnect/Disable edits/local
+Restore route. For an actual UI pass, add `--import --local-ui`: the script
+pauses at the disconnected eligible Image batch, saves a private screenshot
+and display metadata under the build directory, and waits up to 180 seconds.
+Use only that private display: check Disable agent edits, click its Restore,
+then create `<build>/t05-ui-proceed`. The script reconnects, checks Import is
+forbidden while READ Export still works, and compares all recovered bytes.
+Whole-feature chess/presented-camera acceptance is separate.

@@ -245,8 +245,12 @@ replacement/loss makes eligible Array `image_info` unavailable with the same
 reason while preserving enrolled write history.
 Poll kind `image_export` for the raw-channel PNG file name and captured version;
 process that working copy with local tooling without changing live texels.
-Image Import is not implemented. See [PNG exchange](image-png-exchange.md) for
-channel/Color Space policy, quotas, replay and explicit PNG cleanup, and
+Qualified hosts also expose `vsr_image_import`: supply the Array handle,
+observed `data_version` and processed PNG basename with Scene READ+EDIT enabled.
+Poll `image_import` for its normal `batch_ref`, then use `vsr_restore` or Agent
+Activity's local Restore for conditional exact recovery. No caller data version
+is accepted by Restore. See [PNG exchange](image-png-exchange.md) for
+channel/Color Space policy, quotas, replay and separate PNG/undo cleanup, and
 [Image tracking](image-data-tracking.md) for host/cache lifetime prerequisites.
 
 ### Editing a placement's world position

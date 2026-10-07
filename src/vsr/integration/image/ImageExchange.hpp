@@ -45,7 +45,7 @@ struct ExchangeLimits
  * Export acquires no map, write sequence, render slot or undo payload.
  * Import is opt-in through attachRestoration(); it shares the normal edit
  * store and vsr_restore, retaining exact prior samples before any write.
- * The shipped hosts deliberately have not enabled this unfinished slice.
+ * Qualified hosts bind the same physical pool and Activity retention policy.
  * Engine/Integration outlive this service. Destruction joins workers before
  * descriptor-relative cleanup; completed files have no TTL.
  */
@@ -60,7 +60,7 @@ class ImageExchange
   ~ImageExchange();
   VSR_NOT_COPYABLE(ImageExchange)
   void attachScene(SceneId scene, identity::SceneIdentity &identity);
-  // Qualification/continuation seam, not enabled by the shipped hosts yet.
+  // Bind normal recovery before publishing Import tools or capabilities.
   // Edits and this service share a launch and owning-thread lifetime.
   // Import remains unavailable without the host's physical reservation and
   // authoritative global retention/availability callbacks in ExchangeLimits.

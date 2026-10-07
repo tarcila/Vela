@@ -2,9 +2,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Verify eligible Image Export through a freshly installed isolated viewer.
+"""Verify eligible Image exchange through a freshly installed isolated viewer.
 
-Usage: python3 scripts/test-image-export.py build-agent
+Usage: python3 scripts/test-image-export.py build-agent [--import] [--local-ui]
+--import adds external raw processing, shared users and normal exact Restore.
+--local-ui instead pauses for the private viewer's Agent Activity Restore action:
+resize the private window if necessary, Disable agent edits, click Restore, then
+create build-agent/t05-ui-proceed. Screenshot/display metadata are written under
+build-agent. The 180-second pause needs Pillow; ordinary verification does not.
 Requires Xvfb, xauth, xset and the qualified Helide Image-writing host.
 No existing display, viewer, configuration or Pi descriptor is touched.
 """
@@ -67,6 +72,10 @@ def fixture(directory):
         "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "TEXCOORD_0": 1},
                                      "indices": 2, "material": 0}]}],
     }
+    # Distinct Samplers sharing one cache source, not duplicated texels.
+    gltf["materials"].append(dict(gltf["materials"][0]))
+    gltf["meshes"][0]["primitives"].append(
+        dict(gltf["meshes"][0]["primitives"][0], material=1))
     path = directory / "fixture.gltf"
     path.write_text(json.dumps(gltf))
     return path, samples
@@ -98,6 +107,9 @@ def decode_export(path):
 
 def main():
     build = Path(sys.argv[1] if len(sys.argv) > 1 else "build-agent").resolve()
+    verify_import = "--import" in sys.argv[2:]
+    verify_local_ui = "--local-ui" in sys.argv[2:]
+    require(not verify_local_ui or verify_import, "--local-ui requires --import")
     viewer = build / "vsrViewer"
     require(viewer.is_file() and (build / "install/lib").is_dir(),
             "build the viewer and install its libraries before verification")
@@ -109,6 +121,7 @@ def main():
         runtime.mkdir(mode=0o700)
         config.mkdir(mode=0o700)
         asset, expected = fixture(root)
+        fixture_source = (root / "image.png").read_bytes()
         display = next(n for n in range(94, 200)
                        if not Path(f"/tmp/.X{n}-lock").exists()
                        and not Path(f"/tmp/.X11-unix/X{n}").exists())
@@ -146,15 +159,17 @@ def main():
                 require(len(descriptors) == 1, "fresh launch descriptor")
                 descriptor = json.loads(descriptors[0].read_text())
                 exchange = descriptor["image_exchange"]
-                require(exchange["enabled"] and exchange["export"] and not exchange["import"],
+                require(exchange["enabled"] and exchange["export"],
                         "qualified serialized Image exchange")
+                if verify_import:
+                    require(exchange["import"], "fully bound recoverable Image Import")
                 require("available_session_snapshot_bytes" not in exchange["exchange_limits"],
                         "no launch-wide session ledger leak")
                 directory = Path(exchange["image_exchange_directory"])
                 require(stat.S_IMODE(directory.stat().st_mode) == 0o700, "private directory mode")
                 session = {}
 
-                def rpc(method, params):
+                def rpc(method, params, expected_status=200):
                     headers = {"Authorization": "Bearer " + descriptor["launch_credential"],
                                "Content-Type": "application/json"}
                     if session:
@@ -167,7 +182,10 @@ def main():
                                                        "method": method, "params": params}), headers)
                         response = connection.getresponse()
                         value = json.loads(response.read())
-                        require(response.status == 200 and "result" in value, "authenticated RPC result")
+                        require(response.status == expected_status, "authenticated RPC status")
+                        if expected_status != 200:
+                            return value["error"]
+                        require("result" in value, "authenticated RPC result")
                         return value["result"]
                     finally:
                         connection.close()
@@ -215,6 +233,86 @@ def main():
                 replay = tool("vsr_image_export", arguments)
                 require(replay["replayed"] and replay["result"] == receipt and not file.exists(),
                         "historical replay does not regenerate")
+                if verify_import:
+                    tools = rpc("tools/list", {})["tools"]
+                    schema = next(t["inputSchema"] for t in tools
+                                  if t["name"] == "vsr_image_import")
+                    require(schema["additionalProperties"] is False,
+                            "strict published Import schema")
+                    changed = bytearray(expected)
+                    for index in range(0, len(changed), 4):
+                        changed[index], changed[index + 1] = changed[index + 1], changed[index]
+                    rows = b"\0" + changed[:12] + b"\0" + changed[12:]
+                    processed = directory / "processed.png"
+                    processed.write_bytes(b"\x89PNG\r\n\x1a\n"
+                                          + chunk(b"IHDR", struct.pack(">IIBBBBB", 3, 2, 8, 6, 0, 0, 0))
+                                          + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+                    imported, import_args = operation("vsr_image_import", {
+                        "scene_id": scene["id"], "handle": image["handle"],
+                        "data_version": info["data_version"], "file_name": processed.name})
+                    imported_receipt = imported["result"]
+                    require(imported["kind"] == "image_import" and imported["committed"],
+                            "normal committing Import")
+                    require(imported_receipt["data_version"] != info["data_version"]
+                            and len(imported_receipt["affected_samplers"]) == 2
+                            and imported_receipt["affected_complete"], "shared cached users/version")
+                    observed, _ = operation("vsr_image_export", {"scene_id": scene["id"],
+                                                               "handle": image["handle"]})
+                    require(decode_export(directory / observed["result"]["file_name"]) == changed,
+                            "all raw imported samples including transparent colors")
+                    processed.unlink()
+                    retry = tool("vsr_image_import", import_args)
+                    require(retry["replayed"] and retry["result"] == imported_receipt,
+                            "Import replay never rereads deleted PNG")
+                    if verify_local_ui:
+                        from PIL import ImageGrab
+                        rpc("vsr/detach", {})
+                        session.clear()
+                        (build / "t05-ui-env.json").write_text(json.dumps({
+                            "DISPLAY": env["DISPLAY"], "XAUTHORITY": env["XAUTHORITY"]}))
+                        (build / "t05-ui-env.json").chmod(0o600)
+                        os.environ["XAUTHORITY"] = env["XAUTHORITY"]
+                        time.sleep(1)
+                        ImageGrab.grab(xdisplay=env["DISPLAY"]).save(build / "t05-ui.png")
+                        proceed = build / "t05-ui-proceed"
+                        proceed.unlink(missing_ok=True)
+                        print("PRIVATE_UI_READY: Disable agent edits and click the eligible "
+                              "Image batch's Restore; create " + str(proceed), flush=True)
+                        until = time.monotonic() + 180
+                        while not proceed.exists():
+                            require(time.monotonic() < until, "bounded local UI recovery")
+                            time.sleep(0.1)
+                        session.update(rpc("vsr/attach", {}))
+                        denied = rpc("tools/call", {"name": "vsr_image_import", "arguments": {
+                            "request_id": next_id + 1, "scene_id": scene["id"],
+                            "handle": image["handle"], "data_version": imported_receipt["data_version"],
+                            "file_name": "absent.png"}}, expected_status=403)
+                        require(denied["data"]["code"] == "forbidden",
+                                "actual UI Disable edits blocks Import before admission")
+                        observed_local, _ = operation("vsr_image_export", {
+                            "scene_id": scene["id"], "handle": image["handle"]})
+                        require(decode_export(directory / observed_local["result"]["file_name"])
+                                == expected, "Agent Activity local Restore after disconnect")
+                        print("IMAGE_LOCAL_UI_ACCEPTANCE disconnected=true edits_disabled=true "
+                              "read_export=true exact_bytes=24 restored=true")
+                    else:
+                        restored, _ = operation("vsr_restore", {"scene_id": scene["id"],
+                            "target_batch_ref": imported_receipt["batch_ref"]})
+                        restore_receipt = restored["result"]
+                        require(restored["kind"] == "restore" and restored["committed"]
+                                and restore_receipt["versions"] == []
+                                and restore_receipt["node_versions"] == []
+                                and restore_receipt["image_versions"][0]["data_version"]
+                                    != imported_receipt["data_version"], "one-way fresh Image restore receipt")
+                        recovered, _ = operation("vsr_image_export", {"scene_id": scene["id"],
+                                                                    "handle": image["handle"]})
+                        require(decode_export(directory / recovered["result"]["file_name"]) == expected,
+                                "exact prior texels restored in same cached Array")
+                        print("IMAGE_IMPORT_ACCEPTANCE host=vsrViewer/Linux/Helide shared_samplers=2 "
+                              "exact_bytes=24 normal_restore=true replay=deleted_input receipt="
+                              + json.dumps(imported_receipt) + " restore=" + json.dumps(restore_receipt))
+                    require(fixture_source == (root / "image.png").read_bytes(),
+                            "original asset unchanged")
                 rpc("vsr/detach", {})
                 host.terminate()
                 require(host.wait(timeout=15) == 0, "normal viewer exit")
