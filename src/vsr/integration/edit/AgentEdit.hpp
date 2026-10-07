@@ -438,6 +438,7 @@ struct ImageSnapshot
   ObjectHandle handle;
   std::uint64_t completedWrite{0};
   std::string batchOrder;
+  std::string batchScope;
   std::weak_ptr<const void> registration;
   scene::Scene *scene{nullptr};
 };
@@ -647,12 +648,20 @@ inline bool RestorationStore::prepareImage(RestorationRecord record)
     m_imageScopeOrder.reserve(m_imageScopeOrder.size() + 1);
     m_imageScopes.emplace(scopeKey, record.scene);
     record.image->batchOrder = id;
+    record.image->batchScope = scopeKey;
     m_pendingImages.emplace(id, std::move(record));
-    m_imageScopeOrder.push_back(id);
+    m_imageScopeOrder.push_back(scopeKey);
   } catch (...) {
     m_pendingImages.erase(id);
     m_imageScopes.erase(scopeKey);
     throw;
+  }
+  // Retire bounded scope history during preparation, never allocate a key
+  // while publishing a completed write. Retained payloads carry their own
+  // authoritative scope even under explicit larger host limits.
+  while (m_imageScopeOrder.size() > 1024) {
+    m_imageScopes.erase(m_imageScopeOrder.front());
+    m_imageScopeOrder.erase(m_imageScopeOrder.begin());
   }
   ++m_reserved;
   return true;
@@ -667,21 +676,20 @@ inline void RestorationStore::publishImage(const BatchRef &ref)
   --m_reserved;
   m_order.push_back(std::move(it->second.image->batchOrder));
   m_records.insert(m_pendingImages.extract(it));
-  while (m_imageScopeOrder.size() > 1024) {
-    m_imageScopes.erase(ref.launchId + "/" + m_imageScopeOrder.front());
-    m_imageScopeOrder.erase(m_imageScopeOrder.begin());
-  }
 }
 
 inline void RestorationStore::cancelImage(const BatchRef &ref)
 {
   std::lock_guard<std::mutex> lock(m_mutex);
-  if (m_pendingImages.erase(ref.batchId)) {
+  const auto it = m_pendingImages.find(ref.batchId);
+  if (it != m_pendingImages.end()) {
+    auto scopeKey = std::move(it->second.image->batchScope);
+    m_pendingImages.erase(it);
     --m_reserved;
-    m_imageScopes.erase(ref.launchId + "/" + ref.batchId);
+    m_imageScopes.erase(scopeKey);
     m_imageScopeOrder.erase(
         std::remove(
-            m_imageScopeOrder.begin(), m_imageScopeOrder.end(), ref.batchId),
+            m_imageScopeOrder.begin(), m_imageScopeOrder.end(), scopeKey),
         m_imageScopeOrder.end());
   }
 }
@@ -690,6 +698,10 @@ inline std::optional<SceneId> RestorationStore::imageScope(
     const BatchRef &ref) const
 {
   std::lock_guard<std::mutex> lock(m_mutex);
+  const auto record = m_records.find(ref.batchId);
+  if (record != m_records.end() && record->second.ref.launchId == ref.launchId
+      && record->second.image)
+    return record->second.scene;
   const auto it = m_imageScopes.find(ref.launchId + "/" + ref.batchId);
   return it == m_imageScopes.end() ? std::optional<SceneId>{}
                                    : std::optional<SceneId>{it->second};
@@ -698,10 +710,10 @@ inline std::optional<SceneId> RestorationStore::imageScope(
 inline void RestorationStore::forgetImageScope(const BatchRef &ref)
 {
   std::lock_guard<std::mutex> lock(m_mutex);
-  m_imageScopes.erase(ref.launchId + "/" + ref.batchId);
+  const auto scopeKey = ref.launchId + "/" + ref.batchId;
+  m_imageScopes.erase(scopeKey);
   m_imageScopeOrder.erase(
-      std::remove(
-          m_imageScopeOrder.begin(), m_imageScopeOrder.end(), ref.batchId),
+      std::remove(m_imageScopeOrder.begin(), m_imageScopeOrder.end(), scopeKey),
       m_imageScopeOrder.end());
 }
 

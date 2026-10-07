@@ -240,6 +240,9 @@ class ActivityLog
   // Consumes eligibility at restoration commit and releases its payload.
   bool markRestored(const BatchRef &ref);
   bool markConflicting(const BatchRef &ref);
+  // No temporary owning key at the post-write publication boundary.
+  bool markRestored(const std::string &launchId, const std::string &batchId);
+  bool markConflicting(const std::string &launchId, const std::string &batchId);
 
   // Authorized lookup by complete Operation Reference (spec §4, §9).
   Lookup lookup(SessionAuthority &authority,
@@ -267,7 +270,8 @@ class ActivityLog
 
   bool safe(const Slot &s) const;
 
-  bool setEligibility(const BatchRef &ref, Eligibility to);
+  bool setEligibility(
+      const std::string &launchId, const std::string &batchId, Eligibility to);
 
   void loseEligibility(Slot &s, Eligibility to);
 
@@ -504,12 +508,24 @@ inline void ActivityLog::publishRestoration(Id id)
 
 inline bool ActivityLog::markRestored(const BatchRef &ref)
 {
-  return setEligibility(ref, Eligibility::RESTORED);
+  return markRestored(ref.launchId, ref.batchId);
 }
 
 inline bool ActivityLog::markConflicting(const BatchRef &ref)
 {
-  return setEligibility(ref, Eligibility::CONFLICTING);
+  return markConflicting(ref.launchId, ref.batchId);
+}
+
+inline bool ActivityLog::markRestored(
+    const std::string &launchId, const std::string &batchId)
+{
+  return setEligibility(launchId, batchId, Eligibility::RESTORED);
+}
+
+inline bool ActivityLog::markConflicting(
+    const std::string &launchId, const std::string &batchId)
+{
+  return setEligibility(launchId, batchId, Eligibility::CONFLICTING);
 }
 
 inline Lookup ActivityLog::lookup(SessionAuthority &authority,
@@ -607,11 +623,13 @@ inline bool ActivityLog::safe(const Slot &s) const
   return !s.entry.active && !s.pinned;
 }
 
-inline bool ActivityLog::setEligibility(const BatchRef &ref, Eligibility to)
+inline bool ActivityLog::setEligibility(
+    const std::string &launchId, const std::string &batchId, Eligibility to)
 {
   std::lock_guard<std::mutex> lock(m_mutex);
   for (auto &s : m_slots) {
-    if (!s.entry.batchRef || !(*s.entry.batchRef == ref))
+    if (!s.entry.batchRef || s.entry.batchRef->launchId != launchId
+        || s.entry.batchRef->batchId != batchId)
       continue;
     if (s.entry.eligibility != Eligibility::ELIGIBLE)
       return false;
@@ -768,13 +786,13 @@ inline bool EngineActivitySink::restorationKnown(
 inline void EngineActivitySink::restorationRestored(
     const std::string &launchId, const std::string &batchId)
 {
-  m_log.markRestored(BatchRef{launchId, batchId});
+  m_log.markRestored(launchId, batchId);
 }
 
 inline void EngineActivitySink::restorationConflicting(
     const std::string &launchId, const std::string &batchId)
 {
-  m_log.markConflicting(BatchRef{launchId, batchId});
+  m_log.markConflicting(launchId, batchId);
 }
 
 inline void EngineActivitySink::apply(

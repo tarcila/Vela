@@ -169,7 +169,11 @@ The unfinished Import service can be qualified through
 `ImageExchange::attachRestoration(EditService&)`; the viewer and headless tutorial
 intentionally do not call it. Their descriptors/discovery keep `import:false`,
 and their tool lists still omit `vsr_image_import`. Do not enable this seam in a
-production host until the complete Import acceptance gate is recorded.
+production host until the complete Import acceptance gate is recorded. Merely
+attaching the edit store is insufficient: Import stays absent unless the host
+also supplies its physical reservation and authoritative global retention and
+availability callbacks. These prerequisites are not certification of the
+remaining complete control/result ownership audit.
 
 The opt-in service submits normal `image_import` operations with Scene READ+EDIT,
 strict handle/data_version/file_name arguments, backend cleanup and historical
@@ -180,7 +184,22 @@ advances rather than rewinds data_version. It returns `image_versions` separatel
 from existing object/node versions. Later ordinary writes, even change-back,
 permanently conflict; open maps remain untouched. Wrong-Scene retained Image
 records reject before consumed/conflicting checks, without consuming eligibility.
-Absent history cannot fabricate foreign-Scene evidence.
+Absent history cannot fabricate foreign-Scene evidence. Restore arguments are
+strict: only `request_id`, `scene_id` and `target_batch_ref` are accepted; the
+batch reference contains only `launch_id` and `batch_id`. A caller data version
+is never restore authority and is rejected before request-ID admission.
+
+Import and Image restore recheck current authority, cancellation and deadline
+**after** fallible receipt/synchronization preparation and immediately before
+`Array::map()`. That map is the sole sequence reservation boundary. A failed
+map notification leaves the value burned, bytes/token unchanged and the Array
+unmapped; a failed unmap notification still completes the write and reports
+`applied_with_sync_failure`. Import store nodes/order keys and Image restore
+receipt capacity are prepared before mutation; retained-batch publication and
+restore eligibility consumption do not allocate replacement keys or receipts.
+Retired Scene identity bindings are observed through weak lifetimes before
+any pointer is dereferenced. Replacement identity domains cannot inherit a
+prior batch, and retained foreign scope still precedes permanent conflict.
 
 Input is opened once relative to the held exchange directory with no-follow,
 nonblocking and close-on-exec flags. Regular-file/effective-user/single-link and
@@ -195,7 +214,10 @@ ignores colour/profile ancillary payloads within 65536 bytes without conversion,
 and rejects tRNS/APNG, unsupported critical chunks and malformed streams. Output
 is exactly T raw straight-alpha/top-down bytes. Codec allocations are F+1 filtered
 bytes and a 128 KiB aligned arena supplied through zlib's allocation hooks, plus
-constant controls. IDAT chunks stream from E without concatenation. No growing
+constant controls. IDAT chunks stream from E without concatenation, including
+one-byte and empty chunks. Colour/profile contents remain ignored, but these
+chunks must still precede PLTE/IDAT; bad zlib trailers, dictionary-dependent
+streams, concatenated streams and noncontiguous IDAT are rejected. No growing
 codec/profile allocation or unchecked general-purpose image decode is used.
 Along with the private 512 KiB worker stack/64 KiB guard, this is below W=4F+1 MiB;
 remaining control/TLS ownership still needs the final host allocation audit.
@@ -212,9 +234,12 @@ Default activity/store limits remain unchanged. Available capacities are
 observations, never future admission guarantees.
 
 This continuation is **not full Import acceptance**. Production host enablement,
-complete lifecycle/registration/failure and allocation-bound qualification, the
-27 MiB example, schema/documentation completion and an eligible live host Import
-smoke remain required. PNG cleanup and undo retention remain independent.
+complete control/result physical-ownership and retention-pressure qualification,
+the 27 MiB example, final host schema/discovery publication and an eligible live
+host Import smoke remain required. Focused loopback coverage now additionally
+checks exact encoded/ancillary boundaries, Import despite exceeded export disk
+quota, session-before-global rejection, notification failures, registration
+retirement/replacement, and the unchanged default activity/store ceilings. PNG cleanup and undo retention remain independent.
 
 ## Isolated eligible-Image verification
 

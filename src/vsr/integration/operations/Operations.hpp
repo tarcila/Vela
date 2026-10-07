@@ -151,6 +151,10 @@ struct StepContext
   // query lets its owner detect cancellation/deadline without polling status
   // (or retaining client credentials), then wake once to release resources.
   std::function<bool()> isAbandoned;
+  // Owning-thread final guard, after fallible preparation and immediately
+  // before mutation. Rechecks live authority, cancellation and deadline;
+  // it does not reserve resources or consume a write sequence.
+  std::function<Outcome()> beforeWrite;
 
   // Restoration storage in the application-owned activity budget (spec §5).
   // Each forwards to the installed ActivitySink for this operation's record
@@ -1270,6 +1274,32 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
     return !r || r->terminal.has_value() || r->pendingCancel.has_value()
         || (r->deadline > 0. && m_clock() >= r->deadline);
   };
+  ctx.beforeWrite =
+      [this, alive, key, sessionId, target, capability, boundSceneRead] {
+        if (!alive.lock())
+          return Outcome::CANCELLED;
+        Outcome current = sessionId.empty()
+            ? (m_authority.authorizeLocal(target, capability)
+                      ? Outcome::OK
+                      : Outcome::FORBIDDEN)
+            : fromSessionCode(m_authority.authorizeExecution(
+                  sessionId, target, capability));
+        if (current == Outcome::OK && boundSceneRead) {
+          const auto bound = sceneFor(target);
+          current = bound
+              ? fromSessionCode(m_authority.authorizeExecution(
+                    sessionId, Target::scene(*bound), Capability::READ))
+              : Outcome::FORBIDDEN;
+        }
+        if (current != Outcome::OK)
+          return current;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const auto *r = find(key);
+        if (!r || r->terminal || r->pendingCancel)
+          return Outcome::CANCELLED;
+        return r->deadline > 0. && m_clock() >= r->deadline ? Outcome::TIMEOUT
+                                                            : Outcome::OK;
+      };
   // Serialized with notify() under the engine lock.
   auto withSink = [this, alive, key](auto &&fn) {
     if (!alive.lock())

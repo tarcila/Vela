@@ -1005,7 +1005,10 @@ void ImageExchange::attachRestoration(edit::EditService &edits)
 
 bool ImageExchange::importAvailable() const
 {
-  return m_state->edits && !m_state->editsLifetime.expired();
+  return m_state->edits && !m_state->editsLifetime.expired()
+      && m_state->limits.reservePhysicalMemory
+      && m_state->limits.availableGlobalRetention
+      && m_state->limits.restorationRetained;
 }
 
 void ImageExchange::State::pruneRestorations() const
@@ -1354,12 +1357,23 @@ operations::Admission ImageExchange::submitImport(
             + ",\"eviction_possible\":true}";
         job->receipt.reserve(job->receipt.size() + 512);
         state->edits->syncStates().prepareScene(scene);
-        if (ctx.isAbandoned())
+        if (ctx.beforeWrite) {
+          const auto authority = ctx.beforeWrite();
+          if (authority != Outcome::OK) {
+            if (ctx.cancelRestoration)
+              ctx.cancelRestoration();
+            Step rejected;
+            rejected.outcome = authority;
+            return rejected;
+          }
+        } else if (ctx.isAbandoned())
           return Step{};
         void *destination = nullptr;
         try {
           destination = array->map();
-        } catch (const std::runtime_error &) {
+        } catch (...) {
+          // Reservation remains spent if pre-map notification fails; no
+          // pointer was exposed and no completed token may be published.
           return fail(Outcome::BUSY, "resource_limit");
         }
         if (!destination)

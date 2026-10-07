@@ -382,7 +382,14 @@ session pressure `busy/restore_budget_exhausted`, and other capacity pressure
 `busy/resource_limit`. Non-ok terminal outcomes have `isError:true`; committed
 sync failures retain `applied_with_sync_failure` and fresh receipts. Image restore
 returns `image_versions:[{handle,data_version}]`, `versions:[]`, `node_versions:[]`
-and `restored:true`, without caller-supplied data_version. Retained wrong-Scene
+and `restored:true`, without caller-supplied data_version. Restore rejects unknown
+arguments (including caller data_version) and unknown batch-reference fields
+before request-ID admission. Import/Image restore recheck live authority after
+fallible receipt preparation, immediately before the sole map/reservation
+boundary. Image restore receipts and retained-store publication storage are
+prepared before mutation; map-notification failure spends the reservation
+without publishing a token, while unmap-notification failure is committed with
+`applied_with_sync_failure`. Retained wrong-Scene
 Image batches return `outcome_unavailable/foreign_scene` before consumed or target
 checks, while absent/evicted history cannot fabricate that evidence. Production
 Import capability publication and complete qualification remain unfinished.

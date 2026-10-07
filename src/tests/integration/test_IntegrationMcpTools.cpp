@@ -29,6 +29,9 @@
 #include "vsr/rendering/pipeline/ImagePipeline.h"
 #include "vsr/rendering/view/ManipulatorToVSR.hpp"
 #include "vsr/scene/Scene.hpp"
+#ifdef VSR_TEST_VIEWER_UI
+#include "vsr/ui/imgui/windows/IntegrationActivityModel.h"
+#endif
 // anari
 #include <anari/anari_cpp.hpp>
 // stb
@@ -64,6 +67,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 // Mock only the OS entropy boundary; all Image services remain real.
@@ -317,13 +321,17 @@ struct WriteFaultObserver : vsr::scene::EmptyUpdateDelegate
   void signalArrayMapped(const vsr::scene::Array *) override;
   void signalArrayUnmapped(const vsr::scene::Array *) override;
   bool failMap{true};
+  bool allocationFailure{false};
   bool failUnmap{false};
 };
 
 void WriteFaultObserver::signalArrayMapped(const vsr::scene::Array *)
 {
-  if (failMap)
+  if (failMap) {
+    if (allocationFailure)
+      throw std::bad_alloc();
     throw std::runtime_error("downstream map failure");
+  }
 }
 
 void WriteFaultObserver::signalArrayUnmapped(const vsr::scene::Array *)
@@ -418,6 +426,15 @@ struct Fixture
     engine = operations::OperationEngine::create(
         integration, *authority, {}, [this] { return now; });
     if (imageImports) {
+      // This fixture is a qualified isolated host, not a physical-lease
+      // bypass. Explicit caller-supplied pools remain shared and unchanged.
+      if (!exchangeLimits.reservePhysicalMemory) {
+        const auto physical = std::make_shared<vsr::rendering::FrameBudget>(
+            exchangeLimits.physicalByteCap);
+        exchangeLimits.reservePhysicalMemory = [physical](std::size_t bytes) {
+          return physical->reserve(bytes);
+        };
+      }
       activity::Limits activityLimits;
       activityLimits.bytes = exchangeLimits.globalRetentionBytes;
       imageActivity = std::make_unique<activity::ActivityLog>(activityLimits);
@@ -6316,6 +6333,27 @@ SCENARIO("MCP Image Export checks exact entropy bounds and strict schema",
   stbi_image_free(decoded);
 }
 
+SCENARIO(
+    "Image Import stays unexposed without physical and retention callbacks",
+    "[integration][mcp][image-import][image-import-qualification]")
+{
+  Fixture f({}, true, false, false, 120., true);
+  f.images.reset();
+  f.images = std::make_unique<image::ImageExchange>(
+      f.integration, *f.engine, f.authority->launchId(), f.dir);
+  f.images->attachScene(f.sceneId, *f.sceneIds);
+  f.images->attachRestoration(*f.edits);
+  CHECK_FALSE(f.images->importAvailable());
+  json::Value metadata;
+  REQUIRE(json::parse(f.images->metadata(f.sceneId), metadata));
+  CHECK_FALSE(metadata.get("import")->b);
+  std::vector<mcp::Tool> tools;
+  mcp::tools::addImageTools(tools, {f.ids, *f.images});
+  CHECK(std::none_of(tools.begin(), tools.end(), [](const auto &tool) {
+    return tool.name == "vsr_image_import";
+  }));
+}
+
 SCENARIO("MCP Image Import replaces shared samples and restores once",
     "[integration][mcp][image-import]")
 {
@@ -6347,6 +6385,24 @@ SCENARIO("MCP Image Import replaces shared samples and restores once",
   const auto imported = f.await(s, 4);
   REQUIRE(imported.str("outcome") == "ok");
   REQUIRE(imported.flag("committed"));
+  REQUIRE(imported.result()->get("handle"));
+  CHECK(imported.result()->get("handle")->s == handle);
+  REQUIRE(imported.result()->get("data_version"));
+  REQUIRE(imported.result()->get("scene_revision"));
+  REQUIRE(imported.result()->get("affected_samplers"));
+  REQUIRE(imported.result()->get("affected_users"));
+  REQUIRE(imported.result()->get("affected_complete"));
+  const auto *policy = imported.result()->get("restoration_policy");
+  REQUIRE(policy);
+  REQUIRE(policy->get("mode"));
+  REQUIRE(policy->get("session_snapshot_ceiling_bytes"));
+  REQUIRE(policy->get("effective_global_limit_bytes"));
+  REQUIRE(policy->get("eviction_possible"));
+  CHECK(policy->get("mode")->s == "capacity_based");
+  CHECK(policy->get("session_snapshot_ceiling_bytes")->n == 67108864);
+  CHECK(policy->get("effective_global_limit_bytes")->n == 16777216);
+  CHECK(policy->get("eviction_possible")->b);
+  CHECK_FALSE(imported.json.get("result")->get("isError")->b);
   bool foundImportActivity = false;
   for (const auto &record : f.imageActivity->snapshot())
     if (record.entry.ref && record.entry.ref->requestId == 4) {
@@ -6367,7 +6423,9 @@ SCENARIO("MCP Image Import replaces shared samples and restores once",
   REQUIRE(imported.result()->get("batch_ref"));
   const auto batch = *imported.result()->get("batch_ref");
   REQUIRE(::unlink((f.exchangePath() + "/" + file).c_str()) == 0);
-  CHECK(f.importImage(s, 4, handle, version, file).flag("replayed"));
+  const auto replayed = f.importImage(s, 4, handle, version, file);
+  CHECK(replayed.flag("replayed"));
+  CHECK(json::write(*replayed.result()) == json::write(*imported.result()));
   f.restoreBatch(s, 5, batch);
   const auto restored = f.await(s, 5);
   REQUIRE(restored.str("outcome") == "ok");
@@ -6381,10 +6439,25 @@ SCENARIO("MCP Image Import replaces shared samples and restores once",
   CHECK(restored.result()->get("versions")->a.empty());
   CHECK(restored.result()->get("node_versions")->a.empty());
   REQUIRE(restored.result()->get("image_versions")->a.size() == 1);
-  CHECK(restored.result()->get("image_versions")->a[0].get("data_version")->s
+  const auto &imageVersion = restored.result()->get("image_versions")->a[0];
+  REQUIRE(imageVersion.get("handle"));
+  REQUIRE(imageVersion.get("data_version"));
+  CHECK(imageVersion.get("handle")->s == handle);
+  CHECK(imageVersion.get("data_version")->s
       != imported.result()->get("data_version")->s);
-  f.restoreBatch(s, 6, batch);
-  CHECK(f.await(s, 6).str("outcome") == "already_restored");
+  CHECK_FALSE(restored.result()->get("matrix_versions"));
+  CHECK(restored.result()->get("restored")->b);
+  CHECK_FALSE(restored.json.get("result")->get("isError")->b);
+  const auto observed = f.inspectArray(s, 6);
+  CHECK(observed.result()
+            ->get("items")
+            ->a.at(0)
+            .get("image_info")
+            ->get("data_version")
+            ->s
+      == imageVersion.get("data_version")->s);
+  f.restoreBatch(s, 7, batch);
+  CHECK(f.await(s, 7).str("outcome") == "already_restored");
 }
 
 namespace {
@@ -6493,6 +6566,168 @@ SCENARIO("MCP Image Import decodes every filter and bounded compressed rows",
     CHECK(
         std::all_of(samples, samples + 262144, [](auto c) { return c == 0; }));
   }
+}
+
+SCENARIO("MCP Image Import validates split streams and colour chunk order",
+    "[integration][mcp][image-import][image-import-structure]")
+{
+  const auto base = inputPng(1, 1, 6, {0, 29, 17, 41, 0});
+  const std::vector<unsigned char> compressed(
+      base.begin() + 41, base.end() - 16);
+  using Chunks =
+      std::vector<std::pair<std::string, std::vector<unsigned char>>>;
+  std::vector<std::pair<std::string, Chunks>> forms;
+  Chunks split{{"IDAT", {}}};
+  for (const auto byte : compressed) {
+    split.push_back({"IDAT", {byte}});
+    split.push_back({"IDAT", {}});
+  }
+  forms.push_back({"valid split IDAT", split});
+  for (const auto *type : {"gAMA", "cHRM", "sRGB", "iCCP"}) {
+    forms.push_back({std::string(type) + " after IDAT",
+        {{"IDAT", compressed}, {type, {}}}});
+    forms.push_back({std::string(type) + " after palette",
+        {{"PLTE", {1, 2, 3}}, {type, {}}, {"IDAT", compressed}}});
+  }
+  auto corrupt = compressed;
+  corrupt.back() ^= 1;
+  forms.push_back({"Adler mismatch with valid CRC", {{"IDAT", corrupt}}});
+  corrupt = compressed;
+  corrupt.pop_back();
+  forms.push_back({"truncated trailer", {{"IDAT", corrupt}}});
+  corrupt = compressed;
+  corrupt.insert(corrupt.end(), compressed.begin(), compressed.end());
+  forms.push_back({"concatenated streams", {{"IDAT", corrupt}}});
+  corrupt = compressed;
+  corrupt[0] = 0x78;
+  corrupt[1] = 0x20; // Valid header checksum, preset dictionary required.
+  forms.push_back({"preset dictionary", {{"IDAT", corrupt}}});
+  for (const auto &form : forms) {
+    INFO(form.first);
+    std::vector<unsigned char> bytes(base.begin(), base.begin() + 33);
+    for (const auto &chunk : form.second)
+      pngChunk(bytes, chunk.first, chunk.second);
+    pngChunk(bytes, "IEND", {});
+    Fixture f({}, true, false, false, 120., true, UINT64_MAX, {}, true);
+    auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 1, 1);
+    image->setName("tracked-image");
+    const unsigned char before[] = {17, 29, 41, 0};
+    image->setData(static_cast<const void *>(before));
+    const auto s = f.attach();
+    const auto item = f.inspectArray(s, 1).result()->get("items")->a.at(0);
+    writeInput(f.exchangePath() + "/agent.png", bytes);
+    f.importImage(s,
+        2,
+        item.get("handle")->s,
+        item.get("image_info")->get("data_version")->s,
+        "agent.png");
+    const auto result = f.await(s, 2);
+    const bool accepted = form.first == "valid split IDAT";
+    CHECK(result.str("outcome") == (accepted ? "ok" : "invalid_request"));
+    CHECK(result.flag("committed") == accepted);
+    if (!accepted) {
+      const auto *reason = result.result()->get("reason");
+      CHECK((reason && reason->s == "invalid_png"));
+      CHECK(std::memcmp(image->data(), before, sizeof(before)) == 0);
+      CHECK(image->dataWriteSequence() == 1);
+      CHECK(f.edits->restorations().size() == 0);
+    } else {
+      const unsigned char after[] = {29, 17, 41, 0};
+      CHECK(std::memcmp(image->data(), after, sizeof(after)) == 0);
+    }
+  }
+}
+
+SCENARIO("MCP Image Import applies individual encoded and ancillary ceilings",
+    "[integration][mcp][image-import][image-import-limits]")
+{
+  for (int form = 0; form < 4; ++form) {
+    INFO(form);
+    Fixture f({}, true, false, false, 120., true, UINT64_MAX, {}, true);
+    const std::size_t width = form < 2 ? 1 : 64;
+    auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, width, width);
+    image->setName("tracked-image");
+    std::vector<unsigned char> before(width * width * 4, 71);
+    image->setData(static_cast<const void *>(before.data()));
+    const auto s = f.attach();
+    const auto item = f.inspectArray(s, 1).result()->get("items")->a.at(0);
+    const std::vector<unsigned char> rows(before.size() + width, 0);
+    const auto plain = inputPng(width, width, 6, rows);
+    // For 1x1 RGBA, F=5 and the independent encoded ceiling is 65546.
+    // The larger target separately tests exact 65536 ancillary payload bytes.
+    const auto ancillary = form < 2 ? 65546 - plain.size() - 12 + form
+                                    : std::size_t(65536 + form - 2);
+    const auto png = inputPng(width,
+        width,
+        6,
+        rows,
+        {{"teXt", std::vector<unsigned char>(ancillary, 0)}});
+    if (form < 2)
+      REQUIRE(png.size() == std::size_t(65546 + form));
+    writeInput(f.exchangePath() + "/agent.png", png);
+    if (form == 0) {
+      // Export quota pressure must not prevent a bounded individual Import.
+      const auto oversized = f.exchangePath() + "/quota.png";
+      const auto fd = ::open(oversized.c_str(), O_CREAT | O_WRONLY, 0600);
+      REQUIRE(fd >= 0);
+      REQUIRE(::ftruncate(fd, 268435457) == 0);
+      REQUIRE(::close(fd) == 0);
+    }
+    f.importImage(s,
+        2,
+        item.get("handle")->s,
+        item.get("image_info")->get("data_version")->s,
+        "agent.png");
+    const auto result = f.await(s, 2);
+    const bool accepted = form == 0 || form == 2;
+    CHECK(result.str("outcome") == (accepted ? "ok" : "invalid_request"));
+    CHECK(result.flag("committed") == accepted);
+    if (accepted) {
+      const auto *bytes = static_cast<const unsigned char *>(image->data());
+      CHECK(std::all_of(
+          bytes, bytes + before.size(), [](auto v) { return v == 0; }));
+      f.restoreBatch(s, 3, *result.result()->get("batch_ref"));
+      REQUIRE(f.await(s, 3).str("outcome") == "ok");
+    } else {
+      CHECK(result.result()->get("reason")->s == "invalid_png");
+      CHECK(image->dataWriteSequence() == 1);
+    }
+    CHECK(std::memcmp(image->data(), before.data(), before.size()) == 0);
+  }
+}
+
+SCENARIO(
+    "MCP Image admission checks session capacity before global or file limits",
+    "[integration][mcp][image-import][image-import-limits]")
+{
+  Fixture f({}, true, false, false, 120., true, UINT64_MAX, {}, true);
+  // A single snapshot is four bytes over 64 MiB; the unchanged default
+  // 16 MiB global ceiling, transient ceiling and absent file must not win.
+  auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 16777217, 1);
+  image->setName("tracked-image");
+  const auto s = f.attach();
+  const auto item = f.inspectArray(s, 1).result()->get("items")->a.at(0);
+  f.importImage(s,
+      2,
+      item.get("handle")->s,
+      item.get("image_info")->get("data_version")->s,
+      "absent.png");
+  const auto result = f.await(s, 2);
+  CHECK(result.str("outcome") == "busy");
+  CHECK(result.result()->get("reason")->s == "restore_budget_exhausted");
+  CHECK_FALSE(result.flag("committed"));
+  CHECK_FALSE(image->isMapped());
+  CHECK(image->dataWriteSequence() == 0);
+  json::Value metadata;
+  REQUIRE(json::parse(f.images->metadata(f.sceneId, s.id), metadata));
+  const auto *limits = metadata.get("exchange_limits");
+  CHECK(limits->get("effective_global_retention_byte_cap")->n == 16777216);
+  CHECK(limits->get("available_session_snapshot_bytes")->n == 67108864);
+  CHECK(f.imageActivity->limits().entries == 1024);
+  CHECK(f.imageActivity->limits().restorableBatches == 32);
+  CHECK(activity::ENTRY_OVERHEAD == 256);
+  CHECK(f.edits->restorations().capacity() == 32);
+  CHECK(f.edits->restorations().size() == 0);
 }
 
 SCENARIO("MCP Image Import preserves raw channels and ignores colour profiles",
@@ -6707,6 +6942,50 @@ SCENARIO(
   CHECK(memory->used() == baseline);
 }
 
+SCENARIO("Image host teardown releases retained and active snapshot ownership",
+    "[integration][mcp][image-import][image-import-teardown]")
+{
+  auto memory = std::make_shared<vsr::rendering::FrameBudget>(8u << 20);
+  const auto baseline = memory->used();
+  image::ExchangeLimits limits;
+  limits.physicalByteCap = memory->limit();
+  limits.reservePhysicalMemory = [memory](std::size_t bytes) {
+    return memory->reserve(bytes);
+  };
+  std::string directory;
+  const auto start = std::chrono::steady_clock::now();
+  {
+    Fixture f({}, true, false, false, 120., true, UINT64_MAX, limits, true);
+    auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 256, 256);
+    image->setName("tracked-image");
+    const std::vector<unsigned char> before(262144, 71), rows(262400, 0);
+    image->setData(static_cast<const void *>(before.data()));
+    const auto s = f.attach();
+    const auto item = f.inspectArray(s, 1).result()->get("items")->a.at(0);
+    directory = f.exchangePath();
+    writeInput(directory + "/agent.png", inputPng(256, 256, 6, rows));
+    f.importImage(s,
+        2,
+        item.get("handle")->s,
+        item.get("image_info")->get("data_version")->s,
+        "agent.png");
+    REQUIRE(f.integration.service() > 0);
+    SECTION("retained after completed Import")
+    {
+      REQUIRE(f.await(s, 2).str("outcome") == "ok");
+      CHECK(f.edits->restorations().size() == 1);
+    }
+    SECTION("active backend is joined before engine/store destruction")
+    {
+      CHECK(f.edits->restorations().size() == 0);
+    }
+    CHECK(memory->used() > baseline);
+  }
+  CHECK(memory->used() == baseline);
+  CHECK_FALSE(std::filesystem::exists(directory));
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds(5));
+}
+
 SCENARIO("MCP Image Import refuses unsafe leaves and unstable input promptly",
     "[integration][mcp][image-import][image-import-files]")
 {
@@ -6739,6 +7018,31 @@ SCENARIO("MCP Image Import refuses unsafe leaves and unstable input promptly",
   {
     REQUIRE(::unlink(path.c_str()) == 0);
     REQUIRE(::mkdir(path.c_str(), 0700) == 0);
+  }
+  SECTION("Unix socket")
+  {
+    REQUIRE(::unlink(path.c_str()) == 0);
+    const auto fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    REQUIRE(fd >= 0);
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    REQUIRE(path.size() < sizeof(address.sun_path));
+    std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
+    REQUIRE(::bind(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address))
+        == 0);
+    REQUIRE(::close(fd) == 0);
+  }
+  SECTION("hard link introduced after read")
+  {
+    afterImportRead = [path](int) {
+      REQUIRE(::link(path.c_str(), (path + "-alias").c_str()) == 0);
+    };
+    interceptImportRead = true;
+  }
+  SECTION("unlinked input after read")
+  {
+    afterImportRead = [path](int) { REQUIRE(::unlink(path.c_str()) == 0); };
+    interceptImportRead = true;
   }
   SECTION("changed size after read")
   {
@@ -6796,7 +7100,6 @@ SCENARIO(
     CHECK(rejected.result()->get("reason")->s == "image_mapped");
     CHECK(image->isMapped());
     image->unmap();
-    return;
   }
   SECTION("two imports cannot commit one token")
   {
@@ -6807,7 +7110,6 @@ SCENARIO(
     const auto &rejected = a.str("outcome") == "ok" ? b : a;
     CHECK(rejected.str("outcome") == "conflict");
     CHECK(rejected.result()->get("reason")->s == "stale_data_version");
-    return;
   }
   SECTION("queued authority withdrawal wins over identity disclosure")
   {
@@ -6816,12 +7118,65 @@ SCENARIO(
     f.authority->setAgentEditsDisabled(true);
     CHECK(f.await(s, 2).str("outcome") == "forbidden");
     CHECK(std::memcmp(image->data(), before, sizeof(before)) == 0);
-    return;
   }
+}
+
+SCENARIO("MCP Image restoration preserves prewrite authority and eligibility",
+    "[integration][mcp][image-import][image-import-guards]")
+{
+  Fixture f({}, true, false, false, 120., true, UINT64_MAX, {}, true);
+  auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 1, 1);
+  image->setName("tracked-image");
+  const unsigned char before[] = {17, 29, 41, 0};
+  image->setData(static_cast<const void *>(before));
+  const auto s = f.attach();
+  const auto item = f.inspectArray(s, 1).result()->get("items")->a.at(0);
+  const auto handle = item.get("handle")->s;
+  const auto version = item.get("image_info")->get("data_version")->s;
+  writeInput(
+      f.exchangePath() + "/agent.png", inputPng(1, 1, 6, {0, 29, 17, 41, 0}));
   f.importImage(s, 2, handle, version, "agent.png");
   const auto imported = f.await(s, 2);
   REQUIRE(imported.str("outcome") == "ok");
   const auto batch = *imported.result()->get("batch_ref");
+  SECTION("restore accepts no caller version or unknown batch fields")
+  {
+    const auto args = "{\"request_id\":3,\"scene_id\":"
+        + std::to_string(f.sceneId) + ",\"target_batch_ref\":"
+        + json::write(batch) + ",\"data_version\":\"caller-token\"}";
+    CHECK(f.tool(s, "vsr_restore", args).errorCode() == "invalid_request");
+    auto extra = batch;
+    extra.o.emplace("data_version", json::Value{});
+    const auto nested =
+        "{\"request_id\":3,\"scene_id\":" + std::to_string(f.sceneId)
+        + ",\"target_batch_ref\":" + json::write(extra) + "}";
+    CHECK(f.tool(s, "vsr_restore", nested).errorCode() == "invalid_request");
+    // Schema rejection burns no request ID and leaves the batch eligible.
+    f.restoreBatch(s, 3, batch);
+    CHECK(f.await(s, 3).str("outcome") == "ok");
+  }
+  SECTION("authority withdrawn during restore preparation prevents mapping")
+  {
+    const auto completed = image->dataWriteSequence();
+    f.restores->setFaultInjector([&] {
+      f.authority->setAgentEditsDisabled(true);
+      return false;
+    });
+    f.restoreBatch(s, 3, batch);
+    const auto rejected = f.await(s, 3);
+    CHECK(rejected.str("outcome") == "forbidden");
+    CHECK_FALSE(rejected.flag("committed"));
+    CHECK(image->dataWriteSequence() == completed);
+    CHECK_FALSE(image->isMapped());
+    const unsigned char after[] = {29, 17, 41, 0};
+    CHECK(std::memcmp(image->data(), after, sizeof(after)) == 0);
+    CHECK(f.restores->eligible(
+        {batch.get("launch_id")->s, batch.get("batch_id")->s}));
+    f.restores->setFaultInjector({});
+    f.authority->setAgentEditsDisabled(false);
+    f.restoreBatch(s, 4, batch);
+    CHECK(f.await(s, 4).str("outcome") == "ok");
+  }
   SECTION("restore leaves an ordinary map open and eligible")
   {
     REQUIRE(image->map());
@@ -6843,6 +7198,52 @@ SCENARIO(
     f.restoreBatch(s, 4, batch);
     CHECK(f.await(s, 4).str("outcome") == "conflict");
     CHECK(f.edits->restorations().size() == 0);
+  }
+  SECTION("expired Image history precedes a retired registration binding")
+  {
+    f.edits->restorations().expireUnless(
+        [](const edit::BatchRef &) { return false; });
+    f.sceneIds.reset();
+    f.restoreBatch(s, 3, batch);
+    const auto unavailable = f.await(s, 3);
+    CHECK(unavailable.str("outcome") == "outcome_unavailable");
+    REQUIRE(unavailable.result());
+    const auto *reason = unavailable.result()->get("reason");
+    CHECK((reason && reason->s == "expired"));
+    CHECK_FALSE(unavailable.flag("committed"));
+    const unsigned char after[] = {29, 17, 41, 0};
+    CHECK(std::memcmp(image->data(), after, sizeof(after)) == 0);
+  }
+  SECTION("retired registration is safe even without a replacement binding")
+  {
+    f.sceneIds.reset();
+    f.restoreBatch(s, 3, batch);
+    CHECK(f.await(s, 3).str("outcome") == "conflict");
+    CHECK(f.edits->restorations().size() == 0);
+    const unsigned char after[] = {29, 17, 41, 0};
+    CHECK(std::memcmp(image->data(), after, sizeof(after)) == 0);
+  }
+  SECTION("replacement Scene identity cannot inherit an eligible batch")
+  {
+    f.sceneIds.reset();
+    f.sceneIds = std::make_unique<identity::SceneIdentity>(f.ids, f.scene);
+    f.restores->attachScene(f.sceneId, *f.sceneIds);
+    f.images->attachScene(f.sceneId, *f.sceneIds);
+    f.restoreBatch(s, 3, batch);
+    CHECK(f.await(s, 3).str("outcome") == "conflict");
+    const unsigned char after[] = {29, 17, 41, 0};
+    CHECK(std::memcmp(image->data(), after, sizeof(after)) == 0);
+    identity::SceneIdentity other(f.ids, f.hidden);
+    f.restores->attachScene(f.hiddenId, other);
+    f.tool(s,
+        "vsr_restore",
+        "{\"request_id\":4,\"scene_id\":" + std::to_string(f.hiddenId)
+            + ",\"target_batch_ref\":" + json::write(batch) + "}");
+    const auto foreign = f.await(s, 4);
+    CHECK(foreign.str("outcome") == "outcome_unavailable");
+    CHECK(foreign.result()->get("reason")->s == "foreign_scene");
+    f.restoreBatch(s, 5, batch);
+    CHECK(f.await(s, 5).str("outcome") == "conflict");
   }
   SECTION("deleted and reused pool slot cannot revive recovery")
   {
@@ -6886,6 +7287,173 @@ SCENARIO(
     REQUIRE(f.await(s, 4).str("outcome") == "ok");
     wrong(5);
   }
+}
+
+#ifdef VSR_TEST_VIEWER_UI
+SCENARIO(
+    "Agent Activity exposes and locally restores disconnected Image batches",
+    "[integration][mcp][image-import][image-import-activity]")
+{
+  Fixture f({}, true, false, false, 120., true, UINT64_MAX, {}, true);
+  auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 1, 1);
+  image->setName("tracked-image");
+  const unsigned char before[] = {17, 29, 41, 0};
+  image->setData(static_cast<const void *>(before));
+  const auto s = f.attach();
+  const auto item = f.inspectArray(s, 1).result()->get("items")->a.at(0);
+  writeInput(
+      f.exchangePath() + "/agent.png", inputPng(1, 1, 6, {0, 29, 17, 41, 0}));
+  f.importImage(s,
+      2,
+      item.get("handle")->s,
+      item.get("image_info")->get("data_version")->s,
+      "agent.png");
+  REQUIRE(f.await(s, 2).str("outcome") == "ok");
+  vsr::ui::imgui::IntegrationServices services;
+  services.integration = &f.integration;
+  services.authority = f.authority.get();
+  services.activity = f.imageActivity.get();
+  services.restore = f.restores.get();
+  services.scenes.emplace_back(f.sceneId, "scene");
+  vsr::ui::imgui::IntegrationActivityModel model(std::move(services));
+  std::optional<edit::BatchRef> batch;
+  for (const auto &row : model.refresh().activity) {
+    if (row.entry.kind != activity::OperationKind::IMAGE_IMPORT)
+      continue;
+    CHECK(row.entry.eligibility == activity::Eligibility::ELIGIBLE);
+    REQUIRE(row.entry.batchRef);
+    REQUIRE(row.entry.targets.size() == 1);
+    CHECK(row.entry.targets[0].id == f.sceneId);
+    batch = row.entry.batchRef;
+  }
+  REQUIRE(batch);
+  REQUIRE(model.disconnect());
+  REQUIRE(model.setAgentEditsDisabled(true));
+  const auto &disconnected = model.refresh();
+  CHECK_FALSE(disconnected.sessionOwned);
+  CHECK(disconnected.agentEditsDisabled);
+  CHECK(disconnected.usage.restorableBatches == 1);
+  REQUIRE(disconnected.scenes.size() == 1);
+  CHECK(disconnected.scenes[0].localEdit);
+  const auto local = model.restore(f.sceneId, *batch);
+  REQUIRE(local.code == Outcome::OK);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!f.restores->resultLocal(local.ref)) {
+    f.drain();
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+  }
+  const auto restored = f.restores->resultLocal(local.ref);
+  REQUIRE(restored->outcome == Outcome::OK);
+  CHECK(restored->committed);
+  CHECK(restored->imageVersions.size() == 1);
+  CHECK(std::memcmp(image->data(), before, sizeof(before)) == 0);
+  CHECK(model.refresh().usage.restorableBatches == 0);
+  CHECK(f.edits->restorations().size() == 0);
+  bool restoredRow = false;
+  for (const auto &row : model.state().activity)
+    if (row.entry.kind == activity::OperationKind::IMAGE_IMPORT) {
+      restoredRow = true;
+      CHECK(row.entry.eligibility == activity::Eligibility::RESTORED);
+    }
+  CHECK(restoredRow);
+}
+#endif
+
+SCENARIO("MCP Image notifications burn reservations without losing recovery",
+    "[integration][mcp][image-import][image-import-notification]")
+{
+  Fixture f({}, true, false, false, 120., true, UINT64_MAX, {}, true);
+  auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 1, 1);
+  image->setName("tracked-image");
+  const unsigned char before[] = {17, 29, 41, 0};
+  const unsigned char after[] = {29, 17, 41, 0};
+  image->setData(static_cast<const void *>(before));
+  REQUIRE(image->dataWriteSequence() == 1);
+  const auto s = f.attach();
+  const auto item = f.inspectArray(s, 1).result()->get("items")->a.at(0);
+  const auto handle = item.get("handle")->s;
+  const auto version = item.get("image_info")->get("data_version")->s;
+  writeInput(
+      f.exchangePath() + "/agent.png", inputPng(1, 1, 6, {0, 29, 17, 41, 0}));
+  auto *fault = f.scene.updateDelegate().emplace<WriteFaultObserver>();
+  SECTION(
+      "failed Import map burns exactly one reservation and releases charges")
+  {
+    fault->allocationFailure = true;
+    f.importImage(s, 2, handle, version, "agent.png");
+    const auto failed = f.await(s, 2);
+    CHECK(failed.str("outcome") == "busy");
+    CHECK_FALSE(failed.flag("committed"));
+    CHECK_FALSE(image->isMapped());
+    CHECK(image->dataWriteSequence() == 1);
+    CHECK(std::memcmp(image->data(), before, sizeof(before)) == 0);
+    CHECK(f.edits->restorations().size() == 0);
+    json::Value metadata;
+    REQUIRE(json::parse(f.images->metadata(f.sceneId, s.id), metadata));
+    CHECK(metadata.get("exchange_limits")
+              ->get("available_session_snapshot_bytes")
+              ->n
+        == 67108864);
+    fault->failMap = false;
+    f.importImage(s, 3, handle, version, "agent.png");
+    const auto imported = f.await(s, 3);
+    REQUIRE(imported.str("outcome") == "ok");
+    CHECK(image->dataWriteSequence() == 3);
+    f.restoreBatch(s, 4, *imported.result()->get("batch_ref"));
+    CHECK(f.await(s, 4).str("outcome") == "ok");
+    CHECK(image->dataWriteSequence() == 4);
+    CHECK(std::memcmp(image->data(), before, sizeof(before)) == 0);
+  }
+  SECTION("failed Restore map keeps its snapshot and spent sequence")
+  {
+    fault->failMap = false;
+    f.importImage(s, 2, handle, version, "agent.png");
+    const auto imported = f.await(s, 2);
+    REQUIRE(imported.str("outcome") == "ok");
+    REQUIRE(image->dataWriteSequence() == 2);
+    const auto batch = *imported.result()->get("batch_ref");
+    fault->failMap = true;
+    fault->allocationFailure = true;
+    f.restoreBatch(s, 3, batch);
+    const auto failed = f.await(s, 3);
+    CHECK(failed.str("outcome") == "busy");
+    CHECK_FALSE(failed.flag("committed"));
+    CHECK(image->dataWriteSequence() == 2);
+    CHECK_FALSE(image->isMapped());
+    CHECK(std::memcmp(image->data(), after, sizeof(after)) == 0);
+    CHECK(f.restores->eligible(
+        {batch.get("launch_id")->s, batch.get("batch_id")->s}));
+    fault->failMap = false;
+    f.restoreBatch(s, 4, batch);
+    CHECK(f.await(s, 4).str("outcome") == "ok");
+    CHECK(image->dataWriteSequence() == 4);
+    CHECK(std::memcmp(image->data(), before, sizeof(before)) == 0);
+  }
+  SECTION(
+      "unmap notification failure still publishes import and consumes restore")
+  {
+    fault->failMap = false;
+    fault->failUnmap = true;
+    f.importImage(s, 2, handle, version, "agent.png");
+    const auto imported = f.await(s, 2);
+    REQUIRE(imported.str("outcome") == "applied_with_sync_failure");
+    CHECK(imported.flag("committed"));
+    CHECK(image->dataWriteSequence() == 2);
+    CHECK_FALSE(image->isMapped());
+    CHECK(std::memcmp(image->data(), after, sizeof(after)) == 0);
+    const auto batch = *imported.result()->get("batch_ref");
+    f.restoreBatch(s, 3, batch);
+    const auto restored = f.await(s, 3);
+    REQUIRE(restored.str("outcome") == "applied_with_sync_failure");
+    CHECK(restored.flag("committed"));
+    REQUIRE(restored.result()->get("image_versions")->a.size() == 1);
+    CHECK(image->dataWriteSequence() == 3);
+    CHECK(std::memcmp(image->data(), before, sizeof(before)) == 0);
+    f.restoreBatch(s, 4, batch);
+    CHECK(f.await(s, 4).str("outcome") == "already_restored");
+  }
+  f.scene.updateDelegate().erase(fault);
 }
 
 SCENARIO(

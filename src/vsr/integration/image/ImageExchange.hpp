@@ -58,6 +58,8 @@ class ImageExchange
   void attachScene(SceneId scene, identity::SceneIdentity &identity);
   // Qualification/continuation seam, not enabled by the shipped hosts yet.
   // Edits and this service share a launch and owning-thread lifetime.
+  // Import remains unavailable without the host's physical reservation and
+  // authoritative global retention/availability callbacks in ExchangeLimits.
   void attachRestoration(edit::EditService &edits);
   bool importAvailable() const;
   // Empty session selects launch-wide descriptor metadata, not a ledger.

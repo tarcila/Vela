@@ -145,6 +145,11 @@ DecodeResult decodePng(const ImageBytes &encoded,
       } else if (!(type[0] & 32))
         return DecodeResult::INVALID_PNG;
       else {
+        // Ignoring colour/profile contents does not relax their required
+        // placement before palette/data, nor expand an embedded profile.
+        if ((is("gAMA") || is("cHRM") || is("sRGB") || is("iCCP"))
+            && (palette || idat))
+          return DecodeResult::INVALID_PNG;
         if (length > 65536 - ancillary)
           return DecodeResult::INVALID_PNG;
         ancillary += length;

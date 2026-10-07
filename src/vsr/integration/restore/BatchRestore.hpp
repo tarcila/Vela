@@ -81,6 +81,9 @@ struct RestoreResult
   std::vector<edit::NodeVersion> nodeVersions;
   std::vector<ImageVersion> imageVersions;
   std::string reason;
+  // Image-only wire receipt storage is prepared before map(), then moved
+  // into the terminal Step without allocating after the committed write.
+  std::string imageReceipt;
   // outcome_unavailable because the log/store expired the batch; unknown
   // and wrong-launch references leave this false (addendum 04 §7).
   bool expired{false};
@@ -120,6 +123,11 @@ class RestoreService
 
  private:
   using Slot = std::shared_ptr<std::optional<RestoreResult>>;
+  struct SceneBinding
+  {
+    SceneIdentity *identity{nullptr};
+    std::weak_ptr<const void> lifetime;
+  };
 
   static bool validEnvelope(const RestoreRequest &request);
   operations::Request makeRequest(RestoreRequest request, Slot slot);
@@ -133,7 +141,7 @@ class RestoreService
   std::shared_ptr<bool> m_alive;
 
   mutable std::mutex m_mutex;
-  std::map<SceneId, SceneIdentity *> m_identities;
+  std::map<SceneId, SceneBinding> m_identities;
   // Consumed / conflicting batch IDs (launch-qualified); payloads released.
   std::set<std::string> m_consumed;
   std::set<std::string> m_conflicting;
@@ -167,7 +175,7 @@ inline RestoreService::~RestoreService()
 inline void RestoreService::attachScene(SceneId scene, SceneIdentity &identity)
 {
   std::lock_guard<std::mutex> lock(m_mutex);
-  m_identities[scene] = &identity;
+  m_identities[scene] = {&identity, identity.lifetime()};
 }
 
 inline void RestoreService::setFaultInjector(RestoreFaultInjector injector)
@@ -255,6 +263,11 @@ inline operations::Request RestoreService::makeRequest(
       res.outcome = syncOutcome;
     step.outcome = res.outcome;
     step.committed = true;
+    if (!res.imageReceipt.empty()) {
+      step.result = std::move(res.imageReceipt);
+      *slot = std::move(res);
+      return step;
+    }
     step.result = "{\"target_batch_ref\":"
         + edit::detail::batchRefJson(res.targetBatchRef) + ","
         + edit::detail::commitDetailJson(
@@ -358,18 +371,13 @@ inline RestoreResult RestoreService::commit(
   {
     std::lock_guard<std::mutex> lock(m_mutex);
     auto it = m_identities.find(request.scene);
-    if (it != m_identities.end())
-      ident = it->second;
+    if (it != m_identities.end() && !it->second.lifetime.expired())
+      ident = it->second.identity;
     fault = m_fault;
     consumed = m_consumed.count(detail::consumedKey(request.targetBatchRef));
     conflicted =
         m_conflicting.count(detail::consumedKey(request.targetBatchRef));
   }
-  if (!ident || ident->scene() != &scene) {
-    res.outcome = Outcome::INVALID_REQUEST;
-    return res;
-  }
-
   // Image scope precedes consumed/conflicting/target checks, after current
   // authority. Retirement cannot transfer this registration's recovery.
   const auto imageScope =
@@ -397,7 +405,6 @@ inline RestoreResult RestoreService::commit(
     res.reason = "foreign_scene";
     return res;
   }
-
   // 1. Select exactly the named record; never fall back to another one. //
 
   if (consumed) {
@@ -433,8 +440,9 @@ inline RestoreResult RestoreService::commit(
 
   if (record->image) {
     const auto &snapshot = record->image;
-    auto *array =
-        dynamic_cast<scene::Array *>(ident->resolve(snapshot->handle));
+    auto *array = ident && ident->scene() == &scene
+        ? dynamic_cast<scene::Array *>(ident->resolve(snapshot->handle))
+        : nullptr;
     if (snapshot->registration.expired() || snapshot->scene != &scene || !array
         || !array->isImage()) {
       markConflicting(request.targetBatchRef, ctx);
@@ -460,16 +468,31 @@ inline RestoreResult RestoreService::commit(
       res.imageVersions.reserve(1);
       res.imageVersions.push_back({snapshot->handle, {}});
       res.imageVersions[0].dataVersion.reserve(256);
+      res.imageReceipt = "{\"target_batch_ref\":"
+          + edit::detail::batchRefJson(request.targetBatchRef)
+          + ",\"committed\":true,\"versions\":[],\"node_versions\":[],"
+            "\"image_versions\":[{\"handle\":\""
+          + edit::detail::hex64(snapshot->handle.domain)
+          + edit::detail::hex64(snapshot->handle.serial)
+          + "\",\"data_version\":\"";
+      res.imageReceipt.reserve(res.imageReceipt.size() + 512);
       m_edits.syncStates().prepareScene(request.scene);
     } catch (const std::bad_alloc &) {
       res.outcome = Outcome::BUSY;
       res.reason = "resource_limit";
       return res;
     }
+    if (ctx.beforeWrite) {
+      res.outcome = ctx.beforeWrite();
+      if (res.outcome != Outcome::OK)
+        return res;
+    }
     void *destination = nullptr;
     try {
       destination = array->map();
-    } catch (const std::runtime_error &) {
+    } catch (...) {
+      // map() reserves before notification, but exposes no write pointer if
+      // that notification fails. The value stays burned, not completed.
       res.outcome = Outcome::BUSY;
       res.reason = "resource_limit";
       return res;
@@ -506,11 +529,27 @@ inline RestoreResult RestoreService::commit(
         (unsigned long long)*array->dataWriteSequence());
     res.imageVersions[0].dataVersion.assign(token);
     res.sceneRevision = ident->sceneRevision();
+    res.imageReceipt.append(token);
+    const auto &revision = *res.sceneRevision;
+    char suffix[256];
+    std::snprintf(suffix,
+        sizeof(suffix),
+        "\"}],\"scene_revision\":\"%llu.%llu.%llu.%llu\",\"restored\":true}",
+        (unsigned long long)revision.launch.activation,
+        (unsigned long long)revision.launch.nonce,
+        (unsigned long long)revision.domain,
+        (unsigned long long)revision.value);
+    res.imageReceipt.append(suffix);
     try {
       m_edits.syncStates().beginHook(request.scene);
     } catch (...) {
       res.outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
     }
+    return res;
+  }
+
+  if (!ident || ident->scene() != &scene) {
+    res.outcome = Outcome::INVALID_REQUEST;
     return res;
   }
 

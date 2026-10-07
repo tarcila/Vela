@@ -206,6 +206,13 @@ inline std::optional<restore::RestoreRequest> restoreArg(
   const auto *t = args.get("target_batch_ref");
   if (!scene || !t || !t->isObject())
     return std::nullopt;
+  for (const auto &argument : args.o)
+    if (argument.first != "request_id" && argument.first != "scene_id"
+        && argument.first != "target_batch_ref")
+      return std::nullopt;
+  for (const auto &argument : t->o)
+    if (argument.first != "launch_id" && argument.first != "batch_id")
+      return std::nullopt;
   const auto *launch = t->get("launch_id");
   const auto *batch = t->get("batch_id");
   if (!launch || !launch->isString() || !batch || !batch->isString())
@@ -303,15 +310,16 @@ inline void addEditTools(std::vector<Tool> &tools, EditDeps deps)
   Tool restoreTool;
   restoreTool.name = "vsr_restore";
   restoreTool.description =
-      "Conditionally restore the exact prior changed state of the batch named by target_batch_ref, not a whole layer. Later target or required ancestor writes conflict, including change-back; unrelated edits and reset defaults survive. Success consumes eligibility without redo; restore conflicts permanently consume eligibility. Sync failure can still mean committed: inspect committed independently of outcome.";
+      "Conditionally restore the exact prior changed state of the batch named by target_batch_ref, not a whole layer. Image batches restore exact prior samples in the same Array and advance data_version; supply no caller data_version. The addressed scene_id must match the retained Image batch's original Scene registration. Later target or required ancestor writes conflict, including change-back; unrelated edits and reset defaults survive. Success consumes eligibility without redo; restore conflicts permanently consume eligibility. Sync failure can still mean committed: inspect committed independently of outcome. Committed receipts contain image_versions (empty for parameter/node batches), ordinary versions and node_versions; there is no matrix_versions field.";
   restoreTool.inputSchemaJson =
       std::string("{\"type\":\"object\",\"properties\":{") + requestIdSchema()
       + ",\"scene_id\":{\"type\":\"integer\",\"minimum\":0},"
         "\"target_batch_ref\":{\"type\":\"object\",\"properties\":{"
         "\"launch_id\":{\"type\":\"string\"},"
         "\"batch_id\":{\"type\":\"string\"}},"
-        "\"required\":[\"launch_id\",\"batch_id\"]}},"
-        "\"required\":[\"request_id\",\"scene_id\",\"target_batch_ref\"]}";
+        "\"required\":[\"launch_id\",\"batch_id\"],\"additionalProperties\":false}},"
+        "\"required\":[\"request_id\",\"scene_id\",\"target_batch_ref\"],"
+        "\"additionalProperties\":false}";
   restoreTool.handler = [deps](const session::Credentials &c,
                             const json::Value &args) {
     const auto id = requestIdArg(args.get("request_id"));
