@@ -127,10 +127,34 @@ SCENARIO("Resetting a populated scene releases live layer references safely",
   index->populate();
   REQUIRE(worldBoundsMax(anariDevice.device, *index).x == Approx(1.f));
 
+  bool resetInBatch = false;
+  SECTION("With an explicit included-layer list")
+  {
+    index->setIncludedLayers({scene.defaultLayer(), other});
+  }
+  SECTION("With the Scene's active layers") {}
+  SECTION("Within an update batch")
+  {
+    resetInBatch = true;
+  }
+
+  if (resetInBatch)
+    scene.beginUpdateBatch();
   scene.removeAllObjects();
   REQUIRE(scene.objectDB().light.empty());
   REQUIRE(scene.objectDB().surface.empty());
+  REQUIRE(scene.numberOfLayers() == 0);
+  REQUIRE(scene.numberOfActiveLayers() == 0);
   scene.removeAllObjects();
+
+  if (resetInBatch)
+    scene.endUpdateBatch();
+
+  // Repopulation must not revive layers destroyed by either reset.
+  index->populate();
+  vsr::math::box3 bounds;
+  REQUIRE(index->queryWorldBounds(bounds));
+  REQUIRE(bounds.lower.x > bounds.upper.x);
 
   // The same delegate must remain usable after reset, including index reuse
   // and ordinary last-layer-reference release followed by object removal.
@@ -141,11 +165,62 @@ SCENARIO("Resetting a populated scene releases live layer references safely",
     scene.insertChildObjectNode(layer->root(), replacement);
     REQUIRE(replacement->useCount(Object::UseKind::LAYER) == 1);
     scene.removeLayer(layer);
+    REQUIRE(scene.numberOfLayers() == 0);
+    REQUIRE(scene.numberOfActiveLayers() == 0);
     REQUIRE(replacement->useCount(Object::UseKind::LAYER) == 0);
     scene.removeObject(replacement.data());
     REQUIRE(scene.objectDB().light.empty());
   }
   scene.removeAllObjects();
+}
+
+SCENARIO("Removing a populated layer updates the world before returning",
+    "[RenderIndex][Scene][reset]")
+{
+  TestDevice anariDevice;
+  REQUIRE(anariDevice);
+  InstancedSphereScene content;
+  auto &scene = content.scene;
+  auto *layer = scene.defaultLayer();
+  auto *index =
+      scene.updateDelegate().emplace<vsr::rendering::RenderIndexAllLayers>(
+          scene, Token("helide"), anariDevice.device);
+  index->populate();
+  REQUIRE(worldBoundsMax(anariDevice.device, *index).x == Approx(1.f));
+
+  SECTION("Remove by pointer")
+  {
+    scene.removeLayer(layer);
+  }
+  SECTION("Remove an explicitly included layer by name")
+  {
+    index->setIncludedLayers({layer});
+    scene.removeLayer(scene.getLayerName(layer));
+  }
+  SECTION("Remove all layers in an update batch")
+  {
+    scene.beginUpdateBatch();
+    scene.removeAllLayers();
+    scene.endUpdateBatch();
+  }
+  SECTION("Keep the remaining populated layer synchronized")
+  {
+    auto *remaining = scene.addLayer(Token("remaining"));
+    auto node =
+        scene.insertChildTransformNode(remaining->root(), translation(50.f));
+    scene.insertChildObjectNode(node, scene.getObject<Surface>(0));
+    scene.removeLayer(layer);
+    REQUIRE(worldBoundsMax(anariDevice.device, *index).x == Approx(51.f));
+    REQUIRE(scene.numberOfLayers() == 1);
+    REQUIRE(scene.numberOfActiveLayers() == 1);
+    return;
+  }
+
+  vsr::math::box3 bounds;
+  REQUIRE(index->queryWorldBounds(bounds));
+  REQUIRE(bounds.lower.x > bounds.upper.x);
+  REQUIRE(scene.numberOfLayers() == 0);
+  REQUIRE(scene.numberOfActiveLayers() == 0);
 }
 
 SCENARIO("Rewriting a transform array moves its instances", "[RenderIndex]")

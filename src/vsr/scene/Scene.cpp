@@ -644,12 +644,13 @@ void Scene::removeAllObjects()
 {
   if (m_imageWrites && !m_imageWrites->isOwningThread())
     throw std::runtime_error("Scene::removeAllObjects() - wrong Array thread");
+  // Layer-removal callbacks may synchronize remaining live layers, so finish
+  // them before delegates clear their object caches.
+  removeAllLayers();
   m_updateDelegate.signalRemoveAllObjects();
 
   m_defaultObjects.material.reset();
   m_defaultObjects.camera.reset();
-
-  removeAllLayers();
 
   m_db.array.clear();
   m_db.surface.clear();
@@ -816,21 +817,21 @@ void Scene::removeLayer(Token name)
 {
   if (!m_layers.contains(name))
     return;
-  m_updateDelegate.signalLayerRemoved(m_layers[name].ptr.get());
-  m_layers[name].ptr->revokeMembership();
+  // Keep the payload alive for delegates, but exclude it from any Scene
+  // traversal triggered by the removal notification.
+  auto removed = m_layers[name].ptr;
+  removed->revokeMembership();
   if (m_layers[name].active)
     m_numActiveLayers--;
   m_layers.erase(name);
+  m_updateDelegate.signalLayerRemoved(removed.get());
 }
 
 void Scene::removeLayer(const Layer *layer)
 {
   for (size_t i = 0; i < m_layers.size(); i++) {
     if (m_layers.at_index(i).second.ptr.get() == layer) {
-      m_updateDelegate.signalLayerRemoved(
-          m_layers.at_index(i).second.ptr.get());
-      m_layers.at_index(i).second.ptr->revokeMembership();
-      m_layers.erase(i);
+      removeLayer(m_layers.at_index(i).first);
       return;
     }
   }
@@ -838,13 +839,8 @@ void Scene::removeLayer(const Layer *layer)
 
 void Scene::removeAllLayers()
 {
-  for (auto itr = m_layers.begin(); itr != m_layers.end(); itr++) {
-    m_updateDelegate.signalLayerRemoved(itr->second.ptr.get());
-    itr->second.ptr->revokeMembership();
-  }
-
-  m_layers.clear();
-  m_numActiveLayers = 0;
+  while (!m_layers.empty())
+    removeLayer(m_layers.at_index(0).first);
 }
 
 LayerNodeRef Scene::insertChildNode(LayerNodeRef parent, const char *name)

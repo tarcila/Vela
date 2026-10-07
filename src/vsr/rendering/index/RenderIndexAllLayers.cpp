@@ -125,11 +125,16 @@ void RenderIndexAllLayers::signalLayerTransformUpdated(const Layer *l)
 
 void RenderIndexAllLayers::signalLayerRemoved(const Layer *l)
 {
+  // Empty-cache repopulation must never traverse a removed Layer, including
+  // after reset has already released its instances.
+  m_includedLayers.erase(
+      std::remove(m_includedLayers.begin(), m_includedLayers.end(), l),
+      m_includedLayers.end());
   if (m_instanceCache.contains(l)) {
     releaseInstances(device(), m_instanceCache[l]);
     m_instanceCache.erase(l);
-    requestWorldUpdate();
   }
+  requestWorldUpdate();
 }
 
 void RenderIndexAllLayers::signalActiveLayersChanged()
