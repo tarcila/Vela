@@ -233,10 +233,13 @@ can still be supported. Ordinary host writes advance the completed token;
 inspection and read-only access do not. Sampler image references remain Array
 handles with summaries.
 
-PNG Image Export/Import is not implemented in this tracking slice. Discovery
-reports that truthfully; do not infer file-exchange tools from Array support.
-See [Image tracking](image-data-tracking.md) for host prerequisites and cache
-lifetime semantics.
+Qualified hosts expose `vsr_image_export`, requiring Scene READ rather than
+EDIT, and advertise their private `image_exchange_directory` through discovery.
+Poll kind `image_export` for the raw-channel PNG file name and captured version;
+process that working copy with local tooling without changing live texels.
+Image Import is not implemented. See [PNG exchange](image-png-exchange.md) for
+channel/Color Space policy, quotas, replay and explicit PNG cleanup, and
+[Image tracking](image-data-tracking.md) for host/cache lifetime prerequisites.
 
 ### Editing a placement's world position
 

@@ -438,6 +438,8 @@ class Inspector
     m_views = std::move(views);
   }
 
+  void setImageExchange(std::function<std::string(SceneId)> observe);
+
   const PageLimits &limits() const
   {
     return m_limits;
@@ -915,12 +917,19 @@ class Inspector
     if (!views)
       item += std::string(",\"node_edits_exposed\":")
           + (m_integration.nodeEditsExposed(i) ? "true" : "false")
-          + ",\"image_exchange\":{\"supported\":false,\"enabled\":false,\"reason\":"
-          + detail::jsonString(m_integration.imageTrackingAvailable(i)
-                  ? "not_implemented"
-                  : "host_write_contract_unavailable")
-          + ",\"data_tracking\":"
-          + (m_integration.imageTrackingAvailable(i) ? "true" : "false") + "}";
+          + ",\"image_exchange\":"
+          + (m_imageExchange
+                  ? m_imageExchange(i)
+                  : std::string(
+                        "{\"supported\":false,\"enabled\":false,\"reason\":")
+                      + detail::jsonString(
+                          m_integration.imageTrackingAvailable(i)
+                              ? "not_implemented"
+                              : "host_write_contract_unavailable")
+                      + ",\"data_tracking\":"
+                      + (m_integration.imageTrackingAvailable(i) ? "true"
+                                                                 : "false")
+                      + "}");
     if (!views)
       item +=
           ",\"inspection\":{\"kinds\":[\"objects\",\"layers\",\"nodes\"],\"default_page_size\":"
@@ -1628,12 +1637,19 @@ class Inspector
   session::SessionAuthority &m_authority;
   IdentityLookup m_identities;
   ViewLookup m_views;
+  std::function<std::string(SceneId)> m_imageExchange;
   PageLimits m_limits;
   std::shared_ptr<ScratchPool> m_scratch;
   std::uint64_t m_key[2]{};
 };
 
 // Inlined definitions ////////////////////////////////////////////////////////
+
+inline void Inspector::setImageExchange(
+    std::function<std::string(SceneId)> observe)
+{
+  m_imageExchange = std::move(observe);
+}
 
 inline RequestDiagnostics Inspector::requestDiagnostics(
     Query q, const PageArgs &args) const

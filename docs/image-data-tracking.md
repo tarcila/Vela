@@ -32,12 +32,11 @@ change-back.
 An unmap publishes before downstream notification: notification failure does
 not roll back bytes or pretend the write did not complete.
 
-PNG file exchange is **not implemented in this slice**. Discovery reports
-`image_exchange.supported=false`, `enabled=false`, and a separate
-`data_tracking` Boolean. Its reason is `not_implemented` on qualified hosts,
-otherwise `host_write_contract_unavailable`. There is no export/import tool or
-exchange directory advertisement. Array availability does not imply that an
-agent can yet export, import or restore texels.
+Qualified viewer/headless hosts now expose [PNG Image Export](image-png-exchange.md).
+Discovery distinguishes export availability from the `data_tracking` prerequisite
+and still reports `import:false`. Tracking alone is not file-exchange authority;
+unsafe/unavailable directories remain unavailable. Image Import and Image undo
+are not implemented.
 
 ## Host prerequisite
 

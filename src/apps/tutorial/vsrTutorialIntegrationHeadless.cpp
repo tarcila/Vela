@@ -32,6 +32,7 @@
 #include "vsr/integration/descriptor/LaunchDescriptor.hpp"
 #include "vsr/integration/mcp/McpServer.hpp"
 #include "vsr/integration/mcp/tools/EditTools.hpp"
+#include "vsr/integration/mcp/tools/ImageTools.hpp"
 #include "vsr/integration/mcp/tools/LookupTools.hpp"
 #include "vsr/integration/mcp/tools/QueryTools.hpp"
 #include "vsr/integration/mcp/tools/RenderTools.hpp"
@@ -271,6 +272,7 @@ struct Host
   std::unique_ptr<vi::inspection::Inspector> inspector;
 #ifdef VSR_USE_INTEGRATION_MCP
   vi::descriptor::RuntimeDirectory runtimeDir;
+  std::unique_ptr<vi::image::ImageExchange> images;
   std::unique_ptr<vi::mcp::McpServer> mcp;
 #endif
 
@@ -278,6 +280,7 @@ struct Host
   {
 #ifdef VSR_USE_INTEGRATION_MCP
     mcp.reset();
+    images.reset();
 #endif
     inspector.reset();
     view.release();
@@ -402,7 +405,25 @@ int main(int argc, const char *argv[])
   });
 
 #ifdef VSR_USE_INTEGRATION_MCP
+  const auto runtimeStatus =
+      vi::descriptor::openOsRuntimeDirectory(host->runtimeDir);
+  vi::image::ExchangeLimits imageLimits;
+  imageLimits.globalRetentionBytes = host->activity->limits().bytes;
+  imageLimits.availableGlobalRetention = [&host] {
+    const auto cap = host->activity->limits().bytes;
+    const auto used = host->activity->usage().bytes;
+    return used < cap ? cap - used : 0;
+  };
+  host->images = std::make_unique<vi::image::ImageExchange>(integration,
+      *host->engine,
+      host->authority->launchId(),
+      host->runtimeDir,
+      imageLimits);
+  host->images->attachScene(*sceneId, *host->identity);
+  host->inspector->setImageExchange(
+      [&host](vi::SceneId id) { return host->images->metadata(id); });
   vi::mcp::Config cfg;
+  vi::mcp::tools::addImageTools(cfg.tools, {*host->ids, *host->images});
   vi::mcp::tools::addQueryTools(cfg.tools, {*host->engine, *host->inspector});
   vi::mcp::tools::addLookupTools(cfg.tools, *host->engine);
   vi::mcp::tools::addEditTools(cfg.tools,
@@ -412,9 +433,9 @@ int main(int argc, const char *argv[])
   cfg.log = [](std::string_view line) {
     std::fprintf(stderr, "%.*s\n", int(line.size()), line.data());
   };
-  if (auto st = vi::descriptor::openOsRuntimeDirectory(host->runtimeDir);
-      !st.ok()) {
-    std::fprintf(stderr, "runtime directory: %s\n", st.reason.c_str());
+  if (!runtimeStatus.ok()) {
+    std::fprintf(
+        stderr, "runtime directory: %s\n", runtimeStatus.reason.c_str());
     return 1;
   }
   if (auto st = vi::mcp::McpServer::start(
@@ -440,6 +461,9 @@ int main(int argc, const char *argv[])
   // Service integration work and pump pending renders until interrupted.
   while (!g_stop) {
     integration.service();
+#ifdef VSR_USE_INTEGRATION_MCP
+    host->images->pump();
+#endif
     host->translations->pump();
     host->renders->pump();
     if (!g_stop)

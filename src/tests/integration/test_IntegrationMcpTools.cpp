@@ -18,6 +18,7 @@
 #include "vsr/integration/mcp/McpServer.hpp"
 #include "vsr/integration/mcp/tools/EditTools.hpp"
 #include "vsr/integration/mcp/tools/FrameTools.hpp"
+#include "vsr/integration/mcp/tools/ImageTools.hpp"
 #include "vsr/integration/mcp/tools/LookupTools.hpp"
 #include "vsr/integration/mcp/tools/QueryTools.hpp"
 #include "vsr/integration/mcp/tools/RenderTools.hpp"
@@ -29,14 +30,20 @@
 #include "vsr/scene/Scene.hpp"
 // anari
 #include <anari/anari_cpp.hpp>
+// stb
+#include <stb_image.h>
 // std
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <memory>
@@ -49,8 +56,22 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
+
+// Mock only the OS entropy boundary; all Image services remain real.
+static std::atomic<bool> fixedExportEntropy{false};
+extern "C" ssize_t getrandom(void *buffer, size_t bytes, unsigned flags)
+{
+  if (fixedExportEntropy.load()) {
+    std::memset(buffer, 0, bytes);
+    return ssize_t(bytes);
+  }
+  return ::syscall(SYS_getrandom, buffer, bytes, flags);
+}
 
 using namespace vsr::integration;
 using operations::Outcome;
@@ -184,6 +205,36 @@ bool confirmReady(SceneId)
   return true;
 }
 
+struct ImageAllocator : std::pmr::memory_resource
+{
+  std::size_t remaining{0};
+
+ protected:
+  void *do_allocate(std::size_t bytes, std::size_t alignment) override;
+  void do_deallocate(
+      void *p, std::size_t bytes, std::size_t alignment) override;
+  bool do_is_equal(
+      const std::pmr::memory_resource &other) const noexcept override;
+};
+
+void *ImageAllocator::do_allocate(std::size_t bytes, std::size_t alignment)
+{
+  if (!remaining)
+    throw std::bad_alloc();
+  --remaining;
+  return std::pmr::new_delete_resource()->allocate(bytes, alignment);
+}
+void ImageAllocator::do_deallocate(
+    void *p, std::size_t bytes, std::size_t alignment)
+{
+  std::pmr::new_delete_resource()->deallocate(p, bytes, alignment);
+}
+bool ImageAllocator::do_is_equal(
+    const std::pmr::memory_resource &other) const noexcept
+{
+  return this == &other;
+}
+
 struct WriteFaultObserver : vsr::scene::EmptyUpdateDelegate
 {
   void signalArrayMapped(const vsr::scene::Array *) override;
@@ -240,6 +291,7 @@ struct Fixture
   std::unique_ptr<edit::EditService> edits;
   std::unique_ptr<edit::TranslationService> translations;
   std::unique_ptr<restore::RestoreService> restores;
+  std::unique_ptr<image::ImageExchange> images;
   bool hookOk{true};
   TempDir tmp;
   descriptor::RuntimeDirectory dir;
@@ -251,7 +303,8 @@ struct Fixture
       bool preview = false,
       double previewLifetime = 120.,
       bool imageWrites = false,
-      std::uint64_t writeLimit = UINT64_MAX)
+      std::uint64_t writeLimit = UINT64_MAX,
+      image::ExchangeLimits exchangeLimits = {})
       : integration(DEFAULT_QUEUE_CAPACITY, writeLimit)
   {
     for (int i = 0; i < 5; i++)
@@ -298,8 +351,14 @@ struct Fixture
     }
     restores = std::make_unique<restore::RestoreService>(*engine, *edits);
     restores->attachScene(sceneId, *sceneIds);
+    images = std::make_unique<image::ImageExchange>(
+        integration, *engine, authority->launchId(), dir, exchangeLimits);
+    images->attachScene(sceneId, *sceneIds);
+    inspector->setImageExchange(
+        [this](SceneId id) { return images->metadata(id); });
 
     mcp::Config cfg;
+    mcp::tools::addImageTools(cfg.tools, {ids, *images});
     mcp::tools::addQueryTools(cfg.tools, {*engine, *inspector});
     mcp::tools::addLookupTools(cfg.tools, *engine);
     mcp::tools::addEditTools(
@@ -308,6 +367,37 @@ struct Fixture
         mcp::McpServer::start(cfg, *authority, *engine, dir, server);
     if (!st.ok())
       FAIL("start failed: " << st.reason);
+  }
+
+  Reply await(const Session &s, std::uint64_t id)
+  {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (;;) {
+      drain();
+      auto reply = status(s, s.id, id);
+      if (reply.str("state") == "terminal")
+        return reply;
+      REQUIRE(std::chrono::steady_clock::now() < deadline);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+
+  std::string exchangePath()
+  {
+    json::Value metadata;
+    REQUIRE(json::parse(images->metadata(sceneId), metadata));
+    REQUIRE(metadata.get("enabled")->b);
+    return metadata.get("image_exchange_directory")->s;
+  }
+
+  Reply exportImage(
+      const Session &s, std::uint64_t id, const std::string &handle)
+  {
+    return tool(s,
+        "vsr_image_export",
+        "{\"request_id\":" + std::to_string(id) + ",\"scene_id\":"
+            + std::to_string(sceneId) + ",\"handle\":\"" + handle + "\"}");
   }
 
   Reply inspectArray(const Session &s,
@@ -355,7 +445,10 @@ struct Fixture
 
   void drain()
   {
-    while (integration.service() > 0) {
+    for (;;) {
+      images->pump();
+      if (integration.service() == 0)
+        break;
     }
   }
 
@@ -1194,7 +1287,6 @@ SCENARIO("MCP Image support fields distinguish formats and host availability",
   CHECK(static_cast<const unsigned char *>(image->data())[0] == 31);
   const auto listed = f.rpc("tools/list", "{}", &reconnected);
   for (const auto &tool : listed.json.get("result")->get("tools")->a) {
-    CHECK(tool.get("name")->s != "vsr_image_export");
     CHECK(tool.get("name")->s != "vsr_image_import");
   }
 }
@@ -5082,6 +5174,552 @@ SCENARIO(
     f.drain();
     CHECK(f.status(s, s.id, 4).str("outcome") == "conflict");
   }
+}
+
+SCENARIO("MCP Image Export captures sharing without mutating texels",
+    "[integration][mcp][image-export]")
+{
+  Fixture f({}, true, false, false, 120., true);
+  auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 2, 2);
+  image->setName("tracked-image");
+  const unsigned char pixels[] = {
+      17, 29, 41, 0, 3, 5, 7, 255, 101, 103, 107, 127, 211, 223, 227, 1};
+  image->setData(static_cast<const void *>(pixels));
+  auto sampler = f.scene.createObject<vsr::scene::Sampler>("image2D");
+  sampler->setParameterObject("image", *image);
+  auto light = f.scene.createObject<vsr::scene::Light>("hdri");
+  light->setParameterObject("radiance", *image);
+  auto s = f.attach();
+  auto observed = f.inspectArray(s, 1);
+  const auto &item = observed.result()->get("items")->a.at(0);
+  const auto handle = item.get("handle")->s;
+  const auto version = item.get("image_info")->get("data_version")->s;
+  const auto args = "{\"request_id\":2,\"scene_id\":"
+      + std::to_string(f.sceneId) + ",\"handle\":\"" + handle + "\"}";
+  REQUIRE(f.tool(s, "vsr_image_export", args).str("kind") == "image_export");
+  Reply done;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  do {
+    f.drain();
+    done = f.status(s, s.id, 2);
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  } while (done.str("state") != "terminal");
+  REQUIRE(done.str("outcome") == "ok");
+  CHECK_FALSE(done.flag("committed"));
+  const auto &result = *done.result();
+  CHECK(result.get("data_version")->s == version);
+  REQUIRE(result.get("affected_samplers")->a.size() == 1);
+  REQUIRE(result.get("affected_users")->a.size() == 1);
+  CHECK(result.get("affected_complete")->b);
+  CHECK(std::memcmp(image->data(), pixels, sizeof(pixels)) == 0);
+  auto after = f.inspectArray(s, 3);
+  CHECK(after.result()
+            ->get("items")
+            ->a.at(0)
+            .get("image_info")
+            ->get("data_version")
+            ->s
+      == version);
+  CHECK(f.tool(s, "vsr_image_export", args).flag("replayed"));
+}
+
+SCENARIO("MCP Image Export preserves every raw channel and Color Space",
+    "[integration][mcp][image-export]")
+{
+  const anari::DataType types[] = {ANARI_UFIXED8,
+      ANARI_UFIXED8_VEC2,
+      ANARI_UFIXED8_VEC3,
+      ANARI_UFIXED8_VEC4,
+      ANARI_UFIXED8_R_SRGB,
+      ANARI_UFIXED8_RA_SRGB,
+      ANARI_UFIXED8_RGB_SRGB,
+      ANARI_UFIXED8_RGBA_SRGB,
+      ANARI_FIXED8,
+      ANARI_FIXED8_VEC2,
+      ANARI_FIXED8_VEC3,
+      ANARI_FIXED8_VEC4};
+  for (std::size_t format = 0; format < std::size(types); ++format) {
+    Fixture f({}, true, false, false, 120., true);
+    const std::size_t channels = format % 4 + 1;
+    auto image = f.scene.createArray(types[format], 3, 2);
+    image->setName("tracked-image");
+    std::vector<unsigned char> samples(6 * channels);
+    for (std::size_t i = 0; i < samples.size(); ++i)
+      samples[i] = static_cast<unsigned char>(17 + i * 29);
+    if (channels == 2 || channels == 4)
+      samples[channels - 1] = 0; // Nonzero transparent color must survive.
+    image->setData(static_cast<const void *>(samples.data()));
+    const auto s = f.attach();
+    auto inspection = f.inspectArray(s, 1);
+    const auto &item = inspection.result()->get("items")->a.at(0);
+    const auto handle = item.get("handle")->s;
+    const auto version = item.get("image_info")->get("data_version")->s;
+    REQUIRE(f.exportImage(s, 2, handle).str("kind") == "image_export");
+    auto receipt = f.await(s, 2);
+    REQUIRE(receipt.str("outcome") == "ok");
+    const auto &r = *receipt.result();
+    CHECK(r.get("channel_count")->n == channels);
+    CHECK(r.get("color_space")->s
+        == (format >= 4 && format < 8 ? "srgb" : "linear"));
+    CHECK(r.get("row_order")->s == "top_down");
+    CHECK(r.get("data_version")->s == version);
+    const auto path = f.exchangePath() + "/" + r.get("file_name")->s;
+    struct stat st{};
+    REQUIRE(::stat(path.c_str(), &st) == 0);
+    CHECK((st.st_mode & 0777) == 0600);
+    CHECK(st.st_nlink == 1);
+    std::ifstream input(path, std::ios::binary);
+    std::vector<unsigned char> png((std::istreambuf_iterator<char>(input)), {});
+    REQUIRE(png.size() >= 33);
+    CHECK(png[24] == 8);
+    const unsigned char colorTypes[] = {0, 4, 2, 6};
+    CHECK(png[25] == colorTypes[channels - 1]);
+    CHECK(png[28] == 0);
+    // Only IHDR, IDAT and IEND: no color-management or ancillary chunks.
+    std::size_t offset = 8;
+    const char *chunks[] = {"IHDR", "IDAT", "IEND"};
+    for (auto chunk : chunks) {
+      REQUIRE(offset + 12 <= png.size());
+      CHECK(std::string(
+                reinterpret_cast<const char *>(png.data() + offset + 4), 4)
+          == chunk);
+      const std::size_t length = (std::size_t(png[offset]) << 24)
+          | (std::size_t(png[offset + 1]) << 16)
+          | (std::size_t(png[offset + 2]) << 8) | png[offset + 3];
+      offset += length + 12;
+    }
+    CHECK(offset == png.size());
+    int width{}, height{}, decodedChannels{};
+    auto *decoded = stbi_load_from_memory(
+        png.data(), int(png.size()), &width, &height, &decodedChannels, 0);
+    REQUIRE(decoded);
+    CHECK(width == 3);
+    CHECK(height == 2);
+    CHECK(decodedChannels == channels);
+    CHECK(std::memcmp(decoded, samples.data(), samples.size()) == 0);
+    stbi_image_free(decoded);
+    const auto &limits = *r.get("exchange_limits");
+    CHECK(limits.get("max_encoded_file_bytes")->n
+        == 2 * (samples.size() + 2) + 65536);
+    CHECK(limits.get("max_codec_work_bytes")->n
+        == 4 * (samples.size() + 2) + 1048576);
+    CHECK(limits.get("files_used")->n == 1);
+    CHECK(limits.get("bytes_used")->n == png.size());
+    CHECK(limits.get("usage_complete")->b);
+    CHECK(limits.get("available_session_snapshot_bytes")->n == 67108864);
+    REQUIRE(::unlink(path.c_str()) == 0);
+    CHECK(f.exportImage(s, 2, handle).flag("replayed"));
+    CHECK(f.status(s, s.id, 2).result()->get("file_name")->s
+        == r.get("file_name")->s);
+    CHECK(::access(path.c_str(), F_OK) != 0); // Replay does not regenerate.
+  }
+}
+
+SCENARIO("MCP Image Export rejects mapped Images and bounded resource pressure",
+    "[integration][mcp][image-export]")
+{
+  image::ExchangeLimits limits;
+  SECTION("small effective transient ceiling")
+  {
+    limits.transientBytes = 1024;
+  }
+  Fixture f({}, true, false, false, 120., true, UINT64_MAX, limits);
+  auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 1, 1);
+  image->setName("tracked-image");
+  const auto s = f.attach();
+  const auto item = f.inspectArray(s, 1).result()->get("items")->a.at(0);
+  const auto handle = item.get("handle")->s;
+  const auto path = f.exchangePath();
+  SECTION("mapping")
+  {
+    image->map();
+    f.exportImage(s, 2, handle);
+    auto result = f.await(s, 2);
+    CHECK(result.str("outcome") == "busy");
+    CHECK(result.result()->get("reason")->s == "image_mapped");
+    CHECK(image->isMapped());
+    image->unmap();
+    return;
+  }
+  SECTION("file quota")
+  {
+    for (int i = 0; i < 1024; ++i) {
+      std::ofstream file(path + "/agent-" + std::to_string(i) + ".png");
+      file << 'x';
+    }
+  }
+  SECTION("byte quota")
+  {
+    REQUIRE(::truncate((path + "/large.png").c_str(), 268435456) == -1);
+    std::ofstream file(path + "/large.png");
+    file.close();
+    REQUIRE(::truncate((path + "/large.png").c_str(), 268435456) == 0);
+  }
+  SECTION("incomplete scan")
+  {
+    for (int i = 0; i < 4097; ++i)
+      REQUIRE(::symlink("absent", (path + "/link-" + std::to_string(i)).c_str())
+          == 0);
+  }
+  f.exportImage(s, 2, handle);
+  auto result = f.await(s, 2);
+  CHECK(result.str("outcome") == "busy");
+  REQUIRE(result.result());
+  CHECK(result.result()->get("reason")->s == "resource_limit");
+  CHECK_FALSE(result.flag("committed"));
+}
+
+SCENARIO(
+    "MCP Image Export serializes captures independently of write permission",
+    "[integration][mcp][image-export]")
+{
+  Fixture f({}, true, false, false, 120., true, 2);
+  auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 1, 1);
+  image->setName("tracked-image");
+  const unsigned char first[] = {17, 29, 41, 0};
+  const unsigned char second[] = {101, 103, 107, 127};
+  image->setData(static_cast<const void *>(first));
+  const auto s = f.attach();
+  const auto item = f.inspectArray(s, 1).result()->get("items")->a.at(0);
+  const auto handle = item.get("handle")->s;
+  const auto version = item.get("image_info")->get("data_version")->s;
+  f.authority->setAgentEditsDisabled(true);
+  REQUIRE(f.exportImage(s, 2, handle).str("state") == "pending");
+  REQUIRE(f.integration.service() > 0); // Capture before the ordinary writer.
+  image->setData(static_cast<const void *>(second));
+  CHECK_THROWS(
+      image->map()); // Exhausted launch-wide counter does not stop export.
+  REQUIRE(f.exportImage(s, 3, handle).str("state") == "pending");
+  auto a = f.await(s, 2);
+  auto b = f.await(s, 3);
+  REQUIRE(a.str("outcome") == "ok");
+  REQUIRE(b.str("outcome") == "ok");
+  CHECK(a.result()->get("file_name")->s != b.result()->get("file_name")->s);
+  CHECK(a.result()->get("data_version")->s == version);
+  CHECK(b.result()->get("data_version")->s != version);
+  for (const auto *receipt : {a.result(), b.result()}) {
+    std::ifstream input(f.exchangePath() + "/" + receipt->get("file_name")->s,
+        std::ios::binary);
+    std::vector<unsigned char> png((std::istreambuf_iterator<char>(input)), {});
+    int width{}, height{}, channels{};
+    auto *decoded = stbi_load_from_memory(
+        png.data(), int(png.size()), &width, &height, &channels, 0);
+    REQUIRE(decoded);
+    CHECK(std::memcmp(decoded, receipt == a.result() ? first : second, 4) == 0);
+    stbi_image_free(decoded);
+  }
+  f.authority->restrict(
+      session::Target::scene(f.sceneId), session::Capability::READ);
+  CHECK(f.exportImage(s, 4, handle).errorCode() == "forbidden");
+}
+
+SCENARIO(
+    "MCP Image Export fails closed for foreign identity and replaced ancestry",
+    "[integration][mcp][image-export]")
+{
+  Fixture f({}, true, false, false, 120., true);
+  auto image = f.scene.createArray(ANARI_UFIXED8, 1, 1);
+  image->setName("tracked-image");
+  const auto s = f.attach();
+  const auto handle =
+      f.inspectArray(s, 1).result()->get("items")->a.at(0).get("handle")->s;
+  SECTION("known foreign Array")
+  {
+    identity::SceneIdentity foreign(f.ids, f.hidden);
+    f.images->attachScene(f.hiddenId, foreign);
+    auto other = f.hidden.createArray(ANARI_UFIXED8, 1, 1);
+    char text[33];
+    auto h = foreign.handleOf(other.data());
+    std::snprintf(text,
+        sizeof(text),
+        "%016llx%016llx",
+        (unsigned long long)h.domain,
+        (unsigned long long)h.serial);
+    f.exportImage(s, 2, text);
+    auto result = f.await(s, 2);
+    CHECK(result.str("outcome") == "invalid_request");
+    CHECK(result.result()->get("reason")->s == "foreign_scene");
+  }
+  SECTION("replaced exchange directory")
+  {
+    const auto path = f.exchangePath();
+    REQUIRE(::rename(path.c_str(), (path + "-old").c_str()) == 0);
+    REQUIRE(::mkdir(path.c_str(), 0700) == 0);
+    f.exportImage(s, 2, handle);
+    auto result = f.await(s, 2);
+    CHECK(result.str("outcome") == "invalid_request");
+    CHECK(result.result()->get("reason")->s == "file_rejected");
+    json::Value metadata;
+    REQUIRE(json::parse(f.images->metadata(f.sceneId), metadata));
+    CHECK_FALSE(metadata.get("enabled")->b);
+  }
+  SECTION("symlinked exchange directory")
+  {
+    const auto path = f.exchangePath();
+    REQUIRE(::rename(path.c_str(), (path + "-old").c_str()) == 0);
+    REQUIRE(::symlink((path + "-old").c_str(), path.c_str()) == 0);
+    f.exportImage(s, 2, handle);
+    auto result = f.await(s, 2);
+    CHECK(result.str("outcome") == "invalid_request");
+    CHECK(result.result()->get("reason")->s == "file_rejected");
+  }
+  SECTION("cancel before capture")
+  {
+    f.exportImage(s, 2, handle);
+    REQUIRE(f.tool(s, "vsr_cancel", "{\"operation_ref\":" + ref(s.id, 2) + "}")
+            .errorCode()
+            .empty());
+    f.drain();
+    CHECK(f.status(s, s.id, 2).str("outcome") == "cancelled");
+  }
+}
+
+SCENARIO("MCP Image Export bounds collision retries without overwriting files",
+    "[integration][mcp][image-export]")
+{
+  Fixture f({}, true, false, false, 120., true);
+  auto image = f.scene.createArray(ANARI_UFIXED8, 1, 1);
+  image->setName("tracked-image");
+  const auto s = f.attach();
+  const auto handle =
+      f.inspectArray(s, 1).result()->get("items")->a.at(0).get("handle")->s;
+  struct EntropyScope
+  {
+    EntropyScope()
+    {
+      fixedExportEntropy = true;
+    }
+    ~EntropyScope()
+    {
+      fixedExportEntropy = false;
+    }
+  } entropy;
+  f.exportImage(s, 2, handle);
+  auto first = f.await(s, 2);
+  REQUIRE(first.str("outcome") == "ok");
+  const auto path =
+      f.exchangePath() + "/" + first.result()->get("file_name")->s;
+  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  file << "agent-owned-replacement";
+  file.close();
+  f.exportImage(s, 3, handle);
+  auto second = f.await(s, 3);
+  CHECK(second.str("outcome") == "busy");
+  CHECK(second.result()->get("reason")->s == "resource_limit");
+  std::ifstream retained(path);
+  std::string content;
+  retained >> content;
+  CHECK(content == "agent-owned-replacement");
+  json::Value metadata;
+  REQUIRE(json::parse(f.images->metadata(f.sceneId), metadata));
+  CHECK(metadata.get("exchange_limits")->get("files_used")->n == 1);
+}
+
+SCENARIO("MCP Image Export binding result and work caps do not fail capture",
+    "[integration][mcp][image-export]")
+{
+  Fixture f({}, true, false, false, 120., true);
+  auto image = f.scene.createArray(ANARI_UFIXED8, 1, 1);
+  image->setName("tracked-image");
+  SECTION("combined result cap")
+  {
+    for (int i = 0; i < 300; ++i)
+      f.scene.createObject<vsr::scene::Sampler>("image2D")->setParameterObject(
+          "image", *image);
+  }
+  SECTION("reference work cap")
+  {
+    auto material = f.scene.createObject<vsr::scene::Material>("matte");
+    for (int i = 0; i < 4200; ++i)
+      material->setParameter(("extra" + std::to_string(i)).c_str(), 1.f);
+  }
+  const auto s = f.attach();
+  const auto handle =
+      f.inspectArray(s, 1).result()->get("items")->a.at(0).get("handle")->s;
+  f.exportImage(s, 2, handle);
+  auto result = f.await(s, 2);
+  REQUIRE(result.str("outcome") == "ok");
+  CHECK_FALSE(result.result()->get("affected_complete")->b);
+  CHECK(result.result()->get("affected_samplers")->a.size()
+          + result.result()->get("affected_users")->a.size()
+      <= 256);
+  CHECK(result.result()->get("exchange_limits")->get("usage_complete")->b);
+}
+
+SCENARIO("MCP Image Export allocation failure releases admission capacity",
+    "[integration][mcp][image-export]")
+{
+  ImageAllocator allocator;
+  SECTION("capture allocation fails")
+  {
+    allocator.remaining = 0;
+  }
+  SECTION("encoded output allocation fails")
+  {
+    allocator.remaining = 1;
+  }
+  image::ExchangeLimits limits;
+  limits.allocator = &allocator;
+  Fixture f({}, true, false, false, 120., true, UINT64_MAX, limits);
+  auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 1, 1);
+  image->setName("tracked-image");
+  const auto s = f.attach();
+  const auto handle =
+      f.inspectArray(s, 1).result()->get("items")->a.at(0).get("handle")->s;
+  REQUIRE(f.exportImage(s, 2, handle).str("state") == "pending");
+  auto rejected = f.await(s, 2);
+  CHECK(rejected.str("outcome") == "busy");
+  REQUIRE(rejected.result());
+  REQUIRE(rejected.result()->get("reason"));
+  CHECK(rejected.result()->get("reason")->s == "resource_limit");
+  allocator.remaining = 2;
+  f.exportImage(s, 3, handle);
+  auto result = f.await(s, 3);
+  CHECK(result.str("outcome") == "ok");
+}
+
+SCENARIO("MCP Image Export cancellation cleans an active immutable capture",
+    "[integration][mcp][image-export][image-export-cancel]")
+{
+  Fixture f({}, true, false, false, 120., true);
+  auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 2048, 2048);
+  image->setName("tracked-image");
+  const auto s = f.attach();
+  const auto handle =
+      f.inspectArray(s, 1).result()->get("items")->a.at(0).get("handle")->s;
+  f.exportImage(s, 2, handle);
+  REQUIRE(f.integration.service() > 0);
+  REQUIRE(f.tool(s, "vsr_cancel", "{\"operation_ref\":" + ref(s.id, 2) + "}")
+          .errorCode()
+          .empty());
+  f.drain();
+  CHECK(f.status(s, s.id, 2).str("outcome") == "cancelled");
+  f.exportImage(s, 3, handle);
+  auto result = f.await(s, 3);
+  REQUIRE(result.str("outcome") == "ok");
+  CHECK(result.result()->get("exchange_limits")->get("files_used")->n == 1);
+}
+
+SCENARIO("MCP Image Export removes partial files after disk failure",
+    "[integration][mcp][image-export]")
+{
+  Fixture f({}, true, false, false, 120., true);
+  auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 32, 32);
+  image->setName("tracked-image");
+  const auto s = f.attach();
+  const auto handle =
+      f.inspectArray(s, 1).result()->get("items")->a.at(0).get("handle")->s;
+  struct FileLimit
+  {
+    struct rlimit previous{};
+    decltype(std::signal(SIGXFSZ, SIG_IGN)) previousSignal{};
+    FileLimit()
+    {
+      REQUIRE(::getrlimit(RLIMIT_FSIZE, &previous) == 0);
+      previousSignal = std::signal(SIGXFSZ, SIG_IGN);
+      struct rlimit limit = previous;
+      limit.rlim_cur = 100;
+      REQUIRE(::setrlimit(RLIMIT_FSIZE, &limit) == 0);
+    }
+    ~FileLimit()
+    {
+      ::setrlimit(RLIMIT_FSIZE, &previous);
+      std::signal(SIGXFSZ, previousSignal);
+    }
+  };
+  const auto path = f.exchangePath();
+  {
+    FileLimit limit;
+    f.exportImage(s, 2, handle);
+    auto result = f.await(s, 2);
+    CHECK(result.str("outcome") == "invalid_request");
+    CHECK(result.result()->get("reason")->s == "file_rejected");
+    CHECK(std::filesystem::is_empty(path));
+  }
+  f.exportImage(s, 3, handle);
+  auto result = f.await(s, 3);
+  REQUIRE(result.str("outcome") == "ok");
+  CHECK_FALSE(std::filesystem::is_empty(path));
+  REQUIRE(f.rpc("vsr/detach", "{}", &s).status == 200);
+  auto later = f.attach();
+  auto historical = f.status(later, s.id, 3);
+  CHECK(historical.str("kind") == "image_export");
+  CHECK(historical.result()->get("file_name")->s
+      == result.result()->get("file_name")->s);
+  f.images.reset();
+  CHECK_FALSE(std::filesystem::exists(path));
+}
+
+SCENARIO("MCP Image Export checks exact entropy bounds and strict schema",
+    "[integration][mcp][image-export]")
+{
+  image::ExchangeLimits limits;
+  SECTION("one byte below the conservative peak")
+  {
+    limits.transientBytes = 2950655;
+  }
+  SECTION("exact conservative peak")
+  {
+    limits.transientBytes = 2950656;
+  }
+  Fixture f({}, true, false, false, 120., true, UINT64_MAX, limits);
+  auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 256, 256);
+  image->setName("tracked-image");
+  std::vector<unsigned char> pixels(262144);
+  std::uint32_t entropy = 0x12345678;
+  for (auto &sample : pixels) {
+    entropy ^= entropy << 13;
+    entropy ^= entropy >> 17;
+    entropy ^= entropy << 5;
+    sample = static_cast<unsigned char>(entropy);
+  }
+  image->setData(static_cast<const void *>(pixels.data()));
+  const auto s = f.attach();
+  const auto handle =
+      f.inspectArray(s, 1).result()->get("items")->a.at(0).get("handle")->s;
+  const auto base = "{\"request_id\":2,\"scene_id\":"
+      + std::to_string(f.sceneId) + ",\"handle\":\"" + handle + "\"";
+  CHECK(
+      f.tool(s, "vsr_image_export", base + ",\"file_name\":\"arbitrary.png\"}")
+          .errorCode()
+      == "invalid_request");
+  auto tools = f.rpc("tools/list", "{}", &s);
+  bool found = false;
+  for (const auto &tool : tools.json.get("result")->get("tools")->a) {
+    CHECK(tool.get("name")->s != "vsr_image_import");
+    if (tool.get("name")->s == "vsr_image_export") {
+      found = true;
+      CHECK_FALSE(tool.get("inputSchema")->get("additionalProperties")->b);
+      CHECK(tool.get("inputSchema")->get("required")->a.size() == 3);
+    }
+  }
+  REQUIRE(found);
+  f.exportImage(s, 2, handle);
+  auto result = f.await(s, 2);
+  if (limits.transientBytes == 2950655) {
+    CHECK(result.str("outcome") == "busy");
+    CHECK(result.result()->get("reason")->s == "resource_limit");
+    return;
+  }
+  REQUIRE(result.str("outcome") == "ok");
+  CHECK(result.result()
+            ->get("exchange_limits")
+            ->get("transient_image_byte_cap")
+            ->n
+      == 2950656);
+  std::ifstream input(
+      f.exchangePath() + "/" + result.result()->get("file_name")->s,
+      std::ios::binary);
+  std::vector<unsigned char> png((std::istreambuf_iterator<char>(input)), {});
+  CHECK(png.size() == 262488);
+  int width{}, height{}, channels{};
+  auto *decoded = stbi_load_from_memory(
+      png.data(), int(png.size()), &width, &height, &channels, 0);
+  REQUIRE(decoded);
+  CHECK(std::memcmp(decoded, pixels.data(), pixels.size()) == 0);
+  stbi_image_free(decoded);
 }
 
 #endif

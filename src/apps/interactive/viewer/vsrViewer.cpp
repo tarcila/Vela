@@ -35,6 +35,7 @@
 #include <vsr/integration/mcp/McpServer.hpp>
 #include <vsr/integration/mcp/tools/EditTools.hpp>
 #include <vsr/integration/mcp/tools/FrameTools.hpp>
+#include <vsr/integration/mcp/tools/ImageTools.hpp>
 #include <vsr/integration/mcp/tools/LookupTools.hpp>
 #include <vsr/integration/mcp/tools/QueryTools.hpp>
 #include <vsr/integration/mcp/tools/RenderTools.hpp>
@@ -699,6 +700,10 @@ class Application : public VSRApplication
       m_translations->pump();
     if (m_renders)
       m_renders->pump();
+#ifdef VSR_USE_INTEGRATION_MCP
+    if (m_images)
+      m_images->pump();
+#endif
     if (m_frames && m_integration) {
       // Bind only after initial background setup has completed. Natural render
       // starts and observation callbacks execute on the viewer owner. The
@@ -954,6 +959,7 @@ DockSpace         ID=0x80F5B4C5 Window=0x079D3A04 Pos=0,56 Size=3840,2206 Split=
   std::unique_ptr<vsr::integration::inspection::Inspector> m_inspector;
 #ifdef VSR_USE_INTEGRATION_MCP
   vsr::integration::descriptor::RuntimeDirectory m_runtimeDir;
+  std::unique_ptr<vsr::integration::image::ImageExchange> m_images;
   std::unique_ptr<vsr::integration::mcp::McpServer> m_mcp;
 #endif
 #endif
@@ -1131,7 +1137,25 @@ void Application::setupIntegration()
   services.scenes.emplace_back(*sceneId, options.name);
 
 #ifdef VSR_USE_INTEGRATION_MCP
+  const auto runtimeStatus =
+      vi::descriptor::openOsRuntimeDirectory(m_runtimeDir);
+  vi::image::ExchangeLimits imageLimits;
+  imageLimits.globalRetentionBytes = m_activity->limits().bytes;
+  imageLimits.availableGlobalRetention = [this] {
+    const auto cap = m_activity->limits().bytes;
+    const auto used = m_activity->usage().bytes;
+    return used < cap ? cap - used : 0;
+  };
+  m_images = std::make_unique<vi::image::ImageExchange>(*m_integration,
+      *m_engine,
+      m_authority->launchId(),
+      m_runtimeDir,
+      imageLimits);
+  m_images->attachScene(*sceneId, *m_identity);
+  m_inspector->setImageExchange(
+      [this](vi::SceneId id) { return m_images->metadata(id); });
   vi::mcp::Config cfg;
+  vi::mcp::tools::addImageTools(cfg.tools, {*m_ids, *m_images});
   vi::mcp::tools::addQueryTools(cfg.tools, {*m_engine, *m_inspector});
   vi::mcp::tools::addLookupTools(cfg.tools, *m_engine);
   vi::mcp::tools::addEditTools(
@@ -1141,8 +1165,9 @@ void Application::setupIntegration()
   cfg.log = [](std::string_view line) {
     vsr::core::logStatus("[vsrViewer] %.*s", int(line.size()), line.data());
   };
-  if (auto st = vi::descriptor::openOsRuntimeDirectory(m_runtimeDir); !st.ok())
-    vsr::core::logError("[vsrViewer] runtime directory: %s", st.reason.c_str());
+  if (!runtimeStatus.ok())
+    vsr::core::logError(
+        "[vsrViewer] runtime directory: %s", runtimeStatus.reason.c_str());
   else if (auto st = vi::mcp::McpServer::start(
                cfg, *m_authority, *m_engine, m_runtimeDir, m_mcp);
       !st.ok())
@@ -1266,6 +1291,7 @@ void Application::teardownIntegration()
     m_activityWindow->model().setServices({});
 #ifdef VSR_USE_INTEGRATION_MCP
   m_mcp.reset();
+  m_images.reset();
 #endif
   if (m_cameraPoses)
     m_cameraPoses->setRecoverySlots({});

@@ -15,6 +15,7 @@ machine-readable field, and `message` strings are explanatory only.
   | `tools/QueryTools.hpp` | `vsr_discover`, `vsr_inspect` | 103 |
   | `tools/LookupTools.hpp` | `vsr_operation_status`, `vsr_cancel` | 103 |
   | `tools/EditTools.hpp` | `vsr_edit`, `vsr_restore` | 104 |
+  | `tools/ImageTools.hpp` | `vsr_image_export` | Image Export |
   | `tools/RenderTools.hpp` | `vsr_render`, `vsr_render_image`, `vsr_select_device`, `vsr_set_view_camera`, `vsr_resynchronize` | 105 |
 
 ## Payload placement
@@ -64,7 +65,7 @@ form:
 | Field | Presence | Meaning |
 |---|---|---|
 | `operation_ref` | always | `{session_id, request_id}`. It is the complete qualified reference, including when the lookup names an earlier session's record |
-| `kind` | always | Retained operation kind: `discover`, `inspect`, `edit`, `restore`, `render`, `select_device`, `set_view_camera`, `resynchronize`. Preserved for lookups from later sessions |
+| `kind` | always | Retained operation kind: `discover`, `inspect`, `edit`, `restore`, `image_export`, `render`, `select_device`, `set_view_camera`, `resynchronize`. Preserved for lookups from later sessions |
 | `state` | always | `pending` or `terminal` |
 | `progress` | while a slot is held | A frozen non-terminal name (see below). `awaiting_cleanup` can coexist with `state: terminal` |
 | `outcome` | once terminal | A frozen code (see below) |
@@ -320,13 +321,48 @@ advances only the inspection revision and invalidates existing pagination cursor
 it is not a completed write or parameter edit. Completed unmap advances inspection,
 Scene and Array parameter versions once and invalidates outstanding cursors again.
 
-Discovery currently reports `image_exchange` with `supported:false`,
-`enabled:false`, and the separate `data_tracking` prerequisite. Its reason is
-`not_implemented` when tracking is qualified, otherwise
-`host_write_contract_unavailable`. PNG export/import tools and directories are not implemented or
-advertised by this slice. See the [host and mutation contract](../../../../docs/image-data-tracking.md)
-for launch-wide reservations, exhaustion, disconnect/unavailability and
-lifetime-safe cache resolution.
+Qualified hosts advertise `image_exchange` with `supported`, `enabled`,
+`export`, `import:false`, `data_tracking`, a private `image_exchange_directory`
+and effective `exchange_limits`. Unsafe directories and unsupported platforms
+advertise unavailable with an explicit reason. Hosts without ImageExchange keep
+`not_implemented`; the tracking prerequisite alone never advertises an endpoint.
+See the [host and mutation contract](../../../../docs/image-data-tracking.md)
+for launch-wide reservations, exhaustion and lifetime-safe cache resolution.
+
+## Image Export
+
+| Tool | Arguments | Capability | Slot / ID |
+|---|---|---|---|
+| `vsr_image_export` | `request_id`, `scene_id`, `handle` | Scene READ | one normal scene slot, one request ID; no render encoder slot |
+
+All three arguments are required; additional properties reject before admission.
+The handle addresses an Array, not a Sampler. Status kind is `image_export` on
+admission, lookup and replay, including authorized later-session lookup.
+Current read authority gates capture and protected historical results. Edits
+being disabled or Image write-sequence exhaustion do not prevent export.
+
+Success returns `handle`, a confined `file_name`, captured `data_version`,
+`dimensions`, `element_type`, `channel_count`, `color_space`, `row_order`,
+`affected_samplers`, direct `affected_users`, `affected_complete`, and
+`exchange_limits`. It is nonmutating (`committed:false`, `isError:false`).
+Binding coverage is limited to 256 results/4096 work; incomplete coverage does
+not fail export. Filesystem quota coverage is separately bounded and incomplete
+coverage prevents admission. Replays return original names/versions, not proof
+of current file bytes, and never regenerate removed files.
+
+| Terminal outcome | Structured reason | Mutation |
+|---|---|---|
+| `invalid_request` | `foreign_scene`, `invalid_handle`, `unsupported_image`, `file_rejected`, `host_write_contract_unavailable` | none |
+| `busy` | `image_mapped`, `resource_limit` | none |
+| `cancelled`, `timeout`, `forbidden` | inherited authority/cancellation contract | none |
+
+Terminal failures use HTTP 200, `structuredContent.outcome`, and `isError:true`;
+initial missing Scene authority uses HTTP 403 / `error.data.code:forbidden`
+without consuming the ID. Raw samples preserve every channel, Color Space and
+top-first row; no gamma/profile chunks or alpha-color destruction occur.
+Import remains absent. See [PNG exchange](../../../../docs/image-png-exchange.md)
+for every limit field, encoder peak/output proof, Linux confinement and the
+separate explicit PNG-versus-undo cleanup policies.
 
 ## Viewport WORLD bounds (ticket 09, partial qualification)
 
