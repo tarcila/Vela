@@ -431,6 +431,10 @@ struct ImageSnapshot
   {}
   VSR_NOT_COPYABLE(ImageSnapshot)
   VSR_NOT_MOVEABLE(ImageSnapshot)
+  // Control/store allocations have a lifetime independent of texels.
+  operations::ResultOwnership controlOwnership;
+  operations::ResultOwnership::Reserve reserveResult;
+  std::shared_ptr<const void> scopeLease;
   // One shared physical allocation; copying records never duplicates texels.
   std::shared_ptr<const void> physicalLease;
   std::shared_ptr<const void> sessionLease;
@@ -474,6 +478,15 @@ class RestorationStore
   void cancelImage(const BatchRef &ref);
   std::optional<SceneId> imageScope(const BatchRef &ref) const;
   void forgetImageScope(const BatchRef &ref);
+  // Bounded Image-only one-way history shares the scope's control lease.
+  enum class ImageState
+  {
+    ELIGIBLE,
+    RESTORED,
+    CONFLICTING
+  };
+  std::optional<ImageState> imageState(const BatchRef &ref) const;
+  bool setImageState(const BatchRef &ref, ImageState state);
 
   std::optional<RestorationRecord> find(const BatchRef &ref) const;
   // True once the record was evicted by the retention budget.
@@ -492,7 +505,14 @@ class RestorationStore
   std::size_t m_reserved{0};
   std::map<std::string, RestorationRecord> m_records;
   std::map<std::string, RestorationRecord> m_pendingImages;
-  std::map<std::string, SceneId> m_imageScopes;
+  struct ImageScope
+  {
+    std::shared_ptr<const void> lease;
+    SceneId scene;
+    ImageState state{ImageState::ELIGIBLE};
+  };
+  std::map<std::string, ImageScope> m_imageScopes;
+  std::map<std::string, std::shared_ptr<const void>> m_imageExpiredLeases;
   std::vector<std::string> m_imageScopeOrder;
   std::vector<std::string> m_order; // oldest first
   std::set<std::string> m_expired;
@@ -584,7 +604,7 @@ class EditService
   mutable std::mutex m_mutex;
   std::map<SceneId, SceneIdentity *> m_identities;
   sync::SyncStates m_sync;
-  std::set<std::string> m_issued; // every batch_id ever issued
+  std::uint64_t m_nextBatchId{0}; // shared edit/import namespace, never reused
   std::map<std::pair<std::string, std::uint64_t>, Slot> m_results;
   std::map<std::uint64_t, Slot> m_localResults;
 };
@@ -646,7 +666,8 @@ inline bool RestorationStore::prepareImage(RestorationRecord record)
   try {
     m_order.reserve(m_order.size() + m_capacity + 1);
     m_imageScopeOrder.reserve(m_imageScopeOrder.size() + 1);
-    m_imageScopes.emplace(scopeKey, record.scene);
+    m_imageScopes.emplace(
+        scopeKey, ImageScope{record.image->scopeLease, record.scene});
     record.image->batchOrder = id;
     record.image->batchScope = scopeKey;
     m_pendingImages.emplace(id, std::move(record));
@@ -704,7 +725,7 @@ inline std::optional<SceneId> RestorationStore::imageScope(
     return record->second.scene;
   const auto it = m_imageScopes.find(ref.launchId + "/" + ref.batchId);
   return it == m_imageScopes.end() ? std::optional<SceneId>{}
-                                   : std::optional<SceneId>{it->second};
+                                   : std::optional<SceneId>{it->second.scene};
 }
 
 inline void RestorationStore::forgetImageScope(const BatchRef &ref)
@@ -717,11 +738,41 @@ inline void RestorationStore::forgetImageScope(const BatchRef &ref)
       m_imageScopeOrder.end());
 }
 
+inline std::optional<RestorationStore::ImageState> RestorationStore::imageState(
+    const BatchRef &ref) const
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  const auto it = m_imageScopes.find(ref.launchId + "/" + ref.batchId);
+  return it == m_imageScopes.end()
+      ? std::optional<ImageState>{}
+      : std::optional<ImageState>{it->second.state};
+}
+
+inline bool RestorationStore::setImageState(
+    const BatchRef &ref, ImageState state)
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  const auto it = m_imageScopes.find(ref.launchId + "/" + ref.batchId);
+  if (it == m_imageScopes.end())
+    return false;
+  it->second.state = state;
+  return true;
+}
+
 inline void RestorationStore::expireLocked(std::string id)
 {
   const auto record = m_records.find(id);
-  if (record != m_records.end())
-    m_imageScopes.erase(record->second.ref.launchId + "/" + id);
+  if (record != m_records.end() && record->second.image) {
+    const auto key = record->second.ref.launchId + "/" + id;
+    const auto scope = m_imageScopes.find(key);
+    if (scope != m_imageScopes.end()) {
+      m_imageExpiredLeases.emplace(id, scope->second.lease);
+      m_imageScopes.erase(scope);
+    }
+    m_imageScopeOrder.erase(
+        std::remove(m_imageScopeOrder.begin(), m_imageScopeOrder.end(), key),
+        m_imageScopeOrder.end());
+  }
   for (auto o = m_order.begin(); o != m_order.end(); ++o)
     if (*o == id) {
       m_order.erase(o);
@@ -730,6 +781,7 @@ inline void RestorationStore::expireLocked(std::string id)
   if (m_records.erase(id) && m_expired.insert(id).second) {
     m_expiredOrder.push_back(id);
     if (m_expiredOrder.size() > 1024) {
+      m_imageExpiredLeases.erase(m_expiredOrder.front());
       m_expired.erase(m_expiredOrder.front());
       m_expiredOrder.erase(m_expiredOrder.begin());
     }
@@ -1029,16 +1081,13 @@ inline std::string EditService::canonicalArguments(const EditBatch &batch)
 
 inline std::optional<std::string> EditService::newBatchId()
 {
-  for (int attempt = 0; attempt < 8; attempt++) {
-    std::uint8_t bytes[16];
-    if (!session::secureRandom(bytes, sizeof(bytes)))
-      return std::nullopt;
-    auto id = session::toLowerHex(bytes, sizeof(bytes));
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_issued.insert(id).second)
-      return id;
-  }
-  return std::nullopt;
+  std::lock_guard<std::mutex> lock(m_mutex);
+  if (m_nextBatchId == UINT64_MAX)
+    return std::nullopt;
+  // Launch qualification supplies uniqueness across launches; a bounded
+  // counter supplies exact uniqueness within the shared namespace without
+  // retaining an unbounded journal of every issued Image batch.
+  return detail::hex64(0) + detail::hex64(++m_nextBatchId);
 }
 
 inline operations::Request EditService::makeRequest(EditBatch batch, Slot slot)

@@ -16,6 +16,10 @@ namespace vsr::integration::edit {
 class EditService;
 }
 
+namespace vsr::integration::restore {
+class RestoreService;
+}
+
 namespace vsr::integration::image {
 
 struct ExchangeLimits
@@ -60,7 +64,8 @@ class ImageExchange
   // Edits and this service share a launch and owning-thread lifetime.
   // Import remains unavailable without the host's physical reservation and
   // authoritative global retention/availability callbacks in ExchangeLimits.
-  void attachRestoration(edit::EditService &edits);
+  void attachRestoration(
+      edit::EditService &edits, restore::RestoreService &restores);
   bool importAvailable() const;
   // Empty session selects launch-wide descriptor metadata, not a ledger.
   std::string metadata(SceneId scene, const std::string &sessionId = {}) const;

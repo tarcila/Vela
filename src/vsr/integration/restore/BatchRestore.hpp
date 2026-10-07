@@ -73,6 +73,8 @@ struct ImageVersion
 
 struct RestoreResult
 {
+  operations::ResultOwnership ownership;
+  std::shared_ptr<const void> wireLease;
   Outcome outcome{Outcome::OK};
   bool committed{false};
   BatchRef targetBatchRef;
@@ -95,7 +97,9 @@ using RestoreFaultInjector = std::function<bool()>;
 class RestoreService
 {
  public:
-  RestoreService(OperationEngine &engine, EditService &edits);
+  RestoreService(OperationEngine &engine,
+      EditService &edits,
+      operations::ResultOwnership::Reserve reserveResult = {});
   ~RestoreService();
   RestoreService(const RestoreService &) = delete;
   RestoreService &operator=(const RestoreService &) = delete;
@@ -103,6 +107,9 @@ class RestoreService
   // Host: associate a registered scene with its identity observer.
   void attachScene(SceneId scene, SceneIdentity &identity);
   void setFaultInjector(RestoreFaultInjector injector);
+  bool owns(const OperationEngine &engine, const EditService &edits) const;
+  bool resultOwnershipAvailable() const;
+  std::weak_ptr<const void> lifetime() const;
 
   // External restoration under the current session.
   Admission submit(const operations::Credentials &credentials,
@@ -122,7 +129,12 @@ class RestoreService
   static std::string canonicalArguments(const RestoreRequest &request);
 
  private:
-  using Slot = std::shared_ptr<std::optional<RestoreResult>>;
+  struct ResultSlot
+  {
+    operations::ResultOwnership ownership;
+    std::optional<RestoreResult> result;
+  };
+  using Slot = std::shared_ptr<ResultSlot>;
   struct SceneBinding
   {
     SceneIdentity *identity{nullptr};
@@ -137,6 +149,7 @@ class RestoreService
 
   OperationEngine &m_engine;
   EditService &m_edits;
+  operations::ResultOwnership::Reserve m_reserveResult;
   RestoreFaultInjector m_fault;
   std::shared_ptr<bool> m_alive;
 
@@ -162,14 +175,34 @@ inline std::string consumedKey(const BatchRef &ref)
 
 } // namespace detail
 
-inline RestoreService::RestoreService(
-    OperationEngine &engine, EditService &edits)
-    : m_engine(engine), m_edits(edits), m_alive(std::make_shared<bool>(true))
+inline RestoreService::RestoreService(OperationEngine &engine,
+    EditService &edits,
+    operations::ResultOwnership::Reserve reserveResult)
+    : m_engine(engine),
+      m_edits(edits),
+      m_reserveResult(std::move(reserveResult)),
+      m_alive(std::make_shared<bool>(true))
 {}
 
 inline RestoreService::~RestoreService()
 {
   m_alive.reset();
+}
+
+inline bool RestoreService::owns(
+    const OperationEngine &engine, const EditService &edits) const
+{
+  return &m_engine == &engine && &m_edits == &edits;
+}
+
+inline bool RestoreService::resultOwnershipAvailable() const
+{
+  return bool(m_reserveResult);
+}
+
+inline std::weak_ptr<const void> RestoreService::lifetime() const
+{
+  return m_alive;
 }
 
 inline void RestoreService::attachScene(SceneId scene, SceneIdentity &identity)
@@ -186,12 +219,18 @@ inline void RestoreService::setFaultInjector(RestoreFaultInjector injector)
 
 inline bool RestoreService::restored(const BatchRef &ref) const
 {
+  if (m_edits.restorations().imageState(ref)
+      == edit::RestorationStore::ImageState::RESTORED)
+    return true;
   std::lock_guard<std::mutex> lock(m_mutex);
   return m_consumed.count(detail::consumedKey(ref)) != 0;
 }
 
 inline bool RestoreService::conflicting(const BatchRef &ref) const
 {
+  if (m_edits.restorations().imageState(ref)
+      == edit::RestorationStore::ImageState::CONFLICTING)
+    return true;
   std::lock_guard<std::mutex> lock(m_mutex);
   return m_conflicting.count(detail::consumedKey(ref)) != 0;
 }
@@ -222,6 +261,8 @@ inline operations::Request RestoreService::makeRequest(
 {
   operations::Request r;
   r.kind = "restore";
+  r.resourceLease = slot->ownership.lease;
+  r.reserveStatus = slot->ownership.reserve;
   r.target = session::Target::scene(request.scene);
   r.capability = session::Capability::EDIT;
   r.canonicalArguments = canonicalArguments(request);
@@ -243,7 +284,7 @@ inline operations::Request RestoreService::makeRequest(
           step.result = "{\"reason\":\"expired\"}";
         else if (!res.reason.empty())
           step.result = "{\"reason\":\"" + res.reason + "\"}";
-        *slot = std::move(res);
+        slot->result = std::move(res);
         return step;
       }
       *committed = std::move(res);
@@ -264,8 +305,10 @@ inline operations::Request RestoreService::makeRequest(
     step.outcome = res.outcome;
     step.committed = true;
     if (!res.imageReceipt.empty()) {
+      step.resourceLease = std::move(res.wireLease);
+      step.reserveStatus = res.ownership.reserve;
       step.result = std::move(res.imageReceipt);
-      *slot = std::move(res);
+      slot->result = std::move(res);
       return step;
     }
     step.result = "{\"target_batch_ref\":"
@@ -284,7 +327,7 @@ inline operations::Request RestoreService::makeRequest(
     if (res.nodeVersions.empty())
       step.result += ",\"node_versions\":[]";
     step.result += ",\"restored\":true}";
-    *slot = std::move(res);
+    slot->result = std::move(res);
     return step;
   };
   return r;
@@ -300,11 +343,32 @@ inline Admission RestoreService::submit(
     a.code = Outcome::INVALID_REQUEST;
     return a;
   }
-  auto slot = std::make_shared<std::optional<RestoreResult>>();
+  operations::ResultOwnership ownership;
+  try {
+    ownership = operations::ResultOwnership(m_reserveResult);
+  } catch (const std::bad_alloc &) {
+    Admission busy;
+    busy.code = Outcome::BUSY;
+    return busy;
+  }
+  auto slot = std::make_shared<ResultSlot>();
+  slot->ownership = std::move(ownership);
   auto a =
       m_engine.submit(credentials, ref, makeRequest(std::move(request), slot));
   if (a.code == Outcome::OK && !a.replayed) {
     std::lock_guard<std::mutex> lock(m_mutex);
+    // Completed Image result slots retain their own charge; bound history
+    // independently of Engine/Activity retention and never prune active slots.
+    while (m_results.size() >= 1024) {
+      auto old = std::find_if(
+          m_results.begin(), m_results.end(), [](const auto &entry) {
+            return entry.second->result.has_value()
+                || entry.second.use_count() == 1;
+          });
+      if (old == m_results.end())
+        break;
+      m_results.erase(old);
+    }
     m_results[{ref.sessionId, ref.requestId}] = slot;
   }
   return a;
@@ -317,10 +381,29 @@ inline LocalAdmission RestoreService::submitLocal(RestoreRequest request)
     a.code = Outcome::INVALID_REQUEST;
     return a;
   }
-  auto slot = std::make_shared<std::optional<RestoreResult>>();
+  operations::ResultOwnership ownership;
+  try {
+    ownership = operations::ResultOwnership(m_reserveResult);
+  } catch (const std::bad_alloc &) {
+    LocalAdmission busy;
+    busy.code = Outcome::BUSY;
+    return busy;
+  }
+  auto slot = std::make_shared<ResultSlot>();
+  slot->ownership = std::move(ownership);
   auto a = m_engine.submitLocal(makeRequest(std::move(request), slot));
   if (a.code == Outcome::OK) {
     std::lock_guard<std::mutex> lock(m_mutex);
+    while (m_localResults.size() >= 1024) {
+      auto old = std::find_if(
+          m_localResults.begin(), m_localResults.end(), [](const auto &entry) {
+            return entry.second->result.has_value()
+                || entry.second.use_count() == 1;
+          });
+      if (old == m_localResults.end())
+        break;
+      m_localResults.erase(old);
+    }
     m_localResults[a.ref.id] = slot;
   }
   return a;
@@ -333,7 +416,7 @@ inline std::optional<RestoreResult> RestoreService::result(
   auto it = m_results.find({ref.sessionId, ref.requestId});
   if (it == m_results.end())
     return std::nullopt;
-  return *it->second;
+  return it->second->result;
 }
 
 inline std::optional<RestoreResult> RestoreService::resultLocal(
@@ -343,13 +426,14 @@ inline std::optional<RestoreResult> RestoreService::resultLocal(
   auto it = m_localResults.find(ref.id);
   if (it == m_localResults.end())
     return std::nullopt;
-  return *it->second;
+  return it->second->result;
 }
 
 inline void RestoreService::markConflicting(
     const BatchRef &ref, operations::StepContext &ctx)
 {
-  {
+  if (!m_edits.restorations().setImageState(
+          ref, edit::RestorationStore::ImageState::CONFLICTING)) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_conflicting.insert(detail::consumedKey(ref));
   }
@@ -363,6 +447,12 @@ inline RestoreResult RestoreService::commit(
 {
   scene::Scene &scene = ctx.scene;
   RestoreResult res;
+  try {
+    res.ownership = operations::ResultOwnership(m_reserveResult);
+  } catch (const std::bad_alloc &) {
+    res.outcome = Outcome::BUSY;
+    return res;
+  }
   res.targetBatchRef = request.targetBatchRef;
   SceneIdentity *ident = nullptr;
   RestoreFaultInjector fault;
@@ -406,6 +496,12 @@ inline RestoreResult RestoreService::commit(
     return res;
   }
   // 1. Select exactly the named record; never fall back to another one. //
+  const auto imageState =
+      m_edits.restorations().imageState(request.targetBatchRef);
+  consumed =
+      consumed || imageState == edit::RestorationStore::ImageState::RESTORED;
+  conflicted = conflicted
+      || imageState == edit::RestorationStore::ImageState::CONFLICTING;
 
   if (consumed) {
     res.outcome = Outcome::ALREADY_RESTORED;
@@ -460,11 +556,13 @@ inline RestoreResult RestoreService::commit(
       res.outcome = Outcome::CONFLICT;
       return res;
     }
-    std::set<std::string> consumedNode;
     try {
       if (fault && fault())
         throw std::bad_alloc();
-      consumedNode.insert(detail::consumedKey(request.targetBatchRef));
+      res.ownership = operations::ResultOwnership(snapshot->reserveResult);
+      res.wireLease = snapshot->reserveResult();
+      if (!res.wireLease)
+        throw std::bad_alloc();
       res.imageVersions.reserve(1);
       res.imageVersions.push_back({snapshot->handle, {}});
       res.imageVersions[0].dataVersion.reserve(256);
@@ -476,6 +574,10 @@ inline RestoreResult RestoreService::commit(
           + edit::detail::hex64(snapshot->handle.serial)
           + "\",\"data_version\":\"";
       res.imageReceipt.reserve(res.imageReceipt.size() + 512);
+      if (!ctx.prepareActivityResult
+          || !ctx.prepareActivityResult(
+              res.imageReceipt.size() + 512, snapshot->reserveResult))
+        throw std::bad_alloc();
       m_edits.syncStates().prepareScene(request.scene);
     } catch (const std::bad_alloc &) {
       res.outcome = Outcome::BUSY;
@@ -509,10 +611,8 @@ inline RestoreResult RestoreService::commit(
     } catch (...) {
       res.outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
     }
-    {
-      std::lock_guard<std::mutex> lock(m_mutex);
-      m_consumed.merge(consumedNode);
-    }
+    m_edits.restorations().setImageState(
+        request.targetBatchRef, edit::RestorationStore::ImageState::RESTORED);
     m_edits.restorations().release(request.targetBatchRef);
     if (ctx.markRestored)
       ctx.markRestored(

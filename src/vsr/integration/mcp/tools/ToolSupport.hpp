@@ -117,6 +117,15 @@ inline ToolResult statusResult(const operations::OperationRef &ref,
 {
   if (s.code != Outcome::OK)
     return rejected(s.code);
+  ToolResult r;
+  if (s.ownership.reserve
+      && (s.kind == "image_import" || s.kind == "restore")) {
+    try {
+      r.ownership = operations::ResultOwnership(s.ownership.reserve);
+    } catch (const std::bad_alloc &) {
+      return rejected(Outcome::BUSY);
+    }
+  }
   std::string j = "{\"operation_ref\":" + operationRefJson(ref)
       + ",\"kind\":" + json::quote(s.kind)
       + ",\"state\":" + (s.terminal ? "\"terminal\"" : "\"pending\"");
@@ -133,10 +142,9 @@ inline ToolResult statusResult(const operations::OperationRef &ref,
     j += std::string(",\"replayed\":") + (*replayed ? "true" : "false");
   j += "}";
 
-  ToolResult r;
-  r.resourceLease = s.resourceLease;
+  r.resourceLease = r.ownership.lease ? r.ownership.lease : s.resourceLease;
   if (s.resourceLease)
-    r.maxResponseBytes = 12582912;
+    r.maxResponseBytes = r.ownership.lease ? 65536 : 12582912;
   r.structuredJson = j;
   r.contentJson = "[{\"type\":\"text\",\"text\":" + json::quote(j) + "}]";
   r.isError = s.terminal && *s.terminal != Outcome::OK;

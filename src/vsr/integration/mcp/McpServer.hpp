@@ -71,6 +71,7 @@ inline constexpr const char *endpointPath = "/mcp";
 // A tool call result from a registered tool handler (ticket 15 adds tools).
 struct ToolResult
 {
+  operations::ResultOwnership ownership;
   operations::Outcome code{operations::Outcome::OK};
   std::string contentJson{"[]"}; // MCP content array, on success
   // Optional MCP structuredContent object, on success (hook added for the
@@ -177,9 +178,19 @@ class McpServer
 
   struct HttpResponse
   {
+    HttpResponse(int code = 200,
+        std::string payload = {},
+        std::shared_ptr<const void> lease = {})
+        : resourceLease(std::move(lease)),
+          status(code),
+          body(std::move(payload))
+    {}
+    VSR_NOT_COPYABLE(HttpResponse)
+    VSR_DEFAULT_MOVEABLE(HttpResponse)
+    // Slow-send body storage dies before its physical coverage.
+    std::shared_ptr<const void> resourceLease;
     int status{200};
     std::string body;
-    std::shared_ptr<const void> resourceLease;
   };
 
   McpServer(Config config,

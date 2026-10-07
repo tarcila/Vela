@@ -8,6 +8,7 @@
 
 // vsr_integration
 #include "vsr/integration/Integration.hpp"
+#include "vsr/integration/operations/ResultOwnership.hpp"
 #include "vsr/integration/session/SessionAuthority.hpp"
 // vsr_scene
 #include "vsr/scene/Scene.hpp"
@@ -155,6 +156,9 @@ struct StepContext
   // before mutation. Rechecks live authority, cancellation and deadline;
   // it does not reserve resources or consume a write sequence.
   std::function<Outcome()> beforeWrite;
+  // Prepare bounded retained Activity result storage before any write.
+  std::function<bool(std::size_t, ResultOwnership::Reserve)>
+      prepareActivityResult;
 
   // Restoration storage in the application-owned activity budget (spec §5).
   // Each forwards to the installed ActivitySink for this operation's record
@@ -234,12 +238,22 @@ struct Request
   // Logical deadline from admission; <= 0 means none.
   double deadlineSeconds{0.0};
   Executor executor;
+  // Optional ownership prepared by a bounded service before admission.
+  std::shared_ptr<const void> resourceLease;
+  ResultOwnership::Reserve reserveStatus;
   // Fresh admission only, after exact replay. Must not reenter the engine.
   std::function<Outcome()> admissionGuard;
 };
 
 struct Status
 {
+  ResultOwnership ownership;
+  Status() = default;
+  Status(const Status &other);
+  Status &operator=(const Status &other);
+  Status(Status &&) noexcept = default;
+  Status &operator=(Status &&) noexcept = default;
+
   Outcome code{Outcome::OK}; // lookup result; OK when the record was found
   std::string kind;
   std::optional<Progress> progress; // physical state while slot is held
@@ -252,6 +266,30 @@ struct Status
   bool backendFault{false};
   std::shared_ptr<const void> resourceLease; // follows this public result copy
 };
+
+inline Status::Status(const Status &other)
+    : ownership(other.ownership),
+      code(other.code),
+      kind(other.kind),
+      progress(other.progress),
+      terminal(other.terminal),
+      committed(other.committed),
+      resultVisible(other.resultVisible),
+      result(other.result),
+      cleanupElapsedSeconds(other.cleanupElapsedSeconds),
+      heldSlots(other.heldSlots),
+      backendFault(other.backendFault),
+      resourceLease(ownership.lease ? ownership.lease : other.resourceLease)
+{}
+
+inline Status &Status::operator=(const Status &other)
+{
+  if (this != &other) {
+    Status copy(other);
+    *this = std::move(copy);
+  }
+  return *this;
+}
 
 struct Admission
 {
@@ -268,8 +306,9 @@ struct LocalAdmission
 
 // Activity sink ///////////////////////////////////////////////////////////
 
-// One engine transition, as observed by VSR. `status` is the full record
-// (result included); consumers apply their own read checks on lookup.
+// One engine transition, as observed by VSR. Owned Image results borrow
+// resultPayload during the synchronous sink call; other records include
+// their result in status. Consumers apply their own read checks on lookup.
 struct ActivityEvent
 {
   std::optional<OperationRef> ref; // external work
@@ -279,6 +318,8 @@ struct ActivityEvent
   // Session-wide work: the targets its completed result lists (else empty).
   std::vector<Target> covered;
   Status status;
+  // Borrowed only during the synchronous sink call under the record lock.
+  const std::string *resultPayload{nullptr};
   double now{0.0};
 };
 
@@ -297,6 +338,10 @@ class ActivitySink
   virtual std::optional<Id> admitted(const ActivityEvent &event) = 0;
   // Progress, terminal and cleanup transitions of an admitted record.
   virtual void updated(Id id, const ActivityEvent &event) = 0;
+  virtual bool prepareResult(Id, std::size_t, ResultOwnership::Reserve)
+  {
+    return false;
+  }
 
   // Restoration payload accounting for an admitted record (StepContext).
   virtual bool reserveRestoration(Id,
@@ -447,6 +492,8 @@ class OperationEngine
 
   struct Record
   {
+    // Outlive every owning string/function in this retained record.
+    std::shared_ptr<const void> resourceLease;
     std::uint64_t serial{0}; // admission order, for eviction
     std::string sessionId; // empty for local callers
     std::uint64_t requestId{0}; // or local counter
@@ -473,7 +520,6 @@ class OperationEngine
     bool backendFault{false};
     std::string result;
     std::optional<ActivitySink::Id> activityId;
-    std::shared_ptr<const void> resourceLease;
     std::function<std::shared_ptr<const void>()> reserveStatus;
   };
 
@@ -808,7 +854,11 @@ inline ActivityEvent OperationEngine::eventOf(
   e.kind = r.kind;
   e.target = r.target;
   e.covered = r.covered;
-  e.status = describe(r, true, now);
+  const bool borrowed =
+      r.resourceLease && (r.kind == "image_import" || r.kind == "restore");
+  e.status = describe(r, !borrowed, now);
+  if (borrowed)
+    e.resultPayload = &r.result;
   e.now = now;
   return e;
 }
@@ -889,6 +939,8 @@ inline OperationEngine::Key OperationEngine::admit(
   r.deadline =
       request.deadlineSeconds > 0.0 ? m_clock() + request.deadlineSeconds : 0.0;
   r.executor = std::move(request.executor);
+  r.resourceLease = std::move(request.resourceLease);
+  r.reserveStatus = std::move(request.reserveStatus);
   r.holdsSlot = true;
   r.dispatched = true;
   ++m_slotsInUse;
@@ -1114,7 +1166,13 @@ inline Status OperationEngine::describe(
   }
   if (r.terminal && resultVisible) {
     if (!r.result.empty() && r.reserveStatus) {
-      s.resourceLease = r.reserveStatus();
+      try {
+        s.ownership = ResultOwnership(r.reserveStatus);
+        s.resourceLease = s.ownership.lease;
+      } catch (const std::bad_alloc &) {
+        s.code = Outcome::BUSY;
+        return s;
+      }
       if (!s.resourceLease) {
         s.code = Outcome::BUSY;
         return s;
@@ -1309,6 +1367,14 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
     if (m_sink && r && r->activityId)
       fn(*m_sink, *r->activityId);
   };
+  ctx.prepareActivityResult = [withSink](std::size_t bytes,
+                                  ResultOwnership::Reserve reserve) {
+    bool ok = false;
+    withSink([&](ActivitySink &s, ActivitySink::Id id) {
+      ok = s.prepareResult(id, bytes, std::move(reserve));
+    });
+    return ok;
+  };
   ctx.reserveRestoration = [withSink](std::size_t bytes,
                                const std::string &launchId,
                                const std::string &batchId) {
@@ -1408,8 +1474,10 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
       break;
     case Step::Status::COMPLETE:
       r->result = std::move(step.result);
-      r->resourceLease = std::move(step.resourceLease);
-      r->reserveStatus = std::move(step.reserveStatus);
+      if (step.resourceLease)
+        r->resourceLease = std::move(step.resourceLease);
+      if (step.reserveStatus)
+        r->reserveStatus = std::move(step.reserveStatus);
       if (r->sessionWide)
         r->covered = std::move(step.covered);
       r->phase = Phase::RUNNING;

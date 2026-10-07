@@ -166,14 +166,16 @@ engine cleanup.
 ## Import continuation: not a completed host capability
 
 The unfinished Import service can be qualified through
-`ImageExchange::attachRestoration(EditService&)`; the viewer and headless tutorial
+`ImageExchange::attachRestoration(EditService&, RestoreService&)`; the viewer and headless tutorial
 intentionally do not call it. Their descriptors/discovery keep `import:false`,
 and their tool lists still omit `vsr_image_import`. Do not enable this seam in a
 production host until the complete Import acceptance gate is recorded. Merely
 attaching the edit store is insufficient: Import stays absent unless the host
 also supplies its physical reservation and authoritative global retention and
-availability callbacks. These prerequisites are not certification of the
-remaining complete control/result ownership audit.
+availability callbacks, and binds the same normal RestoreService with a bounded
+result reservation. RestoreService accepts that reservation as its optional
+constructor argument; it must use the existing host pool, not a separate or
+larger pool. These prerequisites alone do not certify complete host acceptance.
 
 The opt-in service submits normal `image_import` operations with Scene READ+EDIT,
 strict handle/data_version/file_name arguments, backend cleanup and historical
@@ -224,14 +226,36 @@ remaining control/TLS ownership still needs the final host allocation audit.
 
 Preparation reserves the originating session's S=T ceiling first, then existing
 shared activity/store capacity, then transient E+D+W+S. S is physically allocated
-once and its lease transfers to retention; E/D/W and transient S accounting are
-released after commit. For a 256x256 RGBA target the conservative bound is
+once and its lease transfers to retention. Scratch releases only after buffers,
+worker stack, task and future die; control/result/history charges survive their
+producer. Transient use of S ends at commit without releasing its physical lease. For a 256x256 RGBA target the conservative bound is
 3,212,800 bytes and the retained snapshot is 262,144 bytes (host lease overhead is
 separate). Session charges survive disconnect, remain attributed to the original
 session, and release on recovery/conflict/global eviction, not PNG deletion.
 Reconnect gets a distinct 64 MiB session ceiling but not a distinct global pool.
 Default activity/store limits remain unchanged. Available capacities are
 observations, never future admission guarantees.
+
+Import partitions the conservative W allowance into independently owned leases:
+32 KiB Job/Engine controls, 4 KiB snapshot/store controls, 4 KiB scope/history
+controls and 64 KiB Activity result capacity; the remaining E/D/W lease covers
+buffers, codec and worker lifetime. The one physical S lease is unchanged. These
+controls are distinct from logical snapshot/Activity accounting; entry overhead
+remains 256 bytes, with actual result growth reserved before mutation. Result
+storage is bounded to 16 KiB and covered before allocation. Engine Status,
+Activity Entry and native RestoreResult value copies acquire independent 64 KiB
+physical coverage before copying; the wire envelope has its own reservation too.
+A copy without capacity fails rather than retaining an uncharged payload.
+Prepared Activity result updates borrow the Engine's payload during its locked
+sink call instead of allocating an intermediate result copy at publication.
+
+Image consumed/conflicting and expiration controls are independently charged
+and bounded to 1024 histories. Expired histories retain no foreign-Scene scope.
+Restore result slots are bounded to 1024 per external/local history and never
+prune active owners. Batch IDs use one launch-local, nonwrapping edit/import
+counter instead of an unbounded issued-ID journal. Copy-held reservations can
+outlive Engine/Activity eviction or host teardown; they release when those
+copies die, not when the original operation completes.
 
 This continuation is **not full Import acceptance**. Production host enablement,
 complete control/result physical-ownership and retention-pressure qualification,

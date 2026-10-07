@@ -106,6 +106,8 @@ struct ClientSummary
 
 struct Entry
 {
+  operations::ResultOwnership ownership;
+  std::size_t reservedResultBytes{0};
   // Correlation: external work has `ref`; host-local work has `localRef`.
   std::optional<OperationRef> ref;
   std::optional<LocalRef> localRef;
@@ -206,6 +208,9 @@ class ActivityLog
   // Replaces an entry's state (e.g. on completion). False when evicted or
   // when the grown record cannot fit.
   bool update(Id id, Entry entry);
+  bool prepareResult(
+      Id id, std::size_t bytes, operations::ResultOwnership::Reserve reserve);
+  bool updatePrepared(Id id, const operations::ActivityEvent &event);
 
   std::optional<Entry> get(Id id) const;
 
@@ -333,6 +338,9 @@ class EngineActivitySink : public operations::ActivitySink
   std::optional<Id> admitted(const operations::ActivityEvent &ev) override;
 
   void updated(Id id, const operations::ActivityEvent &ev) override;
+  bool prepareResult(Id id,
+      std::size_t bytes,
+      operations::ResultOwnership::Reserve reserve) override;
 
   bool reserveRestoration(Id id,
       std::size_t bytes,
@@ -418,6 +426,62 @@ inline bool ActivityLog::update(Id id, Entry entry)
     m_usage.restorableBatches++;
   it->entry = std::move(entry);
   m_usage.imageBytes += it->entry.image.size();
+  return true;
+}
+
+inline bool ActivityLog::prepareResult(
+    Id id, std::size_t bytes, operations::ResultOwnership::Reserve reserve)
+{
+  if (bytes > 16384)
+    return false;
+  std::lock_guard<std::mutex> lock(m_mutex);
+  auto it = findId(id);
+  if (it == m_slots.end())
+    return false;
+  const auto oldCost = cost(it->entry);
+  const auto prior =
+      std::max(it->entry.result.size(), it->entry.reservedResultBytes);
+  const auto growth = bytes > prior ? bytes - prior : 0;
+  it->pinned = true;
+  const bool ok = makeRoom(growth, 0);
+  it->pinned = false;
+  if (!ok)
+    return false;
+  if (!it->entry.ownership.lease) {
+    it->entry.ownership = operations::ResultOwnership(std::move(reserve));
+    it->entry.result.reserve(16384);
+  }
+  it->entry.reservedResultBytes = bytes;
+  m_usage.bytes = m_usage.bytes - oldCost + cost(it->entry);
+  return true;
+}
+
+inline bool ActivityLog::updatePrepared(
+    Id id, const operations::ActivityEvent &ev)
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  auto it = findId(id);
+  if (it == m_slots.end() || !it->entry.ownership.lease)
+    return false;
+  auto &e = it->entry;
+  const auto oldCost = cost(e);
+  const auto &s = ev.status;
+  e.progress = s.progress;
+  if (s.terminal && !e.terminal)
+    e.finishedAt = ev.now;
+  e.terminal = s.terminal;
+  e.committed = s.committed;
+  e.cleanupElapsedSeconds = s.cleanupElapsedSeconds;
+  e.heldSlots = s.heldSlots;
+  if (s.terminal) {
+    // Capacity and logical growth were reserved before mutation.
+    const auto &payload = ev.resultPayload ? *ev.resultPayload : s.result;
+    if (payload.size() <= e.result.capacity())
+      e.result.assign(payload);
+    e.reservedResultBytes = 0;
+  }
+  e.active = !s.terminal || s.heldSlots > 0;
+  m_usage.bytes = m_usage.bytes - oldCost + cost(e);
   return true;
 }
 
@@ -575,7 +639,8 @@ inline Usage ActivityLog::usage() const
 
 inline std::size_t ActivityLog::cost(const Entry &e)
 {
-  std::size_t c = ENTRY_OVERHEAD + e.result.size() + e.restorationBytes
+  std::size_t c = ENTRY_OVERHEAD
+      + std::max(e.result.size(), e.reservedResultBytes) + e.restorationBytes
       + e.targets.size() * sizeof(Target);
   if (e.ref)
     c += e.ref->sessionId.size();
@@ -736,6 +801,8 @@ inline std::optional<EngineActivitySink::Id> EngineActivitySink::admitted(
 inline void EngineActivitySink::updated(
     Id id, const operations::ActivityEvent &ev)
 {
+  if (m_log.updatePrepared(id, ev))
+    return;
   auto e = m_log.get(id);
   if (!e)
     return; // cannot happen while active; evicted once terminal
@@ -750,6 +817,12 @@ inline void EngineActivitySink::updated(
   // the record still becomes evictable.
   trimmed.result.clear();
   m_log.update(id, std::move(trimmed));
+}
+
+inline bool EngineActivitySink::prepareResult(
+    Id id, std::size_t bytes, operations::ResultOwnership::Reserve reserve)
+{
+  return m_log.prepareResult(id, bytes, std::move(reserve));
 }
 
 inline bool EngineActivitySink::reserveRestoration(Id id,
@@ -807,7 +880,7 @@ inline void EngineActivitySink::apply(
   e.cleanupElapsedSeconds = s.cleanupElapsedSeconds;
   e.heldSlots = s.heldSlots;
   if (s.terminal)
-    e.result = s.result;
+    e.result = ev.resultPayload ? *ev.resultPayload : s.result;
   // Evictable once terminal and no backend resources remain held.
   e.active = !s.terminal || s.heldSlots > 0;
 }

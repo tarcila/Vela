@@ -6,6 +6,7 @@
 #include "vsr/integration/edit/AgentEdit.hpp"
 #include "vsr/integration/image/PngImport.hpp"
 #include "vsr/integration/mcp/Json.hpp"
+#include "vsr/integration/restore/BatchRestore.hpp"
 // posix
 #if defined(__linux__)
 #include <dirent.h>
@@ -40,6 +41,9 @@ constexpr std::size_t BYTE_CAP = 268435456;
 constexpr std::size_t ENTRY_CAP = 4096;
 constexpr std::size_t WORKER_STACK_BYTES = 512u << 10;
 constexpr std::size_t WORKER_GUARD_BYTES = 64u << 10;
+constexpr std::size_t IMPORT_CONTROL_BYTES = 32768;
+constexpr std::size_t IMPORT_STORE_BYTES = 4096;
+constexpr std::size_t IMPORT_RESULT_BYTES = 65536;
 
 std::string quote(const std::string &s)
 {
@@ -379,6 +383,7 @@ struct ImageExchange::State
         : pixels(allocator), encoded(allocator)
     {}
     std::shared_ptr<State> state;
+    std::shared_ptr<const void> controlLease;
     std::shared_ptr<const void> physicalLease;
     ByteBuffer pixels;
     ByteBuffer encoded;
@@ -420,6 +425,8 @@ struct ImageExchange::State
   std::vector<Source> sources;
   edit::EditService *edits{nullptr};
   std::weak_ptr<const void> editsLifetime;
+  restore::RestoreService *restores{nullptr};
+  std::weak_ptr<const void> restoresLifetime;
   std::map<std::string, std::shared_ptr<SessionLedger>> ledgers;
   std::vector<std::weak_ptr<Job>> jobs;
   mutable std::mutex mutex;
@@ -995,17 +1002,25 @@ ImageExchange::~ImageExchange()
       job->join();
 }
 
-void ImageExchange::attachRestoration(edit::EditService &edits)
+void ImageExchange::attachRestoration(
+    edit::EditService &edits, restore::RestoreService &restores)
 {
+  if (!restores.owns(*m_engine, edits))
+    throw std::runtime_error(
+        "Image restoration requires the normal restore service");
   if (edits.launchId() != m_state->launchId)
     throw std::runtime_error("Image restoration requires the same launch");
   m_state->edits = &edits;
   m_state->editsLifetime = edits.lifetime();
+  m_state->restores = &restores;
+  m_state->restoresLifetime = restores.lifetime();
 }
 
 bool ImageExchange::importAvailable() const
 {
   return m_state->edits && !m_state->editsLifetime.expired()
+      && m_state->restores && !m_state->restoresLifetime.expired()
+      && m_state->restores->resultOwnershipAvailable()
       && m_state->limits.reservePhysicalMemory
       && m_state->limits.availableGlobalRetention
       && m_state->limits.restorationRetained;
@@ -1241,8 +1256,16 @@ operations::Admission ImageExchange::submitImport(
     return admission;
   }
   auto state = m_state;
+  // Cover controls before constructing the Job or its owning strings.
+  auto controlLease = state->limits.reservePhysicalMemory(IMPORT_CONTROL_BYTES);
+  if (!controlLease) {
+    operations::Admission admission;
+    admission.code = Outcome::BUSY;
+    return admission;
+  }
   auto job = std::make_shared<State::Job>(state->limits.allocator);
   job->state = state;
+  job->controlLease = std::move(controlLease);
   job->importing = true;
   job->sessionId = credentials.sessionId;
   job->name = std::move(fileName);
@@ -1257,6 +1280,10 @@ operations::Admission ImageExchange::submitImport(
   }
   operations::Request request;
   request.kind = "image_import";
+  request.resourceLease = job->controlLease;
+  request.reserveStatus = [reserve = state->limits.reservePhysicalMemory] {
+    return reserve(IMPORT_RESULT_BYTES);
+  };
   request.target = session::Target::scene(scene);
   request.capability = session::Capability::EDIT;
   request.boundSceneRead = true;
@@ -1276,6 +1303,10 @@ operations::Admission ImageExchange::submitImport(
       if (job->notificationFailed)
         result.outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
       result.result = std::move(job->receipt);
+      result.resourceLease = job->controlLease;
+      result.reserveStatus = [reserve = state->limits.reservePhysicalMemory] {
+        return reserve(IMPORT_RESULT_BYTES);
+      };
       return result;
     }
     const auto fail = [&](Outcome outcome, const char *reason) {
@@ -1295,7 +1326,7 @@ operations::Admission ImageExchange::submitImport(
       }
       if (ctx.abandoned || ctx.isAbandoned())
         return Step{};
-      if (state->editsLifetime.expired())
+      if (state->editsLifetime.expired() || state->restoresLifetime.expired())
         return fail(Outcome::BUSY, "resource_limit");
       identity::SceneIdentity *ids = nullptr;
       std::weak_ptr<const void> registration;
@@ -1356,6 +1387,10 @@ operations::Admission ImageExchange::submitImport(
             + std::to_string(state->limits.globalRetentionBytes)
             + ",\"eviction_possible\":true}";
         job->receipt.reserve(job->receipt.size() + 512);
+        if (!ctx.prepareActivityResult
+            || !ctx.prepareActivityResult(
+                job->receipt.size() + 512, job->snapshot->reserveResult))
+          return fail(Outcome::BUSY, "resource_limit");
         state->edits->syncStates().prepareScene(scene);
         if (ctx.beforeWrite) {
           const auto authority = ctx.beforeWrite();
@@ -1451,6 +1486,18 @@ operations::Admission ImageExchange::submitImport(
         return fail(Outcome::BUSY, "restore_budget_exhausted");
       job->snapshot =
           std::make_shared<edit::ImageSnapshot>(state->limits.allocator);
+      job->snapshot->controlOwnership = operations::ResultOwnership(
+          [reserve = state->limits.reservePhysicalMemory] {
+            return reserve(IMPORT_STORE_BYTES);
+          });
+      job->snapshot->scopeLease =
+          state->limits.reservePhysicalMemory(IMPORT_STORE_BYTES);
+      if (!job->snapshot->scopeLease)
+        return fail(Outcome::BUSY, "resource_limit");
+      job->snapshot->reserveResult =
+          [reserve = state->limits.reservePhysicalMemory] {
+            return reserve(IMPORT_RESULT_BYTES);
+          };
       job->snapshot->sessionLease = std::move(charge);
       job->snapshot->handle = handle;
       job->snapshot->scene = &ctx.scene;
@@ -1479,6 +1526,9 @@ operations::Admission ImageExchange::submitImport(
       if (!state->edits->restorations().prepareImage(std::move(record)))
         return fail(Outcome::BUSY, "resource_limit");
       job->storePrepared = true;
+      if (!ctx.prepareActivityResult
+          || !ctx.prepareActivityResult(64, job->snapshot->reserveResult))
+        return fail(Outcome::BUSY, "resource_limit");
       bool transientReserved = false;
       {
         std::lock_guard<std::mutex> lock(state->mutex);
@@ -1496,8 +1546,9 @@ operations::Admission ImageExchange::submitImport(
             state->limits.reservePhysicalMemory(b->texels);
         if (!job->snapshot->physicalLease)
           return fail(Outcome::BUSY, "resource_limit");
-        job->physicalLease =
-            state->limits.reservePhysicalMemory(b->peak - b->texels);
+        job->physicalLease = state->limits.reservePhysicalMemory(b->peak
+            - b->texels - IMPORT_CONTROL_BYTES - 2 * IMPORT_STORE_BYTES
+            - IMPORT_RESULT_BYTES);
         if (!job->physicalLease)
           return fail(Outcome::BUSY, "resource_limit");
       }

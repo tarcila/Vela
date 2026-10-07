@@ -323,10 +323,13 @@ struct WriteFaultObserver : vsr::scene::EmptyUpdateDelegate
   bool failMap{true};
   bool allocationFailure{false};
   bool failUnmap{false};
+  std::function<void()> afterBurn;
 };
 
 void WriteFaultObserver::signalArrayMapped(const vsr::scene::Array *)
 {
+  if (afterBurn)
+    afterBurn();
   if (failMap) {
     if (allocationFailure)
       throw std::bad_alloc();
@@ -468,13 +471,19 @@ struct Fixture
           });
       REQUIRE(translations->attachScene(sceneId, *sceneIds));
     }
-    restores = std::make_unique<restore::RestoreService>(*engine, *edits);
+    operations::ResultOwnership::Reserve restoreReservation;
+    if (imageImports)
+      restoreReservation = [reserve = exchangeLimits.reservePhysicalMemory] {
+        return reserve(65536);
+      };
+    restores = std::make_unique<restore::RestoreService>(
+        *engine, *edits, std::move(restoreReservation));
     restores->attachScene(sceneId, *sceneIds);
     images = std::make_unique<image::ImageExchange>(
         integration, *engine, authority->launchId(), dir, exchangeLimits);
     images->attachScene(sceneId, *sceneIds);
     if (imageImports)
-      images->attachRestoration(*edits);
+      images->attachRestoration(*edits, *restores);
     inspector->setImageExchange(
         [this](SceneId id, const std::string &sessionId) {
           return images->metadata(id, sessionId);
@@ -6342,7 +6351,7 @@ SCENARIO(
   f.images = std::make_unique<image::ImageExchange>(
       f.integration, *f.engine, f.authority->launchId(), f.dir);
   f.images->attachScene(f.sceneId, *f.sceneIds);
-  f.images->attachRestoration(*f.edits);
+  f.images->attachRestoration(*f.edits, *f.restores);
   CHECK_FALSE(f.images->importAvailable());
   json::Value metadata;
   REQUIRE(json::parse(f.images->metadata(f.sceneId), metadata));
@@ -6908,14 +6917,21 @@ SCENARIO(
   writeInput(f.exchangePath() + "/agent.png", inputPng(256, 256, 6, rows));
   f.importImage(s, 2, handle, version, "agent.png");
   REQUIRE(f.integration.service() > 0);
-  CHECK(memory->used() == baseline + 3212800 + 2 * leaseOverhead); // E+D+W+S.
+  // One S lease; E/D/work and independently owned Job/store/Activity
+  // controls partition W, rather than releasing retained controls with scratch.
+  CHECK(memory->used() == baseline + 3212800 + 6 * leaseOverhead);
+  std::size_t retained = 32768 + 65536 + 2 * leaseOverhead;
   SECTION("successful ownership transfer")
   {
     const auto committed = f.await(s, 2);
     REQUIRE(committed.str("outcome") == "ok");
-    CHECK(memory->used() == baseline + 262144 + leaseOverhead);
+    CHECK(memory->used()
+        == baseline + 262144 + 32768 + 8192 + 65536 + 5 * leaseOverhead);
     f.restoreBatch(s, 3, *committed.result()->get("batch_ref"));
     REQUIRE(f.await(s, 3).str("outcome") == "ok");
+    // Snapshot and scratch are gone; independent Engine, Activity, scope
+    // history and RestoreResult owners remain covered until their eviction.
+    retained = 32768 + 4096 + 5 * 65536 + 7 * leaseOverhead;
   }
   SECTION("late authority withdrawal")
   {
@@ -6934,12 +6950,12 @@ SCENARIO(
   }
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  while (memory->used() != baseline) {
+  while (memory->used() != baseline + retained) {
     f.drain();
     REQUIRE(std::chrono::steady_clock::now() < deadline);
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
-  CHECK(memory->used() == baseline);
+  CHECK(memory->used() == baseline + retained);
 }
 
 SCENARIO("Image host teardown releases retained and active snapshot ownership",
@@ -7405,6 +7421,51 @@ SCENARIO("MCP Image notifications burn reservations without losing recovery",
     CHECK(image->dataWriteSequence() == 4);
     CHECK(std::memcmp(image->data(), before, sizeof(before)) == 0);
   }
+  SECTION("cancelled Import after burn leaves no completed token or snapshot")
+  {
+    const operations::Credentials credentials{
+        f.authority->launchCredential(), s.id, s.secret};
+    fault->afterBurn = [&] { f.engine->cancel(credentials, {s.id, 2}); };
+    f.importImage(s, 2, handle, version, "agent.png");
+    const auto failed = f.await(s, 2);
+    CHECK(failed.str("outcome") == "cancelled");
+    CHECK_FALSE(failed.flag("committed"));
+    CHECK(image->dataWriteSequence() == 1);
+    CHECK_FALSE(image->isMapped());
+    CHECK(std::memcmp(image->data(), before, sizeof(before)) == 0);
+    CHECK(f.edits->restorations().size() == 0);
+    fault->afterBurn = {};
+    fault->failMap = false;
+    f.importImage(s, 3, handle, version, "agent.png");
+    CHECK(f.await(s, 3).str("outcome") == "ok");
+    CHECK(image->dataWriteSequence() == 3);
+  }
+  SECTION("cancelled Restore after burn keeps recovery and the value spent")
+  {
+    fault->failMap = false;
+    f.importImage(s, 2, handle, version, "agent.png");
+    const auto imported = f.await(s, 2);
+    REQUIRE(imported.str("outcome") == "ok");
+    const auto batch = *imported.result()->get("batch_ref");
+    const operations::Credentials credentials{
+        f.authority->launchCredential(), s.id, s.secret};
+    fault->failMap = true;
+    fault->afterBurn = [&] { f.engine->cancel(credentials, {s.id, 3}); };
+    f.restoreBatch(s, 3, batch);
+    const auto failed = f.await(s, 3);
+    CHECK(failed.str("outcome") == "cancelled");
+    CHECK_FALSE(failed.flag("committed"));
+    CHECK(image->dataWriteSequence() == 2);
+    CHECK(std::memcmp(image->data(), after, sizeof(after)) == 0);
+    CHECK(f.restores->eligible(
+        {batch.get("launch_id")->s, batch.get("batch_id")->s}));
+    fault->afterBurn = {};
+    fault->failMap = false;
+    f.restoreBatch(s, 4, batch);
+    CHECK(f.await(s, 4).str("outcome") == "ok");
+    CHECK(image->dataWriteSequence() == 4);
+    CHECK(std::memcmp(image->data(), before, sizeof(before)) == 0);
+  }
   SECTION("failed Restore map keeps its snapshot and spent sequence")
   {
     fault->failMap = false;
@@ -7761,6 +7822,193 @@ SCENARIO(
       source, ANARI_UFIXED8_VEC4, 1, 1, vsr::io::RowOrder::TOP_DOWN, after);
   CHECK(restoredImage.texels == image.texels);
   CHECK(std::memcmp(restoredImage.texels->data(), before, sizeof(before)) == 0);
+}
+
+SCENARIO("Image result copies retain independent physical ownership",
+    "[integration][mcp][image-import][image-import-owners]")
+{
+  auto memory = std::make_shared<vsr::rendering::FrameBudget>(8u << 20);
+  const auto baseline = memory->used();
+  auto probe = memory->reserve(1);
+  const auto overhead = memory->used() - baseline - 1;
+  probe.reset();
+  image::ExchangeLimits limits;
+  limits.physicalByteCap = memory->limit();
+  limits.reservePhysicalMemory = [memory](std::size_t bytes) {
+    return memory->reserve(bytes);
+  };
+  auto f = std::make_unique<Fixture>(inspection::PageLimits{},
+      true,
+      false,
+      false,
+      120.,
+      true,
+      UINT64_MAX,
+      limits,
+      true);
+  auto image = f->scene.createArray(ANARI_UFIXED8_VEC4, 1, 1);
+  image->setName("tracked-image");
+  const unsigned char before[] = {17, 29, 41, 0};
+  image->setData(static_cast<const void *>(before));
+  const auto s = f->attach();
+  const auto item = f->inspectArray(s, 1).result()->get("items")->a.at(0);
+  writeInput(
+      f->exchangePath() + "/agent.png", inputPng(1, 1, 6, {0, 29, 17, 41, 0}));
+  f->importImage(s,
+      2,
+      item.get("handle")->s,
+      item.get("image_info")->get("data_version")->s,
+      "agent.png");
+  REQUIRE(f->await(s, 2).str("outcome") == "ok");
+  const operations::Credentials credentials{
+      f->authority->launchCredential(), s.id, s.secret};
+  std::optional<operations::Status> held =
+      f->engine->status(credentials, {s.id, 2});
+  REQUIRE(held->terminal == Outcome::OK);
+  auto usage = memory->used();
+  std::optional<operations::Status> copy = *held;
+  CHECK(memory->used() == usage + 65536 + overhead);
+  usage = memory->used();
+  auto entries = f->imageActivity->snapshot();
+  CHECK(memory->used() == usage + 65536 + overhead);
+  const auto imported =
+      std::find_if(entries.begin(), entries.end(), [](const auto &entry) {
+        return entry.entry.kind == activity::OperationKind::IMAGE_IMPORT;
+      });
+  REQUIRE(imported != entries.end());
+  usage = memory->used();
+  std::optional<activity::Entry> entryCopy = imported->entry;
+  CHECK(memory->used() == usage + 65536 + overhead);
+  REQUIRE(entryCopy->batchRef);
+  const auto batch = *entryCopy->batchRef;
+  json::Value batchJson;
+  REQUIRE(json::parse(edit::detail::batchRefJson(batch), batchJson));
+  f->restoreBatch(s, 3, batchJson);
+  REQUIRE(f->await(s, 3).str("outcome") == "ok");
+  std::optional<restore::RestoreResult> slot = f->restores->result({s.id, 3});
+  REQUIRE(slot);
+  usage = memory->used();
+  std::optional<restore::RestoreResult> slotCopy = *slot;
+  CHECK(memory->used() == usage + 65536 + overhead);
+  REQUIRE(f->rpc("vsr/detach", "{}", &s).status == 200);
+  f.reset();
+  // Job/worker/snapshot/Engine/Activity/store die independently of held
+  // public copies. The six copies retain only their six own charges.
+  CHECK(memory->used() == baseline + 6 * (65536 + overhead));
+  CHECK(copy->result == held->result);
+  CHECK(entryCopy->result == held->result);
+  held.reset();
+  copy.reset();
+  entries.clear();
+  entryCopy.reset();
+  slot.reset();
+  slotCopy.reset();
+  CHECK(memory->used() == baseline);
+}
+
+SCENARIO("Image scope history owns bounded consumed and expired controls",
+    "[integration][mcp][image-import][image-import-history]")
+{
+  auto memory = std::make_shared<vsr::rendering::FrameBudget>(8u << 20);
+  const auto baseline = memory->used();
+  auto probe = memory->reserve(1);
+  const auto overhead = memory->used() - baseline - 1;
+  probe.reset();
+  {
+    edit::RestorationStore store;
+    CHECK(store.capacity() == 32);
+    for (unsigned i = 0; i < 1050; ++i) {
+      auto snapshot = std::make_shared<edit::ImageSnapshot>();
+      snapshot->scopeLease = memory->reserve(4096);
+      snapshot->physicalLease = memory->reserve(1);
+      REQUIRE(snapshot->scopeLease);
+      REQUIRE(snapshot->physicalLease);
+      snapshot->bytes.resize(1);
+      edit::RestorationRecord record;
+      record.ref = {"launch", std::to_string(i)};
+      record.scene = 7;
+      record.image = snapshot;
+      const auto ref = record.ref;
+      REQUIRE(store.prepareImage(std::move(record)));
+      store.publishImage(ref);
+      if (i % 2) {
+        REQUIRE(store.setImageState(
+            ref, edit::RestorationStore::ImageState::CONFLICTING));
+      } else {
+        REQUIRE(store.setImageState(
+            ref, edit::RestorationStore::ImageState::RESTORED));
+      }
+      store.release(ref);
+      snapshot.reset();
+      CHECK(memory->used()
+          == baseline + std::min<unsigned>(i + 1, 1024) * (4096 + overhead));
+    }
+    CHECK_FALSE(store.imageScope({"launch", "0"}));
+    CHECK(store.imageScope({"launch", "1049"}) == 7);
+    CHECK(store.imageState({"launch", "1049"})
+        == edit::RestorationStore::ImageState::CONFLICTING);
+    CHECK(store.size() == 0);
+  }
+  CHECK(memory->used() == baseline);
+  {
+    edit::RestorationStore store;
+    for (unsigned i = 0; i < 1050; ++i) {
+      auto snapshot = std::make_shared<edit::ImageSnapshot>();
+      snapshot->scopeLease = memory->reserve(4096);
+      REQUIRE(snapshot->scopeLease);
+      edit::RestorationRecord record;
+      record.ref = {"launch", std::to_string(i)};
+      record.scene = 7;
+      record.image = snapshot;
+      REQUIRE(store.prepareImage(std::move(record)));
+      store.publishImage({"launch", std::to_string(i)});
+      store.expireUnless([](const edit::BatchRef &) { return false; });
+      snapshot.reset();
+      CHECK(memory->used()
+          == baseline + std::min<unsigned>(i + 1, 1024) * (4096 + overhead));
+    }
+    CHECK_FALSE(store.imageScope({"launch", "1049"}));
+    CHECK(store.expired({"launch", "1049"}));
+    CHECK_FALSE(store.expired({"launch", "0"}));
+  }
+  CHECK(memory->used() == baseline);
+}
+
+SCENARIO("Image admission preserves default Activity and store ceilings",
+    "[integration][mcp][image-import][image-import-defaults]")
+{
+  activity::ActivityLog log;
+  CHECK(log.limits().bytes == 16777216);
+  CHECK(log.limits().entries == 1024);
+  CHECK(log.limits().restorableBatches == 32);
+  CHECK(activity::ENTRY_OVERHEAD == 256);
+  std::vector<activity::ActivityLog::Id> ids;
+  for (unsigned i = 0; i < 1024; ++i) {
+    activity::Entry entry;
+    entry.active = true;
+    const auto id = log.append(std::move(entry));
+    REQUIRE(id);
+    ids.push_back(*id);
+  }
+  CHECK_FALSE(log.append(activity::Entry{}));
+  for (unsigned i = 0; i < 32; ++i)
+    REQUIRE(log.reserveRestoration(ids[i], 4, {"launch", std::to_string(i)}));
+  CHECK_FALSE(log.reserveRestoration(ids[32], 4, {"launch", "32"}));
+  log.cancelRestoration(ids[0]);
+  CHECK(log.reserveRestoration(ids[32], 4, {"launch", "32"}));
+  edit::RestorationStore store;
+  for (unsigned i = 0; i < 32; ++i) {
+    edit::RestorationRecord record;
+    record.ref = {"launch", std::to_string(i)};
+    record.image = std::make_shared<edit::ImageSnapshot>();
+    REQUIRE(store.prepareImage(std::move(record)));
+  }
+  edit::RestorationRecord extra;
+  extra.ref = {"launch", "32"};
+  extra.image = std::make_shared<edit::ImageSnapshot>();
+  CHECK_FALSE(store.prepareImage(extra));
+  store.cancelImage({"launch", "0"});
+  CHECK(store.prepareImage(std::move(extra)));
 }
 
 #endif
