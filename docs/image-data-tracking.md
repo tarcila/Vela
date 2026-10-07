@@ -32,11 +32,12 @@ change-back.
 An unmap publishes before downstream notification: notification failure does
 not roll back bytes or pretend the write did not complete.
 
-Qualified viewer/headless hosts now expose [PNG Image Export](image-png-exchange.md).
-Discovery distinguishes export availability from the `data_tracking` prerequisite
-and still reports `import:false`. Tracking alone is not file-exchange authority;
-unsafe/unavailable directories remain unavailable. Image Import and Image undo
-are not implemented.
+Fully bound viewer/headless hosts expose [PNG Image Export and recoverable
+Image Import](image-png-exchange.md). Discovery reports export/import availability
+separately from the `data_tracking` prerequisite. Tracking alone is not
+file-exchange authority; unsafe/unavailable directories remain unavailable.
+Import additionally requires shared physical/Activity retention reservations and
+the normal RestoreService binding. Unqualified hosts keep Import absent.
 
 ## Host prerequisite
 
@@ -65,8 +66,8 @@ they are equality-only, not sortable sequence numbers. A smaller constructor
 ceiling supports bounded exhaustion tests without changing token identities or
 introducing wrap/reset. Exhaustion rejects further tracked maps and `setData`
 before mutation, while inspection, const reads and unrelated parameter edits
-remain usable. Future replacement/restore transactions must use this same
-reservation boundary rather than a separate clock.
+remain usable. Image Import and restore use this same reservation boundary,
+not a separate clock.
 
 Disconnect does not remove enrollment. Owning-thread
 `Integration::setImageExchangeAvailable(sceneId,false)` temporarily withdraws

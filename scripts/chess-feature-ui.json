@@ -1,0 +1,5 @@
+{
+  "disable-edits": [["click", 274, 12], ["click", 350, 437], ["click", 85, 194], ["screenshot", "edits-disabled"], ["click", 591, 73]],
+  "before-agent-recovery": [["click", 260, 41], ["click", 270, 202], ["screenshot", "recovered-ui"]],
+  "reenable-edits": [["click", 274, 12], ["click", 350, 437], ["click", 85, 194], ["screenshot", "edits-reenabled"], ["click", 591, 73]]
+}

@@ -15,7 +15,7 @@ machine-readable field, and `message` strings are explanatory only.
   | `tools/QueryTools.hpp` | `vsr_discover`, `vsr_inspect` | 103 |
   | `tools/LookupTools.hpp` | `vsr_operation_status`, `vsr_cancel` | 103 |
   | `tools/EditTools.hpp` | `vsr_edit`, `vsr_restore` | 104 |
-  | `tools/ImageTools.hpp` | `vsr_image_export` | Image Export |
+  | `tools/ImageTools.hpp` | `vsr_image_export`, `vsr_image_import` | Image exchange |
   | `tools/RenderTools.hpp` | `vsr_render`, `vsr_render_image`, `vsr_select_device`, `vsr_set_view_camera`, `vsr_resynchronize` | 105 |
 
 ## Payload placement
@@ -327,8 +327,10 @@ it is not a completed write or parameter edit. Completed unmap advances inspecti
 Scene and Array parameter versions once and invalidates outstanding cursors again.
 
 Qualified hosts advertise `image_exchange` with `supported`, `enabled`,
-`export`, `import:false`, `data_tracking`, a private `image_exchange_directory`
-and effective `exchange_limits`. Unsafe directories and unsupported platforms
+`export`, `import`, `data_tracking`, a private `image_exchange_directory`
+and effective `exchange_limits`. Import is true only with the complete shared
+physical/Activity retention and normal RestoreService binding; tracking or
+Export support alone does not qualify Import. Unsafe directories and unsupported platforms
 advertise unavailable with an explicit reason. The optional strict
 `image_exchange` field in the private launch descriptor publishes the same
 Image-independent directory/limit names as startup observations. It omits
