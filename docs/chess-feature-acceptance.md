@@ -21,8 +21,36 @@ cmake --build build-agent --parallel 2
 cmake --install build-agent --prefix "$PWD/build-agent/install"
 # EVIDENCE must be a workspace-local scratch directory, not a source artifact.
 python3 scripts/test-chess-feature.py build-agent "$EVIDENCE" \
-  scripts/chess-feature-ui.json
+  scripts/chess-feature-ui.json --agentRestorationBytes 67108864
 ```
+
+For the actual CUDA-enabled multi-config rig, reuse its configured build and
+installation; do not substitute a CPU configure:
+
+```bash
+cmake --build _out/_cmake --config RelWithDebInfo --parallel 2
+cmake --install _out/_cmake --config RelWithDebInfo
+python3 scripts/test-chess-feature.py _out/_cmake "$EVIDENCE" \
+  scripts/chess-feature-ui.json --config RelWithDebInfo \
+  --install-prefix "$PWD/_out" --agentRestorationBytes 67108864
+```
+
+`--config` selects the executable subdirectory; `--install-prefix` selects the
+newly installed ANARI library. Both are driver-only provenance/path options,
+not host configuration, device selection or qualification switches. The driver
+records and hashes the selected executables and installed library. A CUDA-enabled
+host using the qualified Helide CPU-ready presentation still proves only that
+presentation path, not GPU presentation.
+
+The acceptance driver **defaults to no override**: without the option the host
+retains its 16777216-byte (16 MiB) Activity/restoration cap. The command above
+explicitly selects the user-authorized 67108864-byte (64 MiB) host cap, needed
+for this original 2048×2048 RGBA Image plus Activity overhead. The driver records
+the exact option and effective metadata in `provenance.json`, and checks that
+session/transient/file ceilings remain unchanged. Production Import never raises
+limits; this is launch configuration, not a persistent preference or permission.
+`scripts/test-agent-host-options.py BUILD EVIDENCE_DIR` separately checks both
+hosts' malformed-option rejection and headless default/explicit metadata/binding.
 
 The UI plan applies only to the fresh private 1280×900 default layout. It uses the
 existing Agent Activity camera/edit controls and Camera Poses recovery button,
@@ -41,9 +69,13 @@ Screenshots are UI-action diagnostics, **not** presented-frame evidence.
 - Actual black Image Export and separate external PIL processing by
   `scripts/recolour-chess-image.py`, preserving raw dimensions/channels/alpha,
   neutral dark texels, Color Space and Row Order. Import uses its observed token,
-  original Array and confined processed basename with **unchanged default caps**.
-- A successful Image import must produce exact processed bytes in that Array and
-  a normal exact restore with a fresh data token. An actual resource rejection
+  original Array and confined processed basename. All independent memory/session/
+  file caps remain unchanged; only the explicitly configured Activity cap differs.
+- A successful Image import must identify the complete discovered shared-Sampler
+  set, keep every binding on that original Array, produce exact processed bytes,
+  and show a qualified post-import frame. Normal exact Restore must publish a
+  fresh token agreeing with export/inspection, preserve all metadata and bindings,
+  recover every original byte and show a qualified restored frame. An actual resource rejection
   instead records `blockers.json`, verifies unchanged bytes/token and explicitly
   leaves this workflow incomplete; it is never credited as shared-user mutation.
 - Camera starts off; the separate local camera checkbox enables only the explicit
@@ -68,7 +100,8 @@ Exit **0** and `PASS` mean every combined assertion passed. Exit **2** means a
 recorded incomplete acceptance (currently the actual 2048×2048 RGBA snapshot
 cannot fit the default 16 MiB global retention cap plus Activity overhead).
 Exit **1** means an unexpected failed assertion/driver error. Never turn exit 2
-into a passing test, increase host budgets automatically, resize the target or
+into a passing test, increase host budgets automatically (an explicit launch
+option is required), resize the target or
 substitute a tiny fixture. PNG cleanup does not free undo; undo eviction/restore
 also does not delete PNGs.
 

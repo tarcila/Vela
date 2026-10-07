@@ -52,6 +52,21 @@ Or open your own scene in the viewer:
 ./_out/_cmake/vsrViewer --agentIntegration -obj /path/to/model.obj
 ```
 
+Both hosts accept `--agentRestorationBytes N` as an explicit **launch-local**
+shared ActivityLog/activity-and-restoration byte limit. The default remains
+**16777216 bytes (16 MiB)**. For example, `--agentRestorationBytes 67108864`
+selects 64 MiB; this can retain a 2048×2048 RGBA snapshot plus record overhead.
+Only positive ASCII decimal bytes are accepted; zero, signs, units, missing or
+invalid values, overflow, duplicate options and `--agentRestorationBytes=N`
+are rejected before any scene-file parsing. Other arguments retain their existing
+host behavior. This is not persisted and never grants camera permission or
+activates the viewer integration by itself. Image Import never raises limits.
+The physical FrameBudget, 64 MiB originating-session snapshot ceiling,
+transient ceiling, exchange file quotas, entry/batch counts and store limits
+remain unchanged; each independent constraint still applies. Descriptor/discovery
+`exchange_limits.effective_global_retention_byte_cap` and Import
+`restoration_policy.effective_global_limit_bytes` report the chosen host cap.
+
 The **descriptor is a JSON connection file created by the application**, not
 something you write yourself. It contains the loopback endpoint and a private
 launch credential. Qualified Image-export hosts also publish an optional strict

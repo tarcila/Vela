@@ -36,6 +36,7 @@ CLI parsing is split into two layers:
 | Option | Description |
 | --- | --- |
 | `--agentIntegration` | Explicitly expose authenticated agent tools, including existing-node edits; requires an integration/MCP-enabled build. | 
+| `--agentRestorationBytes N` | Set the launch-local shared Activity/restoration byte cap (positive decimal bytes); default **16777216** (16 MiB). Does not enable integration or camera control. |
 | `--noDefaultLayout` | Do not apply built-in ImGui dock layout at startup. |
 | `--noDefaultRenderer` | Do not auto-select a default renderer in the viewport. |
 | `--secondaryView <library>` / `-sv <library>` | Enable secondary viewport and set its ANARI library. |

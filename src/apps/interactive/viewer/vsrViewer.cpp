@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+// vsr_app
+#include <vsr/app/AgentOptions.hpp>
 // vsr_io
 #include <vsr/io/procedural.hpp>
 // vsr_ui_imgui
@@ -486,17 +488,22 @@ struct AgentView : vsr::integration::render::RenderBackend
 class Application : public VSRApplication
 {
  public:
-  // `argv` must already have `--agentIntegration` stripped (see main()):
+  // `argv` must already have host integration options stripped (see main()):
   // Context would otherwise take the unknown flag for a state file and
   // skip both the default scene and command-line imports.
-  Application(int argc, const char *argv[], bool agentIntegrationRequested)
+  Application(int argc,
+      const char *argv[],
+      bool agentIntegrationRequested,
+      std::size_t restorationBytes)
       : VSRApplication(argc, argv)
   {
 #ifdef VSR_USE_INTEGRATION
     // Opt-in: nothing is exposed to agents unless the operator asks.
     m_agentIntegrationRequested = agentIntegrationRequested;
+    m_activityLimits.bytes = restorationBytes;
 #else
     (void)agentIntegrationRequested;
+    (void)restorationBytes;
 #endif
   }
   ~Application() override = default;
@@ -916,6 +923,7 @@ DockSpace         ID=0x80F5B4C5 Window=0x079D3A04 Pos=0,56 Size=3840,2206 Split=
   void registerViewportBindings();
 
   bool m_agentIntegrationRequested{false};
+  vsr::integration::activity::Limits m_activityLimits;
   vsr_ui::IntegrationActivity *m_activityWindow{nullptr};
   std::unique_ptr<vsr::integration::Integration> m_integration;
   std::unique_ptr<vsr::integration::session::SessionAuthority> m_authority;
@@ -1090,7 +1098,7 @@ void Application::setupIntegration()
   m_restores->attachScene(*sceneId, *m_identity);
   m_sync = std::make_unique<vi::sync::SyncService>(
       *m_integration, *m_engine, m_edits->syncStates());
-  m_activity = std::make_unique<vi::activity::ActivityLog>();
+  m_activity = std::make_unique<vi::activity::ActivityLog>(m_activityLimits);
   m_activitySink = std::make_unique<vi::activity::EngineActivitySink>(
       *m_activity, *m_integration);
   m_engine->setActivitySink(m_activitySink.get());
@@ -1352,21 +1360,29 @@ void Application::teardownIntegration()
 
 int main(int argc, const char *argv[])
 {
-  // vsrViewer owns `--agentIntegration`; remove it before the base
-  // application and Context parse the remaining arguments.
+  // Reject malformed host options before Context can treat them as scene files.
+  vsr::app::AgentOptions options;
+  if (!vsr::app::parseAgentOptions(argc, argv, options)) {
+    std::fprintf(stderr,
+        "--agentRestorationBytes requires one positive decimal byte count\n");
+    return 1;
+  }
+  // vsrViewer owns `--agentIntegration`; remove it before the base parser.
   bool agentIntegrationRequested = false;
   std::vector<const char *> args;
-  args.reserve(argc);
-  for (int i = 0; i < argc; i++) {
-    if (i > 0 && std::strcmp(argv[i], "--agentIntegration") == 0)
+  args.reserve(options.arguments.size());
+  for (std::size_t i = 0; i < options.arguments.size(); i++) {
+    if (i > 0 && std::strcmp(options.arguments[i], "--agentIntegration") == 0)
       agentIntegrationRequested = true;
     else
-      args.push_back(argv[i]);
+      args.push_back(options.arguments[i]);
   }
 
   {
-    vsr_viewer::Application app(
-        int(args.size()), args.data(), agentIntegrationRequested);
+    vsr_viewer::Application app(int(args.size()),
+        args.data(),
+        agentIntegrationRequested,
+        options.restorationBytes);
     app.run(1920, 1080, "VSR Viewer");
   }
 

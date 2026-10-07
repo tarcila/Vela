@@ -19,6 +19,7 @@
 // Usage: vsrTutorialIntegrationHeadless [--exit-after-activation]
 
 // vsr
+#include "vsr/app/AgentOptions.hpp"
 #include "vsr/app/Context.h"
 #include "vsr/integration/Integration.hpp"
 #include "vsr/integration/activity/Activity.hpp"
@@ -314,12 +315,19 @@ int fail(const char *what)
 
 int main(int argc, const char *argv[])
 {
+  vsr::app::AgentOptions agentOptions;
+  if (!vsr::app::parseAgentOptions(argc, argv, agentOptions)) {
+    std::fprintf(stderr,
+        "--agentRestorationBytes requires one positive decimal byte count\n");
+    return 1;
+  }
   bool exitAfterActivation = false;
-  for (int i = 1; i < argc; i++) {
-    if (std::strcmp(argv[i], "--exit-after-activation") == 0)
+  for (std::size_t i = 1; i < agentOptions.arguments.size(); i++) {
+    if (std::strcmp(agentOptions.arguments[i], "--exit-after-activation") == 0)
       exitAfterActivation = true;
     else {
-      std::fprintf(stderr, "unknown argument '%s'\n", argv[i]);
+      std::fprintf(
+          stderr, "unknown argument '%s'\n", agentOptions.arguments[i]);
       return 1;
     }
   }
@@ -385,7 +393,9 @@ int main(int argc, const char *argv[])
   host->restores->attachScene(*sceneId, *host->identity);
   host->sync = std::make_unique<vi::sync::SyncService>(
       integration, *host->engine, host->edits->syncStates());
-  host->activity = std::make_unique<vi::activity::ActivityLog>();
+  vi::activity::Limits activityLimits;
+  activityLimits.bytes = agentOptions.restorationBytes;
+  host->activity = std::make_unique<vi::activity::ActivityLog>(activityLimits);
   host->activitySink = std::make_unique<vi::activity::EngineActivitySink>(
       *host->activity, integration);
   host->engine->setActivitySink(host->activitySink.get());

@@ -4,7 +4,9 @@
 
 """Isolated installed-vsrViewer chess acceptance; never attach to a user launch.
 
-Usage: test-chess-feature.py BUILD EVIDENCE_DIR [scripts/chess-feature-ui.json]
+Usage: test-chess-feature.py BUILD EVIDENCE_DIR [UI_PLAN] [--agentRestorationBytes N]
+Multi-config builds: --config RelWithDebInfo --install-prefix PREFIX
+Default host restoration budget stays 16777216; 67108864 is an explicit opt-in.
 Requires Pillow, Xvfb/xauth/xset and XTest. Evidence excludes credentials.
 The supplied UI plan uses the private 1280x900 default layout. Without a plan,
 checkpoints accept bounded click/drag commands through ui-command.json. Private
@@ -12,6 +14,7 @@ UI input is a test-driver seam, not a viewer permission API. Exit 2 means an
 observed acceptance blocker; it must never be interpreted as a passing run.
 """
 
+import argparse
 import base64
 import ctypes as c
 import ctypes.util
@@ -112,8 +115,8 @@ class PrivateUI:
 
     def checkpoint(self, name):
         self.screenshot(name)
-        if len(sys.argv) > 3:
-            commands = json.loads(Path(sys.argv[3]).read_text())[name]
+        if self.plan:
+            commands = json.loads(self.plan.read_text())[name]
             for command in commands:
                 require(command[0] in ('click', 'drag', 'resize', 'screenshot', 'continue'), 'restricted UI plan command')
                 if command[0] != 'continue':
@@ -202,13 +205,29 @@ class Client:
 
 
 def main():
-    build, evidence = Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('build', type=Path)
+    parser.add_argument('evidence', type=Path)
+    parser.add_argument('ui_plan', nargs='?', type=Path)
+    parser.add_argument('--agentRestorationBytes', type=int)
+    parser.add_argument('--config', help='CMake multi-config executable subdirectory')
+    parser.add_argument('--install-prefix', type=Path, help='Current installation prefix')
+    args = parser.parse_args()
+    if args.agentRestorationBytes is not None and args.agentRestorationBytes <= 0:
+        parser.error('restoration bytes must be positive')
+    build_root, evidence = args.build.resolve(), args.evidence.resolve()
+    build = build_root / args.config if args.config else build_root
+    install = args.install_prefix.resolve() if args.install_prefix else build_root/'install'
+    require((build/'vsrViewer').is_file() and (install/'lib/libanari_library_vsr.so').is_file(), 'built viewer and installed ANARI VSR library exist')
+    host_options = ([] if args.agentRestorationBytes is None else
+                    ['--agentRestorationBytes', str(args.agentRestorationBytes)])
+    effective_limit = args.agentRestorationBytes or 16777216
     evidence.mkdir(parents=True, exist_ok=True)
     (evidence/'PASS').unlink(missing_ok=True)
     require(ASSET.is_file() and HDR.is_file(), 'actual chess and HDR assets exist')
     sources = [ASSET, HDR] + list(ASSET.parent.glob('*.jpg')) + list(ASSET.parent.glob('*.bin'))
     hashes = {str(p): digest(p) for p in sources}
-    (evidence / 'provenance.json').write_text(json.dumps({'source_assets': hashes, 'build': str(build), 'binaries': {str(p): digest(p) for p in (build/'vsrViewer', build/'vsrIntegrationTests', build/'install/lib/libanari_library_vsr.so')}}, indent=2))
+    (evidence / 'provenance.json').write_text(json.dumps({'source_assets': hashes, 'build': str(build), 'build_root':str(build_root), 'config':args.config, 'install_prefix':str(install), 'host_options':host_options, 'effective_global_retention_byte_cap':effective_limit, 'binaries': {str(p): digest(p) for p in (build/'vsrViewer', build/'vsrIntegrationTests', install/'lib/libanari_library_vsr.so')}}, indent=2))
     with tempfile.TemporaryDirectory(prefix='chess-feature-') as temporary:
         root = Path(temporary)
         runtime, config = root/'runtime', root/'config'
@@ -220,7 +239,7 @@ def main():
         subprocess.run(['xauth', '-f', str(auth), 'add', f'localhost:{display}', 'MIT-MAGIC-COOKIE-1', secrets.token_hex(16)], check=True)
         env = dict(os.environ, DISPLAY=f'localhost:{display}', XAUTHORITY=str(auth), XDG_RUNTIME_DIR=str(runtime), XDG_CONFIG_HOME=str(config), SDL_VIDEODRIVER='x11', ANARI_LIBRARY='helide', VSR_ANARI_LIBRARIES='helide', TMPDIR='/tmp')
         env.pop('SDL_RENDER_DRIVER', None)
-        env['LD_LIBRARY_PATH'] = ':'.join([str(build/'install/lib'), str(build)] + [p for p in env.get('LD_LIBRARY_PATH', '').split(':') if p and '/pi-integration/_out/lib' not in p])
+        env['LD_LIBRARY_PATH'] = ':'.join([str(install/'lib'), str(build)] + [p for p in env.get('LD_LIBRARY_PATH', '').split(':') if p and '/pi-integration/_out/lib' not in p])
         host = ui = None
         with (root/'host.log').open('wb') as log:
             xvfb = subprocess.Popen(['Xvfb', f':{display}', '-screen', '0', '1280x900x24', '-listen', 'tcp', '-nolisten', 'unix', '-auth', str(auth), '-noreset'], stdout=log, stderr=log, env=env)
@@ -229,7 +248,7 @@ def main():
                 while subprocess.run(['xset', 'q'], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2).returncode:
                     require(xvfb.poll() is None and time.monotonic()<until, 'private X readiness')
                     time.sleep(.1)
-                host = subprocess.Popen([str(build/'vsrViewer'), '--agentIntegration', '-gltf', str(ASSET), '-hdri', str(HDR)], stdout=log, stderr=log, env=env)
+                host = subprocess.Popen([str(build/'vsrViewer'), '--agentIntegration', *host_options, '-gltf', str(ASSET), '-hdri', str(HDR)], stdout=log, stderr=log, env=env)
                 until = time.monotonic()+60
                 descriptors = []
                 while not descriptors:
@@ -239,6 +258,9 @@ def main():
                 require(len(descriptors)==1, 'one private descriptor')
                 descriptor = json.loads(descriptors[0].read_text())
                 require(descriptor['image_exchange']['import'], 'fully bound production import')
+                limits = descriptor['image_exchange']['exchange_limits']
+                require(limits['effective_global_retention_byte_cap'] == effective_limit, 'explicit/default ActivityLog metadata')
+                require(limits['session_snapshot_byte_cap'] == 67108864 and limits['transient_image_byte_cap'] == 268435456 and limits['byte_cap'] == 268435456 and limits['file_cap'] == 1024, 'independent caps unchanged')
                 client = Client(descriptor, evidence)
                 tools = client.rpc('tools/list', {})['tools']
                 (evidence/'tools.json').write_text(json.dumps(tools, indent=2))
@@ -254,6 +276,7 @@ def main():
                 (evidence/'nodes.json').write_text(json.dumps(nodes, indent=2))
                 ui = PrivateUI(env, evidence)
                 ui.client = client
+                ui.plan = args.ui_plan
                 ui.resize()
                 ui.screenshot('initial')
                 # Workflow steps follow the discovered live relationships.
@@ -383,6 +406,7 @@ def run_workflows(client, ui, scene_id, discovered, objects, nodes, descriptor, 
     exported = client.operation('vsr_image_export', {'scene_id': scene_id, 'handle': image_handle})
     er = exported['result']
     require(exported['kind'] == 'image_export' and not exported['committed'], 'READ export nonmutating status')
+    require(er['dimensions'] == [2048, 2048] and er['channel_count'] == 4, 'original full-size chess RGBA Image, never a resized fixture')
     require(not image['mapped'], 'actual Image unmapped at inspection')
     for key in ('data_version', 'dimensions', 'element_type', 'channel_count', 'color_space', 'row_order'):
         require(er[key] == metadata[key], 'export exact captured metadata ' + key)
@@ -417,7 +441,7 @@ def run_workflows(client, ui, scene_id, discovered, objects, nodes, descriptor, 
     placements = [n for n in nodes if n.get('object', {}).get('handle') in surfaces]
     require(len(placements)==8, 'actual eight black body placements share this Image')
     (evidence/'shared-users.json').write_text(json.dumps({'samplers':shared, 'materials':materials, 'surfaces':surfaces, 'placements':placements}, indent=2))
-    # No budget override: record a real asset rejection as incomplete acceptance.
+    # An explicit host override does not waive any Import/Restore invariant.
     imported = client.operation('vsr_image_import', {'scene_id': scene_id, 'handle': image_handle, 'data_version': er['data_version'], 'file_name':'processed.png'}, outcome=None)
     blockers = []
     if imported['outcome'] != 'ok':
@@ -430,14 +454,27 @@ def run_workflows(client, ui, scene_id, discovered, objects, nodes, descriptor, 
         (evidence/'blockers.json').write_text(json.dumps(blockers, indent=2))
     else:
         require(imported['committed'] and imported['kind']=='image_import', 'normal imported receipt')
+        ir = imported['result']
+        require(ir['data_version'] != er['data_version'], 'Import publishes fresh token')
+        require(ir['restoration_policy']['effective_global_limit_bytes'] == er['exchange_limits']['effective_global_retention_byte_cap'], 'effective host retention receipt')
+        require(ir['affected_complete'] and set(ir['affected_samplers']) == set(shared), 'Import updates all shared Samplers')
+        require(inspect(image_handle)['image_info']['data_version'] == ir['data_version'], 'Import token agrees with live inspection')
+        for handle in shared:
+            require(parameter(inspect(handle), 'image')['value']['handle'] == image_handle, 'shared Sampler binding never redirected')
         after = client.operation('vsr_image_export', {'scene_id':scene_id, 'handle':image_handle})['result']
         with Image.open(directory/after['file_name']) as actual, Image.open(directory/'processed.png') as expected:
             require(actual.mode==expected.mode and actual.tobytes()==expected.tobytes(), 'all exact processed bytes in original Array')
         frame('image-imported')
         restored = restore(imported['result']['batch_ref'])
+        require(restored['versions'] == [] and restored['node_versions'] == [] and len(restored['image_versions']) == 1 and restored['image_versions'][0]['handle'] == image_handle, 'normal Image-only restore receipt')
         fresh = restored['image_versions'][0]['data_version']
         require(fresh != imported['result']['data_version'] and fresh != er['data_version'], 'restore fresh token never rewinds')
         after = client.operation('vsr_image_export', {'scene_id':scene_id, 'handle':image_handle})['result']
+        require(after['data_version'] == fresh and inspect(image_handle)['image_info']['data_version'] == fresh, 'Restore token agrees with export/inspection')
+        for key in ('dimensions', 'element_type', 'channel_count', 'color_space', 'row_order'):
+            require(after[key] == er[key], 'Restore preserves original metadata ' + key)
+        for handle in shared:
+            require(parameter(inspect(handle), 'image')['value']['handle'] == image_handle, 'Restore retains every shared binding')
         with Image.open(directory/after['file_name']) as actual, Image.open(source) as expected:
             require(actual.tobytes()==expected.tobytes(), 'exact original texels restored')
         frame('image-restored')

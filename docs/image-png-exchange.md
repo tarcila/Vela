@@ -111,8 +111,10 @@ unbounded compression fallback or output-vector growth.
 and `available_global_retention_bytes`. Export observations additionally
 report `max_encoded_file_bytes=E` and `max_codec_work_bytes=W`.
 Authenticated discovery and export observations also report
-`available_session_snapshot_bytes=67108864`. Before Import exists there are no
-Image snapshot ledger charges. Session-specific availability is not included
+`available_session_snapshot_bytes` for the requesting session: the 67108864-byte
+ceiling minus that session's retained and reserved snapshots, clamped at zero.
+Disconnect does not release its ledger charges; a new session has a distinct
+ledger but shares global capacity. Session-specific availability is not included
 in unauthenticated launch metadata. Available capacities are observations,
 not future-admission guarantees.
 
