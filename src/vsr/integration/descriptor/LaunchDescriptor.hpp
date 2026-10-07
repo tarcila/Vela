@@ -6,6 +6,8 @@
 // Header-only: the vsr_integration library globs only top-level sources, and
 // this ticket may not edit that shared CMake file (see ticket 19).
 
+// vsr_integration
+#include "vsr/integration/mcp/Json.hpp"
 // posix
 #if defined(__linux__)
 #include <fcntl.h>
@@ -36,7 +38,7 @@ namespace vsr::integration::descriptor {
  * owner-private runtime directory, opened-file validation for readers, and
  * identity-checked cleanup on orderly shutdown.
  *
- * Schema (one UTF-8 JSON object, at most 4 KiB, exactly these fields once):
+ * Schema (one UTF-8 JSON object, at most 4 KiB, required fields once):
  *   schema_version     integer 1
  *   launch_id          32 lowercase hex
  *   scheme             "http"
@@ -44,6 +46,8 @@ namespace vsr::integration::descriptor {
  *   port               integer in [1, 65535]
  *   path               "/mcp"
  *   launch_credential  canonical unpadded base64url of 32 bytes (43 chars)
+ *   image_exchange     optional strict launch-wide metadata object; never
+ *                      contains authenticated session availability
  *
  * Directory policy (Linux): every component is opened directory-relative with
  * O_NOFOLLOW from "/". Ancestors must be owned by root or the effective user
@@ -117,6 +121,7 @@ struct Descriptor
   std::string host;
   std::uint32_t port{0};
   std::string launchCredential;
+  std::string imageExchange; // validated JSON, empty for older hosts
 };
 
 inline bool platformSupported()
@@ -235,6 +240,75 @@ inline void appendUtf8(std::string &out, std::uint32_t cp)
   }
 }
 
+inline bool validImageExchange(std::string_view text, std::string_view launchId)
+{
+  if (text.empty())
+    return true;
+  using mcp::json::Value;
+  Value value;
+  if (!mcp::json::parse(text, value) || !value.isObject())
+    return false;
+  const auto flag = [&](const char *name) {
+    const auto *v = value.get(name);
+    return v && v->type == Value::Type::BOOL;
+  };
+  for (const auto *name :
+      {"supported", "enabled", "export", "import", "data_tracking"})
+    if (!flag(name))
+      return false;
+  const bool enabled = value.get("enabled")->b;
+  if (value.get("supported")->b != enabled || value.get("export")->b != enabled
+      || value.get("import")->b || (enabled && !value.get("data_tracking")->b))
+    return false;
+  if (value.o.size() != 7)
+    return false;
+  if (enabled) {
+    const auto *directory = value.get("image_exchange_directory");
+    if (!directory || !directory->isString() || directory->s.empty()
+        || directory->s.front() != '/'
+        || directory->s.find('\0') != std::string::npos
+        || directory->s.find("/../") != std::string::npos
+        || directory->s.find("/./") != std::string::npos
+        || directory->s.find("//") != std::string::npos)
+      return false;
+    const auto suffix = "/" + std::string(launchId) + "/images";
+    if (directory->s.size() <= suffix.size()
+        || directory->s.compare(
+            directory->s.size() - suffix.size(), suffix.size(), suffix))
+      return false;
+  } else {
+    const auto *reason = value.get("reason");
+    if (!reason || !reason->isString()
+        || (reason->s != "unsafe_directory" && reason->s != "file_rejected"
+            && reason->s != "unsupported_platform"
+            && reason->s != "host_write_contract_unavailable"))
+      return false;
+  }
+  const auto *limits = value.get("exchange_limits");
+  if (!limits || !limits->isObject() || limits->o.size() != 11)
+    return false;
+  const auto integer = [&](const char *name, double cap, bool exact = false) {
+    const auto *v = limits->get(name);
+    return v && v->isNumber() && v->n >= 0 && v->n <= cap
+        && std::floor(v->n) == v->n && (!exact || v->n == cap);
+  };
+  const auto *complete = limits->get("usage_complete");
+  if (!complete || complete->type != Value::Type::BOOL)
+    return false;
+  return integer("file_cap", 1024, true) && integer("byte_cap", 268435456, true)
+      && integer("files_used", 9007199254740991.)
+      && integer("bytes_used", 9007199254740991.)
+      && integer("quota_scan_entry_cap", 4096, true)
+      && integer("max_ancillary_bytes", 65536, true)
+      && integer("transient_image_byte_cap", 268435456)
+      && integer("session_snapshot_byte_cap", 67108864, true)
+      && integer("effective_global_retention_byte_cap", 9007199254740991.)
+      && integer("available_global_retention_bytes",
+          limits->get("effective_global_retention_byte_cap")
+              ? limits->get("effective_global_retention_byte_cap")->n
+              : 0);
+}
+
 class StrictParser
 {
  public:
@@ -251,6 +325,7 @@ class StrictParser
       fPort,
       fPath,
       fCredential,
+      fExchange,
       fCount
     };
     static const char *names[fCount] = {"schema_version",
@@ -259,7 +334,8 @@ class StrictParser
         "host",
         "port",
         "path",
-        "launch_credential"};
+        "launch_credential",
+        "image_exchange"};
     bool seen[fCount] = {};
 
     ws();
@@ -297,7 +373,28 @@ class StrictParser
         return bad(std::string("duplicate field ") + names[f]);
       seen[f] = true;
 
-      if (f == fVersion || f == fPort) {
+      if (f == fExchange) {
+        const auto begin = m_pos;
+        if (!eat('{'))
+          return bad("image_exchange must be an object");
+        int depth = 1;
+        while (depth && m_pos < m_in.size()) {
+          if (peek() == '"') {
+            std::string ignored;
+            if (!string(ignored))
+              return bad("malformed image_exchange string");
+          } else {
+            const auto c = m_in[m_pos++];
+            if (c == '{')
+              ++depth;
+            if (c == '}')
+              --depth;
+          }
+        }
+        if (depth)
+          return bad("malformed image_exchange object");
+        out.imageExchange = std::string(m_in.substr(begin, m_pos - begin));
+      } else if (f == fVersion || f == fPort) {
         std::uint64_t v = 0;
         if (!integer(v))
           return bad(std::string("field ") + names[f] + " must be an integer");
@@ -347,9 +444,11 @@ class StrictParser
     ws();
     if (m_pos != m_in.size())
       return bad("trailing content after descriptor object");
-    for (int i = 0; i < fCount; i++)
+    for (int i = 0; i < fExchange; i++)
       if (!seen[i])
         return bad(std::string("missing field ") + names[i]);
+    if (!validImageExchange(out.imageExchange, out.launchId))
+      return bad("invalid image_exchange metadata");
     return {};
   }
 
@@ -502,6 +601,8 @@ inline Status validate(const Descriptor &d)
     return detail::fail(Code::invalid_descriptor, "invalid port");
   if (!detail::isCanonicalCredential(d.launchCredential))
     return detail::fail(Code::invalid_descriptor, "invalid launch_credential");
+  if (!detail::validImageExchange(d.imageExchange, d.launchId))
+    return detail::fail(Code::invalid_descriptor, "invalid image_exchange");
   return {};
 }
 
@@ -513,7 +614,10 @@ inline std::string serialize(const Descriptor &d)
   return "{\"schema_version\":1,\"launch_id\":\"" + d.launchId
       + "\",\"scheme\":\"http\",\"host\":\"" + d.host + "\",\"port\":"
       + std::to_string(d.port) + ",\"path\":\"/mcp\",\"launch_credential\":\""
-      + d.launchCredential + "\"}\n";
+      + d.launchCredential + "\""
+      + (d.imageExchange.empty() ? ""
+                                 : ",\"image_exchange\":" + d.imageExchange)
+      + "}\n";
 }
 
 inline Status parse(std::string_view json, Descriptor &out)

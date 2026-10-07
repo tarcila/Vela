@@ -18,7 +18,11 @@ struct ExchangeLimits
 {
   std::size_t transientBytes{268435456};
   std::size_t globalRetentionBytes{16u << 20};
-  // Optional host allocator for physically shared transient-memory accounting.
+  // A host-wide physical lease is acquired once before capture and held
+  // through buffer destruction; smaller configured host ceilings also apply.
+  std::size_t physicalByteCap{268435456};
+  std::function<std::shared_ptr<const void>(std::size_t)> reservePhysicalMemory;
+  // Optional host allocator for deterministic allocation/failure control.
   // Must outlive this service and its engine's active jobs.
   std::pmr::memory_resource *allocator{std::pmr::new_delete_resource()};
   // Owning-thread observation of the existing global activity/restoration pool.
@@ -43,7 +47,9 @@ class ImageExchange
   ~ImageExchange();
   VSR_NOT_COPYABLE(ImageExchange)
   void attachScene(SceneId scene, identity::SceneIdentity &identity);
-  std::string metadata(SceneId scene) const;
+  // Empty session selects launch-wide descriptor metadata, not a ledger.
+  std::string metadata(SceneId scene, const std::string &sessionId = {}) const;
+  std::string unavailableReason(SceneId scene) const;
   // Owning-thread host loop: release completed backend/cancellation slots.
   void pump();
   operations::Admission submitExport(const session::Credentials &credentials,

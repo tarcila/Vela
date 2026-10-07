@@ -8,17 +8,24 @@
 #if defined(__linux__)
 #include <dirent.h>
 #include <fcntl.h>
+#include <linux/openat2.h>
+#include <pthread.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #endif
 // std
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <future>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 namespace vsr::integration::image {
@@ -29,7 +36,8 @@ using ByteBuffer = std::pmr::vector<std::uint8_t>;
 constexpr std::size_t FILE_CAP = 1024;
 constexpr std::size_t BYTE_CAP = 268435456;
 constexpr std::size_t ENTRY_CAP = 4096;
-constexpr std::size_t SNAPSHOT_CAP = 67108864;
+constexpr std::size_t WORKER_STACK_BYTES = 512u << 10;
+constexpr std::size_t WORKER_GUARD_BYTES = 64u << 10;
 
 std::string quote(const std::string &s)
 {
@@ -191,8 +199,7 @@ struct Directory
   dev_t device{};
   ino_t inode{};
   Directory() = default;
-  Directory(const Directory &) = delete;
-  Directory &operator=(const Directory &) = delete;
+  VSR_NOT_COPYABLE(Directory)
   ~Directory();
   bool current() const;
 };
@@ -211,6 +218,50 @@ bool Directory::current() const
       && S_ISDIR(named.st_mode) && held.st_dev == device && held.st_ino == inode
       && named.st_dev == device && named.st_ino == inode
       && descriptor::detail::checkAncestor(fd, ::geteuid()).ok();
+}
+
+void removeContents(int directory, const std::function<bool()> &current)
+{
+  descriptor::detail::Fd scanFd(
+      ::openat(directory, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+  auto *scan = ::fdopendir(scanFd.fd);
+  if (!scan)
+    return;
+  scanFd.release();
+  while (auto *entry = ::readdir(scan)) {
+    if (!std::strcmp(entry->d_name, ".") || !std::strcmp(entry->d_name, ".."))
+      continue;
+    if (!current())
+      break;
+    struct stat named{};
+    if (::fstatat(directory, entry->d_name, &named, AT_SYMLINK_NOFOLLOW) != 0)
+      continue;
+    if (S_ISDIR(named.st_mode)) {
+      struct open_how how{};
+      how.flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW;
+      how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV;
+      descriptor::detail::Fd child(int(
+          ::syscall(SYS_openat2, directory, entry->d_name, &how, sizeof(how))));
+      if (child.fd < 0)
+        continue; // Never recurse into a mount or a replacement link.
+      const std::string name = entry->d_name;
+      const auto childCurrent = [&] {
+        struct stat held{}, latest{};
+        return current() && ::fstat(child.fd, &held) == 0
+            && ::fstatat(directory, name.c_str(), &latest, AT_SYMLINK_NOFOLLOW)
+            == 0
+            && S_ISDIR(latest.st_mode) && held.st_uid == ::geteuid()
+            && held.st_dev == named.st_dev && held.st_ino == named.st_ino
+            && latest.st_dev == held.st_dev && latest.st_ino == held.st_ino;
+      };
+      if (childCurrent())
+        removeContents(child.fd, childCurrent);
+      if (childCurrent())
+        ::unlinkat(directory, name.c_str(), AT_REMOVEDIR);
+    } else if (current())
+      ::unlinkat(directory, entry->d_name, 0);
+  }
+  ::closedir(scan);
 }
 #endif
 
@@ -293,6 +344,7 @@ struct ImageExchange::State
   {
     explicit Job(std::pmr::memory_resource *allocator) : pixels(allocator) {}
     std::shared_ptr<State> state;
+    std::shared_ptr<const void> physicalLease;
     ByteBuffer pixels;
     Bounds bound;
     std::size_t width{}, height{}, channels{};
@@ -302,6 +354,16 @@ struct ImageExchange::State
     std::function<void()> wake;
     std::future<Step> future;
     bool retained{false};
+#if defined(__linux__)
+    struct stat fileIdentity{};
+    std::size_t encodedSize{0};
+    pthread_t worker{};
+    void *stack{nullptr};
+    bool workerStarted{false};
+    std::packaged_task<Step()> task;
+#endif
+    bool start();
+    void join();
     ~Job();
   };
   std::string launchId;
@@ -315,6 +377,7 @@ struct ImageExchange::State
   Usage usage;
   std::size_t reserved{0};
   std::size_t availableRetention{0};
+  std::atomic<bool> stopping{false};
 #if defined(__linux__)
   std::vector<std::unique_ptr<Directory>> ancestry;
   int runtimeFd{-1};
@@ -323,18 +386,96 @@ struct ImageExchange::State
 #endif
   ~State();
   bool current() const;
-  std::string limitsJson(const Bounds *bound = nullptr) const;
+  std::string limitsJson(
+      const Bounds *bound = nullptr, bool authenticatedSession = false) const;
   Step write(Job &job);
+  bool fileCurrent(const Job &job) const;
 };
+
+bool ImageExchange::State::Job::start()
+{
+#if defined(__linux__)
+  const auto page = ::sysconf(_SC_PAGESIZE);
+  if (page <= 0 || WORKER_STACK_BYTES % page || WORKER_GUARD_BYTES % page)
+    return false;
+  task = std::packaged_task<Step()>([this] { return state->write(*this); });
+  stack = ::mmap(nullptr,
+      WORKER_STACK_BYTES + WORKER_GUARD_BYTES,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS,
+      -1,
+      0);
+  if (stack == MAP_FAILED) {
+    stack = nullptr;
+    return false;
+  }
+  pthread_attr_t attr;
+  const bool initialized = ::pthread_attr_init(&attr) == 0;
+  if (initialized && ::mprotect(stack, WORKER_GUARD_BYTES, PROT_NONE) == 0
+      && ::pthread_attr_setguardsize(&attr, 0) == 0
+      && ::pthread_attr_setstack(&attr,
+             static_cast<char *>(stack) + WORKER_GUARD_BYTES,
+             WORKER_STACK_BYTES)
+          == 0) {
+    future = task.get_future();
+    workerStarted = ::pthread_create(
+                        &worker,
+                        &attr,
+                        [](void *self) -> void * {
+                          static_cast<Job *>(self)->task();
+                          return nullptr;
+                        },
+                        this)
+        == 0;
+  }
+  if (initialized)
+    ::pthread_attr_destroy(&attr);
+  if (!workerStarted) {
+    future = {};
+    ::munmap(stack, WORKER_STACK_BYTES + WORKER_GUARD_BYTES);
+    stack = nullptr;
+  }
+  return workerStarted;
+#else
+  return false;
+#endif
+}
+
+void ImageExchange::State::Job::join()
+{
+#if defined(__linux__)
+  if (workerStarted) {
+    ::pthread_join(worker, nullptr);
+    workerStarted = false;
+  }
+  if (stack) {
+    ::munmap(stack, WORKER_STACK_BYTES + WORKER_GUARD_BYTES);
+    stack = nullptr;
+  }
+#endif
+}
 
 ImageExchange::State::Job::~Job()
 {
-  if (future.valid())
-    future.wait();
+  join();
 #if defined(__linux__)
-  if (!retained && !name.empty())
-    ::unlinkat(state->imagesFd, name.c_str(), 0);
+  if (!retained && !name.empty()) {
+    struct stat named{};
+    if (::fstatat(state->imagesFd, name.c_str(), &named, AT_SYMLINK_NOFOLLOW)
+            == 0
+        && S_ISREG(named.st_mode) && named.st_dev == fileIdentity.st_dev
+        && named.st_ino == fileIdentity.st_ino)
+      ::unlinkat(state->imagesFd, name.c_str(), 0);
+  }
 #endif
+  // Release physical buffers before either cap-accounting lease. A host
+  // consumer may admit new memory as soon as the lease disappears.
+  {
+    ByteBuffer empty(pixels.get_allocator().resource());
+    pixels.swap(empty);
+  }
+  // physicalLease is declared before every buffer/control member, so its
+  // automatic destruction occurs only after all of them have been freed.
   std::lock_guard<std::mutex> lock(state->mutex);
   state->reserved -= bound.peak;
 }
@@ -342,21 +483,23 @@ ImageExchange::State::Job::~Job()
 ImageExchange::State::~State()
 {
 #if defined(__linux__)
-  // Never resolve a replacement pathname. Agent subdirectories are not
-  // followed, and regular entries/symlinks are removed only from held fds.
   if (imagesFd >= 0) {
-    descriptor::detail::Fd scanFd(
-        ::openat(imagesFd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-    if (auto *scan = ::fdopendir(scanFd.release())) {
-      while (auto *entry = ::readdir(scan)) {
-        if (std::strcmp(entry->d_name, ".") && std::strcmp(entry->d_name, ".."))
-          ::unlinkat(imagesFd, entry->d_name, 0);
-      }
-      ::closedir(scan);
-    }
-    ::close(imagesFd);
-    if (!ancestry.empty() && ancestry.back()->current())
+    const auto owned = [&] {
+      struct stat held{}, named{};
+      return ::fstat(imagesFd, &held) == 0
+          && ::fstatat(launchFd, "images", &named, AT_SYMLINK_NOFOLLOW) == 0
+          && S_ISDIR(named.st_mode) && held.st_dev == named.st_dev
+          && held.st_ino == named.st_ino
+          && (ancestry.empty()
+              || std::all_of(ancestry.begin(),
+                  ancestry.end(),
+                  [](const auto &d) { return d->current(); }));
+    };
+    if (owned())
+      removeContents(imagesFd, owned);
+    if (owned())
       ::unlinkat(launchFd, "images", AT_REMOVEDIR);
+    ::close(imagesFd);
   }
   if (launchFd >= 0) {
     struct stat held{}, named{};
@@ -391,7 +534,29 @@ bool ImageExchange::State::current() const
 #endif
 }
 
-std::string ImageExchange::State::limitsJson(const Bounds *b) const
+bool ImageExchange::State::fileCurrent(const Job &job) const
+{
+#if defined(__linux__)
+  struct stat named{};
+  const auto &held = job.fileIdentity;
+  return current() && !job.name.empty()
+      && ::fstatat(imagesFd, job.name.c_str(), &named, AT_SYMLINK_NOFOLLOW) == 0
+      && S_ISREG(named.st_mode) && named.st_uid == ::geteuid()
+      && (named.st_mode & 07777) == 0600 && named.st_nlink == 1
+      && named.st_dev == held.st_dev && named.st_ino == held.st_ino
+      && named.st_size >= 0 && std::size_t(named.st_size) == job.encodedSize
+      && named.st_mtim.tv_sec == held.st_mtim.tv_sec
+      && named.st_mtim.tv_nsec == held.st_mtim.tv_nsec
+      && named.st_ctim.tv_sec == held.st_ctim.tv_sec
+      && named.st_ctim.tv_nsec == held.st_ctim.tv_nsec;
+#else
+  (void)job;
+  return false;
+#endif
+}
+
+std::string ImageExchange::State::limitsJson(
+    const Bounds *b, bool authenticatedSession) const
 {
   std::lock_guard<std::mutex> lock(mutex);
   std::string result = "{\"file_cap\":1024,\"byte_cap\":268435456,\"files_used\":"
@@ -405,8 +570,10 @@ std::string ImageExchange::State::limitsJson(const Bounds *b) const
       + std::to_string(availableRetention);
   if (b)
     result += ",\"max_encoded_file_bytes\":" + std::to_string(b->encoded)
-        + ",\"max_codec_work_bytes\":" + std::to_string(b->work)
-        + ",\"available_session_snapshot_bytes\":67108864";
+        + ",\"max_codec_work_bytes\":" + std::to_string(b->work);
+  // Before Import exists no session has a retained or pending Image snapshot.
+  if (b || authenticatedSession)
+    result += ",\"available_session_snapshot_bytes\":67108864";
   return result + "}";
 }
 
@@ -419,9 +586,10 @@ Step ImageExchange::State::write(Job &job)
   Usage observed;
   descriptor::detail::Fd scanFd(
       ::openat(imagesFd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-  DIR *raw = ::fdopendir(scanFd.release());
+  DIR *raw = ::fdopendir(scanFd.fd);
   if (!raw)
     return reject(Outcome::BUSY, "resource_limit");
+  scanFd.release();
   std::unique_ptr<DIR, decltype(&::closedir)> scan(raw, ::closedir);
   std::size_t entries = 0;
   for (;;) {
@@ -442,7 +610,8 @@ Step ImageExchange::State::write(Job &job)
     if (S_ISREG(st.st_mode)) {
       ++observed.files;
       const auto bytes = st.st_size < 0 ? BYTE_CAP : std::size_t(st.st_size);
-      observed.bytes += std::min(bytes, BYTE_CAP + 1);
+      observed.bytes = std::min(
+          BYTE_CAP + 1, observed.bytes + std::min(bytes, BYTE_CAP + 1));
     }
     if (entries == ENTRY_CAP || observed.files >= FILE_CAP
         || observed.bytes > BYTE_CAP)
@@ -477,6 +646,8 @@ Step ImageExchange::State::write(Job &job)
         O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
         0600);
     if (file.fd >= 0) {
+      if (::fstat(file.fd, &job.fileIdentity) != 0)
+        return reject(Outcome::INVALID_REQUEST, "file_rejected");
       job.name = name;
       break;
     }
@@ -501,8 +672,15 @@ Step ImageExchange::State::write(Job &job)
       return reject(Outcome::INVALID_REQUEST, "file_rejected");
     offset += std::size_t(n);
   }
+  job.encodedSize = png.size();
+  struct stat completed{};
+  if (::fstat(file.fd, &completed) != 0
+      || completed.st_dev != job.fileIdentity.st_dev
+      || completed.st_ino != job.fileIdentity.st_ino)
+    return reject(Outcome::INVALID_REQUEST, "file_rejected");
+  job.fileIdentity = completed;
   const auto fd = file.release();
-  if (::close(fd) != 0 || !current() || job.abandoned())
+  if (::close(fd) != 0 || !fileCurrent(job) || job.abandoned())
     return reject(Outcome::INVALID_REQUEST, "file_rejected");
   {
     std::lock_guard<std::mutex> lock(mutex);
@@ -530,8 +708,9 @@ ImageExchange::ImageExchange(Integration &integration,
 {
   m_state->launchId = std::move(launchId);
   m_state->limits = std::move(limits);
-  m_state->limits.transientBytes =
-      std::min(m_state->limits.transientBytes, BYTE_CAP);
+  m_state->limits.transientBytes = std::min({m_state->limits.transientBytes,
+      m_state->limits.physicalByteCap,
+      BYTE_CAP});
   m_state->availableRetention = m_state->limits.globalRetentionBytes;
   if (!m_state->limits.allocator)
     m_state->limits.allocator = std::pmr::new_delete_resource();
@@ -551,22 +730,74 @@ ImageExchange::ImageExchange(Integration &integration,
   m_state->runtimeFd = ::fcntl(runtime.fd(), F_DUPFD_CLOEXEC, 0);
   if (m_state->runtimeFd < 0)
     return;
+  // Normal-exit recursive cleanup must be able to refuse mount crossings,
+  // not merely follow directory-relative names on an older kernel.
+  struct open_how probeHow{};
+  probeHow.flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW;
+  probeHow.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV;
+  descriptor::detail::Fd probe(int(
+      ::syscall(SYS_openat2, runtime.fd(), ".", &probeHow, sizeof(probeHow))));
+  if (probe.fd < 0) {
+    if (errno == ENOSYS || errno == EINVAL)
+      m_state->reason = "unsupported_platform";
+    return;
+  }
   const auto launchPath = runtime.path() + "/" + m_state->launchId;
   if (::mkdirat(runtime.fd(), m_state->launchId.c_str(), 0700) != 0)
     return; // fresh launch only; never adopt existing content
+  struct stat createdLaunch{};
+  if (::fstatat(runtime.fd(),
+          m_state->launchId.c_str(),
+          &createdLaunch,
+          AT_SYMLINK_NOFOLLOW)
+      != 0)
+    return;
   descriptor::detail::Fd launch(::openat(runtime.fd(),
       m_state->launchId.c_str(),
       O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
   if (launch.fd < 0
       || !descriptor::detail::checkPrivateDirectory(launch.fd, ::geteuid())
-          .ok())
+          .ok()) {
+    struct stat named{};
+    if (::fstatat(runtime.fd(),
+            m_state->launchId.c_str(),
+            &named,
+            AT_SYMLINK_NOFOLLOW)
+            == 0
+        && S_ISDIR(named.st_mode) && named.st_dev == createdLaunch.st_dev
+        && named.st_ino == createdLaunch.st_ino)
+      ::unlinkat(runtime.fd(), m_state->launchId.c_str(), AT_REMOVEDIR);
+    return;
+  }
+  struct stat openedLaunch{};
+  if (::fstat(launch.fd, &openedLaunch) != 0
+      || openedLaunch.st_dev != createdLaunch.st_dev
+      || openedLaunch.st_ino != createdLaunch.st_ino)
     return;
   m_state->launchFd = launch.release();
   if (::mkdirat(m_state->launchFd, "images", 0700) != 0)
     return;
+  struct stat createdImages{};
+  if (::fstatat(
+          m_state->launchFd, "images", &createdImages, AT_SYMLINK_NOFOLLOW)
+      != 0)
+    return;
   m_state->imagesFd = ::openat(m_state->launchFd,
       "images",
       O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (m_state->imagesFd < 0) {
+    struct stat named{};
+    if (::fstatat(m_state->launchFd, "images", &named, AT_SYMLINK_NOFOLLOW) == 0
+        && S_ISDIR(named.st_mode) && named.st_dev == createdImages.st_dev
+        && named.st_ino == createdImages.st_ino)
+      ::unlinkat(m_state->launchFd, "images", AT_REMOVEDIR);
+    return;
+  }
+  struct stat openedImages{};
+  if (::fstat(m_state->imagesFd, &openedImages) != 0
+      || openedImages.st_dev != createdImages.st_dev
+      || openedImages.st_ino != createdImages.st_ino)
+    return;
   m_state->path = launchPath + "/images";
   descriptor::detail::Fd parent(
       ::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
@@ -618,6 +849,7 @@ ImageExchange::ImageExchange(Integration &integration,
 
 ImageExchange::~ImageExchange()
 {
+  m_state->stopping = true;
   // Join while engine callbacks are still live, before the host tears down
   // its engine and activity pool. Jobs hold State until their cleanup ends.
   std::vector<std::weak_ptr<State::Job>> jobs;
@@ -626,8 +858,8 @@ ImageExchange::~ImageExchange()
     jobs = m_state->jobs;
   }
   for (const auto &weak : jobs)
-    if (auto job = weak.lock(); job && job->future.valid())
-      job->future.wait();
+    if (auto job = weak.lock())
+      job->join();
 }
 
 void ImageExchange::attachScene(
@@ -636,7 +868,8 @@ void ImageExchange::attachScene(
   m_state->sources.push_back({scene, &identity, identity.lifetime()});
 }
 
-std::string ImageExchange::metadata(SceneId scene) const
+std::string ImageExchange::metadata(
+    SceneId scene, const std::string &sessionId) const
 {
   if (m_state->limits.availableGlobalRetention) {
     const auto available = m_state->limits.availableGlobalRetention();
@@ -654,7 +887,17 @@ std::string ImageExchange::metadata(SceneId scene) const
                   + quote(!tracking ? "host_write_contract_unavailable"
                           : m_state->reason.empty() ? "file_rejected"
                                                     : m_state->reason))
-      + ",\"exchange_limits\":" + m_state->limitsJson() + "}";
+      + ",\"exchange_limits\":"
+      + m_state->limitsJson(nullptr, !sessionId.empty()) + "}";
+}
+
+std::string ImageExchange::unavailableReason(SceneId scene) const
+{
+  if (!m_integration->imageTrackingAvailable(scene))
+    return "host_write_contract_unavailable";
+  if (m_state->current())
+    return {};
+  return m_state->reason.empty() ? "file_rejected" : m_state->reason;
 }
 
 void ImageExchange::pump()
@@ -715,7 +958,10 @@ operations::Admission ImageExchange::submitExport(
         } catch (const std::bad_alloc &) {
           return reject(Outcome::BUSY, "resource_limit");
         }
-        job->retained = result.outcome == Outcome::OK && !ctx.isAbandoned();
+        if (result.outcome == Outcome::OK && !state->fileCurrent(*job))
+          return reject(Outcome::INVALID_REQUEST, "file_rejected");
+        if (result.outcome == Outcome::OK && !ctx.isAbandoned())
+          result.onAccepted = [job] { job->retained = true; };
         return result;
       }
       if (ctx.abandoned || ctx.isAbandoned())
@@ -726,8 +972,10 @@ operations::Admission ImageExchange::submitExport(
           continue;
         if (source.scene == scene)
           ids = source.identity;
-        else if (source.identity->resolve(handle))
-          return reject(Outcome::INVALID_REQUEST, "foreign_scene");
+        else if (auto *foreign = source.identity->resolve(handle))
+          return reject(Outcome::INVALID_REQUEST,
+              dynamic_cast<vsr::scene::Array *>(foreign) ? "foreign_scene"
+                                                         : "invalid_handle");
       }
       auto *object = ids ? ids->resolve(handle) : nullptr;
       auto *array = dynamic_cast<vsr::scene::Array *>(object);
@@ -740,6 +988,8 @@ operations::Admission ImageExchange::submitExport(
         return reject(Outcome::INVALID_REQUEST, "unsupported_image");
       if (array->isMapped())
         return reject(Outcome::BUSY, "image_mapped");
+      if (!state->current())
+        return reject(Outcome::INVALID_REQUEST, "file_rejected");
       const auto version = ids->imageDataVersion(handle);
       if (!version)
         return reject(
@@ -754,6 +1004,11 @@ operations::Admission ImageExchange::submitExport(
           return reject(Outcome::BUSY, "resource_limit");
         state->reserved += b->peak;
         job->bound = *b;
+      }
+      if (state->limits.reservePhysicalMemory) {
+        job->physicalLease = state->limits.reservePhysicalMemory(b->peak);
+        if (!job->physicalLease)
+          return reject(Outcome::BUSY, "resource_limit");
       }
       job->width = array->dim(0);
       job->height = array->dim(1);
@@ -780,10 +1035,12 @@ operations::Admission ImageExchange::submitExport(
           + ",\"channel_count\":" + std::to_string(job->channels)
           + ",\"color_space\":\"" + (srgb ? "srgb" : "linear")
           + "\",\"row_order\":\"top_down\"," + bindings(*ids, *array);
-      job->abandoned = ctx.isAbandoned;
+      job->abandoned = [state, check = ctx.isAbandoned] {
+        return state->stopping.load() || check();
+      };
       job->wake = ctx.wake;
-      job->future = std::async(std::launch::async,
-          [state, held = job.get()] { return state->write(*held); });
+      if (!job->start())
+        return reject(Outcome::BUSY, "resource_limit");
       // Host pump observes completion after backend admission, eliminating
       // lost wakes and preserving asynchronous cancellation cleanup.
       Step pending;

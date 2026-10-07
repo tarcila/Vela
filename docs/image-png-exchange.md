@@ -9,10 +9,17 @@ sequence, change texels, or occupy a presentation/render encoder slot.
 Discover the Scene and its `image_exchange` observation. On qualified Linux
 hosts it reports `supported`, `enabled`, `export`, `import:false`,
 `data_tracking`, `image_exchange_directory`, and `exchange_limits`.
-Unsupported platforms or unsafe runtime directories fail closed. Directory
-metadata is currently delivered through authenticated discovery; the strict
-connection descriptor remains unchanged. Do not infer directory availability
-from the tracking prerequisite alone.
+Unsupported platforms or unsafe runtime directories fail closed. The strict
+v1 connection descriptor has optional `image_exchange` launch metadata with
+these directory and Image-independent limit fields; existing descriptors that
+omit it remain readable by the proxy. Nested fields, types, duplicates, limits
+and launch-directory shape are validated, not accepted as arbitrary JSON.
+Authenticated discovery reports current availability: the descriptor is a
+startup observation, not authority or a promise that the directory still exists.
+No session-specific availability is included in the descriptor. Do not infer
+exchange availability from the tracking prerequisite alone. Array `image_info`
+reports the same unavailable reason after directory replacement or loss while
+already-enrolled write history continues; recovery never reuses an old token.
 
 Inspect the Image Array (not its Sampler) and copy its opaque handle:
 
@@ -65,19 +72,34 @@ out of band. External tools should preserve raw samples, dimensions and channels
 Checked arithmetic computes `T = width * height * channels`, `F = T + height`,
 `E = min(67108864, 2*F + 65536)` and `W = 4*F + 1048576`. Export reserves
 `T + E + W` against the effective shared export transient ceiling **before**
-copying. It has no undo snapshot. The ceiling is the minimum of 268435456 and
-the configured host `ExchangeLimits::transientBytes`; pressure rejects
-`busy/resource_limit`. A host may also supply a lifetime-stable, thread-safe
-`std::pmr::memory_resource` for capture/output physical-memory accounting.
-Allocator and worker-start failures unwind reservations and reject busy.
+copying. It has no undo snapshot. The ceiling is the minimum of 268435456,
+`ExchangeLimits::transientBytes`, and the configured host `physicalByteCap`;
+remaining shared capacity can further narrow admission. Pressure rejects
+`busy/resource_limit`. Hosts supply `reservePhysicalMemory` to pre-acquire one
+physical ownership lease; the viewer shares its finite `FrameBudget` with
+presented-frame acquisition/encoding/transport, and the headless host also uses
+a finite physical pool. The lease survives cancellation/backend cleanup until
+all buffers, worker stack and control state are actually destroyed. No undo or
+session charge is acquired. A lifetime-stable, thread-safe host PMR allocator
+may control the capture/output allocations separately; it is not a substitute
+for shared worst-case admission. Allocator and worker-start failures unwind
+reservations and reject busy.
 
 The export encoder is separate from the RGBA presentation encoder. It emits
 one filter-0 byte per row directly from the capture into stored DEFLATE blocks
 of at most 65535 bytes. With `B = ceil(F/65535)`, the exact PNG length is
 `F + 5*B + 63`: 6 zlib framing bytes, 5 per block, and 57 PNG framing bytes.
 It reserves that exact output once, emits no separate filtered buffer, and
-uses constant codec state; actual codec work is below the conservatively
-reserved W. It rejects shapes whose exact output exceeds E before allocation.
+uses constant codec state. W also covers a privately mapped 512 KiB worker
+stack, 64 KiB inaccessible guard, and up to 448 KiB for thread/TLS, future/task,
+quota-directory buffers, bounded binding/receipt strings and bookkeeping. No
+libc default worker stack is used or left in its stack cache: join and munmap
+precede physical-lease release. The codec itself allocates no work buffer;
+its scalar state and 65536-byte write slices are inside these bounds. The two
+PMR allocations are exactly T and the exact PNG length, never a growing codec
+arena. Existing Scene storage and generic host/server infrastructure are outside
+this Image-transient ownership claim; this is not a process RSS ceiling.
+It rejects shapes whose exact output exceeds E before allocation.
 Cancellation/deadlines are checked at block, CRC-slice, scan-entry and file-write
 boundaries. Incompressible samples attain the same exact length; there is no
 unbounded compression fallback or output-vector growth.
@@ -87,7 +109,8 @@ unbounded compression fallback or output-vector growth.
 `max_ancillary_bytes=65536`, `transient_image_byte_cap`,
 `session_snapshot_byte_cap=67108864`, `effective_global_retention_byte_cap`
 and `available_global_retention_bytes`. Export observations additionally
-report `max_encoded_file_bytes=E`, `max_codec_work_bytes=W` and
+report `max_encoded_file_bytes=E` and `max_codec_work_bytes=W`.
+Authenticated discovery and export observations also report
 `available_session_snapshot_bytes=67108864`. Before Import exists there are no
 Image snapshot ledger charges. Session-specific availability is not included
 in unauthenticated launch metadata. Available capacities are observations,
@@ -115,9 +138,22 @@ describes filesystem enumeration: they are independent.
 Remove unneeded PNG working copies explicitly, including agent-created extras.
 Completed files have no TTL and stay until explicit cleanup or normal launch
 teardown; an uncatchable crash can leave files. Partial failed/cancelled exports
-are removed relative to the held directory. Cleanup never follows replacement
-paths or agent subdirectories. Agent-created subdirectories can prevent final
-directory removal and must be cleaned explicitly.
+are removed relative to the held directory only when the name still identifies
+the created regular file; a replacement is not owned by that partial export.
+Before receipt, the host checks directory ancestry, file inode, ownership, mode,
+link count, exact length and observed modification/change times again. Final
+file retention transfers only when the operation engine accepts the receipt,
+not speculatively before cancellation/deadline arbitration.
+Normal teardown removes agent-created subdirectories recursively using held,
+identity-checked descriptors. Linux `openat2` refuses symlinks and mount crossings
+for recursive cleanup; every child remains linked beneath the owned root.
+The constructor probes these kernel guarantees before creating the launch
+exchange; kernels without the required `openat2` support advertise
+`unsupported_platform` rather than promise weaker cleanup.
+Replacement/relocation races stop that subtree's cleanup rather than redirect
+access outside it. Cleanup never follows a replacement pathname or symlink.
+Uncatchable crashes, concurrently hostile same-user changes, or filesystem/
+permission failures cannot be promised successful cleanup.
 
 PNG and undo retention are separate: deleting a PNG does not free a retained
 Image undo snapshot, and restoring/evicting an undo batch does not delete its
@@ -126,3 +162,14 @@ PNG. Import and Image undo are not yet exposed. Host loops must call
 to publish worker completion and release asynchronously cancelled backend slots.
 Destroy the Image service before its engine; keep its allocator alive through
 engine cleanup.
+
+## Isolated eligible-Image verification
+
+After build/install, run `python3 scripts/test-image-export.py build-agent`.
+It creates a private authenticated Xvfb, runtime/configuration and asymmetric
+3×2 glTF Image, launches the actual viewer with the installed libraries and
+Helide, and exercises authenticated discovery, Array inspection, export,
+independent CRC/zlib/sample checks, deleted-file historical replay and normal
+shutdown cleanup. It does not attach to an existing viewer or alter Pi config.
+Import, Image undo and whole-feature chess/presented-camera acceptance are not
+part of this export-only check.

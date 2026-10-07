@@ -38,6 +38,7 @@
 #include "vsr/integration/mcp/tools/RenderTools.hpp"
 #endif
 #include "vsr/rendering/pipeline/ImagePipeline.h"
+#include "vsr/rendering/view/FrameObservation.h"
 #include "vsr/rendering/view/ManipulatorToAnari.hpp"
 // std
 #include <chrono>
@@ -408,6 +409,11 @@ int main(int argc, const char *argv[])
   const auto runtimeStatus =
       vi::descriptor::openOsRuntimeDirectory(host->runtimeDir);
   vi::image::ExchangeLimits imageLimits;
+  const auto hostImageMemory = std::make_shared<vsr::rendering::FrameBudget>();
+  imageLimits.physicalByteCap = hostImageMemory->limit();
+  imageLimits.reservePhysicalMemory = [hostImageMemory](std::size_t bytes) {
+    return hostImageMemory->reserve(bytes);
+  };
   imageLimits.globalRetentionBytes = host->activity->limits().bytes;
   imageLimits.availableGlobalRetention = [&host] {
     const auto cap = host->activity->limits().bytes;
@@ -421,8 +427,12 @@ int main(int argc, const char *argv[])
       imageLimits);
   host->images->attachScene(*sceneId, *host->identity);
   host->inspector->setImageExchange(
-      [&host](vi::SceneId id) { return host->images->metadata(id); });
+      [&host](vi::SceneId id, const std::string &sessionId) {
+        return host->images->metadata(id, sessionId);
+      },
+      [&host](vi::SceneId id) { return host->images->unavailableReason(id); });
   vi::mcp::Config cfg;
+  cfg.imageExchange = host->images->metadata(*sceneId);
   vi::mcp::tools::addImageTools(cfg.tools, {*host->ids, *host->images});
   vi::mcp::tools::addQueryTools(cfg.tools, {*host->engine, *host->inspector});
   vi::mcp::tools::addLookupTools(cfg.tools, *host->engine);

@@ -39,6 +39,7 @@
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -71,6 +72,61 @@ extern "C" ssize_t getrandom(void *buffer, size_t bytes, unsigned flags)
     return ssize_t(bytes);
   }
   return ::syscall(SYS_getrandom, buffer, bytes, flags);
+}
+
+// A deterministic filesystem-race seam after a real export write. Socket
+// writes and descriptor publication are untouched; no service is substituted.
+static std::atomic<bool> interceptExportWrite{false};
+static std::function<void(int)> afterExportWrite;
+extern "C" ssize_t write(int fd, const void *buffer, size_t bytes)
+{
+  const auto n = ::syscall(SYS_write, fd, buffer, bytes);
+  if (n > 0 && interceptExportWrite.load()) {
+    struct stat st{};
+    char path[4096]{};
+    const auto link = "/proc/self/fd/" + std::to_string(fd);
+    const auto length = ::readlink(link.c_str(), path, sizeof(path) - 1);
+    if (::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && length > 0
+        && std::string(path).find("/image-") != std::string::npos
+        && interceptExportWrite.exchange(false))
+      afterExportWrite(fd);
+  }
+  return n;
+}
+
+static std::atomic<bool> failImageDirectoryOpen{false};
+static std::atomic<bool> failLaunchDirectoryOpen{false};
+static std::atomic<bool> interceptImageDirectoryCreate{false};
+static std::function<void()> afterImageDirectoryCreate;
+extern "C" int openat(int parent, const char *name, int flags, ...)
+{
+  mode_t mode = 0;
+  if (flags & O_CREAT) {
+    va_list arguments;
+    va_start(arguments, flags);
+    mode = va_arg(arguments, mode_t);
+    va_end(arguments);
+  }
+  if (failImageDirectoryOpen.load() && !std::strcmp(name, "images")
+      && (flags & O_DIRECTORY) && failImageDirectoryOpen.exchange(false)) {
+    errno = EIO;
+    return -1;
+  }
+  if (failLaunchDirectoryOpen.load() && std::strlen(name) == 32
+      && (flags & O_DIRECTORY) && failLaunchDirectoryOpen.exchange(false)) {
+    errno = EIO;
+    return -1;
+  }
+  return int(::syscall(SYS_openat, parent, name, flags, mode));
+}
+extern "C" int mkdirat(int parent, const char *name, mode_t mode)
+{
+  const auto result = int(::syscall(SYS_mkdirat, parent, name, mode));
+  if (result == 0 && interceptImageDirectoryCreate.load()
+      && !std::strcmp(name, "images")
+      && interceptImageDirectoryCreate.exchange(false))
+    afterImageDirectoryCreate();
+  return result;
 }
 
 using namespace vsr::integration;
@@ -208,6 +264,7 @@ bool confirmReady(SceneId)
 struct ImageAllocator : std::pmr::memory_resource
 {
   std::size_t remaining{0};
+  std::atomic<std::size_t> deallocations{0};
 
  protected:
   void *do_allocate(std::size_t bytes, std::size_t alignment) override;
@@ -228,6 +285,7 @@ void ImageAllocator::do_deallocate(
     void *p, std::size_t bytes, std::size_t alignment)
 {
   std::pmr::new_delete_resource()->deallocate(p, bytes, alignment);
+  ++deallocations;
 }
 bool ImageAllocator::do_is_equal(
     const std::pmr::memory_resource &other) const noexcept
@@ -355,9 +413,13 @@ struct Fixture
         integration, *engine, authority->launchId(), dir, exchangeLimits);
     images->attachScene(sceneId, *sceneIds);
     inspector->setImageExchange(
-        [this](SceneId id) { return images->metadata(id); });
+        [this](SceneId id, const std::string &sessionId) {
+          return images->metadata(id, sessionId);
+        },
+        [this](SceneId id) { return images->unavailableReason(id); });
 
     mcp::Config cfg;
+    cfg.imageExchange = images->metadata(sceneId);
     mcp::tools::addImageTools(cfg.tools, {ids, *images});
     mcp::tools::addQueryTools(cfg.tools, {*engine, *inspector});
     mcp::tools::addLookupTools(cfg.tools, *engine);
@@ -5176,6 +5238,28 @@ SCENARIO(
   }
 }
 
+SCENARIO(
+    "MCP Image Exchange discovery reports only the authenticated session capacity",
+    "[integration][mcp][image-export][image-export-discovery]")
+{
+  Fixture f({}, true, false, false, 120., true);
+  const auto s = f.attach();
+  f.tool(s, "vsr_discover", "{\"request_id\":1}");
+  const auto discovered = f.await(s, 1);
+  const auto &items = discovered.result()->get("items")->a;
+  REQUIRE_FALSE(items.empty());
+  const auto *limits =
+      items.at(0).get("image_exchange")->get("exchange_limits");
+  REQUIRE(limits->get("available_session_snapshot_bytes"));
+  CHECK(limits->get("available_session_snapshot_bytes")->n == 67108864);
+  descriptor::Descriptor published;
+  REQUIRE(descriptor::read(f.server->published().path(), published).ok());
+  json::Value metadata;
+  REQUIRE(json::parse(published.imageExchange, metadata));
+  CHECK_FALSE(
+      metadata.get("exchange_limits")->get("available_session_snapshot_bytes"));
+}
+
 SCENARIO("MCP Image Export captures sharing without mutating texels",
     "[integration][mcp][image-export]")
 {
@@ -5442,6 +5526,47 @@ SCENARIO(
     CHECK(result.str("outcome") == "invalid_request");
     CHECK(result.result()->get("reason")->s == "foreign_scene");
   }
+  SECTION("foreign non-Array retains invalid-handle diagnostics")
+  {
+    identity::SceneIdentity foreign(f.ids, f.hidden);
+    f.images->attachScene(f.hiddenId, foreign);
+    const auto material = f.hidden.createObject<vsr::scene::Material>("matte");
+    const auto h = foreign.handleOf(material.data());
+    char text[33];
+    std::snprintf(text,
+        sizeof(text),
+        "%016llx%016llx",
+        (unsigned long long)h.domain,
+        (unsigned long long)h.serial);
+    f.exportImage(s, 2, text);
+    const auto result = f.await(s, 2);
+    REQUIRE(result.str("outcome") == "invalid_request");
+    CHECK(result.result()->get("reason")->s == "invalid_handle");
+    CHECK(std::filesystem::is_empty(f.exchangePath()));
+  }
+  SECTION("unknown identity")
+  {
+    f.exportImage(s, 2, "00000000000000000000000000000000");
+    const auto result = f.await(s, 2);
+    CHECK(result.str("outcome") == "invalid_request");
+    CHECK(result.result()->get("reason")->s == "invalid_handle");
+    CHECK(std::filesystem::is_empty(f.exchangePath()));
+  }
+  SECTION("local non-Array")
+  {
+    f.tool(s,
+        "vsr_inspect",
+        "{\"request_id\":2,\"scene_id\":" + std::to_string(f.sceneId)
+            + ",\"object_type\":\"ANARI_MATERIAL\"}");
+    const auto observed = f.await(s, 2);
+    REQUIRE(observed.str("outcome") == "ok");
+    f.exportImage(
+        s, 3, observed.result()->get("items")->a.at(0).get("handle")->s);
+    const auto result = f.await(s, 3);
+    REQUIRE(result.str("outcome") == "invalid_request");
+    CHECK(result.result()->get("reason")->s == "invalid_handle");
+    CHECK(std::filesystem::is_empty(f.exchangePath()));
+  }
   SECTION("replaced exchange directory")
   {
     const auto path = f.exchangePath();
@@ -5454,6 +5579,25 @@ SCENARIO(
     json::Value metadata;
     REQUIRE(json::parse(f.images->metadata(f.sceneId), metadata));
     CHECK_FALSE(metadata.get("enabled")->b);
+    const auto unavailable = f.inspectArray(s, 3);
+    const auto &info =
+        *unavailable.result()->get("items")->a.at(0).get("image_info");
+    CHECK(info.get("state")->s == "unavailable");
+    REQUIRE(info.get("reason"));
+    CHECK(info.get("reason")->s == "file_rejected");
+    CHECK_FALSE(info.get("data_version"));
+    const auto version =
+        f.sceneIds->imageDataVersion(f.sceneIds->handleOf(image.data()));
+    const unsigned char changed[] = {123};
+    image->setData(static_cast<const void *>(changed));
+    REQUIRE(::rmdir(path.c_str()) == 0);
+    REQUIRE(::rename((path + "-old").c_str(), path.c_str()) == 0);
+    const auto available = f.inspectArray(s, 4);
+    const auto &restoredInfo =
+        *available.result()->get("items")->a.at(0).get("image_info");
+    CHECK(restoredInfo.get("state")->s == "available");
+    REQUIRE(version);
+    CHECK(restoredInfo.get("data_version")->s != *version);
   }
   SECTION("symlinked exchange directory")
   {
@@ -5474,6 +5618,167 @@ SCENARIO(
     f.drain();
     CHECK(f.status(s, s.id, 2).str("outcome") == "cancelled");
   }
+}
+
+SCENARIO("MCP Image Export refuses raced leaf identity and link changes",
+    "[integration][mcp][image-export][image-export-race]")
+{
+  Fixture f({}, true, false, false, 120., true);
+  auto image = f.scene.createArray(ANARI_UFIXED8, 1, 1);
+  image->setName("tracked-image");
+  const unsigned char pixel[] = {87};
+  image->setData(static_cast<const void *>(pixel));
+  const auto s = f.attach();
+  const auto handle =
+      f.inspectArray(s, 1).result()->get("items")->a.at(0).get("handle")->s;
+  const auto directory = f.exchangePath();
+  TempDir outside;
+  const auto sentinel = outside.path + "/keep.png";
+  std::ofstream(sentinel) << "outside";
+  std::string name;
+  enum class Race
+  {
+    LINK,
+    NAME,
+    SIZE,
+    MODE,
+    ANCESTRY
+  } race{Race::LINK};
+  SECTION("hard link")
+  {
+    race = Race::LINK;
+  }
+  SECTION("replacement symlink")
+  {
+    race = Race::NAME;
+  }
+  SECTION("changed size")
+  {
+    race = Race::SIZE;
+  }
+  SECTION("changed mode")
+  {
+    race = Race::MODE;
+  }
+  SECTION("replaced ancestor")
+  {
+    race = Race::ANCESTRY;
+  }
+  struct HookScope
+  {
+    ~HookScope()
+    {
+      interceptExportWrite = false;
+      afterExportWrite = {};
+    }
+  } hook;
+  afterExportWrite = [&](int fd) {
+    char text[4096]{};
+    const auto link = "/proc/self/fd/" + std::to_string(fd);
+    const auto length = ::readlink(link.c_str(), text, sizeof(text) - 1);
+    if (length <= 0)
+      return;
+    name = text;
+    switch (race) {
+    case Race::LINK:
+      ::link(name.c_str(), (directory + "/alias.png").c_str());
+      break;
+    case Race::NAME:
+      ::unlink(name.c_str());
+      ::symlink(sentinel.c_str(), name.c_str());
+      break;
+    case Race::SIZE:
+      ::ftruncate(fd, 1);
+      break;
+    case Race::MODE:
+      ::fchmod(fd, 0644);
+      break;
+    case Race::ANCESTRY:
+      ::rename(directory.c_str(), (directory + "-old").c_str());
+      ::symlink(outside.path.c_str(), directory.c_str());
+      break;
+    }
+  };
+  interceptExportWrite = true;
+  f.exportImage(s, 2, handle);
+  const auto result = f.await(s, 2);
+  REQUIRE_FALSE(interceptExportWrite.load());
+  REQUIRE(result.str("outcome") == "invalid_request");
+  CHECK(result.result()->get("reason")->s == "file_rejected");
+  CHECK_FALSE(result.flag("committed"));
+  if (race == Race::NAME)
+    CHECK(std::filesystem::is_symlink(
+        name)); // Failure cleanup owns no replacement.
+  CHECK(std::filesystem::file_size(sentinel) == 7);
+}
+
+SCENARIO("MCP Image Export rechecks receipt ownership and late withdrawal",
+    "[integration][mcp][image-export][image-export-receipt]")
+{
+  ImageAllocator allocator;
+  allocator.remaining = 2;
+  image::ExchangeLimits limits;
+  limits.allocator = &allocator;
+  Fixture f({}, true, false, false, 120., true, UINT64_MAX, limits);
+  auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 16, 16);
+  image->setName("tracked-image");
+  const std::vector<unsigned char> pixels(1024, 17);
+  image->setData(static_cast<const void *>(pixels.data()));
+  const auto s = f.attach();
+  const auto handle =
+      f.inspectArray(s, 1).result()->get("items")->a.at(0).get("handle")->s;
+  const auto path = f.exchangePath();
+  f.exportImage(s, 2, handle);
+  REQUIRE(f.integration.service() > 0);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  // The host allocator observes actual output-buffer release: the worker has
+  // closed/validated the file, but no owning-thread receipt has been serviced.
+  while (!allocator.deallocations.load()) {
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  REQUIRE(std::distance(std::filesystem::directory_iterator(path),
+              std::filesystem::directory_iterator{})
+      == 1);
+  const auto file = std::filesystem::directory_iterator(path)->path();
+  std::string outcome = "invalid_request";
+  SECTION("file changed before receipt")
+  {
+    std::ofstream(file, std::ios::binary | std::ios::trunc) << "changed";
+  }
+  SECTION("directory replaced before receipt")
+  {
+    REQUIRE(::rename(path.c_str(), (path + "-old").c_str()) == 0);
+    REQUIRE(::mkdir(path.c_str(), 0700) == 0);
+  }
+  SECTION("cancel before receipt")
+  {
+    f.tool(s, "vsr_cancel", "{\"operation_ref\":" + ref(s.id, 2) + "}");
+    outcome = "cancelled";
+  }
+  SECTION("READ withdrawn before receipt")
+  {
+    f.authority->restrict(
+        session::Target::scene(f.sceneId), session::Capability::READ);
+    outcome = "forbidden";
+  }
+  SECTION("deadline before receipt")
+  {
+    f.now += 31.;
+    outcome = "timeout";
+  }
+  const auto result = f.await(s, 2);
+  CHECK(result.str("outcome") == outcome);
+  CHECK_FALSE(result.flag("committed"));
+  const auto cleanupDeadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (allocator.deallocations.load() < 2) {
+    f.drain();
+    REQUIRE(std::chrono::steady_clock::now() < cleanupDeadline);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  CHECK_FALSE(std::filesystem::exists(file));
 }
 
 SCENARIO("MCP Image Export bounds collision retries without overwriting files",
@@ -5546,6 +5851,58 @@ SCENARIO("MCP Image Export binding result and work caps do not fail capture",
           + result.result()->get("affected_users")->a.size()
       <= 256);
   CHECK(result.result()->get("exchange_limits")->get("usage_complete")->b);
+}
+
+SCENARIO(
+    "MCP Image Export reserves shared host memory until physical buffers are released",
+    "[integration][mcp][image-export][image-export-memory]")
+{
+  auto shared = std::make_shared<vsr::rendering::FrameBudget>(4u << 20);
+  image::ExchangeLimits limits;
+  limits.physicalByteCap = shared->limit();
+  limits.reservePhysicalMemory = [shared](std::size_t bytes) {
+    return shared->reserve(bytes);
+  };
+  Fixture f({}, true, false, false, 120., true, UINT64_MAX, limits);
+  auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 256, 256);
+  image->setName("tracked-image");
+  const auto s = f.attach();
+  const auto handle =
+      f.inspectArray(s, 1).result()->get("items")->a.at(0).get("handle")->s;
+  const std::vector<unsigned char> pixels(262144, 29);
+  image->setData(static_cast<const void *>(pixels.data()));
+  const auto baseline = shared->used();
+  auto occupied = shared->reserve(2u << 20); // A different host consumer.
+  REQUIRE(occupied);
+  f.exportImage(s, 2, handle);
+  const auto rejected = f.await(s, 2);
+  REQUIRE(rejected.str("outcome") == "busy");
+  CHECK(rejected.result()->get("reason")->s == "resource_limit");
+  occupied.reset();
+  CHECK(shared->used() == baseline);
+  f.exportImage(s, 3, handle);
+  REQUIRE(f.integration.service() > 0);
+  CHECK(shared->used() > baseline + 2950655);
+  const auto exported = f.await(s, 3);
+  REQUIRE(exported.str("outcome") == "ok");
+  CHECK(exported.result()
+            ->get("exchange_limits")
+            ->get("transient_image_byte_cap")
+            ->n
+      == 4194304);
+  CHECK(shared->used() == baseline);
+  f.exportImage(s, 4, handle);
+  REQUIRE(f.integration.service() > 0);
+  f.tool(s, "vsr_cancel", "{\"operation_ref\":" + ref(s.id, 4) + "}");
+  f.await(s, 4);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (shared->used() != baseline) {
+    f.drain();
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  CHECK(shared->used() == baseline);
 }
 
 SCENARIO("MCP Image Export allocation failure releases admission capacity",
@@ -5650,6 +6007,183 @@ SCENARIO("MCP Image Export removes partial files after disk failure",
       == result.result()->get("file_name")->s);
   f.images.reset();
   CHECK_FALSE(std::filesystem::exists(path));
+}
+
+SCENARIO(
+    "MCP Image Exchange construction fails closed without adopting old files",
+    "[integration][mcp][image-export][image-export-runtime]")
+{
+  Fixture f({}, true, false, false, 120., true);
+  auto image = f.scene.createArray(ANARI_UFIXED8, 1, 1);
+  image->setName("tracked-image");
+  const auto s = f.attach();
+  const auto initial = f.inspectArray(s, 1);
+  const auto version = initial.result()
+                           ->get("items")
+                           ->a.at(0)
+                           .get("image_info")
+                           ->get("data_version")
+                           ->s;
+  const auto path = f.exchangePath();
+  std::ofstream(path + "/agent.png") << "retained";
+  SECTION("existing launch must not be adopted")
+  {
+    image::ImageExchange duplicate(
+        f.integration, *f.engine, f.authority->launchId(), f.dir);
+    json::Value metadata;
+    REQUIRE(json::parse(duplicate.metadata(f.sceneId), metadata));
+    CHECK_FALSE(metadata.get("enabled")->b);
+    CHECK(metadata.get("reason")->s == "unsafe_directory");
+  }
+  SECTION("invalid runtime does not expose tracking as exchange availability")
+  {
+    f.images.reset();
+    descriptor::RuntimeDirectory invalid;
+    f.images = std::make_unique<image::ImageExchange>(
+        f.integration, *f.engine, f.authority->launchId(), invalid);
+    f.images->attachScene(f.sceneId, *f.sceneIds);
+    const auto unavailable = f.inspectArray(s, 2);
+    const auto &info =
+        *unavailable.result()->get("items")->a.at(0).get("image_info");
+    CHECK(info.get("state")->s == "unavailable");
+    CHECK(info.get("reason")->s == "unsafe_directory");
+    CHECK_FALSE(info.get("data_version"));
+    const unsigned char changed[] = {87};
+    image->setData(static_cast<const void *>(changed));
+    f.images.reset();
+    f.images = std::make_unique<image::ImageExchange>(
+        f.integration, *f.engine, f.authority->launchId(), f.dir);
+    f.images->attachScene(f.sceneId, *f.sceneIds);
+    const auto available = f.inspectArray(s, 3);
+    const auto &current =
+        *available.result()->get("items")->a.at(0).get("image_info");
+    CHECK(current.get("state")->s == "available");
+    CHECK(current.get("data_version")->s != version);
+    return;
+  }
+  SECTION("held runtime renamed before construction")
+  {
+    const auto oldPath = f.tmp.path + "-held";
+    REQUIRE(::rename(f.tmp.path.c_str(), oldPath.c_str()) == 0);
+    REQUIRE(::mkdir(f.tmp.path.c_str(), 0700) == 0);
+    {
+      image::ImageExchange stale(
+          f.integration, *f.engine, f.authority->launchId(), f.dir);
+      json::Value metadata;
+      REQUIRE(json::parse(stale.metadata(f.sceneId), metadata));
+      CHECK_FALSE(metadata.get("enabled")->b);
+      CHECK(metadata.get("reason")->s == "unsafe_directory");
+      CHECK(std::filesystem::is_empty(f.tmp.path));
+    }
+    REQUIRE(::rmdir(f.tmp.path.c_str()) == 0);
+    REQUIRE(::rename(oldPath.c_str(), f.tmp.path.c_str()) == 0);
+  }
+  CHECK(std::filesystem::file_size(path + "/agent.png") == 8);
+  CHECK(f.inspectArray(s, 4)
+            .result()
+            ->get("items")
+            ->a.at(0)
+            .get("image_info")
+            ->get("data_version")
+            ->s
+      == version);
+}
+
+SCENARIO("MCP Image Exchange construction races never redirect cleanup",
+    "[integration][mcp][image-export][image-export-construction]")
+{
+  Fixture f({}, true, false, false, 120., true);
+  const auto path = f.exchangePath();
+  const auto launch = std::filesystem::path(path).parent_path();
+  f.images.reset();
+  TempDir outside;
+  std::ofstream(outside.path + "/keep.png") << "outside";
+  struct HookScope
+  {
+    ~HookScope()
+    {
+      failImageDirectoryOpen = false;
+      failLaunchDirectoryOpen = false;
+      interceptImageDirectoryCreate = false;
+      afterImageDirectoryCreate = {};
+    }
+  } hook;
+  bool raced = false;
+  SECTION("directory open fails after creation")
+  {
+    failImageDirectoryOpen = true;
+  }
+  SECTION("launch open fails after creation")
+  {
+    failLaunchDirectoryOpen = true;
+  }
+  SECTION("launch replaced while creating images")
+  {
+    raced = true;
+    afterImageDirectoryCreate = [&] {
+      ::rename(launch.c_str(), (launch.string() + "-held").c_str());
+      ::symlink(outside.path.c_str(), launch.c_str());
+    };
+    interceptImageDirectoryCreate = true;
+  }
+  {
+    image::ImageExchange unavailable(
+        f.integration, *f.engine, f.authority->launchId(), f.dir);
+    json::Value metadata;
+    REQUIRE(json::parse(unavailable.metadata(f.sceneId), metadata));
+    CHECK_FALSE(metadata.get("enabled")->b);
+    CHECK(metadata.get("reason")->s == "unsafe_directory");
+  }
+  if (!raced)
+    CHECK_FALSE(std::filesystem::exists(launch));
+  else
+    CHECK(std::filesystem::is_symlink(launch));
+  CHECK(std::filesystem::file_size(outside.path + "/keep.png") == 7);
+}
+
+SCENARIO("MCP Image Exchange normal teardown drains active backend jobs",
+    "[integration][mcp][image-export][image-export-teardown]")
+{
+  ImageAllocator allocator;
+  allocator.remaining = 2;
+  image::ExchangeLimits limits;
+  limits.allocator = &allocator;
+  Fixture f({}, true, false, false, 120., true, UINT64_MAX, limits);
+  auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 2048, 2048);
+  image->setName("tracked-image");
+  const auto s = f.attach();
+  const auto handle =
+      f.inspectArray(s, 1).result()->get("items")->a.at(0).get("handle")->s;
+  const auto path = f.exchangePath();
+  f.exportImage(s, 2, handle);
+  REQUIRE(f.integration.service() > 0);
+  const auto started = std::chrono::steady_clock::now();
+  f.server.reset();
+  f.images.reset();
+  f.engine.reset();
+  CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(5));
+  CHECK_FALSE(std::filesystem::exists(path));
+  CHECK(allocator.deallocations.load() >= 1);
+}
+
+SCENARIO(
+    "MCP Image Export normal exit removes nested agent files without following links",
+    "[integration][mcp][image-export][image-export-cleanup]")
+{
+  Fixture f({}, true, false, false, 120., true);
+  const auto path = f.exchangePath();
+  TempDir outside;
+  std::ofstream(outside.path + "/keep.png") << "outside";
+  REQUIRE(::mkdir((path + "/agent").c_str(), 0700) == 0);
+  REQUIRE(::mkdir((path + "/agent/nested").c_str(), 0700) == 0);
+  std::ofstream(path + "/agent/nested/work.png") << "work";
+  REQUIRE(
+      ::symlink(outside.path.c_str(), (path + "/agent/external").c_str()) == 0);
+  f.images.reset();
+  CHECK_FALSE(std::filesystem::exists(path));
+  CHECK_FALSE(
+      std::filesystem::exists(std::filesystem::path(path).parent_path()));
+  CHECK(std::filesystem::exists(outside.path + "/keep.png"));
 }
 
 SCENARIO("MCP Image Export checks exact entropy bounds and strict schema",

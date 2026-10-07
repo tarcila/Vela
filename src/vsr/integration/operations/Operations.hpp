@@ -202,6 +202,10 @@ struct Step
   // Called before copying visible payloads to a public Status, including
   // replay.
   std::function<std::shared_ptr<const void>()> reserveStatus;
+  // No-fail ownership handoff only after COMPLETE is accepted, never after
+  // cancellation/deadline. Runs under the record lock: no engine reentrancy,
+  // I/O or allocation. The executor must not publish ownership speculatively.
+  std::function<void()> onAccepted;
 };
 
 using Executor = std::function<Step(StepContext &)>;
@@ -1327,6 +1331,8 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
       return;
     }
 
+    if (!r->committed && r->deadline > 0. && now >= r->deadline)
+      r->pendingCancel = Outcome::TIMEOUT;
     if (r->pendingCancel && !r->committed) {
       const Outcome o = *r->pendingCancel;
       r->phase = step.status == Step::Status::BACKEND_PENDING ? Phase::BACKEND
@@ -1358,6 +1364,8 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
       if (r->sessionWide)
         r->covered = std::move(step.covered);
       r->phase = Phase::RUNNING;
+      if (step.onAccepted)
+        step.onAccepted();
       finish(*r, step.outcome, now);
       break;
     }

@@ -144,6 +144,50 @@ std::string slurp(const std::string &p)
 
 } // namespace
 
+SCENARIO("Descriptor accepts strict optional Image Exchange metadata",
+    "[integration][image-descriptor]")
+{
+  const std::string limits =
+      "{\"file_cap\":1024,\"byte_cap\":268435456,"
+      "\"files_used\":0,\"bytes_used\":0,\"usage_complete\":true,"
+      "\"quota_scan_entry_cap\":4096,\"max_ancillary_bytes\":65536,"
+      "\"transient_image_byte_cap\":1048576,\"session_snapshot_byte_cap\":67108864,"
+      "\"effective_global_retention_byte_cap\":16777216,"
+      "\"available_global_retention_bytes\":16777216}";
+  const auto exchange = std::string("{\"supported\":true,\"enabled\":true,")
+      + "\"export\":true,\"import\":false,\"data_tracking\":true,"
+      + "\"image_exchange_directory\":\"/tmp/private/vsr/" + kId
+      + "/images\",\"exchange_limits\":" + limits + "}";
+  const auto text = json(kFields + ",\"image_exchange\":" + exchange);
+  desc::Descriptor parsed;
+  REQUIRE(desc::parse(text, parsed).ok());
+  CHECK(desc::parse(desc::serialize(parsed), parsed).ok());
+  CHECK(desc::serialize(parsed).find("image_exchange_directory")
+      != std::string::npos);
+  CHECK(desc::serialize(parsed).find("available_session_snapshot_bytes")
+      == std::string::npos);
+  for (const auto &bad :
+      {replaceOnce(text, "\"files_used\":0", "\"files_used\":0,\"extra\":1"),
+          replaceOnce(
+              text, "\"files_used\":0", "\"files_used\":0,\"files_used\":1"),
+          replaceOnce(text,
+              "\"files_used\":0",
+              "\"files_used\":0,\"available_session_snapshot_bytes\":67108864"),
+          replaceOnce(text, "/images", "/../images"),
+          replaceOnce(text, "\"enabled\":true", "\"enabled\":\"true\""),
+          replaceOnce(text, "\"file_cap\":1024", "\"file_cap\":1025"),
+          replaceOnce(text, "\"launch_credential\":", "\"unknown\":")})
+    CHECK(parseCode(bad) == Code::invalid_descriptor);
+  CHECK(parseCode(json(kFields)) == Code::ok); // Existing proxies/hosts.
+  const auto unavailable =
+      "{\"supported\":false,\"enabled\":false,\"export\":false,"
+      "\"import\":false,\"data_tracking\":true,\"reason\":\"unsafe_directory\","
+      "\"exchange_limits\":"
+      + limits + "}";
+  CHECK(parseCode(json(kFields + ",\"image_exchange\":" + unavailable))
+      == Code::ok);
+}
+
 SCENARIO("Descriptor schema is strict v1", "[integration]")
 {
   GIVEN("the canonical serialization")

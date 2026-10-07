@@ -3,8 +3,8 @@
 
 // vsrMcpProxy driven over pipes against an in-process MCP server with a
 // controlled lease clock, plus fake loopback endpoints for the proxy's
-// local limits (byte cap, deadline, reattach failure, ownership). Compiled to nothing unless VSR_USE_INTEGRATION_MCP
-// is on.
+// local limits (byte cap, deadline, reattach failure, ownership). Compiled to
+// nothing unless VSR_USE_INTEGRATION_MCP is on.
 
 #if defined(VSR_USE_INTEGRATION_MCP) && defined(__linux__)
 
@@ -76,7 +76,8 @@ struct Server
   descriptor::RuntimeDirectory dir;
   std::unique_ptr<mcp::McpServer> server;
 
-  explicit Server(session::MonotonicClock clock = session::steadyClock())
+  explicit Server(session::MonotonicClock clock = session::steadyClock(),
+      bool imageMetadata = false)
   {
     SceneRegistration s;
     s.name = "scene";
@@ -94,6 +95,16 @@ struct Server
     REQUIRE(engine);
     REQUIRE(descriptor::openDirectory(tmp.path, {}, dir).ok());
     mcp::Config cfg;
+    if (imageMetadata)
+      cfg.imageExchange =
+          "{\"supported\":false,\"enabled\":false,"
+          "\"export\":false,\"import\":false,\"data_tracking\":false,"
+          "\"reason\":\"host_write_contract_unavailable\",\"exchange_limits\":{"
+          "\"file_cap\":1024,\"byte_cap\":268435456,\"files_used\":0,\"bytes_used\":0,"
+          "\"usage_complete\":false,\"quota_scan_entry_cap\":4096,\"max_ancillary_bytes\":65536,"
+          "\"transient_image_byte_cap\":268435456,\"session_snapshot_byte_cap\":67108864,"
+          "\"effective_global_retention_byte_cap\":16777216,"
+          "\"available_global_retention_bytes\":16777216}}";
     mcp::Tool t;
     t.name = "echo_probe";
     t.description = "session-scoped probe";
@@ -226,10 +237,11 @@ struct Harness
   }
 };
 
-std::string rpc(int id, const std::string &method, const std::string &params = "{}")
+std::string rpc(
+    int id, const std::string &method, const std::string &params = "{}")
 {
-  return "{\"jsonrpc\":\"2.0\",\"id\":" + std::to_string(id)
-      + ",\"method\":\"" + method + "\",\"params\":" + params + "}";
+  return "{\"jsonrpc\":\"2.0\",\"id\":" + std::to_string(id) + ",\"method\":\""
+      + method + "\",\"params\":" + params + "}";
 }
 
 bool waitFor(const std::function<bool()> &cond)
@@ -248,7 +260,8 @@ bool waitFor(const std::function<bool()> &cond)
 // client closes it, so only Content-Length can end the read.
 struct FakeEndpoint
 {
-  using Handler = std::function<std::optional<std::string>(const std::string &)>;
+  using Handler =
+      std::function<std::optional<std::string>(const std::string &)>;
   int listenFd{-1};
   int port{0};
   Handler handler;
@@ -269,7 +282,8 @@ struct FakeEndpoint
     REQUIRE(::bind(listenFd, reinterpret_cast<sockaddr *>(&a), sizeof(a)) == 0);
     REQUIRE(::listen(listenFd, 8) == 0);
     socklen_t len = sizeof(a);
-    REQUIRE(::getsockname(listenFd, reinterpret_cast<sockaddr *>(&a), &len) == 0);
+    REQUIRE(
+        ::getsockname(listenFd, reinterpret_cast<sockaddr *>(&a), &len) == 0);
     port = ntohs(a.sin_port);
     thread = std::thread([this] { loop(); });
   }
@@ -364,8 +378,8 @@ struct FakeEndpoint
     if (auto out = handler(body)) {
       std::size_t done = 0;
       while (done < out->size()) {
-        const ssize_t n = ::send(
-            c, out->data() + done, out->size() - done, MSG_NOSIGNAL);
+        const ssize_t n =
+            ::send(c, out->data() + done, out->size() - done, MSG_NOSIGNAL);
         if (n <= 0)
           return;
         done += std::size_t(n);
@@ -393,6 +407,25 @@ std::string errorCode(const std::string &line)
 }
 
 } // namespace
+
+SCENARIO("vsrMcpProxy accepts a strict Image Exchange launch descriptor",
+    "[integration][image-descriptor][mcp-proxy]")
+{
+  Server s(session::steadyClock(), true);
+  descriptor::Descriptor d;
+  REQUIRE(descriptor::read(s.descriptorPath(), d).ok());
+  CHECK_FALSE(d.imageExchange.empty());
+  CHECK(d.imageExchange.find("available_session_snapshot_bytes")
+      == std::string::npos);
+  Harness h(s);
+  const auto reply = h.request(
+      "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}");
+  REQUIRE(reply.get("result"));
+  CHECK(reply.get("result")->get("tools")->a.at(0).get("name")->s
+      == "echo_probe");
+  h.finish();
+  CHECK(h.exitCode == 0);
+}
 
 SCENARIO("vsrMcpProxy forwards MCP, hides vsr/*, renews, detaches on EOF",
     "[integration]")
@@ -466,7 +499,8 @@ SCENARIO("vsrMcpProxy forwards MCP, hides vsr/*, renews, detaches on EOF",
 
   // No secret on stdout or stderr. The session secret is unknown to the
   // test, so check the launch credential and every proof-shaped token.
-  REQUIRE(transcript.find(s.authority->launchCredential()) == std::string::npos);
+  REQUIRE(
+      transcript.find(s.authority->launchCredential()) == std::string::npos);
   REQUIRE(transcript.find("session_secret") == std::string::npos);
   REQUIRE(transcript.find("session_id") == std::string::npos);
   REQUIRE(transcript.find("Bearer") == std::string::npos);
@@ -517,7 +551,8 @@ SCENARIO("vsrMcpProxy honours Content-Length and caps response bytes",
     FakeEndpoint ep([](const std::string &b) -> std::optional<std::string> {
       if (isAttach(b))
         return FakeEndpoint::attachOk();
-      return FakeEndpoint::reply("{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{}}");
+      return FakeEndpoint::reply(
+          "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{}}");
     });
     proxy::Proxy p(ep.descriptor(), opts);
     const auto t0 = std::chrono::steady_clock::now();
@@ -535,7 +570,8 @@ SCENARIO("vsrMcpProxy honours Content-Length and caps response bytes",
       return FakeEndpoint::reply(big);
     });
     proxy::Proxy p(ep.descriptor(), opts);
-    REQUIRE(errorCode(p.handleLine(rpc(8, "tools/list"))) == "response_too_large");
+    REQUIRE(
+        errorCode(p.handleLine(rpc(8, "tools/list"))) == "response_too_large");
   }
 
   GIVEN("an undeclared body that streams past the cap")
@@ -546,7 +582,8 @@ SCENARIO("vsrMcpProxy honours Content-Length and caps response bytes",
       return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" + big;
     });
     proxy::Proxy p(ep.descriptor(), opts);
-    REQUIRE(errorCode(p.handleLine(rpc(9, "tools/list"))) == "response_too_large");
+    REQUIRE(
+        errorCode(p.handleLine(rpc(9, "tools/list"))) == "response_too_large");
   }
 }
 
@@ -588,10 +625,11 @@ SCENARIO("vsrMcpProxy answers a failed reattach locally without forwarding",
   REQUIRE(isAttach(seen[0]));
 }
 
-SCENARIO("vsrMcpProxy refuses an endpoint it cannot prove it owns",
-    "[integration]")
+SCENARIO(
+    "vsrMcpProxy refuses an endpoint it cannot prove it owns", "[integration]")
 {
-  for (const auto verdict : {proxy::Ownership::FOREIGN, proxy::Ownership::UNKNOWN}) {
+  for (const auto verdict :
+      {proxy::Ownership::FOREIGN, proxy::Ownership::UNKNOWN}) {
     FakeEndpoint ep([](const std::string &) -> std::optional<std::string> {
       return FakeEndpoint::attachOk();
     });

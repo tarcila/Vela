@@ -121,6 +121,8 @@ struct Config
   // its slot. 0 means "use sendTimeoutMs".
   int responseDeadlineMs{0};
   std::vector<Tool> tools;
+  // Optional strict launch-wide Image Exchange metadata (no session ledger).
+  std::string imageExchange;
   // Fixed-text diagnostics; never receives request data or secrets.
   std::function<void(std::string_view)> log;
 };
@@ -435,6 +437,7 @@ inline StartStatus McpServer::start(Config config,
   d.host = s->m_config.host;
   d.port = s->m_port;
   d.launchCredential = authority.launchCredential();
+  d.imageExchange = s->m_config.imageExchange;
   if (auto ps = descriptor::publish(dir, d, s->m_published); !ps.ok())
     return {StartCode::PUBLISH_FAILED, ps.reason};
 

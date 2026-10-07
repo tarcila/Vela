@@ -438,7 +438,9 @@ class Inspector
     m_views = std::move(views);
   }
 
-  void setImageExchange(std::function<std::string(SceneId)> observe);
+  void setImageExchange(
+      std::function<std::string(SceneId, const std::string &)> observe,
+      std::function<std::string(SceneId)> unavailableReason = {});
 
   const PageLimits &limits() const
   {
@@ -919,7 +921,7 @@ class Inspector
           + (m_integration.nodeEditsExposed(i) ? "true" : "false")
           + ",\"image_exchange\":"
           + (m_imageExchange
-                  ? m_imageExchange(i)
+                  ? m_imageExchange(i, j.sessionId)
                   : std::string(
                         "{\"supported\":false,\"enabled\":false,\"reason\":")
                       + detail::jsonString(
@@ -1437,8 +1439,14 @@ class Inspector
       item += ",\"summary\":" + detail::arraySummary(*array) + ",\"mapped\":"
           + (array->isMapped() ? "true" : "false") + ",\"image_info\":";
       const auto version = ids.imageDataVersion(h);
+      const auto exchangeReason = m_imageExchangeUnavailable
+          ? m_imageExchangeUnavailable(j.target.id)
+          : std::string{};
       if (!array->isImage())
         item += "{\"state\":\"unsupported\",\"reason\":\"unsupported_image\"}";
+      else if (!exchangeReason.empty())
+        item += "{\"state\":\"unavailable\",\"reason\":"
+            + detail::jsonString(exchangeReason) + "}";
       else if (!m_integration.imageTrackingAvailable(j.target.id) || !version)
         item +=
             "{\"state\":\"unavailable\","
@@ -1637,7 +1645,8 @@ class Inspector
   session::SessionAuthority &m_authority;
   IdentityLookup m_identities;
   ViewLookup m_views;
-  std::function<std::string(SceneId)> m_imageExchange;
+  std::function<std::string(SceneId, const std::string &)> m_imageExchange;
+  std::function<std::string(SceneId)> m_imageExchangeUnavailable;
   PageLimits m_limits;
   std::shared_ptr<ScratchPool> m_scratch;
   std::uint64_t m_key[2]{};
@@ -1646,9 +1655,11 @@ class Inspector
 // Inlined definitions ////////////////////////////////////////////////////////
 
 inline void Inspector::setImageExchange(
-    std::function<std::string(SceneId)> observe)
+    std::function<std::string(SceneId, const std::string &)> observe,
+    std::function<std::string(SceneId)> unavailableReason)
 {
   m_imageExchange = std::move(observe);
+  m_imageExchangeUnavailable = std::move(unavailableReason);
 }
 
 inline RequestDiagnostics Inspector::requestDiagnostics(

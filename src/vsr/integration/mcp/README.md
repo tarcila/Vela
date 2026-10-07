@@ -313,7 +313,12 @@ Available requires automatically enrolled, positive, host-resident Array2D
 8-bit fixed-point storage with one through four channels (linear or sRGB).
 It describes support regardless of permission or outstanding mapping. Unsupported
 or unavailable objects omit the available payload, especially `data_version`.
-No fabricated token, conversion or proxy/CUDA materialisation is performed.
+A qualified ImageExchange's unavailable reason (`unsafe_directory`,
+`file_rejected`, or `unsupported_platform`) also governs eligible Array
+`image_info`; tracking qualification alone does not hide directory failure.
+Enrolled identities continue to record ordinary writes during temporary
+unavailability. No fabricated token, conversion or proxy/CUDA materialisation
+is performed.
 Ordinary completed map/unmap writes advance the token once, including same-value
 writes and change-back; inspection while mapped keeps the previous token.
 Read-only inspection/capture does not allocate a write sequence. Map admission
@@ -324,8 +329,14 @@ Scene and Array parameter versions once and invalidates outstanding cursors agai
 Qualified hosts advertise `image_exchange` with `supported`, `enabled`,
 `export`, `import:false`, `data_tracking`, a private `image_exchange_directory`
 and effective `exchange_limits`. Unsafe directories and unsupported platforms
-advertise unavailable with an explicit reason. Hosts without ImageExchange keep
-`not_implemented`; the tracking prerequisite alone never advertises an endpoint.
+advertise unavailable with an explicit reason. The optional strict
+`image_exchange` field in the private launch descriptor publishes the same
+Image-independent directory/limit names as startup observations. It omits
+`available_session_snapshot_bytes`; only authenticated per-request observations
+publish that ledger field. Older descriptors without the optional object remain
+valid, while unknown/duplicate fields and malformed nested metadata still reject.
+Hosts without ImageExchange keep `not_implemented`; the tracking prerequisite
+alone never advertises an endpoint.
 See the [host and mutation contract](../../../../docs/image-data-tracking.md)
 for launch-wide reservations, exhaustion and lifetime-safe cache resolution.
 

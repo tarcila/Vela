@@ -1103,8 +1103,12 @@ void Application::setupIntegration()
     return;
   }
   m_renders->setDimensions(*viewId, AgentView::WIDTH, AgentView::HEIGHT);
-  m_frames = std::make_unique<vi::frame::FrameService>(
-      *m_integration, *m_authority, *m_engine);
+  const auto hostImageMemory = std::make_shared<vsr::rendering::FrameBudget>();
+  m_frames = std::make_unique<vi::frame::FrameService>(*m_integration,
+      *m_authority,
+      *m_engine,
+      vi::session::steadyClock(),
+      hostImageMemory);
   auto *identity = m_identity.get();
   auto *tracker = m_tracker.get();
   m_viewportSceneId = *sceneId;
@@ -1140,6 +1144,10 @@ void Application::setupIntegration()
   const auto runtimeStatus =
       vi::descriptor::openOsRuntimeDirectory(m_runtimeDir);
   vi::image::ExchangeLimits imageLimits;
+  imageLimits.physicalByteCap = hostImageMemory->limit();
+  imageLimits.reservePhysicalMemory = [hostImageMemory](std::size_t bytes) {
+    return hostImageMemory->reserve(bytes);
+  };
   imageLimits.globalRetentionBytes = m_activity->limits().bytes;
   imageLimits.availableGlobalRetention = [this] {
     const auto cap = m_activity->limits().bytes;
@@ -1153,8 +1161,12 @@ void Application::setupIntegration()
       imageLimits);
   m_images->attachScene(*sceneId, *m_identity);
   m_inspector->setImageExchange(
-      [this](vi::SceneId id) { return m_images->metadata(id); });
+      [this](vi::SceneId id, const std::string &sessionId) {
+        return m_images->metadata(id, sessionId);
+      },
+      [this](vi::SceneId id) { return m_images->unavailableReason(id); });
   vi::mcp::Config cfg;
+  cfg.imageExchange = m_images->metadata(*sceneId);
   vi::mcp::tools::addImageTools(cfg.tools, {*m_ids, *m_images});
   vi::mcp::tools::addQueryTools(cfg.tools, {*m_engine, *m_inspector});
   vi::mcp::tools::addLookupTools(cfg.tools, *m_engine);

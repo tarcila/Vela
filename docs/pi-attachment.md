@@ -54,7 +54,12 @@ Or open your own scene in the viewer:
 
 The **descriptor is a JSON connection file created by the application**, not
 something you write yourself. It contains the loopback endpoint and a private
-launch credential. The headless host prints its path; the viewer shows it in
+launch credential. Qualified Image-export hosts also publish an optional strict
+`image_exchange` startup observation with the private working-copy directory
+and effective Image-independent limits, never session-specific available bytes.
+The proxy accepts both this additive metadata and older descriptors without it;
+authenticated discovery remains the current availability observation.
+The headless host prints its path; the viewer shows it in
 **Agent Activity** and logs it as `[vsrViewer] MCP descriptor: <path>` (grep
 the log for `MCP descriptor:`). On Linux it normally looks like:
 
@@ -234,7 +239,10 @@ inspection and read-only access do not. Sampler image references remain Array
 handles with summaries.
 
 Qualified hosts expose `vsr_image_export`, requiring Scene READ rather than
-EDIT, and advertise their private `image_exchange_directory` through discovery.
+EDIT, and advertise their private `image_exchange_directory` through the optional
+strict launch descriptor metadata and authenticated discovery. Directory
+replacement/loss makes eligible Array `image_info` unavailable with the same
+reason while preserving enrolled write history.
 Poll kind `image_export` for the raw-channel PNG file name and captured version;
 process that working copy with local tooling without changing live texels.
 Image Import is not implemented. See [PNG exchange](image-png-exchange.md) for
