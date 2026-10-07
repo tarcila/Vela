@@ -35,7 +35,15 @@ inline void addFrameTools(std::vector<Tool> &tools, FrameDeps deps)
       "Rendered and current revisions are separate; stale displayed images are "
       "historical. Only explicitly exposed qualified sources support images. "
       "Example: {request_id:1,view_id:0}. Fetch via vsr_view_frame_image; replay "
-      "keeps the same historical frame. No UI, HUD, gizmos or desktop pixels.";
+      "keeps the same historical frame. To verify a camera move require "
+      "state=available, image_kind=presented_frame, the addressed view_id and "
+      "view_identity, rendered_view_revision equal to the move receipt, "
+      "rendered_scene_revision equal to the chosen post-move Scene observation, "
+      "matching rendered_configuration.camera, rendered_view_revision_basis="
+      "anari_render_start and stale=false. Poll with fresh request IDs for at "
+      "most 120 seconds, then report timeout; user input or another move makes "
+      "the target superseded. Current effective state, timestamps and independent "
+      "renders are not proof. No UI, HUD, gizmos or desktop pixels.";
   observe.inputSchemaJson = std::string("{\"type\":\"object\",\"properties\":{")
       + requestIdSchema() + ",\"view_id\":{\"type\":\"integer\",\"minimum\":0}},"
         "\"required\":[\"request_id\",\"view_id\"]}";

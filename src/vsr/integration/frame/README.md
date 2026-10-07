@@ -100,6 +100,35 @@ Unsupported/unqualified binding evidence remains unavailable/incomplete.
 Camera control does not widen qualification. Independent rendering and effective
 view-info cannot substitute for the explicitly addressed presented frame.
 
+Client verification procedure (not a new move-and-wait tool):
+
+1. Retain the successful move's `view_identity`, `view_revision` and
+   `effective_camera`. Choose a post-move Scene observation's `scene_revision`.
+2. Submit `vsr_view_frame` with a fresh session-scoped `request_id` for the
+   **same** `view_id`; poll that `operation_ref` to terminal through status.
+   Pending means no result yet. Unavailable includes an authoritative `reason`
+   and cannot establish successful acceptance.
+3. Compare `current_view_revision` with the target as well as the rendered
+   fields. A different current revision means the target was superseded (user
+   input, a later move, or a binding/configuration change); do not accept a
+   newer pose as proof. Compare `current_scene_revision` with the chosen Scene
+   target too. Reobserve/choose a new target if Scene content changes.
+4. An available old/delayed frame can have the correct identity but the wrong
+   `rendered_view_revision`, `rendered_scene_revision`, camera or `stale=true`.
+   Retry using a **new** frame request ID while the target remains current,
+   stopping at 120 seconds with explicit timeout. Do not extend this bound by
+   replaying or restarting requests. Historical status/image replay preserves
+   its original rendered/current observation, not the current move's pixels.
+5. Only when all fields match retrieve that frame through
+   `vsr_view_frame_image`. Preserve its operation/frame identity in evidence;
+   restoring Before agent advances the view revision and supersedes the move.
+
+The host's redundant controller-to-camera flush preserves an already committed
+identical pose instead of issuing a second parameter write. Actual navigation
+still advances the view revision. This lets the natural renderer use the exact
+camera receipt revision without accepting newer unrelated frames or weakening
+change-back detection for ordinary Scene writers.
+
 ## Bounds and image semantics
 
 Limits can narrow the existing2048-axis/2073600-pixel/8MiB PNG/12MiB response

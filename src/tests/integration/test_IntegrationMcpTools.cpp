@@ -25,6 +25,7 @@
 #include "vsr/io/images/ImageCache.hpp"
 #include "vsr/rendering/index/RenderIndexAllLayers.hpp"
 #include "vsr/rendering/pipeline/ImagePipeline.h"
+#include "vsr/rendering/view/ManipulatorToVSR.hpp"
 #include "vsr/scene/Scene.hpp"
 // anari
 #include <anari/anari_cpp.hpp>
@@ -2735,6 +2736,344 @@ SCENARIO(
   f.backend.allowRelease = true;
   f.backend.holdPolls = 0;
   CHECK(f.run(s, "vsr_operation_status", 7).str("outcome") == "ok");
+}
+
+SCENARIO("MCP frame tool describes the camera freshness predicate",
+    "[integration][mcp][camera-frame]")
+{
+  RenderFixture f(true);
+  const auto s = f.attach();
+  const auto listed = post(f.server->port(),
+      {"Host: " + f.server->authority(),
+          "Authorization: Bearer " + f.authority->launchCredential(),
+          "VSR-Session-ID: " + s.id,
+          "VSR-Session-Proof: Bearer " + s.secret},
+      "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}");
+  REQUIRE(listed.json.get("result"));
+  const auto *tools = listed.json.get("result")->get("tools");
+  REQUIRE(tools);
+  bool found = false;
+  for (const auto &tool : tools->a) {
+    if (tool.get("name")->s != "vsr_view_frame")
+      continue;
+    found = true;
+    const auto &description = tool.get("description")->s;
+    for (const auto *field : {"view_identity",
+             "rendered_view_revision",
+             "rendered_scene_revision",
+             "rendered_configuration.camera",
+             "anari_render_start",
+             "stale=false",
+             "120",
+             "superseded"})
+      CHECK(description.find(field) != std::string::npos);
+  }
+  REQUIRE(found);
+}
+
+SCENARIO(
+    "MCP camera targets distinguish delayed, superseded and replayed frames",
+    "[integration][mcp][camera-frame]")
+{
+  RenderFixture f(true);
+  const auto s = f.attach();
+  ViewId view = INVALID_VIEW_ID;
+  identity::ViewRevisionTracker tracker(f.ids, *f.identity);
+  vsr::rendering::Manipulator manipulator;
+  manipulator.setConfig({0.f, 0.f, 0.f}, 5.f);
+  auto binding = [&] {
+    EffectiveViewBinding b;
+    b.width = b.height = 2;
+    b.displayWidth = b.displayHeight = 2.;
+    b.deviceIdentifier = "helide";
+    b.deviceSubtype = "default";
+    b.cameraHandle = f.identity->handleOf(f.camera.data());
+    const auto p = *f.camera->parameterValueAs<vsr::math::float3>("position");
+    const auto d = *f.camera->parameterValueAs<vsr::math::float3>("direction");
+    const auto u = *f.camera->parameterValueAs<vsr::math::float3>("up");
+    b.camera.position = {p.x, p.y, p.z};
+    b.camera.direction = {d.x, d.y, d.z};
+    b.camera.up = {u.x, u.y, u.z};
+    b.camera.fovyDegrees =
+        vsr::math::degrees(*f.camera->parameterValueAs<float>("fovy"));
+    b.rendererSubtype = "default";
+    b.rendererConfigurationRevision = "stable";
+    b.pipelineSource = "viewer_image_pipeline";
+    b.pipelineConfigurationRevision = "stable";
+    b.sourceInstanceGeneration = 1;
+    b.outputColor = "rgba8_srgb";
+    return b;
+  };
+  REQUIRE(f.integration.submit(f.sceneId, [&](auto &) {
+    ViewRegistration vr;
+    vr.scene = f.sceneId;
+    vr.role = ViewRole::INTERACTIVE_VIEWPORT;
+    vr.grants.read = true;
+    vr.observeBinding = [&] {
+      return std::optional<EffectiveViewBinding>(binding());
+    };
+    view = *f.integration.registerView(vr);
+    REQUIRE(f.frames->attachView(view,
+        *f.identity,
+        tracker,
+        frame::SourceQualification::VIEWER_CPU_READY));
+  }));
+  f.integration.service();
+  render::ControllerCamera controller(
+      *f.identity,
+      tracker,
+      manipulator,
+      [&] { return f.camera.data(); },
+      [] { return true; });
+  REQUIRE(f.renders->attachCameraController(
+      view, *f.identity, tracker, controller));
+  REQUIRE(f.frames->setExposed(view, true));
+  f.integration.setAgentCameraControlEnabled(true);
+  auto args = [&](int id) {
+    return "{\"request_id\":" + std::to_string(id)
+        + ",\"view_id\":" + std::to_string(view) + "}";
+  };
+  auto move = [&](int id, int x) {
+    const auto a = "{\"request_id\":" + std::to_string(id) + ",\"view_id\":"
+        + std::to_string(view) + ",\"position\":[" + std::to_string(x)
+        + ",2,7],\"direction\":[0,0,-1],\"up\":[0,1,0],\"fovy_deg\":30}";
+    REQUIRE(
+        f.tool(s, "vsr_set_view_camera", a).str("kind") == "set_view_camera");
+    const auto result = f.run(s, "vsr_operation_status", id);
+    REQUIRE(result.str("outcome") == "ok");
+    REQUIRE(result.flag("committed"));
+    return result;
+  };
+  auto finish = [&](int id) {
+    Reply result;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    do {
+      REQUIRE(
+          f.integration.submit(f.sceneId, [&](auto &) { f.frames->pump(); }));
+      f.integration.service();
+      result = f.tool(s,
+          "vsr_operation_status",
+          "{\"operation_ref\":" + ref(s.id, id) + "}");
+      if (result.str("state") == "terminal")
+        return result;
+      std::this_thread::yield();
+    } while (std::chrono::steady_clock::now() < deadline);
+    FAIL("frame did not reach a terminal outcome within the bounded wait");
+    return result;
+  };
+  auto start = [&] { return f.frames->beginViewerProduction(view, binding); };
+  // Controlled timing at the existing host seam tests lifecycle only. Actual
+  // binding qualification uses the separate real viewport/presentation test.
+  auto present = [&](std::shared_ptr<const frame::Production> production) {
+    const std::uint32_t pixels[]{
+        0xff0000ffu, 0xff00ff00u, 0xffff0000u, 0xffffffffu};
+    auto acquired = f.frames->acquireViewerPixels(
+        view, std::move(production), binding, pixels, 2, 2, "host_sdl_upload");
+    REQUIRE(acquired);
+    f.frames->presentViewerPixels(view, acquired, 2, 2, 2., 2., f.now);
+  };
+  REQUIRE(f.tool(s, "vsr_view_frame", args(1)).str("state") == "pending");
+  f.integration.service();
+  CHECK(f.tool(s,
+             "vsr_operation_status",
+             "{\"operation_ref\":" + ref(s.id, 1) + "}")
+            .str("state")
+      == "pending");
+  SECTION("No presentation returns explicit timeout within 120 seconds")
+  {
+    for (int i = 0; i < 120; ++i) {
+      f.now += 1.;
+      REQUIRE(
+          f.authority->renew({f.authority->launchCredential(), s.id, s.secret})
+          == session::Code::OK);
+    }
+    const auto expired = finish(1);
+    CHECK(expired.str("outcome") == "timeout");
+    CHECK_FALSE(expired.flag("committed"));
+    CHECK_FALSE(imageItem(expired));
+  }
+  SECTION("Controllable Helide with unknown upload remains unavailable")
+  {
+    move(2, 3);
+    const auto production = start();
+    REQUIRE(production);
+    const std::uint32_t pixels[]{0, 0, 0, 0};
+    CHECK_FALSE(f.frames->acquireViewerPixels(
+        view, production, binding, pixels, 2, 2, "unknown_upload"));
+    const auto unavailable = finish(1);
+    REQUIRE(unavailable.result());
+    CHECK(unavailable.result()->get("state")->s == "unavailable");
+    CHECK(
+        unavailable.result()->get("reason")->s == "unsupported_upload_profile");
+    CHECK_FALSE(imageItem(unavailable));
+    CHECK(controller.hasRecovery());
+  }
+  SECTION(
+      "Second move during polling replaces recovery and invalidates the first target")
+  {
+    const auto old = start();
+    REQUIRE(old);
+    const auto first = move(2, 3);
+    const auto firstProduction = start();
+    REQUIRE(firstProduction);
+    present(old);
+    const auto delayed = finish(1);
+    REQUIRE(delayed.result());
+    CHECK(delayed.result()->get("stale")->b);
+    CHECK(delayed.result()
+              ->get("rendered_configuration")
+              ->get("camera")
+              ->get("position")
+              ->a[0]
+              .n
+        == Approx(0.));
+    CHECK(delayed.result()->get("rendered_view_revision")->s
+        != first.result()->get("view_revision")->s);
+    CHECK(delayed.result()->get("current_view_revision")->s
+        == first.result()->get("view_revision")->s);
+    REQUIRE(f.tool(s, "vsr_view_frame", args(3)).str("kind") == "view_frame");
+    CHECK(finish(3).result()->get("stale")->b);
+    const auto second = move(4, 8);
+    present(firstProduction);
+    REQUIRE(f.tool(s, "vsr_view_frame", args(5)).str("kind") == "view_frame");
+    const auto superseded = finish(5);
+    CHECK(superseded.result()->get("rendered_view_revision")->s
+        == first.result()->get("view_revision")->s);
+    CHECK(superseded.result()->get("rendered_view_revision")->s
+        != second.result()->get("view_revision")->s);
+    CHECK(superseded.result()->get("current_view_revision")->s
+        == second.result()->get("view_revision")->s);
+    CHECK(superseded.result()->get("stale")->b);
+    CHECK(superseded.result()
+              ->get("rendered_configuration")
+              ->get("camera")
+              ->get("position")
+              ->a[0]
+              .n
+        == Approx(3.));
+    const auto replay = f.tool(s, "vsr_view_frame", args(1));
+    REQUIRE(replay.flag("replayed"));
+    CHECK(replay.result()->get("frame_identity")->s
+        == delayed.result()->get("frame_identity")->s);
+    CHECK(replay.result()->get("current_view_revision")->s
+        == delayed.result()->get("current_view_revision")->s);
+    CHECK(replay.result()->get("rendered_view_revision")->s
+        != second.result()->get("view_revision")->s);
+    const auto postMoveScene = token(f.identity->sceneRevision());
+    present(start());
+    REQUIRE(f.tool(s, "vsr_view_frame", args(6)).str("kind") == "view_frame");
+    const auto fresh = finish(6);
+    REQUIRE(fresh.result());
+    const auto *r = fresh.result();
+    CHECK(r->get("state")->s == "available");
+    CHECK(r->get("image_kind")->s == "presented_frame");
+    CHECK(r->get("view_id")->n == view);
+    CHECK(
+        r->get("view_identity")->s == second.result()->get("view_identity")->s);
+    CHECK(r->get("rendered_view_revision")->s
+        == second.result()->get("view_revision")->s);
+    CHECK(r->get("rendered_scene_revision")->s == postMoveScene);
+    CHECK(r->get("current_scene_revision")->s == postMoveScene);
+    CHECK(r->get("rendered_view_revision_basis")->s == "anari_render_start");
+    CHECK_FALSE(r->get("stale")->b);
+    const auto *camera = r->get("rendered_configuration")->get("camera");
+    REQUIRE(camera);
+    for (const auto *key : {"position", "direction", "up"})
+      for (int i = 0; i < 3; ++i)
+        CHECK(camera->get(key)->a[i].n
+            == Approx(
+                second.result()->get("effective_camera")->get(key)->a[i].n));
+    CHECK(camera->get("projection")->s == "perspective");
+    CHECK(camera->get("fovy_deg")->n == Approx(30.));
+    const auto image = f.tool(
+        s, "vsr_view_frame_image", "{\"operation_ref\":" + ref(s.id, 6) + "}");
+    REQUIRE(imageItem(image));
+    CHECK_FALSE(unbase64(imageItem(image)->get("data")->s).empty());
+    REQUIRE(
+        f.tool(s,
+             "vsr_view_frame",
+             "{\"request_id\":7,\"view_id\":" + std::to_string(f.viewId) + "}")
+            .str("kind")
+        == "view_frame");
+    const auto other = finish(7);
+    CHECK(other.result()->get("state")->s == "unavailable");
+    CHECK(other.result()->get("reason")->s == "missing_source");
+    identity::ViewRevisionTracker secondaryTracker(f.ids, *f.identity);
+    ViewId secondary = INVALID_VIEW_ID;
+    REQUIRE(f.integration.submit(f.sceneId, [&](auto &) {
+      ViewRegistration vr;
+      vr.scene = f.sceneId;
+      vr.role = ViewRole::INTERACTIVE_VIEWPORT;
+      vr.grants.read = true;
+      vr.observeBinding = [&] {
+        return std::optional<EffectiveViewBinding>(binding());
+      };
+      secondary = *f.integration.registerView(vr);
+      REQUIRE(f.frames->attachView(secondary,
+          *f.identity,
+          secondaryTracker,
+          frame::SourceQualification::VIEWER_CPU_READY));
+    }));
+    f.integration.service();
+    REQUIRE(f.frames->setExposed(secondary, true));
+    REQUIRE(
+        f.tool(s,
+             "vsr_view_frame",
+             "{\"request_id\":8,\"view_id\":" + std::to_string(secondary) + "}")
+            .str("kind")
+        == "view_frame");
+    f.integration.service();
+    const auto secondaryProduction =
+        f.frames->beginViewerProduction(secondary, binding);
+    REQUIRE(secondaryProduction);
+    const std::uint32_t pixels[]{0, 0, 0, 0};
+    const auto secondaryPixels = f.frames->acquireViewerPixels(secondary,
+        secondaryProduction,
+        binding,
+        pixels,
+        2,
+        2,
+        "host_sdl_upload");
+    REQUIRE(secondaryPixels);
+    f.frames->presentViewerPixels(
+        secondary, secondaryPixels, 2, 2, 2., 2., f.now);
+    const auto secondView = finish(8);
+    REQUIRE(secondView.result());
+    CHECK(secondView.result()->get("view_id")->n == secondary);
+    CHECK(secondView.result()->get("view_identity")->s
+        != second.result()->get("view_identity")->s);
+    CHECK(secondView.result()->get("rendered_view_revision")->s
+        != second.result()->get("view_revision")->s);
+    REQUIRE(f.integration.submit(f.sceneId, [&](auto &) {
+      f.frames->detachViewer(secondary);
+      f.integration.unregisterView(secondary);
+    }));
+    f.integration.service();
+    manipulator.pan({0.1f, 0.f});
+    vsr::rendering::updateCameraObject(*f.camera, manipulator);
+    REQUIRE(f.tool(s, "vsr_view_frame", args(9)).str("kind") == "view_frame");
+    const auto user = finish(9);
+    CHECK(user.result()->get("stale")->b);
+    CHECK(user.result()->get("current_view_revision")->s
+        != second.result()->get("view_revision")->s);
+    REQUIRE(controller.restore() == operations::Outcome::OK);
+    CHECK(manipulator.eye().x == Approx(3.));
+    CHECK(*f.camera->parameterValueAs<float>("fovy")
+        == Approx(vsr::math::radians(30.f)));
+    CHECK(
+        token(tracker.revision()) != second.result()->get("view_revision")->s);
+    present(start());
+    auto material = f.scene.createObject<vsr::scene::Material>("matte");
+    material->setParameter("color", vsr::math::float3(1.f, 0.f, 0.f));
+    REQUIRE(f.tool(s, "vsr_view_frame", args(10)).str("kind") == "view_frame");
+    const auto sceneChanged = finish(10);
+    CHECK(sceneChanged.result()->get("stale")->b);
+    CHECK(sceneChanged.result()->get("rendered_scene_revision")->s
+        != sceneChanged.result()->get("current_scene_revision")->s);
+    CHECK(sceneChanged.result()->get("rendered_view_revision")->s
+        == sceneChanged.result()->get("current_view_revision")->s);
+  }
 }
 
 SCENARIO("MCP moves and recovers the authoritative interactive controller",

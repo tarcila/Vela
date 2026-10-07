@@ -24,7 +24,7 @@ trap cleanup EXIT
 # or host/container Unix-socket namespace. No existing display is reused.
 xauth -f "$run/auth" add "localhost:$display" . "$(openssl rand -hex 16)"
 Xvfb ":$display" -auth "$run/auth" -screen 0 800x600x24 \
-  -listen tcp -nolisten unix >"$run/xvfb.log" 2>&1 &
+  -listen tcp -nolisten unix -noreset >"$run/xvfb.log" 2>&1 &
 xvfb=$!
 ready=false
 for attempt in {1..100}; do
@@ -48,6 +48,7 @@ export XDG_RUNTIME_DIR="$run/runtime"
 export DISPLAY="localhost:$display"
 export XAUTHORITY="$run/auth"
 export SDL_VIDEODRIVER=x11
-export SDL_RENDER_DRIVER=software
+# The qualified presentation uses the same default SDL renderer as .viewer-live.
+unset SDL_RENDER_DRIVER
 export LD_LIBRARY_PATH="$build/install/lib:$build:${LD_LIBRARY_PATH:-}"
-timeout 120 "$build/vsrIntegrationTests" '[.viewer-camera]'
+timeout 180 "$build/vsrIntegrationTests" "${VSR_CAMERA_TEST_FILTER:-[.viewer-camera]}"

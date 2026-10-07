@@ -9,6 +9,8 @@
 #include "vsr/integration/render/ControllerCamera.hpp"
 // vsr_io
 #include "vsr/io/procedural.hpp"
+// vsr_rendering
+#include "vsr/rendering/view/ManipulatorToVSR.hpp"
 // catch
 #include "catch.hpp"
 // std
@@ -225,6 +227,44 @@ TEST_CASE("Controller recovery is rolling, bounded and per view",
   request.fovyDegrees = 30.;
   render::PreparedCameraChange prepared;
   CHECK(a.prepare(request, prepared) == operations::Outcome::INVALID_REQUEST);
+}
+
+TEST_CASE("Host camera synchronization preserves the applied pose revision",
+    "[integration][camera-frame]")
+{
+  namespace vi = vsr::integration;
+  vsr::scene::Scene scene;
+  vi::identity::IdentityAuthority ids;
+  vi::identity::SceneIdentity identity(ids, scene);
+  vi::identity::ViewRevisionTracker tracker(ids, identity);
+  auto camera = scene.defaultCamera();
+  tracker.setCamera(identity.handleOf(camera.data()));
+  vsr::rendering::Manipulator manipulator;
+  manipulator.setConfig({0.f, 0.f, 0.f}, 5.f);
+  vi::render::ControllerCamera controller(
+      identity,
+      tracker,
+      manipulator,
+      [&] { return camera.data(); },
+      [] { return true; });
+  vi::render::CameraRequest request;
+  request.position = {3., 2., 7.};
+  request.direction = {0., 0., -1.};
+  request.up = {0., 1., 0.};
+  vi::render::PreparedCameraChange change;
+  REQUIRE(controller.prepare(request, change) == vi::operations::Outcome::OK);
+  change.install();
+  change.synchronize();
+  const auto applied = tracker.revision();
+  const auto sceneRevision = identity.sceneRevision();
+  vsr::rendering::updateCameraObject(*camera, manipulator);
+  CHECK(tracker.revision() == applied);
+  CHECK(identity.sceneRevision() == sceneRevision);
+  manipulator.pan({0.1f, 0.f});
+  vsr::rendering::updateCameraObject(*camera, manipulator);
+  CHECK(tracker.revision() != applied);
+  // Camera-only writes belong to the view domain, not scene content.
+  CHECK(identity.sceneRevision() == sceneRevision);
 }
 
 TEST_CASE("Controller recovery restores projection values and enabled flags",

@@ -12,16 +12,28 @@ void updateCameraObject(vsr::scene::Camera &c,
     const Manipulator &m,
     bool includeManipulatorMetadata)
 {
-  c.beginParameterBatch();
+  bool changed = false;
 
-  c.setParameter("direction", m.dir());
-  c.setParameter("up", m.up());
+  // A controller pose can already have been committed by an agent. Flushing
+  // its dirty token must not manufacture a second camera/Scene revision for
+  // identical parameters and supersede the receipt before natural rendering.
+  auto write = [&](const char *name, const core::Any &value) {
+    const auto *parameter = c.parameter(name);
+    if (!parameter || parameter->value() != value) {
+      if (!changed)
+        c.beginParameterBatch();
+      changed = true;
+      c.setParameter(name, value);
+    }
+  };
+  write("direction", m.dir());
+  write("up", m.up());
 
   if (c.subtype() == scene::tokens::camera::orthographic) {
-    c.setParameter("position", m.eye_FixedDistance());
-    c.setParameter("height", orthographicHeight(m));
+    write("position", m.eye_FixedDistance());
+    write("height", orthographicHeight(m));
   } else {
-    c.setParameter("position", m.eye());
+    write("position", m.eye());
   }
 
   if (includeManipulatorMetadata) {
@@ -33,7 +45,8 @@ void updateCameraObject(vsr::scene::Camera &c,
     c.setMetadataValue("manipulator.mode", int(m.mode()));
   }
 
-  c.endParameterBatch();
+  if (changed)
+    c.endParameterBatch();
 }
 
 // The prefix updateCameraObject() writes every manipulator key under.

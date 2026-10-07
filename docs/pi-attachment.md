@@ -196,9 +196,31 @@ For isolated controller verification after a fresh CPU build/install, run
 private configuration/runtime and authenticated Xvfb display, exercises the
 real viewport binding plus orbit/pan/zoom and recovery, and leaves any existing
 viewer/unsaved Scene untouched. Set `VSR_CAMERA_TEST_DISPLAY` if display 93 is
-occupied. This test deliberately does not claim qualified presented-frame
-acceptance. The normal integration suite supplies the loopback permission,
-receipt, replay and failure contracts.
+occupied. Private Xvfb uses `-noreset` because reset-enabled startup was
+intermittent on this host; readiness is authenticated and bounded, not a fixed
+startup delay. This default selection tests controller behavior only.
+
+For receipt-to-presentation acceptance on the existing Linux SDL CPU-ready
+binding, after build/install run:
+
+```bash
+VSR_CAMERA_TEST_FILTER='[.viewer-camera-frame]' \
+  bash scripts/test-viewport-camera.sh build-agent
+```
+
+The test warms the natural viewport, commits an agent move, chooses the
+post-move Scene revision, and polls fresh frame operations for at most 120
+seconds. It checks the exact view identity and receipt revision, rendered
+camera/projection/FOV, Scene revision, `anari_render_start` and `stale=false`,
+retrieves the PNG, then restores Before agent. Its `CAMERA_FRAME_ACCEPTANCE`
+line records the actual host/SDL renderer/device/binding and both receipts.
+Helide selection alone is not qualification: the existing `VIEWER_CPU_READY`
+source must acquire the real final `host_sdl_upload` buffer and complete the
+checked SDL presentation. Unknown/interop uploads, unsupported display scale,
+unavailable results and timeout do not pass. No independent render or desktop
+capture is used. The normal suite supplies loopback delayed/stale frames,
+second-move and user-input supersession, historical replay, timeout and
+unavailable-source contracts.
 
 ### Inspecting Images
 
