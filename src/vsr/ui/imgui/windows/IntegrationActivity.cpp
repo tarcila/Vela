@@ -207,6 +207,50 @@ void IntegrationActivity::buildActivity(const IntegrationActivityState &s)
       (unsigned long long)s.usage.reservedRetentionBytes,
       s.usage.oversizedRetention ? "oversized entry alone" : "normal FIFO");
 
+  if (s.recoveryProposal) {
+    const auto &p = *s.recoveryProposal;
+    ImGui::SeparatorText("Exceptional recovery approval (trusted host only)");
+    ImGui::Text("%s; Scene %llu; original operation %s#%llu",
+        p.identity.kind.c_str(),
+        (unsigned long long)p.identity.target,
+        p.identity.sessionId.substr(0, 8).c_str(),
+        (unsigned long long)p.identity.originalRequest);
+    ImGui::TextWrapped("Target/evidence: %s", p.targetDescription.c_str());
+    ImGui::Text("Required: %llu bytes; soft: %llu; hard: %llu",
+        (unsigned long long)p.requiredBytes,
+        (unsigned long long)p.softBytes,
+        (unsigned long long)p.hardBytes);
+    ImGui::Text("Requested finite maximum: %llu; approved: %llu",
+        (unsigned long long)p.requiredBytes,
+        (unsigned long long)p.approvedMaximum);
+    ImGui::Text(
+        "Expires at monotonic %.1f (five minutes from refusal)", p.expiresAt);
+    ImGui::Text("Canonical storage: %zu / %zu bytes",
+        p.canonicalCharge,
+        s.canonicalProposalByteCap);
+    ImGui::TextWrapped(
+        "One successful commit will evict ALL older recovery "
+        "and retain this entry alone. Permanent limits do not change. "
+        "Approval does not guarantee allocation or bypass physical, "
+        "format, freshness or ordinary Scene READ/EDIT safeguards.");
+    ImGui::BeginDisabled(p.claimed || p.approvedMaximum != 0);
+    if (ImGui::Button("Approve this one operation")) {
+      const bool approved =
+          m_model.approveRecovery(p.identity, p.requiredBytes);
+      m_lastLocal = approved
+          ? "Recovery exception approved; retry the original "
+            "proposal with a fresh request ID."
+          : "Recovery approval rejected.";
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button(p.approvedMaximum ? "Revoke exception" : "Decline")) {
+      m_model.revokeRecovery(p.identity);
+      m_lastLocal = "Recovery exception revoked/declined.";
+    }
+    ImGui::Separator();
+  }
+
   const auto flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg
       | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
   if (!ImGui::BeginTable("##integration_activity", 8, flags))

@@ -453,7 +453,9 @@ inline std::uint64_t IdentityAuthority::nextSerial()
 class SceneIdentity::Observer : public scene::BaseUpdateDelegate
 {
  public:
-  explicit Observer(SceneIdentity *owner) : m_owner(owner) {}
+  explicit Observer(SceneIdentity *owner)
+      : m_owner(owner), m_ownerLifetime(owner->lifetime())
+  {}
 
   void signalObjectAdded(const scene::Object *o) override
   {
@@ -476,12 +478,20 @@ class SceneIdentity::Observer : public scene::BaseUpdateDelegate
   }
   void signalArrayMapped(const scene::Array *) override
   {
+    // Prepared notification leases can outlive this identity's registration.
     // Outstanding mapping changes inspection, not completed data or parameters.
-    m_owner->inspectionChanged();
+    if (!m_ownerLifetime.expired())
+      m_owner->inspectionChanged();
   }
   void signalArrayUnmapped(const scene::Array *a) override
   {
-    m_owner->parameterChanged(a);
+    if (!m_ownerLifetime.expired())
+      m_owner->parameterChanged(a);
+  }
+  void signalArrayMapCancelled(const scene::Array *) override
+  {
+    if (!m_ownerLifetime.expired())
+      m_owner->inspectionChanged();
   }
   void signalObjectParameterUseCountZero(const scene::Object *) override {}
   void signalObjectLayerUseCountZero(const scene::Object *) override {}
@@ -528,6 +538,7 @@ class SceneIdentity::Observer : public scene::BaseUpdateDelegate
 
  private:
   SceneIdentity *m_owner{nullptr};
+  std::weak_ptr<const void> m_ownerLifetime;
 };
 
 // SceneIdentity //

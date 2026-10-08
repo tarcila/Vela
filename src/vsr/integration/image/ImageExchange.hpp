@@ -94,13 +94,15 @@ class ImageExchange
       identity::ObjectHandle handle,
       std::string targetVersion,
       std::string dependencies,
-      std::string fileName);
+      std::string fileName,
+      std::optional<std::uint64_t> approvalRequestId = {});
   operations::Admission submitImport(const session::Credentials &credentials,
       const operations::OperationRef &ref,
       SceneId scene,
       identity::ObjectHandle handle,
       std::string dataVersion,
-      std::string fileName);
+      std::string fileName,
+      std::optional<std::uint64_t> approvalRequestId = {});
 
  private:
   operations::Admission submitCapture(const session::Credentials &credentials,

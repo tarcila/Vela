@@ -8,6 +8,7 @@
 
 // vsr_integration
 #include "vsr/integration/Integration.hpp"
+#include "vsr/integration/approval/RecoveryApproval.hpp"
 #include "vsr/integration/operations/ResultOwnership.hpp"
 #include "vsr/integration/session/SessionAuthority.hpp"
 // vsr_scene
@@ -145,22 +146,25 @@ struct RestorationPolicy
   std::uint64_t softBytes{0};
   std::uint64_t hardBytes{0};
 
-  std::string refusal(std::size_t requiredBytes) const;
+  std::string refusal(
+      std::size_t requiredBytes, bool approvalAvailable = false) const;
   std::string receipt(std::size_t requiredBytes) const;
 };
 
-inline std::string RestorationPolicy::refusal(std::size_t requiredBytes) const
+inline std::string RestorationPolicy::refusal(
+    std::size_t requiredBytes, bool approvalAvailable) const
 {
   const bool approval = requiredBytes > hardBytes;
   return std::string("{\"reason\":\"")
-      + (approval ? "restoration_approval_required" : "restore_budget_exhausted")
+      + (approval ? "restoration_approval_required"
+                  : "restore_budget_exhausted")
       + "\",\"required_capacity_bytes\":" + std::to_string(requiredBytes)
       + ",\"configured_capacity_bytes\":" + std::to_string(softBytes)
       + ",\"effective_soft_limit_bytes\":" + std::to_string(softBytes)
       + ",\"effective_hard_limit_bytes\":" + std::to_string(hardBytes)
       + ",\"approval_required\":" + (approval ? "true" : "false")
-      + ",\"approval_available\":false,\"committed\":false,"
-        "\"history_unchanged\":true}";
+      + ",\"approval_available\":" + (approvalAvailable ? "true" : "false")
+      + ",\"committed\":false,\"history_unchanged\":true}";
 }
 
 inline std::string RestorationPolicy::receipt(std::size_t requiredBytes) const
@@ -212,6 +216,18 @@ struct StepContext
   std::function<void()> cancelRestoration;
   // On commit: the record becomes an eligible restorable batch.
   std::function<void()> publishRestoration;
+  // Host-produced canonical replacement contents; the request's semantic
+  // arguments are also bound by the engine. Empty reserve uses host coverage.
+  std::function<bool(std::size_t,
+      std::string_view,
+      std::weak_ptr<const void>,
+      approval::ProposalStore::Reserve,
+      std::string_view)>
+      authorizeRecovery;
+  std::function<bool()> consumeRecoveryApproval;
+  bool approvalOffered{false};
+  bool recoveryApprovalRequested{false};
+  approval::ProposalStore::Reserve reserveRecoveryMemory;
   bool sharedRetention{false}; // an authoritative Activity sink owns policy
   std::optional<RestorationPolicy> restorationPolicy;
   // False once the sink no longer retains the batch as eligible.
@@ -275,6 +291,7 @@ struct Request
   // Canonical semantic form of the parsed arguments (defaults applied,
   // numbers normalized); identical retries compare equal.
   std::string canonicalArguments;
+  std::optional<std::uint64_t> approvalRequestId;
   // Logical deadline from admission; <= 0 means none.
   double deadlineSeconds{0.0};
   Executor executor;
@@ -388,10 +405,12 @@ class ActivitySink
 
   // Restoration payload accounting for an admitted record (StepContext).
   virtual std::optional<RestorationPolicy> restorationPolicy() const;
+  virtual approval::ProposalStore *recoveryApprovals();
   virtual bool reserveRestoration(Id,
       std::size_t /*bytes*/,
       const std::string & /*launchId*/,
-      const std::string & /*batchId*/)
+      const std::string & /*batchId*/,
+      const std::shared_ptr<approval::ProposalStore::Claim> & = {})
   {
     return true;
   }
@@ -413,6 +432,11 @@ class ActivitySink
       const std::string & /*launchId*/, const std::string & /*batchId*/)
   {}
 };
+
+inline approval::ProposalStore *ActivitySink::recoveryApprovals()
+{
+  return nullptr;
+}
 
 inline std::optional<RestorationPolicy> ActivitySink::restorationPolicy() const
 {
@@ -498,6 +522,7 @@ class OperationEngine
   // outlive the engine or be cleared first. Only work admitted afterwards is
   // recorded.
   void setActivitySink(ActivitySink *sink);
+  void setRecoveryMemoryReserve(approval::ProposalStore::Reserve reserve);
 
   // External scene work //
 
@@ -553,6 +578,9 @@ class OperationEngine
     bool boundSceneRead{false};
     std::vector<Target> covered; // session-wide only, set on completion
     std::string canonicalArguments;
+    std::optional<std::uint64_t> approvalRequestId;
+    std::shared_ptr<approval::ProposalStore::Claim> recoveryApproval;
+    std::size_t recoveryCharge{0};
     double deadlineSeconds{0.0};
     double deadline{0.0};
     Executor executor;
@@ -629,6 +657,7 @@ class OperationEngine
   std::size_t m_slotsInUse{0};
   std::uint64_t m_serial{0};
   std::uint64_t m_localCounter{0};
+  approval::ProposalStore::Reserve m_recoveryReserve;
   ActivitySink *m_sink{nullptr};
   std::unique_ptr<scene::Scene> m_placeholderScene;
 };
@@ -894,6 +923,13 @@ inline void OperationEngine::setActivitySink(ActivitySink *sink)
   m_sink = sink;
 }
 
+inline void OperationEngine::setRecoveryMemoryReserve(
+    approval::ProposalStore::Reserve reserve)
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  m_recoveryReserve = std::move(reserve);
+}
+
 inline ActivityEvent OperationEngine::eventOf(
     const Key &key, const Record &r, double now) const
 {
@@ -960,6 +996,7 @@ inline bool OperationEngine::sameRequest(
           || (r.target.kind == q.target.kind && r.target.id == q.target.id))
       && r.capability == q.capability && r.boundSceneRead == q.boundSceneRead
       && r.canonicalArguments == q.canonicalArguments
+      && r.approvalRequestId == q.approvalRequestId
       && r.deadlineSeconds == q.deadlineSeconds;
 }
 
@@ -996,6 +1033,7 @@ inline OperationEngine::Key OperationEngine::admit(
   r.boundSceneRead = request.boundSceneRead;
   r.sessionWide = request.sessionWide;
   r.canonicalArguments = std::move(request.canonicalArguments);
+  r.approvalRequestId = request.approvalRequestId;
   r.deadlineSeconds = request.deadlineSeconds;
   r.deadline =
       request.deadlineSeconds > 0.0 ? m_clock() + request.deadlineSeconds : 0.0;
@@ -1161,6 +1199,7 @@ inline void OperationEngine::releaseSlot(Record &r)
   if (!r.committed && m_sink && r.activityId)
     m_sink->cancelRestoration(*r.activityId);
   r.executor = {};
+  r.recoveryApproval.reset();
 }
 
 inline void OperationEngine::finish(Record &r, Outcome outcome, double now)
@@ -1408,32 +1447,41 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
     return !r || r->terminal.has_value() || r->pendingCancel.has_value()
         || (r->deadline > 0. && m_clock() >= r->deadline);
   };
-  ctx.beforeWrite =
-      [this, alive, key, sessionId, target, capability, boundSceneRead] {
-        if (!alive.lock())
-          return Outcome::CANCELLED;
-        Outcome current = sessionId.empty()
-            ? (m_authority.authorizeLocal(target, capability)
-                      ? Outcome::OK
-                      : Outcome::FORBIDDEN)
-            : fromSessionCode(m_authority.authorizeExecution(
-                  sessionId, target, capability));
-        if (current == Outcome::OK && boundSceneRead) {
-          const auto bound = sceneFor(target);
-          current = bound
-              ? fromSessionCode(m_authority.authorizeExecution(
-                    sessionId, Target::scene(*bound), Capability::READ))
-              : Outcome::FORBIDDEN;
-        }
-        if (current != Outcome::OK)
-          return current;
-        std::lock_guard<std::mutex> lock(m_mutex);
-        const auto *r = find(key);
-        if (!r || r->terminal || r->pendingCancel)
-          return Outcome::CANCELLED;
-        return r->deadline > 0. && m_clock() >= r->deadline ? Outcome::TIMEOUT
-                                                            : Outcome::OK;
-      };
+  ctx.beforeWrite = [this,
+                        alive,
+                        key,
+                        sessionId,
+                        target,
+                        capability,
+                        boundSceneRead] {
+    if (!alive.lock())
+      return Outcome::CANCELLED;
+    Outcome current = sessionId.empty()
+        ? (m_authority.authorizeLocal(target, capability) ? Outcome::OK
+                                                          : Outcome::FORBIDDEN)
+        : fromSessionCode(
+              m_authority.authorizeExecution(sessionId, target, capability));
+    if (current == Outcome::OK && boundSceneRead) {
+      const auto bound = sceneFor(target);
+      current = !bound ? Outcome::FORBIDDEN
+          : sessionId.empty()
+          ? (m_authority.authorizeLocal(Target::scene(*bound), Capability::READ)
+                    ? Outcome::OK
+                    : Outcome::FORBIDDEN)
+          : fromSessionCode(m_authority.authorizeExecution(
+                sessionId, Target::scene(*bound), Capability::READ));
+    }
+    if (current != Outcome::OK)
+      return current;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const auto *r = find(key);
+    if (!r || r->terminal || r->pendingCancel)
+      return Outcome::CANCELLED;
+    if (r->recoveryApproval && !r->recoveryApproval->valid(r->recoveryCharge))
+      return Outcome::FORBIDDEN;
+    return r->deadline > 0. && m_clock() >= r->deadline ? Outcome::TIMEOUT
+                                                        : Outcome::OK;
+  };
   ctx.prepareCommit = [this, key](
                           const std::string &receipt, std::size_t capacity) {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -1469,18 +1517,81 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
   withSink([&](ActivitySink &s, ActivitySink::Id) {
     ctx.restorationPolicy = s.restorationPolicy();
   });
-  ctx.reserveRestoration = [withSink](std::size_t bytes,
+  {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const auto *r = find(key);
+    ctx.recoveryApprovalRequested = r && r->approvalRequestId.has_value();
+    ctx.reserveRecoveryMemory = m_recoveryReserve;
+  }
+  ctx.authorizeRecovery = [this, alive, key, &ctx](std::size_t bytes,
+                              std::string_view canonical,
+                              std::weak_ptr<const void> registration,
+                              approval::ProposalStore::Reserve reserve,
+                              std::string_view layout) {
+    if (!alive.lock())
+      return false;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto *r = find(key);
+    if (!r || !m_sink || !ctx.restorationPolicy)
+      return false;
+    if (bytes <= ctx.restorationPolicy->hardBytes)
+      return !r->approvalRequestId;
+    auto *store = m_sink->recoveryApprovals();
+    if (!store || r->sessionId.empty())
+      return false;
+    const approval::Identity identity{m_authority.launchId(),
+        r->sessionId,
+        r->target.id,
+        r->kind,
+        r->approvalRequestId.value_or(r->requestId)};
+    if (!r->approvalRequestId) {
+      ctx.approvalOffered = store->offer(identity,
+          canonical,
+          bytes,
+          ctx.restorationPolicy->softBytes,
+          ctx.restorationPolicy->hardBytes,
+          std::move(registration),
+          reserve ? reserve : m_recoveryReserve,
+          r->canonicalArguments,
+          layout);
+      return false;
+    }
+    if (*r->approvalRequestId >= r->requestId)
+      return false;
+    auto claim =
+        store->claim(identity, canonical, bytes, r->canonicalArguments, layout);
+    if (!claim)
+      return false;
+    r->recoveryApproval = std::move(claim);
+    r->recoveryCharge = bytes;
+    return true;
+  };
+  ctx.consumeRecoveryApproval = [this, alive, key] {
+    if (!alive.lock())
+      return false;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto *r = find(key);
+    return r
+        && (!r->recoveryApproval
+            || r->recoveryApproval->consume(r->recoveryCharge));
+  };
+  ctx.reserveRestoration = [withSink, this, key](std::size_t bytes,
                                const std::string &launchId,
                                const std::string &batchId) {
     bool ok = true;
     withSink([&](ActivitySink &s, ActivitySink::Id id) {
-      ok = s.reserveRestoration(id, bytes, launchId, batchId);
+      const auto *r = find(key);
+      ok = s.reserveRestoration(
+          id, bytes, launchId, batchId, r ? r->recoveryApproval : nullptr);
     });
     return ok;
   };
-  ctx.cancelRestoration = [withSink] {
-    withSink(
-        [](ActivitySink &s, ActivitySink::Id id) { s.cancelRestoration(id); });
+  ctx.cancelRestoration = [withSink, this, key] {
+    withSink([&](ActivitySink &s, ActivitySink::Id id) {
+      s.cancelRestoration(id);
+      if (auto *r = find(key))
+        r->recoveryApproval.reset();
+    });
   };
   ctx.publishRestoration = [withSink] {
     withSink(
@@ -1589,6 +1700,8 @@ inline void OperationEngine::onSessionEnded(const std::string &sessionId)
 {
   std::lock_guard<std::mutex> lock(m_mutex);
   const double now = m_clock();
+  if (m_sink && m_sink->recoveryApprovals())
+    m_sink->recoveryApprovals()->invalidateSession(sessionId);
   for (auto &[key, r] : m_records) {
     if (r.sessionId == sessionId)
       cancelRecord(r, Outcome::CANCELLED, now);

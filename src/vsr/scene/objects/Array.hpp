@@ -16,6 +16,9 @@
 namespace vsr::scene {
 
 struct Array;
+namespace detail {
+class PreparedImageWrite;
+}
 
 /* Non-owning, relocation-safe identity. Retirement clears the pointer even
  * when a caller temporarily holds a locked weak reference. */
@@ -134,6 +137,7 @@ struct Array : public Object
   Array &operator=(Array &&);
 
  private:
+  friend class detail::PreparedImageWrite;
   Array(anari::DataType arrayType,
       anari::DataType type,
       size_t items0,

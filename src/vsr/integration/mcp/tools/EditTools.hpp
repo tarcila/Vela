@@ -129,6 +129,9 @@ inline std::optional<edit::EditBatch> editBatchArg(
     return std::nullopt;
   edit::EditBatch batch;
   batch.scene = *scene;
+  batch.approvalRequestId = requestIdArg(args.get("approval_request_id"));
+  if (args.get("approval_request_id") && !batch.approvalRequestId)
+    return {};
   for (const auto &e : list->a) {
     std::optional<std::int64_t> version;
     const auto handle = handleArg(e.get("handle"), launch);
@@ -275,10 +278,13 @@ inline void addEditTools(std::vector<Tool> &tools, EditDeps deps)
       "promoted to an unselected common parent. Names are illustrative; inspect "
       "actual ancestry rather than guessing an assembly from names. "
       "Atomically apply up to 64 object parameter or explicitly exposed node enabled/local or world position/local rotation/scale/transform edits to one scene. Position and scale are three finite float32-representable numbers. Rotation is an object with named azimuth/elevation/roll degree components, composed about Y then X then Z as in VSR; supplied angles are retained, not wrapped. Rotation/scale require a faithful current cached SRT reconstruction (per-linear-component tolerance 1e-5 times max(1,abs(component))); no shear repair. Signed and zero scales are supported when faithful. Space defaults to local; no world rotation/scale/matrix edits. Only scalar-transform nodes accept transform fields. Different fields group deterministically with one expected version; repeated fields reject. Transform replaces a scalar node's complete local affine matrix (four rows of four finite numbers, column-vector math, last-column translation, exact last row [0,0,0,1]). Shear, reflection and singular affine matrices are supported. Transform cannot combine with position/rotation/scale on the same node but may combine with Boolean enabled. Node entries require target_kind=node, opaque version and structural_version from inspection. Returns a "
-      "batch_ref on commit.";
+      "batch_ref on commit. Above-hard refusal offers a trusted host Activity "
+      "decision; retry the exact proposal using a fresh request_id and the "
+      "original approval_request_id after explicit operator approval.";
   editTool.inputSchemaJson = std::string("{\"type\":\"object\",\"properties\":{")
       + requestIdSchema()
       + ",\"scene_id\":{\"type\":\"integer\",\"minimum\":0},"
+        "\"approval_request_id\":{\"type\":\"integer\",\"minimum\":1},"
         "\"edits\":{\"type\":\"array\",\"minItems\":1,\"maxItems\":64,"
         "\"items\":{\"type\":\"object\",\"properties\":{"
         "\"handle\":{\"type\":\"string\"},"
@@ -310,7 +316,7 @@ inline void addEditTools(std::vector<Tool> &tools, EditDeps deps)
   Tool restoreTool;
   restoreTool.name = "vsr_restore";
   restoreTool.description =
-      "Recovery shares the host's publication-FIFO soft budget (4 GiB launch default) across parameter/Node/Image/Mesh batches, with a separate disclosed 32-batch bound and 16 MiB/1024 Activity metadata bounds. Normal entries replace the oldest complete recovery only on successful publication; failed preparation, no-op and replay do not evict. Physical owners can outlive eligibility. Above-soft recovery at most the effective per-entry hard cap (8 GiB launch default) is retained alone; the next normal change uses soft again. Above-hard recovery refuses with required bytes and effective limits; bounded operator approval is not implemented and no agent flag bypasses refusal. Conditionally restore the exact prior changed state of the batch named by target_batch_ref, not a whole layer. Image batches restore exact prior samples in the same Array and advance data_version; supply no caller data_version. The addressed scene_id must match the retained Image batch's original Scene registration. Later target or required ancestor writes conflict, including change-back; unrelated edits and reset defaults survive. Success consumes eligibility without redo; restore conflicts permanently consume eligibility. Sync failure can still mean committed: inspect committed independently of outcome. Committed receipts contain image_versions (empty for parameter/node batches), ordinary versions and node_versions; there is no matrix_versions field.";
+      "Recovery shares the host's publication-FIFO soft budget (4 GiB launch default) across parameter/Node/Image/Mesh batches, with a separate disclosed 32-batch bound and 16 MiB/1024 Activity metadata bounds. Normal entries replace the oldest complete recovery only on successful publication; failed preparation, no-op and replay do not evict. Physical owners can outlive eligibility. Above-soft recovery at most the effective per-entry hard cap (8 GiB launch default) is retained alone; the next normal change uses soft again. Above-hard recovery refuses with required bytes and effective limits; only a trusted host Activity approval for the exact prepared proposal can authorize one above-hard commit; no agent flag bypasses refusal. Conditionally restore the exact prior changed state of the batch named by target_batch_ref, not a whole layer. Image batches restore exact prior samples in the same Array and advance data_version; supply no caller data_version. The addressed scene_id must match the retained Image batch's original Scene registration. Later target or required ancestor writes conflict, including change-back; unrelated edits and reset defaults survive. Success consumes eligibility without redo; restore conflicts permanently consume eligibility. Sync failure can still mean committed: inspect committed independently of outcome. Committed receipts contain image_versions (empty for parameter/node batches), ordinary versions and node_versions; there is no matrix_versions field.";
   restoreTool.inputSchemaJson =
       std::string("{\"type\":\"object\",\"properties\":{") + requestIdSchema()
       + ",\"scene_id\":{\"type\":\"integer\",\"minimum\":0},"

@@ -109,7 +109,8 @@ unbounded compression fallback or output-vector growth.
 `max_ancillary_bytes=65536`, `transient_image_byte_cap`,
 `effective_global_retention_byte_cap` (soft),
 `effective_single_entry_hard_cap_bytes`, `oversized_retention`,
-`approval_available:false`, `available_global_retention_bytes`,
+`approval_available` (trusted host support, not a grant),
+`available_global_retention_bytes`,
 `retention_order:publication_fifo`, `retention_entry_cap`,
 `activity_metadata_byte_cap`, `activity_entry_cap`, `physical_byte_cap` and
 `retained_physical_bytes`. Global availability means soft target minus eligible
@@ -197,8 +198,13 @@ library default remains 256 MiB. An entry above soft and at most hard is retaine
 alone only at successful publication. The next ordinary entry returns history
 to soft-budget FIFO. Exactly soft and exactly hard are inclusive. Above hard
 refuses nonmutatingly with the required charge, effective soft/hard limits,
-`approval_required:true` and `approval_available:false`; the bounded operator
-approval path is not implemented yet. See [shared retention](mesh-exchange.md)
+`approval_required:true` and `approval_available` indicating whether a bounded
+canonical proposal was offered. Explicitly approve in the trusted local Agent
+Activity window/model, then retry identical samples/type/layout/target/evidence
+with a fresh `request_id` and the original refused `approval_request_id`. This is
+one-success-only, expires five minutes after refusal, and never raises permanent
+limits. No agent-supplied flag grants approval. See
+[shared retention and approval](mesh-exchange.md#trusted-one-operation-recovery-approval)
 for exact refusal/receipt fields, independent allocation safeguards and lifetime
 semantics. No file, payload, decoder or transport limits have been raised.
 
@@ -216,7 +222,7 @@ capacity-based, not permanent or time-based.
 
 The service submits normal `image_import` operations with Scene READ+EDIT,
 strict handle/data_version/file_name arguments, backend cleanup and historical
-replay. It refills the addressed Array through **one** ordinary `map()`/`unmap()`
+replay. It refills the addressed Array through **one** owning-thread write
 reservation boundary and publishes an Image payload into the shared batch store.
 Existing `vsr_restore` (including host-local recovery) restores prior bytes and
 advances rather than rewinds data_version. It returns `image_versions` separately
@@ -229,11 +235,19 @@ batch reference contains only `launch_id` and `batch_id`. A caller data version
 is never restore authority and is rejected before request-ID admission.
 
 Import and Image restore recheck current authority, cancellation and deadline
-**after** fallible receipt/synchronization preparation and immediately before
-`Array::map()`. That map is the sole sequence reservation boundary. A failed
-map notification leaves the value burned, bytes/token unchanged and the Array
-unmapped; a failed unmap notification still completes the write and reports
-`applied_with_sync_failure`. Import store nodes/order keys and Image restore
+**after** fallible receipt/synchronization preparation. Import uses an internal
+prepared host Image write: reserve once, notify maps, recheck authority/freshness
+and approval, then copy samples without exposing a writable pointer. Prewrite
+abort closes reached downstream maps without publishing a completed data token
+or Scene revision; the reservation remains spent. Delegate leases and relocation-
+safe Array lifetime evidence protect cleanup across erasure/retirement. Lease
+lists are bounded to 4096 consumers and prepared before reserving the write;
+exceeding that independent preparation bound safely refuses the operation. Real
+callback edits retain their own freshness and ordinary `map()`/`unmap()` always
+keeps its original write-tracking semantics. Restore retains its ordinary map
+boundary. A failed map notification leaves the value burned, bytes/token
+unchanged and the Array unmapped; a failed postwrite unmap notification still
+completes the write and reports `applied_with_sync_failure`. Import store nodes/order keys and Image restore
 receipt capacity are prepared before mutation; retained-batch publication and
 restore eligibility consumption do not allocate replacement keys or receipts.
 Retired Scene identity bindings are observed through weak lifetimes before
@@ -268,8 +282,9 @@ E+D+W+S. The recovery charge includes T, the ImageSnapshot and a conservative
 are distinct from eligible history; the final successful publication serializes
 FIFO against current history, retaining an above-soft entry alone when at most
 hard. Above-hard charges refuse without old-history loss and report the approval
-requirement; no operator override is implemented yet. Session/global lifetime
-ledgers are not separate admission caps.
+requirement. The trusted bounded one-operation approval described above can
+supplement ordinary authority, but cannot bypass independent physical/allocation
+guards. Session/global lifetime ledgers are not separate admission caps.
 S is physically allocated
 once and its lease transfers to retention. Scratch releases only after buffers,
 worker stack, task and future die; control/result/history charges survive their

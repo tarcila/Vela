@@ -393,11 +393,25 @@ safeguards remain. FIFO eviction occurs only at successful publication;
 precommit failures, no-ops and replay do not discard recovery. An entry above
 soft and at most hard is retained alone. Exactly soft is normal; exactly hard
 needs no approval. The next normal entry uses soft again. Discovery reports
-both effective limits, `oversized_retention`, `approval_available:false` and
+both effective limits, `oversized_retention`, `approval_available` (trusted host
+support, not an approval grant) and
 soft availability clamped to zero during exceptional retention. Agent Activity
 also distinguishes oversized-alone from normal FIFO. A commit receipt is a
-historical observation, not current eligibility. Above-hard approval is **not
-implemented**: agents cannot supply an override flag or token. Qualified host
+historical observation, not current eligibility. Above-hard approval is an
+explicit trusted local Agent Activity decision. Inspect the original operation,
+required/effective limits, finite maximum, expiry, all-history eviction warning
+and allocation caveat; approve or decline/revoke locally. Retry the exact prepared
+proposal with a fresh increasing `request_id` and integer `approval_request_id`
+naming the original refusal in the same session. There is no MCP grant endpoint;
+a Boolean, bundle field or ordinary EDIT cannot approve. One pending proposal per
+launch has a five-minute monotonic TTL and a 64 MiB physically charged canonical
+storage bound. Final authority/freshness and all physical/profile/allocation
+checks remain mandatory; one irreversible commit consumes the exception, with
+ordinary exact Restore and unchanged permanent policy. Precommit failure releases
+the exclusive claim; session end, registration loss, revocation and expiration
+invalidate it. Replay resolves before claiming. See the complete
+[operator contract](../../../../docs/mesh-exchange.md#trusted-one-operation-recovery-approval).
+Qualified host
 physical preparation headroom is independently twice max(soft,hard) plus the
 unchanged 256 MiB transient allowance; pinned owners and real allocation
 failures can still refuse without sacrificing recovery. No payload/codec/
@@ -420,7 +434,8 @@ above-hard recovery charge `busy/restoration_approval_required`, and other
 capacity pressure `busy/resource_limit`. The above-hard refusal reports
 `required_capacity_bytes`, `configured_capacity_bytes` (soft),
 `effective_soft_limit_bytes`, `effective_hard_limit_bytes`,
-`approval_required:true`, `approval_available:false`, `committed:false` and
+`approval_required:true`, `approval_available` (proposal successfully offered),
+`committed:false` and
 `history_unchanged:true`. Failed within-hard recovery reservations instead
 report `restore_budget_exhausted`; neither failure evicts eligible history. Non-ok terminal outcomes have `isError:true`; committed
 sync failures retain `applied_with_sync_failure` and fresh receipts. Image restore

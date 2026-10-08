@@ -65,6 +65,8 @@ struct IntegrationActivityState
   std::vector<IntegrationSceneRow> scenes;
   std::vector<IntegrationActivityRow> activity; // oldest first
   vsr::integration::activity::Usage usage;
+  std::optional<vsr::integration::approval::Proposal> recoveryProposal;
+  std::size_t canonicalProposalByteCap{0};
 };
 
 class IntegrationActivityModel
@@ -94,6 +96,9 @@ class IntegrationActivityModel
 
   // Local controls (host authority) //
 
+  bool approveRecovery(const vsr::integration::approval::Identity &identity,
+      std::uint64_t maximum);
+  bool revokeRecovery(const vsr::integration::approval::Identity &identity);
   bool setAgentEditsDisabled(bool disabled);
   bool setAgentCameraControlEnabled(bool enabled);
   // Local whole-session revocation; false when no session was held.
@@ -148,6 +153,12 @@ inline const IntegrationActivityState &IntegrationActivityModel::refresh()
   }
 
   refreshActivity();
+  s.recoveryProposal.reset();
+  if (m_services.activity) {
+    auto &store = m_services.activity->approvals();
+    s.canonicalProposalByteCap = store.canonicalByteCap();
+    s.recoveryProposal = store.snapshot();
+  }
   return s;
 }
 
@@ -172,6 +183,32 @@ inline void IntegrationActivityModel::refreshActivity()
     s.activity.push_back(std::move(row));
   }
   s.usage = log->usage();
+}
+
+inline bool IntegrationActivityModel::approveRecovery(
+    const vsr::integration::approval::Identity &identity, std::uint64_t maximum)
+{
+  namespace vi = vsr::integration;
+  if (!m_services.activity || !m_services.authority || !m_services.integration
+      || !m_services.integration->active()
+      || identity.launchId != m_services.authority->launchId())
+    return false;
+  const auto target = vi::session::Target::scene(identity.target);
+  if (m_services.authority->authorizeExecution(
+          identity.sessionId, target, vi::session::Capability::READ)
+          != vi::session::Code::OK
+      || m_services.authority->authorizeExecution(
+             identity.sessionId, target, vi::session::Capability::EDIT)
+          != vi::session::Code::OK)
+    return false;
+  return m_services.activity->approvals().approve(identity, maximum);
+}
+
+inline bool IntegrationActivityModel::revokeRecovery(
+    const vsr::integration::approval::Identity &identity)
+{
+  return m_services.activity
+      && m_services.activity->approvals().revoke(identity);
 }
 
 inline bool IntegrationActivityModel::setAgentEditsDisabled(bool disabled)

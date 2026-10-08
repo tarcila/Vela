@@ -12,6 +12,7 @@
 #include "vsr/integration/mesh/MeshReplacement.hpp"
 #include "vsr/integration/restore/BatchRestore.hpp"
 // vsr_scene
+#include "vsr/scene/detail/PreparedImageWrite.hpp"
 #include "vsr/scene/detail/PreparedPositionBinding.hpp"
 // posix
 #if defined(__linux__)
@@ -685,7 +686,8 @@ std::string ImageExchange::State::limitsJson(
       + ",\"effective_single_entry_hard_cap_bytes\":"
       + std::to_string(policy.hardRetentionBytes)
       + ",\"oversized_retention\":" + (oversized ? "true" : "false")
-      + ",\"approval_available\":false"
+      + ",\"approval_available\":"
+      + (limits.retention && limits.reservePhysicalMemory ? "true" : "false")
       + ",\"available_global_retention_bytes\":" + std::to_string(available)
       + ",\"retained_physical_bytes\":" + std::to_string(physical)
       + ",\"physical_byte_cap\":" + std::to_string(limits.physicalByteCap)
@@ -1123,6 +1125,7 @@ void ImageExchange::attachRestoration(
   m_state->editsLifetime = edits.lifetime();
   m_state->restores = &restores;
   m_state->restoresLifetime = restores.lifetime();
+  m_engine->setRecoveryMemoryReserve(m_state->limits.reservePhysicalMemory);
 }
 
 bool ImageExchange::importAvailable() const
@@ -1446,7 +1449,8 @@ operations::Admission ImageExchange::submitMeshImport(
     identity::ObjectHandle handle,
     std::string targetVersion,
     std::string dependencies,
-    std::string fileName)
+    std::string fileName,
+    std::optional<std::uint64_t> approvalRequestId)
 {
   operations::Admission invalid;
   invalid.code = Outcome::INVALID_REQUEST;
@@ -1495,6 +1499,7 @@ operations::Admission ImageExchange::submitMeshImport(
   }
   operations::Request request;
   request.kind = "mesh_import";
+  request.approvalRequestId = approvalRequestId;
   request.resourceLease = job->controlLease;
   request.reserveStatus = [reserve = state->limits.reservePhysicalMemory] {
     return reserve(IMPORT_RESULT_BYTES);
@@ -1639,10 +1644,18 @@ operations::Admission ImageExchange::submitMeshImport(
           + sizeof(edit::MeshSnapshot) + 4 * mesh::HEADER_CAP
           + IMPORT_OWNER_BYTES;
       const auto policy = state->restorationPolicy();
-      if (retainedBytes > policy.hardBytes) {
+      const std::string_view canonical(
+          reinterpret_cast<const char *>(job->bundle.bytes.data()),
+          job->bundle.bytes.size());
+      if (!ctx.authorizeRecovery
+          || !ctx.authorizeRecovery(retainedBytes,
+              canonical,
+              registration,
+              state->limits.reservePhysicalMemory,
+              "vmesh")) {
         Step rejected;
         rejected.outcome = Outcome::BUSY;
-        rejected.result = policy.refusal(retainedBytes);
+        rejected.result = policy.refusal(retainedBytes, ctx.approvalOffered);
         return rejected;
       }
       vsr::scene::detail::PreparedPositionBinding::drain(ctx.scene);
@@ -1929,6 +1942,8 @@ operations::Admission ImageExchange::submitMeshImport(
       // allocation.
       for (std::size_t i = 0; i < oldArrays.size(); ++i)
         oldArrays[i] = snapshot->dependencies[i].lifetime.lock()->array;
+      if (ctx.consumeRecoveryApproval && !ctx.consumeRecoveryApproval())
+        return fail(Outcome::FORBIDDEN, "approval_invalidated");
       for (std::size_t i = 0; i < stagedArrays.size(); ++i) {
         stagedArrays[i]->publish();
         addedArrays[i] = stagedArrays[i]->array();
@@ -1991,7 +2006,8 @@ operations::Admission ImageExchange::submitImport(
     SceneId scene,
     identity::ObjectHandle handle,
     std::string dataVersion,
-    std::string fileName)
+    std::string fileName,
+    std::optional<std::uint64_t> approvalRequestId)
 {
   if (!importAvailable() || dataVersion.empty() || dataVersion.size() > 256
       || !confinedName(fileName)) {
@@ -2024,6 +2040,7 @@ operations::Admission ImageExchange::submitImport(
   }
   operations::Request request;
   request.kind = "image_import";
+  request.approvalRequestId = approvalRequestId;
   request.resourceLease = job->controlLease;
   request.reserveStatus = [reserve = state->limits.reservePhysicalMemory] {
     return reserve(IMPORT_RESULT_BYTES);
@@ -2137,6 +2154,36 @@ operations::Admission ImageExchange::submitImport(
               + ",\"data_version\":" + quote(job->expectedVersion) + "}";
           return unchanged;
         }
+        const auto retainedBytes = job->bound.texels
+            + sizeof(edit::ImageSnapshot) + IMPORT_OWNER_BYTES;
+        const auto policy = state->restorationPolicy();
+        const auto layout = std::to_string(job->width) + ":"
+            + std::to_string(job->height) + ":" + std::to_string(job->channels)
+            + ":" + std::to_string(job->elementType);
+        const std::string_view canonical(
+            reinterpret_cast<const char *>(job->pixels.data()),
+            job->pixels.size());
+        if (!ctx.authorizeRecovery
+            || !ctx.authorizeRecovery(retainedBytes,
+                canonical,
+                registration,
+                state->limits.reservePhysicalMemory,
+                layout)) {
+          if (ctx.cancelRestoration)
+            ctx.cancelRestoration();
+          Step rejected;
+          rejected.outcome = Outcome::BUSY;
+          rejected.result = policy.refusal(retainedBytes, ctx.approvalOffered);
+          return rejected;
+        }
+        if (!ctx.reserveRestoration
+            || !ctx.reserveRestoration(
+                retainedBytes, job->batch.launchId, job->batch.batchId)) {
+          Step rejected;
+          rejected.outcome = Outcome::BUSY;
+          rejected.result = policy.refusal(retainedBytes);
+          return rejected;
+        }
         // All fallible control/store/receipt preparation precedes map(), the
         // sole ordinary write-sequence reservation boundary for this write.
         job->receipt = "{\"handle\":" + quote(handleName(handle))
@@ -2161,28 +2208,37 @@ operations::Admission ImageExchange::submitImport(
           }
         } else if (ctx.isAbandoned())
           return Step{};
-        void *destination = nullptr;
+        vsr::scene::detail::PreparedImageWrite write(*array);
         try {
-          destination = array->map();
+          write.start();
         } catch (...) {
-          // Reservation remains spent if pre-map notification fails; no
-          // pointer was exposed and no completed token may be published.
           return fail(Outcome::BUSY, "resource_limit");
         }
-        if (!destination)
-          return fail(Outcome::BUSY, "resource_limit");
-        std::memcpy(
-            job->snapshot->bytes.data(), destination, job->bound.texels);
-        std::memcpy(destination, job->pixels.data(), job->bound.texels);
+        array = write.array();
+        if (!array || registration.expired()
+            || ids->imageDataVersion(handle) != version)
+          return fail(Outcome::CONFLICT, "stale_data_version");
+        if (!state->current())
+          return fail(Outcome::INVALID_REQUEST, "file_rejected");
+        // Map callbacks can revoke authority or cancel work. They can also
+        // perform real external edits, whose clocks must never be rolled back.
+        if (ctx.beforeWrite) {
+          const auto authority = ctx.beforeWrite();
+          if (authority != Outcome::OK) {
+            Step rejected;
+            rejected.outcome = authority;
+            return rejected;
+          }
+        }
+        if (ctx.consumeRecoveryApproval && !ctx.consumeRecoveryApproval())
+          return fail(Outcome::FORBIDDEN, "approval_invalidated");
+        write.commit(
+            job->snapshot->bytes.data(), job->pixels.data(), job->bound.texels);
         job->committed = true;
-        try {
-          array->unmap();
-        } catch (...) {
-          // Array records completedWrite before delegate notification. A
-          // downstream failure cannot turn a completed write into rollback.
+        const auto completedWrite = *array->dataWriteSequence();
+        job->snapshot->completedWrite = completedWrite;
+        if (!write.close())
           job->notificationFailed = true;
-        }
-        job->snapshot->completedWrite = *array->dataWriteSequence();
         state->edits->restorations().publishImage(job->batch);
         job->storePrepared = false;
         if (ctx.publishRestoration)
@@ -2200,7 +2256,7 @@ operations::Admission ImageExchange::submitImport(
             (unsigned long long)handle.launch.nonce,
             (unsigned long long)handle.domain,
             (unsigned long long)handle.serial,
-            (unsigned long long)*array->dataWriteSequence(),
+            (unsigned long long)completedWrite,
             (unsigned long long)revision.launch.activation,
             (unsigned long long)revision.launch.nonce,
             (unsigned long long)revision.domain,
@@ -2221,15 +2277,8 @@ operations::Admission ImageExchange::submitImport(
       if (!b || b->texels > std::numeric_limits<std::size_t>::max() - b->peak)
         return fail(Outcome::BUSY, "resource_limit");
       b->peak += b->texels; // E + D + W + S, not two physical snapshots.
-      const auto retainedBytes =
-          b->texels + sizeof(edit::ImageSnapshot) + IMPORT_OWNER_BYTES;
-      const auto policy = state->restorationPolicy();
-      if (retainedBytes > policy.hardBytes) {
-        Step rejected;
-        rejected.outcome = Outcome::BUSY;
-        rejected.result = policy.refusal(retainedBytes);
-        return rejected;
-      }
+      // Decode and compare exact samples before offering approval; a no-op
+      // never requests a new exception or reserves historical eligibility.
       std::shared_ptr<SessionLedger> ledger;
       {
         std::lock_guard<std::mutex> lock(state->mutex);
@@ -2274,14 +2323,6 @@ operations::Admission ImageExchange::submitImport(
       if (!batchId)
         return fail(Outcome::BUSY, "resource_limit");
       job->batch = {state->launchId, *batchId};
-      if (!ctx.reserveRestoration
-          || !ctx.reserveRestoration(
-              retainedBytes, state->launchId, *batchId)) {
-        Step rejected;
-        rejected.outcome = Outcome::BUSY;
-        rejected.result = policy.refusal(retainedBytes);
-        return rejected;
-      }
       auto globalCharge = std::make_shared<SessionCharge>();
       globalCharge->ledger = state->retentionLedger;
       {

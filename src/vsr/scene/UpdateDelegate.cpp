@@ -14,7 +14,7 @@ namespace {
 // fails. Keep the original exception without allocating a callback wrapper.
 template <typename Notify>
 void notifyAllThenRethrow(
-    const std::vector<std::unique_ptr<BaseUpdateDelegate>> &delegates,
+    const std::vector<std::shared_ptr<BaseUpdateDelegate>> &delegates,
     const Notify &notify)
 {
   std::exception_ptr failure;
@@ -31,6 +31,11 @@ void notifyAllThenRethrow(
 }
 
 } // namespace
+
+void BaseUpdateDelegate::signalArrayMapCancelled(const Array *a)
+{
+  signalArrayUnmapped(a);
+}
 
 size_t MultiUpdateDelegate::size() const
 {

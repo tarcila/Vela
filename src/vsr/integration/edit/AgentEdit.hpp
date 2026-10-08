@@ -90,6 +90,7 @@ struct EditBatch
 {
   SceneId scene{INVALID_SCENE_ID};
   std::vector<EditEntry> edits;
+  std::optional<std::uint64_t> approvalRequestId;
 };
 
 // Wire `batch_ref`: {launch_id, batch_id}.
@@ -1245,6 +1246,8 @@ inline operations::Request EditService::makeRequest(EditBatch batch, Slot slot)
   r.target = session::Target::scene(batch.scene);
   r.capability = session::Capability::EDIT;
   r.canonicalArguments = canonicalArguments(batch);
+  r.approvalRequestId = batch.approvalRequestId;
+  r.boundSceneRead = true;
   std::weak_ptr<bool> alive = m_alive;
   auto shared = std::make_shared<EditBatch>(std::move(batch));
   // One prepared owner serves both the pending committed state and public
@@ -1704,6 +1707,56 @@ inline EditResult EditService::commitPrepared(SceneId sceneId,
         + res.versions.capacity() * sizeof(ParameterVersionToken)
         + res.nodeVersions.capacity() * sizeof(NodeVersion);
     requiredRecoveryBytes = restorationBytes(record);
+    if (ctx.restorationPolicy
+        && (ctx.recoveryApprovalRequested
+            || requiredRecoveryBytes > ctx.restorationPolicy->hardBytes)) {
+      // Exact converted types/values and final local Node state complement
+      // the engine's target/version/ancestry-bound semantic arguments.
+      std::size_t bound = 16384;
+      for (const auto &change : record.changes) {
+        const auto bytes = change.after.type() == ANARI_STRING
+            ? std::strlen(static_cast<const char *>(change.after.data()))
+            : anari::sizeOf(change.after.type());
+        if (bytes > SIZE_MAX - bound)
+          throw std::bad_alloc();
+        bound += bytes;
+      }
+      const auto coverage = ctx.reserveRecoveryMemory
+          ? ctx.reserveRecoveryMemory(bound)
+          : nullptr;
+      if (!coverage)
+        throw std::bad_alloc();
+      std::string canonical;
+      canonical.reserve(bound);
+      for (const auto &change : record.changes) {
+        canonical += std::to_string(change.after.type()) + ":";
+        const auto bytes = change.after.type() == ANARI_STRING
+            ? std::strlen(static_cast<const char *>(change.after.data()))
+            : anari::sizeOf(change.after.type());
+        canonical += std::to_string(bytes) + ":";
+        canonical.append(static_cast<const char *>(change.after.data()), bytes);
+      }
+      static_assert(sizeof(core::math::mat4) == 16 * sizeof(float));
+      static_assert(sizeof(core::math::mat3) == 9 * sizeof(float));
+      for (const auto &p : nodes) {
+        canonical += p.changedEnabled ? "enabled:" : "unchanged:";
+        canonical += p.enabled ? "1" : "0";
+        canonical += p.changedTransform ? "transform:" : "unchanged:";
+        if (p.changedTransform) {
+          canonical.append(
+              reinterpret_cast<const char *>(&p.matrix), sizeof(p.matrix));
+          canonical.append(
+              reinterpret_cast<const char *>(&p.srt), sizeof(p.srt));
+        }
+      }
+      if (!ctx.authorizeRecovery
+          || !ctx.authorizeRecovery(requiredRecoveryBytes,
+              canonical,
+              ident->lifetime(),
+              ctx.reserveRecoveryMemory,
+              "prepared_edit"))
+        throw std::bad_alloc();
+    }
     if (ctx.reserveRestoration
         && !ctx.reserveRestoration(
             requiredRecoveryBytes, record.ref.launchId, record.ref.batchId))
@@ -1732,7 +1785,8 @@ inline EditResult EditService::commitPrepared(SceneId sceneId,
     res.receipt.clear();
     if (ctx.restorationPolicy
         && requiredRecoveryBytes > ctx.restorationPolicy->hardBytes)
-      res.receipt = ctx.restorationPolicy->refusal(requiredRecoveryBytes);
+      res.receipt = ctx.restorationPolicy->refusal(
+          requiredRecoveryBytes, ctx.approvalOffered);
     res.outcome = Outcome::BUSY;
     return res;
   }
@@ -1775,8 +1829,13 @@ inline EditResult EditService::commitPrepared(SceneId sceneId,
             outcome = Outcome::CONFLICT;
         }
       }
-      if (outcome == Outcome::OK)
+      if (outcome == Outcome::OK) {
         scene.beginUpdateBatch();
+        if (ctx.consumeRecoveryApproval && !ctx.consumeRecoveryApproval()) {
+          scene.endUpdateBatch();
+          outcome = Outcome::FORBIDDEN;
+        }
+      }
     } catch (...) {
       outcome = Outcome::BUSY;
     }

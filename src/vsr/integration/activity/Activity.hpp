@@ -208,7 +208,12 @@ class ActivityLog
  public:
   using Id = std::uint64_t;
 
-  explicit ActivityLog(Limits limits = {}) : m_limits(limits) {}
+  explicit ActivityLog(Limits limits = {},
+      session::MonotonicClock clock = session::steadyClock())
+      : m_limits(limits), m_approvals(std::move(clock))
+  {}
+
+  approval::ProposalStore &approvals();
 
   const Limits &limits() const;
 
@@ -244,7 +249,10 @@ class ActivityLog
   // Non-destructive preparation. Entries above soft and at most hard are
   // retained alone; pending work is separate from eligible history. Publication
   // serializes the final FIFO decision, without allocations or rejection.
-  bool reserveRestoration(Id id, std::size_t bytes, BatchRef ref);
+  bool reserveRestoration(Id id,
+      std::size_t bytes,
+      BatchRef ref,
+      const std::shared_ptr<approval::ProposalStore::Claim> &permit = {});
 
   // Releases an unpublished reservation and its payload bytes.
   void cancelRestoration(Id id);
@@ -304,6 +312,7 @@ class ActivityLog
   bool makeImageRoom(std::size_t bytes);
 
   Limits m_limits;
+  approval::ProposalStore m_approvals;
   mutable std::mutex m_mutex;
   Slots m_slots; // oldest first
   Usage m_usage;
@@ -355,10 +364,13 @@ class EngineActivitySink : public operations::ActivitySink
 
   std::optional<operations::RestorationPolicy> restorationPolicy()
       const override;
+  approval::ProposalStore *recoveryApprovals() override;
   bool reserveRestoration(Id id,
       std::size_t bytes,
       const std::string &launchId,
-      const std::string &batchId) override;
+      const std::string &batchId,
+      const std::shared_ptr<approval::ProposalStore::Claim> &permit = {})
+      override;
   void cancelRestoration(Id id) override;
   void publishRestoration(Id id) override;
   bool restorationRetained(
@@ -383,6 +395,11 @@ inline bool Limits::valid() const
 {
   return bytes > 0 && retentionBytes > 0 && hardRetentionBytes >= retentionBytes
       && entries > 0 && restorableBatches > 0;
+}
+
+inline approval::ProposalStore &ActivityLog::approvals()
+{
+  return m_approvals;
 }
 
 inline const Limits &ActivityLog::limits() const
@@ -539,15 +556,25 @@ inline std::optional<Eligibility> ActivityLog::eligibility(
   return std::nullopt;
 }
 
-inline bool ActivityLog::reserveRestoration(
-    Id id, std::size_t bytes, BatchRef ref)
+inline bool ActivityLog::reserveRestoration(Id id,
+    std::size_t bytes,
+    BatchRef ref,
+    const std::shared_ptr<approval::ProposalStore::Claim> &permit)
 {
   std::lock_guard<std::mutex> lock(m_mutex);
   auto it = findId(id);
   if (it == m_slots.end() || it->restorationReserved
       || it->entry.eligibility != Eligibility::NONE)
     return false;
-  if (!m_limits.valid() || bytes > m_limits.hardRetentionBytes
+  const bool exceptional = bytes > m_limits.hardRetentionBytes;
+  if (!m_limits.valid()
+      || (exceptional
+          && (!permit || !it->entry.ref || it->entry.targets.size() != 1
+              || !permit->matches(ref.launchId,
+                  it->entry.ref->sessionId,
+                  it->entry.targets.front().id,
+                  operationKindName(it->entry.kind))
+              || !permit->valid(bytes)))
       || m_reservedRestorable >= UINT64_MAX - m_retentionSerial
       || m_reservedRestorable >= m_limits.restorableBatches
       || bytes > UINT64_MAX - m_usage.reservedRetentionBytes)
@@ -561,6 +588,8 @@ inline bool ActivityLog::reserveRestoration(
   const bool ok = newCost <= oldCost || makeRoom(newCost - oldCost, 0);
   it->pinned = false;
   if (!ok)
+    return false;
+  if (exceptional && !permit->bindReservation(this, id, bytes))
     return false;
   m_usage.bytes = m_usage.bytes - oldCost + newCost;
   it->entry = std::move(grown);
@@ -870,12 +899,19 @@ EngineActivitySink::restorationPolicy() const
       limits.retentionBytes, limits.hardRetentionBytes};
 }
 
+inline approval::ProposalStore *EngineActivitySink::recoveryApprovals()
+{
+  return &m_log.approvals();
+}
+
 inline bool EngineActivitySink::reserveRestoration(Id id,
     std::size_t bytes,
     const std::string &launchId,
-    const std::string &batchId)
+    const std::string &batchId,
+    const std::shared_ptr<approval::ProposalStore::Claim> &permit)
 {
-  return m_log.reserveRestoration(id, bytes, BatchRef{launchId, batchId});
+  return m_log.reserveRestoration(
+      id, bytes, BatchRef{launchId, batchId}, permit);
 }
 
 inline void EngineActivitySink::cancelRestoration(Id id)

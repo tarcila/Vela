@@ -447,7 +447,8 @@ struct Fixture
       activity::Limits activityLimits;
       activityLimits.retentionBytes = exchangeLimits.globalRetentionBytes;
       activityLimits.hardRetentionBytes = exchangeLimits.hardRetentionBytes;
-      imageActivity = std::make_unique<activity::ActivityLog>(activityLimits);
+      imageActivity = std::make_unique<activity::ActivityLog>(
+          activityLimits, [this] { return now; });
       imageActivitySink = std::make_unique<activity::EngineActivitySink>(
           *imageActivity, integration);
       engine->setActivitySink(imageActivitySink.get());
@@ -5768,7 +5769,7 @@ TEST_CASE(
   CHECK(denied.result()->get("effective_soft_limit_bytes")->n == 110000);
   CHECK(denied.result()->get("effective_hard_limit_bytes")->n == 200000);
   CHECK(denied.result()->get("approval_required")->b);
-  CHECK_FALSE(denied.result()->get("approval_available")->b);
+  CHECK(denied.result()->get("approval_available")->b);
   CHECK(denied.result()->get("history_unchanged")->b);
   CHECK_FALSE(denied.result()->get("committed")->b);
   CHECK(f.sceneIds->sceneRevision() == revision);
@@ -12065,5 +12066,13 @@ SCENARIO(
 
 #include "MeshDeviceQualification.inc"
 #include "RetentionPressure.inc"
+
+// Approval cancellation reuses the bounded read gate declared above.
+#include "RecoveryApprovalBoundaries.inc"
+#include "RecoveryApprovalFailure.inc"
+#include "RecoveryApprovalGeneric.inc"
+#include "RecoveryApprovalMapBoundary.inc"
+#include "RecoveryApprovalRefusals.inc"
+#include "RecoveryApprovalWorkflows.inc"
 
 #endif

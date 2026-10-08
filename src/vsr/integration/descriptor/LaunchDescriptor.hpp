@@ -349,7 +349,7 @@ inline bool validImageExchange(std::string_view text, std::string_view launchId)
             "effective_single_entry_hard_cap_bytes", MAX_EXACT_JSON_INTEGER)
         || !soft || !soft->isNumber() || hard->n < soft->n || !oversized
         || oversized->type != Value::Type::BOOL || !approval
-        || approval->type != Value::Type::BOOL || approval->b)
+        || approval->type != Value::Type::BOOL)
       return false;
   }
   return integer("file_cap", FILE_CAP, true)

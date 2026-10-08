@@ -277,9 +277,10 @@ physical-ownership allocation limits remain distinct safeguards, not a second
 session undo ceiling. Qualified Import reads policy directly from the Activity
 log; the Image session/global ledgers measure ownership rather than admission.
 There is no 64 MiB per-session snapshot ceiling. Above-hard recovery requires
-explicit bounded operator approval, but that approval path is **not implemented**
-yet: this slice rejects it without Scene mutation or recovery eviction. No
-agent-supplied field or ordinary edit permission bypasses that refusal.
+explicit bounded operator approval through the trusted local Agent Activity
+window/model, as described below. An unapproved attempt refuses without Scene
+mutation or recovery eviction. No agent-supplied Boolean, bundle field, ordinary
+edit permission or approval of a specification grants this exception.
 A mesh batch conservatively charges all unique required prior Array data plus
 replacement data, `sizeof(Array) + 4096` bytes per retained Array for lifetime/
 control ownership, the snapshot record, and a conservative 256 KiB allowance
@@ -294,7 +295,8 @@ until the corresponding buffers/pins are physically releasable. Charges also inc
 receipt ownership. A charge above hard reports `required_capacity_bytes`,
 `configured_capacity_bytes` (soft), `effective_soft_limit_bytes`,
 `effective_hard_limit_bytes`, `approval_required:true`,
-`approval_available:false`, `committed:false` and `history_unchanged:true`,
+`approval_available` (whether this refusal offered a bounded proposal),
+`committed:false` and `history_unchanged:true`,
 with no irreversible fallback or automatic increase. The viewer/headless host
 physical-owner pool is separately configured to twice the larger of soft and
 hard plus the unchanged 256 MiB transient allowance (17,448,304,640 bytes at
@@ -311,6 +313,61 @@ File creation is descriptor-relative,
 exclusive and identity checked; partial files are removed by held identity,
 never by following replacement links. Resource/authority/cancellation failures
 publish no successful artifact. Changing directory identity disables delivery.
+
+### Trusted one-operation recovery approval
+
+1. Submit an ordinary Image/Mesh Import or parameter/Node edit. Only a validated,
+   changed above-hard proposal can offer approval. A no-op does not offer one.
+2. In **Agent Activity**, inspect the original session/request, Scene, target
+   handle/evidence description, required recovery bytes, effective soft/hard
+   limits, exact finite requested maximum, expiration and canonical-storage cost.
+   Approval warns that **all older recovery will be evicted at successful commit**,
+   this entry will be retained alone, permanent limits stay unchanged, and actual
+   allocation can still fail. Press **Approve this one operation**, or **Decline**.
+3. Retry the identical operation using a fresh, increasing `request_id` and
+   optional integer `approval_request_id` naming the original refused request in
+   the same session. That field references a decision; it cannot grant one.
+   Supply current ordinary authority and the original still-current dependency
+   evidence. Changed targets, evidence, types, layouts, aliases, actions or actual
+   replacement samples cannot use this decision. Filename/size/mtime equivalence
+   is insufficient. Mesh binding/actions/layouts and all carrier bytes are bound;
+   even a differently encoded but semantically equivalent carrier must ask again.
+4. Poll status. One successful irreversible commit consumes the exception, even
+   when subsequent synchronization fails. Use its normal `batch_ref` with ordinary
+   `vsr_restore`; exact conditional one-way restoration is unchanged. Subsequent
+   changes apply normal FIFO/hard-cap policy without a permanent increase.
+
+The trusted ImGui-free local API is
+`IntegrationActivityModel::refresh().recoveryProposal`,
+`approveRecovery(identity, requiredBytes)` and `revokeRecovery(identity)`.
+It rechecks current Scene READ/EDIT and enabled agent edits. Headless hosts may
+expose these same **local** controls to their operator; there is intentionally no
+MCP grant endpoint. `ActivityLog::approvals()` is the lower-level trusted host API,
+not an agent permission transport. Approving a larger or smaller maximum fails:
+this implementation permits exactly the fully charged required maximum.
+
+Each launch Activity log stores at most **one live canonical proposal**, for
+**five monotonic minutes from the original refusal**. Approval, reads and retries
+never renew expiration. A live proposal cannot be replaced by another refused
+operation; decline/revoke it first or let it expire. Its canonical contents,
+semantic arguments, typed prepared state and bounded control metadata must fit
+**64 MiB total**, charged to the existing independent host physical pool before
+copying. This cap is not an additional session undo ceiling. If canonical storage
+or actual allocation cannot fit, no proposal is offered and old history survives.
+Image samples/type/dimensions, Mesh carrier contents/layouts/aliases and converted
+parameter/Node values/final local state are captured, not just file attributes.
+The store also binds launch/session/kind/Scene/original request and exact charge.
+
+An exclusive RAII claim prevents concurrent reuse. Precommit failure/cancellation
+releases the claim without consuming approval; retry requires a fresh request ID
+and all original evidence must still be current. Revocation, session end, lost
+registration/identity lifetime or expiry invalidates both pending approval and
+claims. Claimed canonical owners stay physically charged until cleanup releases
+all ownership. Final authority, freshness, format/profile/resource and allocation
+checks remain mandatory, and admission passes an operation-bound opaque permit
+to the authoritative Activity reservation; it never raises the global hard cap.
+Historical transport replay resolves before claiming and returns the historical
+result without recommit, eviction, consumption or authority renewal.
 
 ### Working-file lifecycle and failure handling
 
@@ -337,13 +394,14 @@ Poll ordinary operation status and inspect `committed` before deciding recovery:
 - `busy` / `resource_limit` identifies actual transient, physical, file, slot or
   publication-resource safeguards. Above-hard recovery reports
   `busy/restoration_approval_required` with the fully accounted required charge,
-  effective limits and unimplemented approval requirement described above.
+  effective limits and the trusted approval requirement described above.
   Other failed recovery reservations report `restore_budget_exhausted`; they
   never evict existing recovery. Old eligible history alone is not an admission
   barrier for an admissible entry. Exchange metadata reports
   `effective_global_retention_byte_cap` (soft),
   `effective_single_entry_hard_cap_bytes`, `oversized_retention`,
-  `approval_available:false`, `available_global_retention_bytes`
+  `approval_available` (trusted host support, not an approval grant),
+  `available_global_retention_bytes`
   (soft minus eligible charges, clamped to zero during oversized retention),
   `retention_order:publication_fifo`,
   `retention_entry_cap`, `activity_metadata_byte_cap`, `activity_entry_cap`,

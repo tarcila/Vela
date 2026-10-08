@@ -78,7 +78,7 @@ def main():
                     assert 'session_snapshot_byte_cap' not in limits
                     assert limits['available_global_retention_bytes'] == cap
                     assert limits['oversized_retention'] is False
-                    assert limits['approval_available'] is False
+                    assert limits['approval_available'] is True
                     assert limits['physical_byte_cap'] == 2 * hard + 268435456
                     assert limits['transient_image_byte_cap'] == 268435456
                     assert limits['file_cap'] == 1024 and limits['byte_cap'] == 268435456

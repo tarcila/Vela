@@ -16,6 +16,10 @@ using namespace vsr::integration;
 using namespace vsr::integration::activity;
 using session::Attachment;
 using session::Code;
+using namespace std::string_view_literals;
+
+#include "RecoveryApproval.inc"
+#include "RecoveryApprovalAdmission.inc"
 
 namespace {
 

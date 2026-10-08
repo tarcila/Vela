@@ -64,19 +64,21 @@ inline void addMeshImportTool(std::vector<Tool> &tools, ImageDeps deps)
   Tool tool;
   tool.name = "vsr_mesh_import";
   tool.description =
-      "Replace count-preserving positions on one exposed triangle Geometry from a confined .vmesh. Requires current READ+EDIT and enabled agent edits. Copy current target_version and complete dependencies from Mesh Export; descriptive bundle source is not authority and export provenance is not required. Other fields must preserve; no count, state or optional field changes yet. Poll mesh_import for committed, current evidence and normal batch_ref for vsr_restore. Old shared Arrays are never overwritten. Recovery shares the effective host soft/hard limits (4 GiB/8 GiB defaults): above-soft entries at most hard retain alone, and the next normal change uses soft again. Above-hard refusal reports required bytes and limits without mutation or eviction; bounded operator approval is not implemented. See docs/mesh-exchange.md.";
+      "Replace count-preserving positions on one exposed triangle Geometry from a confined .vmesh. Requires current READ+EDIT and enabled agent edits. Copy current target_version and complete dependencies from Mesh Export; descriptive bundle source is not authority and export provenance is not required. Other fields must preserve; no count, state or optional field changes yet. Poll mesh_import for committed, current evidence and normal batch_ref for vsr_restore. Old shared Arrays are never overwritten. Recovery shares the effective host soft/hard limits (4 GiB/8 GiB defaults): above-soft entries at most hard retain alone, and the next normal change uses soft again. Above-hard refusal reports required bytes and limits without mutation or eviction; request a trusted host Activity approval, then retry with fresh request_id and approval_request_id naming the refused original. No agent flag grants approval. See docs/mesh-exchange.md.";
   tool.inputSchemaJson = std::string("{\"type\":\"object\",\"properties\":{")
       + requestIdSchema()
       + ",\"scene_id\":{\"type\":\"integer\",\"minimum\":0},\"handle\":{\"type\":\"string\"},"
         "\"target_version\":{\"type\":\"string\"},\"dependencies\":{\"type\":\"array\",\"maxItems\":64},"
-        "\"file_name\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":128}},"
+        "\"file_name\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":128},"
+        "\"approval_request_id\":{\"type\":\"integer\",\"minimum\":1}},"
         "\"required\":[\"request_id\",\"scene_id\",\"handle\",\"target_version\",\"dependencies\",\"file_name\"],\"additionalProperties\":false}";
   tool.handler = [deps](
                      const session::Credentials &c, const json::Value &args) {
     for (const auto &argument : args.o)
       if (argument.first != "request_id" && argument.first != "scene_id"
           && argument.first != "handle" && argument.first != "target_version"
-          && argument.first != "dependencies" && argument.first != "file_name")
+          && argument.first != "dependencies" && argument.first != "file_name"
+          && argument.first != "approval_request_id")
         return rejected(operations::Outcome::INVALID_REQUEST);
     const auto id = requestIdArg(args.get("request_id"));
     const auto scene = targetIdArg(args, "scene_id");
@@ -89,6 +91,9 @@ inline void addMeshImportTool(std::vector<Tool> &tools, ImageDeps deps)
         || !dependencies || dependencies->type != json::Value::Type::ARRAY
         || !file || !file->isString())
       return rejected(operations::Outcome::INVALID_REQUEST);
+    const auto approval = requestIdArg(args.get("approval_request_id"));
+    if (args.get("approval_request_id") && !approval)
+      return rejected(operations::Outcome::INVALID_REQUEST);
     const operations::OperationRef ref{c.sessionId, *id};
     return detail::ack(ref,
         deps.images->submitMeshImport(c,
@@ -97,7 +102,8 @@ inline void addMeshImportTool(std::vector<Tool> &tools, ImageDeps deps)
             *handle,
             version->s,
             json::write(*dependencies),
-            file->s));
+            file->s,
+            approval));
   };
   tools.push_back(std::move(tool));
 }
@@ -159,12 +165,15 @@ inline void addImageTools(std::vector<Tool> &tools, ImageDeps deps)
       "Recovery shares effective host soft/hard limits (4 GiB/8 GiB defaults). "
       "Above-soft entries at most hard retain alone; the next normal change uses "
       "soft again. Above-hard refusal reports required bytes and limits without "
-      "mutation or eviction; bounded operator approval is not implemented.";
+      "mutation or eviction. Request explicit trusted host Activity approval, "
+      "then retry with fresh request_id and approval_request_id naming the "
+      "original refusal. No agent flag grants approval.";
   import.inputSchemaJson = std::string("{\"type\":\"object\",\"properties\":{")
       + requestIdSchema()
       + ",\"scene_id\":{\"type\":\"integer\",\"minimum\":0},"
         "\"handle\":{\"type\":\"string\"},\"data_version\":{\"type\":\"string\"},"
-        "\"file_name\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":128}},"
+        "\"file_name\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":128},"
+        "\"approval_request_id\":{\"type\":\"integer\",\"minimum\":1}},"
         "\"required\":[\"request_id\",\"scene_id\",\"handle\",\"data_version\",\"file_name\"],"
         "\"additionalProperties\":false}";
   import.handler = [deps](
@@ -178,15 +187,19 @@ inline void addImageTools(std::vector<Tool> &tools, ImageDeps deps)
     for (const auto &argument : args.o)
       if (argument.first != "request_id" && argument.first != "scene_id"
           && argument.first != "handle" && argument.first != "data_version"
-          && argument.first != "file_name")
+          && argument.first != "file_name"
+          && argument.first != "approval_request_id")
         return rejected(operations::Outcome::INVALID_REQUEST);
     if (!id || !scene || !handle || !version || !version->isString() || !file
         || !file->isString())
       return rejected(operations::Outcome::INVALID_REQUEST);
+    const auto approval = requestIdArg(args.get("approval_request_id"));
+    if (args.get("approval_request_id") && !approval)
+      return rejected(operations::Outcome::INVALID_REQUEST);
     const operations::OperationRef ref{c.sessionId, *id};
     return detail::ack(ref,
         deps.images->submitImport(
-            c, ref, *scene, *handle, version->s, file->s));
+            c, ref, *scene, *handle, version->s, file->s, approval));
   };
   tools.push_back(std::move(import));
 }

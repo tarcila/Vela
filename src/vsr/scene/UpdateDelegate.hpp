@@ -17,6 +17,9 @@ namespace vsr::scene {
 struct Array;
 struct Object;
 struct Parameter;
+namespace detail {
+class PreparedImageWrite;
+}
 
 /*
  * Abstract observer interface that receives all mutating signals produced by
@@ -44,6 +47,9 @@ struct BaseUpdateDelegate
       const Object *o, const std::vector<const Parameter *> &ps) = 0;
   virtual void signalArrayMapped(const Array *a) = 0;
   virtual void signalArrayUnmapped(const Array *a) = 0;
+  // Trusted prepared Image writes can close a map before exposing writable
+  // storage. Release downstream maps, without claiming a completed data write.
+  virtual void signalArrayMapCancelled(const Array *a);
   virtual void signalObjectParameterUseCountZero(const Object *obj) = 0;
   virtual void signalObjectLayerUseCountZero(const Object *obj) = 0;
   virtual void signalObjectRemoved(const Object *o) = 0;
@@ -59,8 +65,8 @@ struct BaseUpdateDelegate
   // Bracket a run of mutations that should produce at most one downstream
   // rebuild. Nesting is counted, so an outer batch is not ended by an inner
   // one. Every signal above still arrives; only the work they trigger is
-  // coalesced. Optional hooks (CODING_STANDARDS section 13): a delegate that has
-  // nothing to coalesce need not say so.
+  // coalesced. Optional hooks (CODING_STANDARDS section 13): a delegate that
+  // has nothing to coalesce need not say so.
   virtual void signalUpdateBatchBegin() {}
   virtual void signalUpdateBatchEnd() {}
 
@@ -172,7 +178,8 @@ struct MultiUpdateDelegate : public BaseUpdateDelegate
   void signalObjectMetadataChanged(const Object *o) override;
 
  private:
-  std::vector<std::unique_ptr<BaseUpdateDelegate>> m_delegates;
+  friend class detail::PreparedImageWrite;
+  std::vector<std::shared_ptr<BaseUpdateDelegate>> m_delegates;
 };
 
 // Inline definitions /////////////////////////////////////////////////////////
@@ -180,7 +187,7 @@ struct MultiUpdateDelegate : public BaseUpdateDelegate
 template <typename T, typename... Args>
 inline T *MultiUpdateDelegate::emplace(Args &&...args)
 {
-  m_delegates.push_back(std::make_unique<T>(std::forward<Args>(args)...));
+  m_delegates.push_back(std::make_shared<T>(std::forward<Args>(args)...));
   return (T *)m_delegates.back().get();
 }
 
