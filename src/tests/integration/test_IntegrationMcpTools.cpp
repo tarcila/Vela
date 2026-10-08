@@ -6703,9 +6703,11 @@ SCENARIO(
 }
 
 SCENARIO("MCP mesh import changes Helide pixels and restores identities",
-    "[integration][mcp][mesh-import][mesh-topology]")
+    "[integration][mcp][mesh-import][mesh-topology][mesh-tool]")
 {
   bool topology = false, retainedPrimitive = false;
+  bool externalTool = false, independentlyAuthored = false;
+  bool toolMaintained = false;
   SECTION("count-preserving positions") {}
   SECTION("count-changing topology, removal, addition and aliases")
   {
@@ -6715,6 +6717,22 @@ SCENARIO("MCP mesh import changes Helide pixels and restores identities",
   {
     topology = true;
     retainedPrimitive = true;
+  }
+  SECTION("Trimesh translation retains typed attributes and aliases")
+  {
+    externalTool = true;
+    toolMaintained = true;
+  }
+  SECTION("actual Trimesh subdivision with explicit attribute loss")
+  {
+    topology = true;
+    externalTool = true;
+  }
+  SECTION("independently authored Trimesh bundle without export provenance")
+  {
+    topology = true;
+    externalTool = true;
+    independentlyAuthored = true;
   }
   Helide helide;
   REQUIRE(helide.device);
@@ -6730,7 +6748,7 @@ SCENARIO("MCP mesh import changes Helide pixels and restores identities",
   auto material = f.scene.createObject<vsr::scene::Material>("matte");
   material->setParameter("color", vsr::math::float3(1, 0, 0));
   vsr::scene::ArrayRef priorColor;
-  if (retainedPrimitive) {
+  if (retainedPrimitive || externalTool) {
     priorColor = f.scene.createArray(ANARI_FLOAT32_VEC3, 1);
     const float red[] = {1, 0, 0};
     priorColor->setData(static_cast<const void *>(red));
@@ -6740,6 +6758,13 @@ SCENARIO("MCP mesh import changes Helide pixels and restores identities",
   }
   auto first = f.scene.createSurface("first", geometry, material);
   auto second = f.scene.createSurface("second", geometry, material);
+  auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 1, 1);
+  const unsigned char texel[] = {23, 45, 67, 255};
+  image->setData(static_cast<const void *>(texel));
+  auto sampler = f.scene.createObject<vsr::scene::Sampler>("image2D");
+  sampler->setParameterObject("image", *image);
+  auto unrelatedMaterial = f.scene.getObject<vsr::scene::Material>(0);
+  unrelatedMaterial->setParameterObject("color", *sampler);
   auto root = f.scene.defaultLayer()->root();
   auto leftMatrix = vsr::math::IDENTITY_MAT4;
   auto rightMatrix = vsr::math::IDENTITY_MAT4;
@@ -6757,6 +6782,18 @@ SCENARIO("MCP mesh import changes Helide pixels and restores identities",
   const float uv[] = {0, 0, 1, 0, 0.5, 1};
   coordinates->setData(static_cast<const void *>(uv));
   geometry->setParameterObject("vertex.attribute0", *coordinates);
+  vsr::scene::ArrayRef fixedColors;
+  const unsigned char rgba[] = {0, 1, 254, 255, 0, 1, 254, 255, 0, 1, 254, 255};
+  if (toolMaintained) {
+    geometry->setParameterObject("vertex.attribute1", *coordinates);
+    geometry->parameter("vertex.attribute1")->setEnabled(false);
+    fixedColors = f.scene.createArray(ANARI_UFIXED8_VEC4, 3);
+    fixedColors->setData(static_cast<const void *>(rgba));
+    geometry->setParameterObject("vertex.color", *fixedColors);
+    geometry->parameter("vertex.color")->setEnabled(false);
+    geometry->setParameterObject("vertex.attribute2", *fixedColors);
+    geometry->parameter("vertex.attribute2")->setEnabled(false);
+  }
   geometry->setParameter("custom", 17.f);
   auto camera = f.scene.createObject<vsr::scene::Camera>("perspective");
   camera->setParameter("position", vsr::math::float3(0, 0, 5));
@@ -6805,12 +6842,21 @@ SCENARIO("MCP mesh import changes Helide pixels and restores identities",
   const auto exported = f.await(s, 1);
   REQUIRE(exported.str("outcome") == "ok");
   const auto path = f.exchangePath();
+  // Independent authoring receives a nonexistent input path: it cannot derive
+  // data or source metadata from the export artifact. Only the MCP caller
+  // copies the fresh target/dependency evidence; that is not bundle provenance.
+  const auto inputName = independentlyAuthored
+      ? "never-exported.vmesh"
+      : exported.result()->get("file_name")->s;
   const auto command = std::string(VSR_MESH_TEST_PYTHON) + " "
       + VSR_MESH_TEST_SOURCE
-      + (topology ? "/scripts/test-mesh-topology.py '"
-                  : "/scripts/test-mesh-position.py '")
-      + path + "/" + exported.result()->get("file_name")->s + "' '" + path
-      + "/edited.vmesh'" + (retainedPrimitive ? " retain-primitive" : "");
+      + (externalTool    ? "/scripts/mesh-tool-replacement.py '"
+              : topology ? "/scripts/test-mesh-topology.py '"
+                         : "/scripts/test-mesh-position.py '")
+      + path + "/" + inputName + "' '" + path + "/edited.vmesh'"
+      + (retainedPrimitive ? " retain-primitive" : "")
+      + (independentlyAuthored ? " --independent" : "")
+      + (toolMaintained ? " --maintained" : "");
   REQUIRE(std::system(command.c_str()) == 0);
   const auto arguments = "{\"request_id\":2,\"scene_id\":"
       + std::to_string(f.sceneId) + ",\"handle\":"
@@ -6833,12 +6879,24 @@ SCENARIO("MCP mesh import changes Helide pixels and restores identities",
       == geometry.data());
   CHECK(second->parameterValueAsObject<vsr::scene::Geometry>("geometry")
       == geometry.data());
+  CHECK(first->parameterValueAsObject<vsr::scene::Material>("material")
+      == material.data());
+  CHECK(second->parameterValueAsObject<vsr::scene::Material>("material")
+      == material.data());
+  CHECK(sampler->parameterValueAsObject<vsr::scene::Array>("image")
+      == image.data());
+  CHECK(unrelatedMaterial->parameterValueAsObject<vsr::scene::Sampler>("color")
+      == sampler.data());
+  CHECK(std::memcmp(image->data(), texel, sizeof(texel)) == 0);
   CHECK(geometry->name() == "editable triangle");
   if (topology) {
-    CHECK(replacement->size() == 4);
+    CHECK(replacement->size()
+        == (externalTool && !independentlyAuthored ? 6 : 4));
     CHECK(geometry->parameterValueAsObject<vsr::scene::Array>("primitive.index")
               ->size()
-        == (retainedPrimitive ? 1 : 2));
+        == (externalTool && !independentlyAuthored ? 4
+                : retainedPrimitive                ? 1
+                                                   : 2));
     if (retainedPrimitive) {
       CHECK(
           geometry->parameterValueAsObject<vsr::scene::Array>("primitive.color")
@@ -6846,6 +6904,13 @@ SCENARIO("MCP mesh import changes Helide pixels and restores identities",
       CHECK(other->parameterValueAsObject<vsr::scene::Array>("primitive.color")
           == priorColor.data());
       CHECK(material->parameter("color")->value().getString() == "color");
+    }
+    if (externalTool) {
+      CHECK(material->parameter("color")->value().getString() == "color");
+      CHECK(other->parameterValueAsObject<vsr::scene::Array>("primitive.color")
+          == priorColor.data());
+      const float red[] = {1, 0, 0};
+      CHECK(std::memcmp(priorColor->data(), red, sizeof(red)) == 0);
     }
     CHECK_FALSE(geometry->parameter("vertex.attribute0"));
     CHECK(geometry->parameterValueAsObject<vsr::scene::Array>("primitive.color")
@@ -6858,6 +6923,21 @@ SCENARIO("MCP mesh import changes Helide pixels and restores identities",
     CHECK(
         geometry->parameterValueAsObject<vsr::scene::Array>("vertex.attribute0")
         == coordinates.data());
+  }
+  if (toolMaintained) {
+    CHECK(geometry->parameterValueAsObject<vsr::scene::Array>("primitive.color")
+        == priorColor.data());
+    CHECK(
+        geometry->parameterValueAsObject<vsr::scene::Array>("vertex.attribute1")
+        == coordinates.data());
+    CHECK_FALSE(geometry->parameter("vertex.attribute1")->isEnabled());
+    CHECK(geometry->parameterValueAsObject<vsr::scene::Array>("vertex.color")
+        == fixedColors.data());
+    CHECK(
+        geometry->parameterValueAsObject<vsr::scene::Array>("vertex.attribute2")
+        == fixedColors.data());
+    CHECK(fixedColors->elementType() == ANARI_UFIXED8_VEC4);
+    CHECK(std::memcmp(fixedColors->data(), rgba, sizeof(rgba)) == 0);
   }
   CHECK(std::memcmp(indices->data(), triangle, sizeof(triangle)) == 0);
   CHECK(std::memcmp(coordinates->data(), uv, sizeof(uv)) == 0);
@@ -6890,7 +6970,7 @@ SCENARIO("MCP mesh import changes Helide pixels and restores identities",
       == indices.data());
   CHECK(geometry->parameterValueAsObject<vsr::scene::Array>("vertex.attribute0")
       == coordinates.data());
-  if (retainedPrimitive)
+  if (retainedPrimitive || externalTool)
     CHECK(geometry->parameterValueAsObject<vsr::scene::Array>("primitive.color")
         == priorColor.data());
   else
@@ -6898,6 +6978,22 @@ SCENARIO("MCP mesh import changes Helide pixels and restores identities",
   CHECK_FALSE(geometry->parameter("primitive.attribute1"));
   CHECK_FALSE(geometry->parameter("faceVarying.attribute2"));
   CHECK_FALSE(geometry->parameter("vertex.tangent"));
+  if (toolMaintained) {
+    CHECK(geometry->parameterValueAsObject<vsr::scene::Array>("vertex.color")
+        == fixedColors.data());
+    CHECK(
+        geometry->parameterValueAsObject<vsr::scene::Array>("vertex.attribute2")
+        == fixedColors.data());
+    CHECK(
+        geometry->parameterValueAsObject<vsr::scene::Array>("vertex.attribute1")
+        == coordinates.data());
+    CHECK(std::memcmp(fixedColors->data(), rgba, sizeof(rgba)) == 0);
+  }
+  CHECK(sampler->parameterValueAsObject<vsr::scene::Array>("image")
+      == image.data());
+  CHECK(unrelatedMaterial->parameterValueAsObject<vsr::scene::Sampler>("color")
+      == sampler.data());
+  CHECK(std::memcmp(image->data(), texel, sizeof(texel)) == 0);
   CHECK(pixels() == before);
   anari::release(helide.device, backend.renderer);
   f.scene.updateDelegate().erase(index);

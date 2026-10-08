@@ -23,4 +23,6 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
 add_test(NAME vsr::integration COMMAND ${PROJECT_NAME} "[integration]")
 add_test(NAME vsr::mesh-helper
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/test-mesh-bundle.py)
+add_test(NAME vsr::mesh-tool-helper
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/test-mesh-trimesh.py)
 

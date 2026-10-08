@@ -231,6 +231,11 @@ publish no successful artifact. Changing directory identity disables delivery.
 
 ## Python / NumPy helper
 
+For runnable selective edits, a real Trimesh count-changing workflow,
+independent authoring and explicit conversion-loss/correspondence handling, see
+[the mesh-tool cookbook](mesh-tool-cookbook.md). Its topology-only adapter is
+installed alongside this lossless helper; external tools never run in Import.
+
 The installed `share/vela/python/vsr_mesh.py` requires NumPy; add that directory
 to `PYTHONPATH`. No private viewer API or Archive parsing is needed:
 

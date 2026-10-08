@@ -129,8 +129,12 @@ add_subdirectory(external)
 add_subdirectory(src)
 
 if (VSR_USE_INTEGRATION)
-  install(FILES python/vsr_mesh.py DESTINATION share/vela/python)
-  install(FILES docs/mesh-exchange.md DESTINATION share/vela/docs)
+  install(FILES python/vsr_mesh.py python/vsr_mesh_trimesh.py
+    DESTINATION share/vela/python)
+  install(FILES docs/mesh-exchange.md docs/mesh-tool-cookbook.md
+    DESTINATION share/vela/docs)
+  install(FILES scripts/mesh-numpy-edit.py scripts/mesh-tool-replacement.py
+    DESTINATION share/vela/examples)
 endif()
 
 ## Cleanup CMake variables ##
