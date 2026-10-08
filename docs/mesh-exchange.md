@@ -215,6 +215,10 @@ at compile time. No tracking predicate authorizes a new exchange format.
 
 ## Bounds and ownership
 
+For the shared Image/Mesh/parameter/Node policy, see the
+[rolling recovery operator guide](agent-undo-retention.md). Its Barney Image
+rendering limitation does not defer actual Barney Mesh update/restore checks.
+
 Maximum 64 Geometry parameters/fields/unique payloads, 64 KiB JSON header,
 64 MiB combined payload; shared directory maximum 1024 files / 256 MiB and
 4096 quota-scan entries. Shared exchange transient and physical ceilings also

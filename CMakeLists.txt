@@ -133,6 +133,8 @@ if (VSR_USE_INTEGRATION)
     DESTINATION share/vela/python)
   install(FILES docs/mesh-exchange.md docs/mesh-tool-cookbook.md
     docs/mesh-device-qualification.md docs/mesh-exchange-persistence.md
+    docs/image-png-exchange.md docs/image-device-qualification.md
+    docs/agent-undo-retention.md
     DESTINATION share/vela/docs)
   install(FILES scripts/mesh-numpy-edit.py scripts/mesh-tool-replacement.py
     scripts/mesh-device-edit.py DESTINATION share/vela/examples)

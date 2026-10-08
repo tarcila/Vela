@@ -174,6 +174,13 @@ engine cleanup.
 
 ## Recoverable Import
 
+See the [rolling recovery operator guide](agent-undo-retention.md) for the shared
+4 GiB/8 GiB defaults, FIFO, trusted one-operation approval and capacity semantics.
+A committed CPU Image edit is not proof of rendered refresh: the currently unfixed
+Barney backend can retain a stale texture. Only its actual rendered Image
+update/restore qualification is deferred; CPU recovery, retention policy and
+Barney Mesh checks remain required. See [Image qualification](image-device-qualification.md).
+
 The viewer and headless tutorial bind
 `ImageExchange::attachRestoration(EditService&, RestoreService&)` to their
 existing shared FrameBudget and authoritative Activity retention/availability

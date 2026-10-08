@@ -33,5 +33,8 @@ if (VSR_USE_INTEGRATION_MCP AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_test(NAME vsr::mesh-device-helide COMMAND ${PROJECT_NAME} "[.mesh-device]")
   set_tests_properties(vsr::mesh-device-helide PROPERTIES ENVIRONMENT
     "VSR_MESH_QUALIFICATION_LIBRARY=helide")
+  add_test(NAME vsr::image-device-helide COMMAND ${PROJECT_NAME} "[.image-device]")
+  set_tests_properties(vsr::image-device-helide PROPERTIES ENVIRONMENT
+    "VSR_IMAGE_QUALIFICATION_LIBRARY=helide")
 endif()
 

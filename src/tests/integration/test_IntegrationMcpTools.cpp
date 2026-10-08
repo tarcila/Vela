@@ -12065,6 +12065,8 @@ SCENARIO(
 }
 
 #include "MeshDeviceQualification.inc"
+// Image qualification reuses the device/lifetime guards, not Mesh pixels.
+#include "ImageDeviceQualification.inc"
 #include "RetentionPressure.inc"
 
 // Approval cancellation reuses the bounded read gate declared above.
@@ -12074,5 +12076,6 @@ SCENARIO(
 #include "RecoveryApprovalMapBoundary.inc"
 #include "RecoveryApprovalRefusals.inc"
 #include "RecoveryApprovalWorkflows.inc"
+#include "RetentionDelivery.inc"
 
 #endif
