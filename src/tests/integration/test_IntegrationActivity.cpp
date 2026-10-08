@@ -111,6 +111,7 @@ SCENARIO("Default activity budgets match the spec", "[integration]")
   Limits l;
   REQUIRE(l.bytes == 16u * 1024 * 1024);
   REQUIRE(l.retentionBytes == UINT64_C(4294967296));
+  REQUIRE(l.hardRetentionBytes == UINT64_C(8589934592));
   REQUIRE(l.entries == 1024);
   REQUIRE(l.restorableBatches == 32);
   REQUIRE(l.imageBytes == 32u * 1024 * 1024);
@@ -188,6 +189,104 @@ TEST_CASE("Wide recovery accounting never preallocates the soft target",
   CHECK(log.usage().retentionBytes == 1);
   CHECK(log.usage().reservedRetentionBytes == 0);
   CHECK(log.usage().bytes < 4096); // bookkeeping only, not GiB allocations
+}
+
+TEST_CASE("Default oversized recovery is prepared without losing history",
+    "[integration][retention-oversized][retention-accounting]")
+{
+  if (sizeof(std::size_t) < 8)
+    return;
+  ActivityLog log;
+  const auto old = log.append(Entry{});
+  REQUIRE(old);
+  REQUIRE(log.reserveRestoration(*old, 1, {"launch", "old"}));
+  log.publishRestoration(*old);
+  const auto pending = log.append(Entry{});
+  REQUIRE(pending);
+  REQUIRE(log.reserveRestoration(
+      *pending, std::size_t(UINT64_C(8589934592)), {"launch", "hard"}));
+  CHECK(log.eligibility({"launch", "old"}) == Eligibility::ELIGIBLE);
+  CHECK(log.usage().retentionBytes == 1);
+  CHECK(log.usage().reservedRetentionBytes == UINT64_C(8589934592));
+  log.cancelRestoration(*pending);
+  CHECK(log.eligibility({"launch", "old"}) == Eligibility::ELIGIBLE);
+  REQUIRE(log.reserveRestoration(
+      *pending, std::size_t(UINT64_C(8589934592)), {"launch", "hard"}));
+  log.publishRestoration(*pending);
+  CHECK(log.eligibility({"launch", "old"}) == Eligibility::EXPIRED);
+  CHECK(log.usage().restorableBatches == 1);
+  CHECK(log.usage().retentionBytes == UINT64_C(8589934592));
+  const auto above = log.append(Entry{});
+  REQUIRE(above);
+  CHECK_FALSE(log.reserveRestoration(
+      *above, std::size_t(UINT64_C(8589934593)), {"launch", "above"}));
+  CHECK(log.eligibility({"launch", "hard"}) == Eligibility::ELIGIBLE);
+  CHECK(log.usage().retentionBytes == UINT64_C(8589934592));
+  REQUIRE(log.reserveRestoration(*above, 1, {"launch", "ordinary"}));
+  CHECK(log.eligibility({"launch", "hard"}) == Eligibility::ELIGIBLE);
+  log.publishRestoration(*above);
+  CHECK(log.eligibility({"launch", "hard"}) == Eligibility::EXPIRED);
+  CHECK(log.usage().retentionBytes == 1);
+  CHECK(log.usage().bytes < 4096);
+}
+
+TEST_CASE("Recovery boundaries use inclusive soft and hard limits",
+    "[integration][retention-oversized][retention-accounting]")
+{
+  const auto bytes = GENERATE(UINT64_C(4294967296),
+      UINT64_C(4294967297),
+      UINT64_C(8589934592),
+      UINT64_C(8589934593));
+  if (sizeof(std::size_t) < 8)
+    return;
+  ActivityLog log;
+  const auto old = log.append(Entry{});
+  REQUIRE(old);
+  REQUIRE(log.reserveRestoration(*old, 1, {"launch", "old"}));
+  log.publishRestoration(*old);
+  const auto fresh = log.append(Entry{});
+  REQUIRE(fresh);
+  const bool approvedWithoutOverride = bytes <= UINT64_C(8589934592);
+  CHECK(log.reserveRestoration(*fresh, std::size_t(bytes), {"launch", "fresh"})
+      == approvedWithoutOverride);
+  CHECK(log.eligibility({"launch", "old"}) == Eligibility::ELIGIBLE);
+  if (approvedWithoutOverride) {
+    log.publishRestoration(*fresh);
+    CHECK(log.usage().retentionBytes == bytes);
+    CHECK(log.usage().restorableBatches == 1);
+    CHECK(log.usage().oversizedRetention == (bytes > UINT64_C(4294967296)));
+    CHECK(log.eligibility({"launch", "old"}) == Eligibility::EXPIRED);
+  } else {
+    CHECK(log.usage().retentionBytes == 1);
+    CHECK(log.usage().reservedRetentionBytes == 0);
+  }
+  CHECK(log.usage().bytes < 4096);
+  // With small charges, normal retention can preserve a suffix, whereas
+  // just-above-soft can never preserve even one old byte.
+  Limits limits;
+  limits.retentionBytes = 100;
+  limits.hardRetentionBytes = 200;
+  ActivityLog small(limits);
+  auto entry = Entry{};
+  entry.batchRef = BatchRef{"launch", "old"};
+  entry.eligibility = Eligibility::ELIGIBLE;
+  entry.restorationBytes = 1;
+  REQUIRE(small.append(entry));
+  entry.batchRef = BatchRef{"launch", "normal"};
+  entry.restorationBytes = 99;
+  REQUIRE(small.append(entry));
+  CHECK(small.eligibility({"launch", "old"}) == Eligibility::ELIGIBLE);
+  entry.batchRef = BatchRef{"launch", "zero"};
+  entry.restorationBytes = 0;
+  REQUIRE(small.append(entry));
+  entry.batchRef = BatchRef{"launch", "oversized"};
+  entry.restorationBytes = 101;
+  REQUIRE(small.append(entry));
+  CHECK(small.eligibility({"launch", "old"}) == Eligibility::EXPIRED);
+  CHECK(small.eligibility({"launch", "normal"}) == Eligibility::EXPIRED);
+  CHECK(small.eligibility({"launch", "zero"}) == Eligibility::EXPIRED);
+  CHECK(small.usage().restorableBatches == 1);
+  CHECK(small.usage().retentionBytes == 101);
 }
 
 TEST_CASE("Recovery FIFO follows publication rather than preparation",

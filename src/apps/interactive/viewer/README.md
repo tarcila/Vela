@@ -36,7 +36,8 @@ CLI parsing is split into two layers:
 | Option | Description |
 | --- | --- |
 | `--agentIntegration` | Explicitly expose authenticated agent tools, including existing-node edits; requires an integration/MCP-enabled build. | 
-| `--agentRestorationBytes N` | Set the launch-local shared Activity/restoration byte cap (positive decimal bytes); default **16777216** (16 MiB). Does not enable integration or camera control. |
+| `--agentRestorationBytes N` | Set the launch-local shared recovery soft target (positive uint64 decimal bytes); default **4294967296** (4 GiB). Does not enable integration or camera control. |
+| `--agentRestorationHardBytes N` | Set the single-entry recovery hard cap (at least soft); default **8589934592** (8 GiB). Above-soft entries at most hard retain alone; above-hard approval is not implemented. Neither limit preallocates memory. |
 | `--noDefaultLayout` | Do not apply built-in ImGui dock layout at startup. |
 | `--noDefaultRenderer` | Do not auto-select a default renderer in the viewport. |
 | `--secondaryView <library>` / `-sv <library>` | Enable secondary viewport and set its ANARI library. |

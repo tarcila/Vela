@@ -18,35 +18,43 @@ namespace vsr::app {
 struct AgentOptions
 {
   std::uint64_t restorationBytes{UINT64_C(4294967296)};
+  std::uint64_t restorationHardBytes{UINT64_C(8589934592)};
   std::vector<const char *> arguments;
 };
 
-// Independent physical ownership headroom for retained + prepared recovery
-// and the unchanged 256 MiB transient work allowance. Saturate to addressable
-// size on narrow hosts; policy/configuration itself remains 64-bit.
-inline std::size_t agentPhysicalByteCap(std::uint64_t softBytes)
+// Independent physical ownership headroom for retained + prepared recovery,
+// including two exceptional entries, plus transient work. This is a lease
+// ceiling, not an allocation or a promise that pinned owners can always fit.
+// Saturate to addressable size on narrow hosts; policy remains 64-bit.
+inline std::size_t agentPhysicalByteCap(std::uint64_t softBytes,
+    std::uint64_t hardBytes = UINT64_C(8589934592),
+    std::size_t transientBytes = 256u << 20)
 {
-  constexpr std::size_t HEADROOM = 256u << 20;
   constexpr auto MAX = std::numeric_limits<std::size_t>::max();
-  return softBytes > (MAX - HEADROOM) / 2
+  const auto entryBytes = softBytes > hardBytes ? softBytes : hardBytes;
+  return entryBytes > (MAX - transientBytes) / 2
       ? MAX
-      : std::size_t(softBytes) * 2 + HEADROOM;
+      : std::size_t(entryBytes) * 2 + transientBytes;
 }
 
 inline bool parseAgentOptions(
     int argc, const char *const argv[], AgentOptions &options)
 {
   AgentOptions parsed;
-  bool seen = false;
+  bool seenSoft = false, seenHard = false;
   for (int i = 0; i < argc; ++i) {
     const std::string_view arg(argv[i]);
-    if (i == 0 || arg != "--agentRestorationBytes") {
-      // Refuse equal-sign forms of our option, not baseline flags.
-      if (i > 0 && arg.substr(0, 24) == "--agentRestorationBytes=")
+    const bool hard = arg == "--agentRestorationHardBytes";
+    if (i == 0 || (arg != "--agentRestorationBytes" && !hard)) {
+      // Refuse equal-sign forms of our options, not baseline flags.
+      if (i > 0
+          && (arg.substr(0, 24) == "--agentRestorationBytes="
+              || arg.substr(0, 28) == "--agentRestorationHardBytes="))
         return false;
       parsed.arguments.push_back(argv[i]);
       continue;
     }
+    auto &seen = hard ? seenHard : seenSoft;
     if (seen || ++i == argc)
       return false;
     seen = true;
@@ -64,8 +72,10 @@ inline bool parseAgentOptions(
     }
     if (bytes == 0)
       return false;
-    parsed.restorationBytes = bytes;
+    (hard ? parsed.restorationHardBytes : parsed.restorationBytes) = bytes;
   }
+  if (parsed.restorationHardBytes < parsed.restorationBytes)
+    return false;
   options = std::move(parsed);
   return true;
 }

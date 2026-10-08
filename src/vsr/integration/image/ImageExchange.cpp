@@ -459,6 +459,7 @@ struct ImageExchange::State
   bool current() const;
   std::string limitsJson(
       const Bounds *bound = nullptr, const std::string &sessionId = {}) const;
+  operations::RestorationPolicy restorationPolicy() const;
   Step write(Job &job);
   Step read(Job &job);
   void pruneRestorations() const;
@@ -648,17 +649,26 @@ bool ImageExchange::State::fileCurrent(const Job &job) const
 #endif
 }
 
+operations::RestorationPolicy ImageExchange::State::restorationPolicy() const
+{
+  const auto &policy = limits.retention->limits();
+  return {policy.retentionBytes, policy.hardRetentionBytes};
+}
+
 std::string ImageExchange::State::limitsJson(
     const Bounds *b, const std::string &sessionId) const
 {
   std::lock_guard<std::mutex> lock(mutex);
   auto policy = activity::Limits{};
   policy.retentionBytes = limits.globalRetentionBytes;
+  policy.hardRetentionBytes = limits.hardRetentionBytes;
   std::uint64_t available = policy.retentionBytes;
+  bool oversized = false;
   if (limits.retention) {
     policy = limits.retention->limits();
     const auto used = limits.retention->usage().retentionBytes;
-    available = policy.retentionBytes - used;
+    oversized = used > policy.retentionBytes;
+    available = oversized ? 0 : policy.retentionBytes - used;
   }
   std::uint64_t physical = 0;
   {
@@ -672,6 +682,10 @@ std::string ImageExchange::State::limitsJson(
         "\"transient_image_byte_cap\":" + std::to_string(limits.transientBytes)
       + ",\"effective_global_retention_byte_cap\":"
       + std::to_string(policy.retentionBytes)
+      + ",\"effective_single_entry_hard_cap_bytes\":"
+      + std::to_string(policy.hardRetentionBytes)
+      + ",\"oversized_retention\":" + (oversized ? "true" : "false")
+      + ",\"approval_available\":false"
       + ",\"available_global_retention_bytes\":" + std::to_string(available)
       + ",\"retained_physical_bytes\":" + std::to_string(physical)
       + ",\"physical_byte_cap\":" + std::to_string(limits.physicalByteCap)
@@ -1624,6 +1638,13 @@ operations::Admission ImageExchange::submitMeshImport(
               * (sizeof(vsr::scene::Array) + 4096)
           + sizeof(edit::MeshSnapshot) + 4 * mesh::HEADER_CAP
           + IMPORT_OWNER_BYTES;
+      const auto policy = state->restorationPolicy();
+      if (retainedBytes > policy.hardBytes) {
+        Step rejected;
+        rejected.outcome = Outcome::BUSY;
+        rejected.result = policy.refusal(retainedBytes);
+        return rejected;
+      }
       vsr::scene::detail::PreparedPositionBinding::drain(ctx.scene);
       std::shared_ptr<SessionLedger> ledger;
       {
@@ -1714,12 +1735,9 @@ operations::Admission ImageExchange::submitMeshImport(
       if (!ctx.reserveRestoration
           || !ctx.reserveRestoration(
               retainedBytes, state->launchId, *batchId)) {
-        auto rejected = fail(Outcome::BUSY, "restore_budget_exhausted");
-        rejected.result =
-            "{\"reason\":\"restore_budget_exhausted\",\"required_capacity_bytes\":"
-            + std::to_string(retainedBytes) + ",\"configured_capacity_bytes\":"
-            + std::to_string(state->limits.retention->limits().retentionBytes)
-            + "}";
+        Step rejected;
+        rejected.outcome = Outcome::BUSY;
+        rejected.result = policy.refusal(retainedBytes);
         return rejected;
       }
       edit::RestorationRecord record;
@@ -1869,7 +1887,8 @@ operations::Admission ImageExchange::submitMeshImport(
           + ",\"batch_ref\":" + edit::detail::batchRefJson(job->batch)
           + ",\"target_version\":"
           + quote(mesh::targetVersion(*geometry, handle, true))
-          + ",\"dependencies\":" + resulting + "],\"committed\":true";
+          + ",\"dependencies\":" + resulting + "],\"committed\":true"
+          + ",\"restoration_policy\":" + policy.receipt(retainedBytes);
       if (job->receipt.size() + 256 > 16384)
         return fail(Outcome::BUSY, "resource_limit");
       job->receipt.reserve(job->receipt.size() + 256);
@@ -2122,10 +2141,9 @@ operations::Admission ImageExchange::submitImport(
         // sole ordinary write-sequence reservation boundary for this write.
         job->receipt = "{\"handle\":" + quote(handleName(handle))
             + ",\"batch_ref\":" + edit::detail::batchRefJson(job->batch) + ","
-            + bindings(*ids, *array) + ",\"restoration_policy\":{"
-              "\"mode\":\"publication_fifo\",\"effective_global_limit_bytes\":"
-            + std::to_string(state->limits.retention->limits().retentionBytes)
-            + ",\"eviction_possible\":true}";
+            + bindings(*ids, *array) + ",\"restoration_policy\":"
+            + state->restorationPolicy().receipt(job->bound.texels
+                + sizeof(edit::ImageSnapshot) + IMPORT_OWNER_BYTES);
         job->receipt.reserve(job->receipt.size() + 512);
         if (!ctx.prepareActivityResult
             || !ctx.prepareActivityResult(
@@ -2203,6 +2221,15 @@ operations::Admission ImageExchange::submitImport(
       if (!b || b->texels > std::numeric_limits<std::size_t>::max() - b->peak)
         return fail(Outcome::BUSY, "resource_limit");
       b->peak += b->texels; // E + D + W + S, not two physical snapshots.
+      const auto retainedBytes =
+          b->texels + sizeof(edit::ImageSnapshot) + IMPORT_OWNER_BYTES;
+      const auto policy = state->restorationPolicy();
+      if (retainedBytes > policy.hardBytes) {
+        Step rejected;
+        rejected.outcome = Outcome::BUSY;
+        rejected.result = policy.refusal(retainedBytes);
+        return rejected;
+      }
       std::shared_ptr<SessionLedger> ledger;
       {
         std::lock_guard<std::mutex> lock(state->mutex);
@@ -2247,17 +2274,12 @@ operations::Admission ImageExchange::submitImport(
       if (!batchId)
         return fail(Outcome::BUSY, "resource_limit");
       job->batch = {state->launchId, *batchId};
-      const auto retainedBytes =
-          b->texels + sizeof(edit::ImageSnapshot) + IMPORT_OWNER_BYTES;
       if (!ctx.reserveRestoration
           || !ctx.reserveRestoration(
               retainedBytes, state->launchId, *batchId)) {
-        auto rejected = fail(Outcome::BUSY, "restore_budget_exhausted");
-        rejected.result =
-            "{\"reason\":\"restore_budget_exhausted\",\"required_capacity_bytes\":"
-            + std::to_string(retainedBytes) + ",\"configured_capacity_bytes\":"
-            + std::to_string(state->limits.retention->limits().retentionBytes)
-            + "}";
+        Step rejected;
+        rejected.outcome = Outcome::BUSY;
+        rejected.result = policy.refusal(retainedBytes);
         return rejected;
       }
       auto globalCharge = std::make_shared<SessionCharge>();

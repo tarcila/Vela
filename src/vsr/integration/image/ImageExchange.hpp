@@ -32,6 +32,7 @@ struct ExchangeLimits
   // Launch configuration hint for export-only hosts. Qualified Import reads
   // policy/accounting directly from retention, never from a second ledger cap.
   std::uint64_t globalRetentionBytes{UINT64_C(4294967296)};
+  std::uint64_t hardRetentionBytes{UINT64_C(8589934592)};
   const activity::ActivityLog *retention{nullptr};
   // A host-wide physical lease is acquired once before capture and held
   // through buffer destruction; smaller configured host ceilings also apply.

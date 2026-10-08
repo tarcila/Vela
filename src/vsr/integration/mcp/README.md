@@ -380,14 +380,28 @@ admission/status/replay and existing `vsr_restore`, not a separate undo tool.
 Success returns `handle`, fresh `data_version`, `scene_revision`, `batch_ref`,
 `affected_samplers`, `affected_users`, `affected_complete` and
 `restoration_policy` (mode=publication_fifo, effective_global_limit_bytes,
-eviction_possible=true). Normal Image/Mesh/parameter/Node recovery shares one
-4 GiB default soft target, with a disclosed 32-batch FIFO bound; no separate
-64 MiB session snapshot ceiling remains. Eligible free space is reported
+effective_single_entry_hard_cap_bytes, required_capacity_bytes, oversized,
+eviction_possible=true). Image/Mesh/parameter/Node recovery shares one
+4 GiB default soft target and an 8 GiB per-entry hard cap, with a disclosed
+32-batch FIFO bound; no separate 64 MiB session snapshot ceiling remains.
+Both limits use checked uint64 launch configuration
+(`--agentRestorationBytes`, `--agentRestorationHardBytes`, hard >= soft) and do
+not preallocate memory. Eligible free space is reported
 separately from snapshot/pin physical ownership. Metadata/results retain their
 16 MiB/1024-record bounds, and real physical/transient/transport/allocation
 safeguards remain. FIFO eviction occurs only at successful publication;
-precommit failures, no-ops and replay do not discard recovery. Above-soft
-admission/approval is not implemented in this slice.
+precommit failures, no-ops and replay do not discard recovery. An entry above
+soft and at most hard is retained alone. Exactly soft is normal; exactly hard
+needs no approval. The next normal entry uses soft again. Discovery reports
+both effective limits, `oversized_retention`, `approval_available:false` and
+soft availability clamped to zero during exceptional retention. Agent Activity
+also distinguishes oversized-alone from normal FIFO. A commit receipt is a
+historical observation, not current eligibility. Above-hard approval is **not
+implemented**: agents cannot supply an override flag or token. Qualified host
+physical preparation headroom is independently twice max(soft,hard) plus the
+unchanged 256 MiB transient allowance; pinned owners and real allocation
+failures can still refuse without sacrificing recovery. No payload/codec/
+transport scope or default rendering-library FrameBudget has been enlarged.
 Generic parameter/Node commits prepare both receipt buffers, version storage,
 store publication nodes and synchronization state before the final authority
 and dependency check. Their conservative recovery charge includes this
@@ -402,8 +416,13 @@ finishes truthfully and marks the Scene failed, allowing explicit Resynchronize.
 Its terminal PNG/file/storage errors are `invalid_request` with
 `invalid_png`, `file_rejected`, `unsupported_image`, or `foreign_scene`; stale
 versions use `conflict/stale_data_version`, open maps `busy/image_mapped`,
-above-soft recovery charge `busy/restore_budget_exhausted`, and other capacity pressure
-`busy/resource_limit`. Non-ok terminal outcomes have `isError:true`; committed
+above-hard recovery charge `busy/restoration_approval_required`, and other
+capacity pressure `busy/resource_limit`. The above-hard refusal reports
+`required_capacity_bytes`, `configured_capacity_bytes` (soft),
+`effective_soft_limit_bytes`, `effective_hard_limit_bytes`,
+`approval_required:true`, `approval_available:false`, `committed:false` and
+`history_unchanged:true`. Failed within-hard recovery reservations instead
+report `restore_budget_exhausted`; neither failure evicts eligible history. Non-ok terminal outcomes have `isError:true`; committed
 sync failures retain `applied_with_sync_failure` and fresh receipts. Image restore
 returns `image_versions:[{handle,data_version}]`, `versions:[]`, `node_versions:[]`
 and `restored:true`, without caller-supplied data_version. Restore rejects unknown

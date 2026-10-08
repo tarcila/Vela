@@ -310,7 +310,8 @@ inline bool validImageExchange(std::string_view text, std::string_view launchId)
   }
   const auto *limits = value.get("exchange_limits");
   if (!limits || !limits->isObject()
-      || (limits->o.size() != 11 && limits->o.size() != 16))
+      || (limits->o.size() != 11 && limits->o.size() != 16
+          && limits->o.size() != 19))
     return false;
   const auto integer = [&](const char *name, double cap, bool exact = false) {
     const auto *v = limits->get(name);
@@ -337,6 +338,18 @@ inline bool validImageExchange(std::string_view text, std::string_view launchId)
         || !integer("retention_entry_cap", MAX_EXACT_JSON_INTEGER)
         || !integer("activity_metadata_byte_cap", MAX_EXACT_JSON_INTEGER)
         || !integer("activity_entry_cap", MAX_EXACT_JSON_INTEGER))
+      return false;
+  }
+  if (limits->o.size() == 19) {
+    const auto *oversized = limits->get("oversized_retention");
+    const auto *approval = limits->get("approval_available");
+    const auto *soft = limits->get("effective_global_retention_byte_cap");
+    const auto *hard = limits->get("effective_single_entry_hard_cap_bytes");
+    if (!integer(
+            "effective_single_entry_hard_cap_bytes", MAX_EXACT_JSON_INTEGER)
+        || !soft || !soft->isNumber() || hard->n < soft->n || !oversized
+        || oversized->type != Value::Type::BOOL || !approval
+        || approval->type != Value::Type::BOOL || approval->b)
       return false;
   }
   return integer("file_cap", FILE_CAP, true)

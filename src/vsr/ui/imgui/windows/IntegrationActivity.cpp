@@ -202,9 +202,10 @@ void IntegrationActivity::buildActivity(const IntegrationActivityState &s)
       s.usage.bytes,
       s.usage.restorableBatches,
       s.usage.imageBytes);
-  ImGui::Text("Recovery: %llu eligible bytes; %llu pending bytes (FIFO)",
+  ImGui::Text("Recovery: %llu eligible bytes; %llu pending bytes (%s)",
       (unsigned long long)s.usage.retentionBytes,
-      (unsigned long long)s.usage.reservedRetentionBytes);
+      (unsigned long long)s.usage.reservedRetentionBytes,
+      s.usage.oversizedRetention ? "oversized entry alone" : "normal FIFO");
 
   const auto flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg
       | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;

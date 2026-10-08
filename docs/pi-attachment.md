@@ -52,20 +52,28 @@ Or open your own scene in the viewer:
 ./_out/_cmake/vsrViewer --agentIntegration -obj /path/to/model.obj
 ```
 
-Both hosts accept `--agentRestorationBytes N` as an explicit **launch-local**
-shared ActivityLog/activity-and-restoration byte limit. The default remains
-**16777216 bytes (16 MiB)**. For example, `--agentRestorationBytes 67108864`
-selects 64 MiB; this can retain a 2048×2048 RGBA snapshot plus record overhead.
-Only positive ASCII decimal bytes are accepted; zero, signs, units, missing or
-invalid values, overflow, duplicate options and `--agentRestorationBytes=N`
-are rejected before any scene-file parsing. Other arguments retain their existing
-host behavior. This is not persisted and never grants camera permission or
-activates the viewer integration by itself. Image Import never raises limits.
-The physical FrameBudget, 64 MiB originating-session snapshot ceiling,
-transient ceiling, exchange file quotas, entry/batch counts and store limits
-remain unchanged; each independent constraint still applies. Descriptor/discovery
-`exchange_limits.effective_global_retention_byte_cap` and Import
-`restoration_policy.effective_global_limit_bytes` report the chosen host cap.
+Both hosts accept explicit **launch-local** shared recovery settings:
+`--agentRestorationBytes N` is the soft FIFO target (default **4294967296 bytes,
+4 GiB**), and `--agentRestorationHardBytes N` is the single-entry hard cap
+(default **8589934592 bytes, 8 GiB**, at least soft). At most soft uses normal
+FIFO; above soft and at most hard retains alone only at successful publication.
+The next normal change returns to soft. Above-hard recovery refuses without
+mutation or recovery loss and reports required bytes, effective limits and the
+approval requirement; bounded operator approval is not implemented yet.
+Only positive ASCII uint64 decimal bytes are accepted; zero, signs, units,
+missing/invalid values, overflow, duplicate options, equal-sign forms and hard
+below soft reject before scene-file parsing. Other arguments keep their existing
+host behavior. These settings are not persisted, do not preallocate memory,
+never grant camera permission and do not enable integration by themselves.
+No 64 MiB session undo ceiling remains. Metadata/results, payload, decoder,
+transport, transient-work and actual allocation safeguards stay independent.
+Host physical leases cover twice max(soft,hard) plus the unchanged 256 MiB
+transient allowance, saturated at addressable size, not total process/GPU memory.
+Descriptor/discovery `exchange_limits` reports the effective soft/hard limits,
+oversized state, clamped soft availability and physical ownership separately;
+Image/Mesh `restoration_policy` receipts report historical admission facts.
+See [shared recovery policy](mesh-exchange.md) for exact fields and lifetime
+semantics; changing source/configuration never updates a running host.
 
 The **descriptor is a JSON connection file created by the application**, not
 something you write yourself. It contains the loopback endpoint and a private

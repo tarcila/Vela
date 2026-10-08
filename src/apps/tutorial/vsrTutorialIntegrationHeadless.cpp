@@ -318,7 +318,8 @@ int main(int argc, const char *argv[])
   vsr::app::AgentOptions agentOptions;
   if (!vsr::app::parseAgentOptions(argc, argv, agentOptions)) {
     std::fprintf(stderr,
-        "--agentRestorationBytes requires one positive decimal byte count\n");
+        "--agentRestorationBytes requires one positive decimal byte count; "
+        "--agentRestorationHardBytes likewise, with hard >= soft\n");
     return 1;
   }
   bool exitAfterActivation = false;
@@ -387,7 +388,8 @@ int main(int argc, const char *argv[])
       integration, *host->authority, *host->engine, *host->edits);
   host->translations->attachScene(*sceneId, *host->identity);
   const auto hostImageMemory = std::make_shared<vsr::rendering::FrameBudget>(
-      vsr::app::agentPhysicalByteCap(agentOptions.restorationBytes));
+      vsr::app::agentPhysicalByteCap(
+          agentOptions.restorationBytes, agentOptions.restorationHardBytes));
   host->restores = std::make_unique<vi::restore::RestoreService>(*host->engine,
       *host->edits,
       [hostImageMemory] { return hostImageMemory->reserve(65536); });
@@ -396,6 +398,7 @@ int main(int argc, const char *argv[])
       integration, *host->engine, host->edits->syncStates());
   vi::activity::Limits activityLimits;
   activityLimits.retentionBytes = agentOptions.restorationBytes;
+  activityLimits.hardRetentionBytes = agentOptions.restorationHardBytes;
   host->activity = std::make_unique<vi::activity::ActivityLog>(activityLimits);
   host->activitySink = std::make_unique<vi::activity::EngineActivitySink>(
       *host->activity, integration);
@@ -428,6 +431,7 @@ int main(int argc, const char *argv[])
   };
   imageLimits.retention = host->activity.get();
   imageLimits.globalRetentionBytes = host->activity->limits().retentionBytes;
+  imageLimits.hardRetentionBytes = host->activity->limits().hardRetentionBytes;
   imageLimits.restorationRetained = [&host](const std::string &launch,
                                         const std::string &batch) {
     return host->activity->eligibility({launch, batch})

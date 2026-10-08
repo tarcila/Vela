@@ -46,8 +46,22 @@ def main():
             result = subprocess.run([str(build/name), '--agentRestorationBytes=64'], env=env, capture_output=True, timeout=10)
             assert result.returncode == 1 and b'--agentRestorationBytes requires' in result.stderr
             count += 1
+            for flags in (['--agentRestorationHardBytes'],
+                          ['--agentRestorationHardBytes', '0'],
+                          ['--agentRestorationHardBytes', '1'],
+                          ['--agentRestorationHardBytes', '18446744073709551616'],
+                          ['--agentRestorationHardBytes=8589934592'],
+                          ['--agentRestorationHardBytes', '8589934592', '--agentRestorationHardBytes', '8589934592']):
+                result = subprocess.run([str(build/name), *flags], env=env, capture_output=True, timeout=10)
+                assert result.returncode == 1 and not result.stdout
+                assert b'--agentRestorationHardBytes' in result.stderr
+                assert not list(runtime.rglob('*.json')) and not list(config.iterdir())
+                count += 1
         limits_seen = []
-        for flags, cap in (([], 16777216), (['--agentRestorationBytes', '67108864'], 67108864)):
+        configurations = (([], 4294967296, 8589934592),
+                          (['--agentRestorationBytes', '67108864'], 67108864, 8589934592),
+                          (['--agentRestorationHardBytes', '600000', '--agentRestorationBytes', '120000'], 120000, 600000))
+        for flags, cap, hard in configurations:
             with (evidence/f'headless-{cap}.log').open('wb') as log:
                 host = subprocess.Popen([str(build/'vsrTutorialIntegrationHeadless'), *flags], env=env, stdout=log, stderr=log)
                 try:
@@ -60,7 +74,12 @@ def main():
                     descriptor = json.loads(descriptors[0].read_text())
                     limits = descriptor['image_exchange']['exchange_limits']
                     assert limits['effective_global_retention_byte_cap'] == cap
-                    assert limits['session_snapshot_byte_cap'] == 67108864
+                    assert limits['effective_single_entry_hard_cap_bytes'] == hard
+                    assert 'session_snapshot_byte_cap' not in limits
+                    assert limits['available_global_retention_bytes'] == cap
+                    assert limits['oversized_retention'] is False
+                    assert limits['approval_available'] is False
+                    assert limits['physical_byte_cap'] == 2 * hard + 268435456
                     assert limits['transient_image_byte_cap'] == 268435456
                     assert limits['file_cap'] == 1024 and limits['byte_cap'] == 268435456
                     client = chess.Client(descriptor, evidence)
@@ -73,7 +92,7 @@ def main():
                     assert host.wait(timeout=15) == 0
                 assert not descriptors[0].exists()
         (evidence/'summary.json').write_text(json.dumps({'malformed_host_invocations': count, 'limits': limits_seen}, indent=2))
-        print(f'HOST_OPTIONS PASS: {count} malformed invocations; default/explicit metadata and binding')
+        print(f'HOST_OPTIONS PASS: {count} malformed invocations; default/soft-only/soft-hard metadata and binding')
 
 
 if __name__ == '__main__':

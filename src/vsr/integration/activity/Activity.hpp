@@ -39,6 +39,7 @@ struct Limits
 {
   std::size_t bytes{16u << 20}; // activity metadata/results
   std::uint64_t retentionBytes{UINT64_C(4294967296)};
+  std::uint64_t hardRetentionBytes{UINT64_C(8589934592)};
   std::size_t entries{1024};
   std::size_t restorableBatches{32};
   std::size_t imageBytes{32u << 20}; // retained images, counted only here
@@ -172,6 +173,7 @@ struct Usage
 {
   std::uint64_t retentionBytes{0}; // published eligible recovery
   std::uint64_t reservedRetentionBytes{0}; // active preparation, not history
+  bool oversizedRetention{false};
   std::size_t bytes{0};
   std::size_t entries{0};
   std::size_t restorableBatches{0};
@@ -239,8 +241,8 @@ class ActivityLog
   // retained; nullopt once the record is gone (outcome_unavailable).
   std::optional<Eligibility> eligibility(const BatchRef &ref) const;
 
-  // Non-destructive preparation. Normal entries fit individually under the
-  // soft budget; pending work is separate from eligible history. Publication
+  // Non-destructive preparation. Entries above soft and at most hard are
+  // retained alone; pending work is separate from eligible history. Publication
   // serializes the final FIFO decision, without allocations or rejection.
   bool reserveRestoration(Id id, std::size_t bytes, BatchRef ref);
 
@@ -351,6 +353,8 @@ class EngineActivitySink : public operations::ActivitySink
       std::size_t bytes,
       operations::ResultOwnership::Reserve reserve) override;
 
+  std::optional<operations::RestorationPolicy> restorationPolicy()
+      const override;
   bool reserveRestoration(Id id,
       std::size_t bytes,
       const std::string &launchId,
@@ -377,8 +381,8 @@ class EngineActivitySink : public operations::ActivitySink
 
 inline bool Limits::valid() const
 {
-  return bytes > 0 && retentionBytes > 0 && entries > 0
-      && restorableBatches > 0;
+  return bytes > 0 && retentionBytes > 0 && hardRetentionBytes >= retentionBytes
+      && entries > 0 && restorableBatches > 0;
 }
 
 inline const Limits &ActivityLog::limits() const
@@ -392,7 +396,7 @@ inline std::optional<ActivityLog::Id> ActivityLog::append(Entry entry)
   if (!m_limits.valid() || m_serial == UINT64_MAX)
     return std::nullopt;
   if (entry.eligibility == Eligibility::ELIGIBLE
-      && (entry.restorationBytes > m_limits.retentionBytes
+      && (entry.restorationBytes > m_limits.hardRetentionBytes
           || m_reservedRestorable >= UINT64_MAX - m_retentionSerial))
     return std::nullopt;
   const std::size_t need = cost(entry);
@@ -543,7 +547,7 @@ inline bool ActivityLog::reserveRestoration(
   if (it == m_slots.end() || it->restorationReserved
       || it->entry.eligibility != Eligibility::NONE)
     return false;
-  if (bytes > m_limits.retentionBytes
+  if (!m_limits.valid() || bytes > m_limits.hardRetentionBytes
       || m_reservedRestorable >= UINT64_MAX - m_retentionSerial
       || m_reservedRestorable >= m_limits.restorableBatches
       || bytes > UINT64_MAX - m_usage.reservedRetentionBytes)
@@ -661,7 +665,9 @@ inline Lookup ActivityLog::lookup(SessionAuthority &authority,
 inline Usage ActivityLog::usage() const
 {
   std::lock_guard<std::mutex> lock(m_mutex);
-  return m_usage;
+  auto result = m_usage;
+  result.oversizedRetention = result.retentionBytes > m_limits.retentionBytes;
+  return result;
 }
 
 inline std::size_t ActivityLog::cost(const Entry &e)
@@ -742,10 +748,15 @@ inline void ActivityLog::loseEligibility(Slot &s, Eligibility to)
 
 inline void ActivityLog::makeRetentionRoom(std::uint64_t bytes)
 {
-  // Reservation established bytes <= limit. Pending work is not evictable
-  // history and does not consume this target; physical leases cover overlap.
+  // Oversized publication leaves no space for old recovery. An ordinary
+  // publication always uses soft, even after an oversized entry. Pending work
+  // is not evictable history; independent physical leases cover overlap.
+  const auto remaining = bytes > m_limits.retentionBytes
+      ? UINT64_C(0)
+      : m_limits.retentionBytes - bytes;
   while (m_usage.restorableBatches >= m_limits.restorableBatches
-      || m_usage.retentionBytes > m_limits.retentionBytes - bytes) {
+      || (bytes > m_limits.retentionBytes && m_usage.restorableBatches > 0)
+      || m_usage.retentionBytes > remaining) {
     Slot *victim = nullptr;
     for (auto &s : m_slots)
       if (s.entry.eligibility == Eligibility::ELIGIBLE
@@ -849,6 +860,14 @@ inline bool EngineActivitySink::prepareResult(
     Id id, std::size_t bytes, operations::ResultOwnership::Reserve reserve)
 {
   return m_log.prepareResult(id, bytes, std::move(reserve));
+}
+
+inline std::optional<operations::RestorationPolicy>
+EngineActivitySink::restorationPolicy() const
+{
+  const auto &limits = m_log.limits();
+  return operations::RestorationPolicy{
+      limits.retentionBytes, limits.hardRetentionBytes};
 }
 
 inline bool EngineActivitySink::reserveRestoration(Id id,

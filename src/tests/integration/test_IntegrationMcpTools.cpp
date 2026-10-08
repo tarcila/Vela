@@ -14,6 +14,7 @@
 #include "vsr/integration/context/ContextAdapter.hpp"
 // vsr
 #include <SDL3/SDL.h>
+#include "vsr/app/AgentOptions.hpp"
 #include "vsr/integration/Integration.hpp"
 #include "vsr/integration/activity/Activity.hpp"
 #include "vsr/integration/mcp/McpServer.hpp"
@@ -445,6 +446,7 @@ struct Fixture
       }
       activity::Limits activityLimits;
       activityLimits.retentionBytes = exchangeLimits.globalRetentionBytes;
+      activityLimits.hardRetentionBytes = exchangeLimits.hardRetentionBytes;
       imageActivity = std::make_unique<activity::ActivityLog>(activityLimits);
       imageActivitySink = std::make_unique<activity::EngineActivitySink>(
           *imageActivity, integration);
@@ -5589,6 +5591,322 @@ TEST_CASE("Public mixed recovery retains the newest complete FIFO suffix",
       ownership.get("exchange_limits")->get("retained_physical_bytes")->n == 0);
 }
 
+TEST_CASE("Public Image and Mesh retain oversized recovery alone",
+    "[integration][mcp][retention-oversized]")
+{
+  const bool meshOversized = GENERATE(false, true);
+  const bool failSync = GENERATE(false, true);
+  image::ExchangeLimits limits;
+  limits.globalRetentionBytes = meshOversized ? 120000 : 400000;
+  PositionFixture f(limits, true);
+  const auto session = f.attach();
+  const auto evidence = f.working(session);
+  const std::size_t side = meshOversized ? 1 : 512;
+  const std::size_t bytes = side * side * 4;
+  auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, side, side);
+  const std::vector<unsigned char> before(bytes, 71), rows(bytes + side, 0);
+  image->setData(static_cast<const void *>(before.data()));
+  writeInput(
+      f.exchangePath() + "/oversized.png", inputPng(side, side, 6, rows, {}));
+  const auto handle = f.sceneIds->handleOf(image.data());
+  const auto imageVersion = *f.sceneIds->imageDataVersion(handle);
+  const auto importImage = [&](std::uint64_t id) {
+    f.importImage(session,
+        id,
+        f.objectHandle(image.data()),
+        imageVersion,
+        "oversized.png");
+    return f.await(session, id);
+  };
+  const auto importMesh = [&](std::uint64_t id) {
+    f.importPositions(session, id, *evidence.result());
+    return f.await(session, id);
+  };
+  const auto older = meshOversized ? importImage(2) : importMesh(2);
+  REQUIRE(older.flag("committed"));
+  const auto oldBatch = *older.result()->get("batch_ref");
+  CHECK(f.imageActivity->usage().retentionBytes <= limits.globalRetentionBytes);
+  REQUIRE(f.restores->eligible(
+      {oldBatch.get("launch_id")->s, oldBatch.get("batch_id")->s}));
+  f.hookOk = !failSync;
+  const auto oversized = meshOversized ? importMesh(3) : importImage(3);
+  INFO(json::write(oversized.json));
+  REQUIRE(oversized.flag("committed"));
+  CHECK(oversized.str("outcome")
+      == (failSync ? "applied_with_sync_failure" : "ok"));
+  f.hookOk = true;
+  const auto batch = *oversized.result()->get("batch_ref");
+  const auto *policy = oversized.result()->get("restoration_policy");
+  REQUIRE(policy);
+  REQUIRE(policy->get("oversized"));
+  CHECK(policy->get("oversized")->b);
+  json::Value metadata;
+  REQUIRE(json::parse(f.images->metadata(f.sceneId, session.id), metadata));
+  const auto *capacity = metadata.get("exchange_limits");
+  REQUIRE(capacity->get("oversized_retention"));
+  CHECK(capacity->get("oversized_retention")->b);
+  CHECK(capacity->get("available_global_retention_bytes")->n == 0);
+  CHECK(
+      capacity->get("effective_single_entry_hard_cap_bytes")->n == 8589934592.);
+  CHECK(f.imageActivity->usage().restorableBatches == 1);
+  CHECK(f.imageActivity->usage().retentionBytes > limits.globalRetentionBytes);
+  f.restoreBatch(session, 4, oldBatch);
+  CHECK(f.await(session, 4).str("outcome") == "outcome_unavailable");
+  // Replay cannot re-publish, evict again or refresh recovery age.
+  CHECK((meshOversized ? f.importPositions(session, 3, *evidence.result())
+                       : f.importImage(session,
+                             3,
+                             f.objectHandle(image.data()),
+                             imageVersion,
+                             "oversized.png"))
+          .flag("replayed"));
+  SECTION("oversized entry restores exact data and bindings")
+  {
+    f.restoreBatch(session, 5, batch);
+    REQUIRE(f.await(session, 5).flag("committed"));
+    if (meshOversized) {
+      CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>(
+                "vertex.position")
+          == f.positions.data());
+      CHECK(std::memcmp(f.positions->data(),
+                PositionFixture::POINTS,
+                sizeof(PositionFixture::POINTS))
+          == 0);
+    } else {
+      CHECK(std::memcmp(image->data(), before.data(), bytes) == 0);
+    }
+  }
+  SECTION("the next ordinary edit returns to the soft budget")
+  {
+    auto held = f.edits->restorations().find(
+        {batch.get("launch_id")->s, batch.get("batch_id")->s});
+    REQUIRE(held);
+    f.tool(session,
+        "vsr_inspect",
+        "{\"request_id\":5,\"scene_id\":" + std::to_string(f.sceneId)
+            + ",\"object_type\":\"ANARI_MATERIAL\"}");
+    const auto inspected = f.await(session, 5);
+    const auto item = inspected.result()->get("items")->a.at(0);
+    const auto target = "\"handle\":" + json::write(*item.get("handle"))
+        + ",\"version\":" + json::write(*item.get("version"));
+    f.editOpacity(session, 6, target, 0.25);
+    const auto ordinary = f.await(session, 6);
+    INFO(json::write(ordinary.json));
+    REQUIRE(ordinary.flag("committed"));
+    CHECK(f.imageActivity->usage().restorableBatches == 1);
+    CHECK(
+        f.imageActivity->usage().retentionBytes <= limits.globalRetentionBytes);
+    REQUIRE(json::parse(f.images->metadata(f.sceneId, session.id), metadata));
+    CHECK_FALSE(metadata.get("exchange_limits")->get("oversized_retention")->b);
+    f.restoreBatch(session, 7, batch);
+    CHECK(f.await(session, 7).str("outcome") == "outcome_unavailable");
+    f.restoreBatch(session, 8, *ordinary.result()->get("batch_ref"));
+    REQUIRE(f.await(session, 8).flag("committed"));
+    REQUIRE(json::parse(f.images->metadata(f.sceneId, session.id), metadata));
+    CHECK(
+        metadata.get("exchange_limits")->get("retained_physical_bytes")->n > 0);
+    std::thread release([&] { held.reset(); });
+    release.join();
+    f.images->pump();
+    REQUIRE(json::parse(f.images->metadata(f.sceneId, session.id), metadata));
+    CHECK(metadata.get("exchange_limits")->get("retained_physical_bytes")->n
+        == 0);
+  }
+  CHECK(f.other->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == f.positions.data());
+  CHECK(std::filesystem::exists(f.exchangePath() + "/oversized.png"));
+  CHECK(std::filesystem::exists(f.exchangePath() + "/edited.vmesh"));
+}
+
+TEST_CASE(
+    "Public above-hard Image and Mesh refusal preserves Scene and recovery",
+    "[integration][mcp][retention-oversized]")
+{
+  const bool mesh = GENERATE(false, true);
+  image::ExchangeLimits limits;
+  limits.globalRetentionBytes = 110000;
+  limits.hardRetentionBytes = 200000;
+  PositionFixture f(limits);
+  const auto session = f.attach();
+  const auto evidence = f.working(session);
+  auto small = f.scene.createArray(ANARI_UFIXED8_VEC4, 1, 1);
+  const unsigned char original[] = {17, 29, 41, 53};
+  small->setData(static_cast<const void *>(original));
+  writeInput(
+      f.exchangePath() + "/small.png", inputPng(1, 1, 6, {0, 1, 2, 3, 4}, {}));
+  f.importImage(session,
+      2,
+      f.objectHandle(small.data()),
+      *f.sceneIds->imageDataVersion(f.sceneIds->handleOf(small.data())),
+      "small.png");
+  const auto previous = f.await(session, 2);
+  REQUIRE(previous.flag("committed"));
+  const auto previousBatch = *previous.result()->get("batch_ref");
+  auto large = f.scene.createArray(ANARI_UFIXED8_VEC4, 256, 256);
+  const std::vector<unsigned char> originalLarge(262144, 71), rows(262400, 0);
+  large->setData(static_cast<const void *>(originalLarge.data()));
+  writeInput(f.exchangePath() + "/large.png", inputPng(256, 256, 6, rows, {}));
+  const auto version =
+      *f.sceneIds->imageDataVersion(f.sceneIds->handleOf(large.data()));
+  const auto revision = f.sceneIds->sceneRevision();
+  const auto retained = f.imageActivity->usage().retentionBytes;
+  const auto arrays = f.scene.numberOfObjects(ANARI_ARRAY);
+  const auto submit = [&] {
+    return mesh
+        ? f.importPositions(session, 3, *evidence.result())
+        : f.importImage(
+              session, 3, f.objectHandle(large.data()), version, "large.png");
+  };
+  submit();
+  const auto denied = f.await(session, 3);
+  INFO(json::write(denied.json));
+  REQUIRE(denied.str("outcome") == "busy");
+  CHECK_FALSE(denied.flag("committed"));
+  REQUIRE(denied.result());
+  CHECK(denied.result()->get("reason")->s == "restoration_approval_required");
+  CHECK(denied.result()->get("required_capacity_bytes")->n > 200000);
+  CHECK(denied.result()->get("effective_soft_limit_bytes")->n == 110000);
+  CHECK(denied.result()->get("effective_hard_limit_bytes")->n == 200000);
+  CHECK(denied.result()->get("approval_required")->b);
+  CHECK_FALSE(denied.result()->get("approval_available")->b);
+  CHECK(denied.result()->get("history_unchanged")->b);
+  CHECK_FALSE(denied.result()->get("committed")->b);
+  CHECK(f.sceneIds->sceneRevision() == revision);
+  CHECK(f.scene.numberOfObjects(ANARI_ARRAY) == arrays);
+  CHECK(f.imageActivity->usage().retentionBytes == retained);
+  CHECK(f.imageActivity->usage().reservedRetentionBytes == 0);
+  CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == f.positions.data());
+  CHECK(std::memcmp(large->data(), originalLarge.data(), originalLarge.size())
+      == 0);
+  CHECK(submit().flag("replayed"));
+  f.restoreBatch(session, 4, previousBatch);
+  REQUIRE(f.await(session, 4).flag("committed"));
+  CHECK(std::memcmp(small->data(), original, sizeof(original)) == 0);
+}
+
+TEST_CASE("Public parameter batches obey the same per-entry hard cap",
+    "[integration][mcp][retention-oversized]")
+{
+  image::ExchangeLimits limits;
+  limits.globalRetentionBytes = 9000;
+  limits.hardRetentionBytes = 10000;
+  Fixture f({}, true, false, false, 120., true, UINT64_MAX, limits, true);
+  const auto session = f.attach();
+  const auto target = f.firstTarget(session, 1);
+  f.editOpacity(session, 2, target, 0.25);
+  const auto previous = f.await(session, 2);
+  INFO(json::write(previous.json));
+  REQUIRE(previous.flag("committed"));
+  const auto previousBatch = *previous.result()->get("batch_ref");
+  const auto retained = f.imageActivity->usage().retentionBytes;
+  for (int i = 0; i < 15; ++i)
+    f.scene.createObject<vsr::scene::Material>("matte")->setParameter(
+        "opacity", 1.f);
+  f.tool(session,
+      "vsr_inspect",
+      "{\"request_id\":3,\"scene_id\":" + std::to_string(f.sceneId)
+          + ",\"object_type\":\"ANARI_MATERIAL\"}");
+  const auto inspected = f.await(session, 3);
+  std::string edits;
+  for (const auto &item : inspected.result()->get("items")->a) {
+    if (!edits.empty())
+      edits += ',';
+    edits += "{\"handle\":" + json::write(*item.get("handle"))
+        + ",\"version\":" + json::write(*item.get("version"))
+        + ",\"parameter\":\"opacity\",\"value\":0.5}";
+  }
+  const auto revision = f.sceneIds->sceneRevision();
+  f.tool(session,
+      "vsr_edit",
+      "{\"request_id\":4,\"scene_id\":" + std::to_string(f.sceneId)
+          + ",\"edits\":[" + edits + "]}");
+  const auto refused = f.await(session, 4);
+  INFO(json::write(refused.json));
+  REQUIRE(refused.str("outcome") == "busy");
+  CHECK_FALSE(refused.flag("committed"));
+  REQUIRE(refused.result());
+  CHECK(refused.result()->get("required_capacity_bytes")->n > 10000);
+  CHECK(refused.result()->get("effective_hard_limit_bytes")->n == 10000);
+  CHECK(refused.result()->get("approval_required")->b);
+  CHECK(f.sceneIds->sceneRevision() == revision);
+  CHECK(f.imageActivity->usage().retentionBytes == retained);
+  CHECK(f.opacity0() == 0.25f);
+  f.restoreBatch(session, 5, previousBatch);
+  REQUIRE(f.await(session, 5).flag("committed"));
+  CHECK(f.opacity0() == 1.f);
+}
+
+TEST_CASE("Public oversized preparation fits host hard-aware physical headroom",
+    "[integration][mcp][retention-oversized][retention-physical]")
+{
+  const bool legacyPhysicalCap = GENERATE(false, true);
+  image::ExchangeLimits limits;
+  limits.globalRetentionBytes = 120000;
+  limits.hardRetentionBytes = 600000;
+  // 256x256 RGBA: T=262144, F=262400, E=590336, W=2098176.
+  // Import peak E+D+W+S is exactly 3212800 bytes. Use a practical scaled
+  // transient ceiling, not a larger decoder/payload scope or a lease bypass.
+  limits.transientBytes = 3212800;
+  limits.physicalByteCap = legacyPhysicalCap
+      ? 3452800 // old 2*soft + transient
+      : vsr::app::agentPhysicalByteCap(limits.globalRetentionBytes,
+            limits.hardRetentionBytes,
+            limits.transientBytes);
+  const auto physical =
+      std::make_shared<vsr::rendering::FrameBudget>(limits.physicalByteCap);
+  limits.reservePhysicalMemory = [physical](std::size_t bytes) {
+    return physical->reserve(bytes);
+  };
+  Fixture f({}, true, false, false, 120., true, UINT64_MAX, limits, true);
+  const auto session = f.attach();
+  auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 256, 256);
+  const std::vector<unsigned char> before(262144, 71), rows(262400, 0);
+  image->setData(static_cast<const void *>(before.data()));
+  writeInput(f.exchangePath() + "/first.png", inputPng(256, 256, 6, rows, {}));
+  const auto handle = f.sceneIds->handleOf(image.data());
+  f.importImage(session,
+      1,
+      f.objectHandle(image.data()),
+      *f.sceneIds->imageDataVersion(handle),
+      "first.png");
+  const auto first = f.await(session, 1);
+  REQUIRE(first.flag("committed"));
+  const auto batch = *first.result()->get("batch_ref");
+  std::vector<unsigned char> changed(262400, 0);
+  for (std::size_t y = 0; y < 256; ++y)
+    std::fill_n(changed.begin() + y * 1025 + 1, 1024, 23);
+  writeInput(
+      f.exchangePath() + "/second.png", inputPng(256, 256, 6, changed, {}));
+  f.importImage(session,
+      2,
+      f.objectHandle(image.data()),
+      *f.sceneIds->imageDataVersion(handle),
+      "second.png");
+  const auto second = f.await(session, 2);
+  INFO(json::write(second.json));
+  CHECK(second.flag("committed") == !legacyPhysicalCap);
+  if (legacyPhysicalCap) {
+    REQUIRE(second.str("outcome") == "busy");
+    CHECK(second.result()->get("reason")->s == "resource_limit");
+    f.restoreBatch(session, 3, batch);
+    REQUIRE(f.await(session, 3).flag("committed"));
+    CHECK(std::memcmp(image->data(), before.data(), before.size()) == 0);
+  } else {
+    REQUIRE(second.str("outcome") == "ok");
+    CHECK(physical->limit() == 4412800);
+    CHECK(physical->used() <= physical->limit());
+    CHECK(f.imageActivity->usage().restorableBatches == 1);
+    CHECK(f.imageActivity->usage().oversizedRetention);
+    f.restoreBatch(session, 3, batch);
+    CHECK(f.await(session, 3).str("outcome") == "outcome_unavailable");
+    f.restoreBatch(session, 4, *second.result()->get("batch_ref"));
+    REQUIRE(f.await(session, 4).flag("committed"));
+    const std::vector<unsigned char> zero(262144, 0);
+    CHECK(std::memcmp(image->data(), zero.data(), zero.size()) == 0);
+  }
+}
+
 SCENARIO("MCP position import checks scoped freshness before I/O and commit",
     "[integration][mcp][mesh-import][mesh-import-guards]")
 {
@@ -5775,6 +6093,7 @@ SCENARIO(
 {
   image::ExchangeLimits limits;
   limits.globalRetentionBytes = 4096;
+  limits.hardRetentionBytes = 4096;
   PositionFixture f(limits);
   const auto session = f.attach();
   const auto evidence = f.working(session);
@@ -6079,6 +6398,7 @@ SCENARIO("MCP position import shares Image retention and directory quotas",
 {
   image::ExchangeLimits limits;
   limits.globalRetentionBytes = 200000;
+  limits.hardRetentionBytes = 200000;
   PositionFixture f(limits);
   const auto session = f.attach();
   const auto evidence = f.working(session);
@@ -7516,6 +7836,7 @@ SCENARIO(
   for (unsigned independent = 0; independent < 2; ++independent) {
     image::ExchangeLimits limits;
     limits.globalRetentionBytes = 4096;
+    limits.hardRetentionBytes = 4096;
     PositionFixture f(limits);
     auto positions = f.scene.createArray(ANARI_FLOAT32_VEC3, COUNT);
     positions->setData(static_cast<const void *>(points.data()));

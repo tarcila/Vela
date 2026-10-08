@@ -140,6 +140,40 @@ struct Limits
 
 // Executor contract ////////////////////////////////////////////////////////
 
+struct RestorationPolicy
+{
+  std::uint64_t softBytes{0};
+  std::uint64_t hardBytes{0};
+
+  std::string refusal(std::size_t requiredBytes) const;
+  std::string receipt(std::size_t requiredBytes) const;
+};
+
+inline std::string RestorationPolicy::refusal(std::size_t requiredBytes) const
+{
+  const bool approval = requiredBytes > hardBytes;
+  return std::string("{\"reason\":\"")
+      + (approval ? "restoration_approval_required" : "restore_budget_exhausted")
+      + "\",\"required_capacity_bytes\":" + std::to_string(requiredBytes)
+      + ",\"configured_capacity_bytes\":" + std::to_string(softBytes)
+      + ",\"effective_soft_limit_bytes\":" + std::to_string(softBytes)
+      + ",\"effective_hard_limit_bytes\":" + std::to_string(hardBytes)
+      + ",\"approval_required\":" + (approval ? "true" : "false")
+      + ",\"approval_available\":false,\"committed\":false,"
+        "\"history_unchanged\":true}";
+}
+
+inline std::string RestorationPolicy::receipt(std::size_t requiredBytes) const
+{
+  return "{\"mode\":\"publication_fifo\",\"effective_global_limit_bytes\":"
+      + std::to_string(softBytes)
+      + ",\"effective_single_entry_hard_cap_bytes\":"
+      + std::to_string(hardBytes)
+      + ",\"required_capacity_bytes\":" + std::to_string(requiredBytes)
+      + ",\"oversized\":" + (requiredBytes > softBytes ? "true" : "false")
+      + ",\"eviction_possible\":true}";
+}
+
 struct StepContext
 {
   scene::Scene &scene;
@@ -179,6 +213,7 @@ struct StepContext
   // On commit: the record becomes an eligible restorable batch.
   std::function<void()> publishRestoration;
   bool sharedRetention{false}; // an authoritative Activity sink owns policy
+  std::optional<RestorationPolicy> restorationPolicy;
   // False once the sink no longer retains the batch as eligible.
   std::function<bool(const std::string &launchId, const std::string &batchId)>
       restorationRetained;
@@ -352,6 +387,7 @@ class ActivitySink
   }
 
   // Restoration payload accounting for an admitted record (StepContext).
+  virtual std::optional<RestorationPolicy> restorationPolicy() const;
   virtual bool reserveRestoration(Id,
       std::size_t /*bytes*/,
       const std::string & /*launchId*/,
@@ -377,6 +413,11 @@ class ActivitySink
       const std::string & /*launchId*/, const std::string & /*batchId*/)
   {}
 };
+
+inline std::optional<RestorationPolicy> ActivitySink::restorationPolicy() const
+{
+  return std::nullopt;
+}
 
 // Control gate //////////////////////////////////////////////////////////////
 
@@ -1425,6 +1466,9 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
     });
     return ok;
   };
+  withSink([&](ActivitySink &s, ActivitySink::Id) {
+    ctx.restorationPolicy = s.restorationPolicy();
+  });
   ctx.reserveRestoration = [withSink](std::size_t bytes,
                                const std::string &launchId,
                                const std::string &batchId) {

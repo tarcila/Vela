@@ -1269,6 +1269,7 @@ inline operations::Request EditService::makeRequest(EditBatch batch, Slot slot)
       EditResult res = commit(*shared, ctx);
       if (!res.committed) {
         step.outcome = res.outcome;
+        step.result = std::move(res.receipt);
         if (res.failedEntry)
           step.result = "{\"committed\":false,\"failed_entry\":"
               + std::to_string(*res.failedEntry) + ",\"value_error\":\""
@@ -1648,6 +1649,7 @@ inline EditResult EditService::commitPrepared(SceneId sceneId,
   bool reserved = false;
   bool charged = false; // reserved in the activity budget
   bool publicationPrepared = false;
+  std::size_t requiredRecoveryBytes = 0;
   // At most 64 entries; includes decimal uint64 maxima and all fixed syntax.
   const std::size_t receiptCapacity =
       m_launchId.size() + 1024 + plan.size() * 192 + nodes.size() * 512;
@@ -1701,9 +1703,10 @@ inline EditResult EditService::commitPrepared(SceneId sceneId,
     record.publicationBytes = 2 * receiptCapacity
         + res.versions.capacity() * sizeof(ParameterVersionToken)
         + res.nodeVersions.capacity() * sizeof(NodeVersion);
+    requiredRecoveryBytes = restorationBytes(record);
     if (ctx.reserveRestoration
         && !ctx.reserveRestoration(
-            restorationBytes(record), record.ref.launchId, record.ref.batchId))
+            requiredRecoveryBytes, record.ref.launchId, record.ref.batchId))
       throw std::bad_alloc();
     charged = true;
     if (!m_store.prepareRecord(record.ref))
@@ -1727,6 +1730,9 @@ inline EditResult EditService::commitPrepared(SceneId sceneId,
     // Admitted ID stays consumed; no commit and no batch.
     res.batchRef.reset();
     res.receipt.clear();
+    if (ctx.restorationPolicy
+        && requiredRecoveryBytes > ctx.restorationPolicy->hardBytes)
+      res.receipt = ctx.restorationPolicy->refusal(requiredRecoveryBytes);
     res.outcome = Outcome::BUSY;
     return res;
   }

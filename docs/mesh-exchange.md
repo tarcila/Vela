@@ -252,11 +252,18 @@ not a new limit on ordinary Scene editing.
 
 Mesh, Image and existing parameter/Node batches share one Activity-owned
 recovery policy. Newly launched qualified hosts default to exactly
-4,294,967,296 bytes (4 GiB), configured with `--agentRestorationBytes` in binary
-bytes; explicit launch settings are preserved. This target is not preallocated.
-For a normal entry whose complete conservative recovery charge fits that soft
-budget, successful publication evicts the oldest complete eligible batches until
-the newest suffix fits. Order is successful publication, not preparation,
+4,294,967,296 bytes (4 GiB) soft and 8,589,934,592 bytes (8 GiB) per-entry
+hard, configured with `--agentRestorationBytes` and
+`--agentRestorationHardBytes` in binary bytes. Both are checked uint64 values;
+hard must be at least soft. Explicit launch settings are preserved, never
+changed in a running host. Neither value is preallocated. For a normal entry
+whose complete conservative recovery charge is at most soft, successful
+publication evicts the oldest complete eligible batches until the newest suffix
+fits. A charge above soft and at most hard evicts all older entries only at
+successful publication and remains exactly conditionally recoverable alone.
+Exactly soft uses normal FIFO; exactly hard requires no approval. A subsequent
+normal change uses soft again, evicting an older oversized entry even if both
+would fit below hard. Order is successful publication, not preparation,
 request arrival, status access or restore attempts. The separate 32-entry
 recovery bound uses the same FIFO decision. Pending preparation is not history:
 validation, allocations, authority and freshness checks precede eviction.
@@ -269,9 +276,10 @@ metadata churn. Genuine metadata/publication, transport, transient-work and
 physical-ownership allocation limits remain distinct safeguards, not a second
 session undo ceiling. Qualified Import reads policy directly from the Activity
 log; the Image session/global ledgers measure ownership rather than admission.
-There is no 64 MiB per-session snapshot ceiling. This slice does not implement
-the oversized-entry exception, an 8 GiB hard cap or above-cap approval; entries
-above the effective soft budget still refuse before Scene mutation/eviction.
+There is no 64 MiB per-session snapshot ceiling. Above-hard recovery requires
+explicit bounded operator approval, but that approval path is **not implemented**
+yet: this slice rejects it without Scene mutation or recovery eviction. No
+agent-supplied field or ordinary edit permission bypasses that refusal.
 A mesh batch conservatively charges all unique required prior Array data plus
 replacement data, `sizeof(Array) + 4096` bytes per retained Array for lifetime/
 control ownership, the snapshot record, and a conservative 256 KiB allowance
@@ -283,12 +291,18 @@ viewer RAM/GPU memory. Image snapshots and mesh lifetime entries additionally
 share a physical-retention ledger: Activity eviction or consumed history cannot
 make copied snapshots or not-yet-drained pins uncharged. Reservations survive
 until the corresponding buffers/pins are physically releasable. Charges also include a 106,496-byte conservative allowance for request/store/
-receipt ownership. A charge above the currently supported soft limit reports
-`required_capacity_bytes` and `configured_capacity_bytes` before publication,
+receipt ownership. A charge above hard reports `required_capacity_bytes`,
+`configured_capacity_bytes` (soft), `effective_soft_limit_bytes`,
+`effective_hard_limit_bytes`, `approval_required:true`,
+`approval_available:false`, `committed:false` and `history_unchanged:true`,
 with no irreversible fallback or automatic increase. The viewer/headless host
-physical-owner pool is separately configured to twice the soft target plus
-256 MiB (8,858,370,048 bytes at the default), saturating at addressable `size_t`
-on narrow hosts. Its checked leases cover preparation overlap and copied/pinned
+physical-owner pool is separately configured to twice the larger of soft and
+hard plus the unchanged 256 MiB transient allowance (17,448,304,640 bytes at
+the defaults), saturating at addressable `size_t` on narrow hosts. This permits
+safe preparation alongside a prior exceptional entry rather than silently
+reimposing soft as an admission ceiling. Additional outstanding/pinned owners
+can still exhaust this independent physical lease ceiling; admission never
+promises an allocation will succeed. Its checked leases cover preparation overlap and copied/pinned
 owners until release, not all process/Scene/GPU memory. No amount is preallocated.
 The rendering library's default FrameBudget remains 256 MiB; explicit host
 budgets now accept larger finite limits. Transient/codec/file limits are unchanged.
@@ -321,16 +335,26 @@ Poll ordinary operation status and inspect `committed` before deciding recovery:
 - Stale evidence/conflict requires fresh export evidence and a deliberate retry;
   no force/merge path exists. An ordinary open map is busy, not silently closed.
 - `busy` / `resource_limit` identifies actual transient, physical, file, slot or
-  publication-resource safeguards. An individually unsupported recovery charge
-  reports `restore_budget_exhausted`, `required_capacity_bytes` and
-  `configured_capacity_bytes`. Old eligible history alone is not an admission
-  barrier for a normal entry. Exchange metadata reports
-  `effective_global_retention_byte_cap`, `available_global_retention_bytes`
-  (soft target minus eligible charges), `retention_order:publication_fifo`,
+  publication-resource safeguards. Above-hard recovery reports
+  `busy/restoration_approval_required` with the fully accounted required charge,
+  effective limits and unimplemented approval requirement described above.
+  Other failed recovery reservations report `restore_budget_exhausted`; they
+  never evict existing recovery. Old eligible history alone is not an admission
+  barrier for an admissible entry. Exchange metadata reports
+  `effective_global_retention_byte_cap` (soft),
+  `effective_single_entry_hard_cap_bytes`, `oversized_retention`,
+  `approval_available:false`, `available_global_retention_bytes`
+  (soft minus eligible charges, clamped to zero during oversized retention),
+  `retention_order:publication_fifo`,
   `retention_entry_cap`, `activity_metadata_byte_cap`, `activity_entry_cap`,
   `physical_byte_cap` and `retained_physical_bytes` (snapshot/pin ledger charges,
   including conservative Mesh ownership allowances, not process RSS or the
-  entire shared physical pool). Authenticated observations add
+  entire shared physical pool). Image and Mesh commit receipts also expose
+  `restoration_policy` with both effective limits, `required_capacity_bytes`,
+  `oversized` and `eviction_possible:true`. These are historical commit facts,
+  not proof the entry remains eligible: use current Restore/status observations.
+  Agent Activity distinguishes normal FIFO from an oversized entry alone.
+  Authenticated observations add
   `session_retained_physical_bytes`; this is ownership, not a session cap.
   Evicted/consumed eligibility does not imply physical reclamation: copied
   recovery and Scene pins remain charged until actual release. Eligible free

@@ -494,16 +494,19 @@ class Application : public VSRApplication
   Application(int argc,
       const char *argv[],
       bool agentIntegrationRequested,
-      std::uint64_t restorationBytes)
+      std::uint64_t restorationBytes,
+      std::uint64_t restorationHardBytes)
       : VSRApplication(argc, argv)
   {
 #ifdef VSR_USE_INTEGRATION
     // Opt-in: nothing is exposed to agents unless the operator asks.
     m_agentIntegrationRequested = agentIntegrationRequested;
     m_activityLimits.retentionBytes = restorationBytes;
+    m_activityLimits.hardRetentionBytes = restorationHardBytes;
 #else
     (void)agentIntegrationRequested;
     (void)restorationBytes;
+    (void)restorationHardBytes;
 #endif
   }
   ~Application() override = default;
@@ -1092,7 +1095,8 @@ void Application::setupIntegration()
       *m_integration, *m_authority, *m_engine, *m_edits);
   m_translations->attachScene(*sceneId, *m_identity);
   const auto hostImageMemory = std::make_shared<vsr::rendering::FrameBudget>(
-      vsr::app::agentPhysicalByteCap(m_activityLimits.retentionBytes));
+      vsr::app::agentPhysicalByteCap(m_activityLimits.retentionBytes,
+          m_activityLimits.hardRetentionBytes));
   m_restores = std::make_unique<vi::restore::RestoreService>(*m_engine,
       *m_edits,
       [hostImageMemory] { return hostImageMemory->reserve(65536); });
@@ -1160,6 +1164,7 @@ void Application::setupIntegration()
   };
   imageLimits.retention = m_activity.get();
   imageLimits.globalRetentionBytes = m_activity->limits().retentionBytes;
+  imageLimits.hardRetentionBytes = m_activity->limits().hardRetentionBytes;
   imageLimits.restorationRetained = [this](const std::string &launch,
                                         const std::string &batch) {
     return m_activity->eligibility({launch, batch})
@@ -1361,7 +1366,8 @@ int main(int argc, const char *argv[])
   vsr::app::AgentOptions options;
   if (!vsr::app::parseAgentOptions(argc, argv, options)) {
     std::fprintf(stderr,
-        "--agentRestorationBytes requires one positive decimal byte count\n");
+        "--agentRestorationBytes requires one positive decimal byte count; "
+        "--agentRestorationHardBytes likewise, with hard >= soft\n");
     return 1;
   }
   // vsrViewer owns `--agentIntegration`; remove it before the base parser.
@@ -1379,7 +1385,8 @@ int main(int argc, const char *argv[])
     vsr_viewer::Application app(int(args.size()),
         args.data(),
         agentIntegrationRequested,
-        options.restorationBytes);
+        options.restorationBytes,
+        options.restorationHardBytes);
     app.run(1920, 1080, "VSR Viewer");
   }
 

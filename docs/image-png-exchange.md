@@ -107,11 +107,14 @@ unbounded compression fallback or output-vector growth.
 `exchange_limits` reports `file_cap=1024`, `byte_cap=268435456`,
 `files_used`, `bytes_used`, `usage_complete`, `quota_scan_entry_cap=4096`,
 `max_ancillary_bytes=65536`, `transient_image_byte_cap`,
-`effective_global_retention_byte_cap`, `available_global_retention_bytes`,
+`effective_global_retention_byte_cap` (soft),
+`effective_single_entry_hard_cap_bytes`, `oversized_retention`,
+`approval_available:false`, `available_global_retention_bytes`,
 `retention_order:publication_fifo`, `retention_entry_cap`,
 `activity_metadata_byte_cap`, `activity_entry_cap`, `physical_byte_cap` and
 `retained_physical_bytes`. Global availability means soft target minus eligible
-recovery charges, not physical free space. Physical ledger charges measure
+recovery charges, clamped to zero during oversized retention, not physical free
+space. Physical ledger charges measure
 snapshot/pin ownership, not the entire shared host pool or process RSS; they can
 outlive eligibility through copies/pins. Authenticated observations add
 `session_retained_physical_bytes`, an ownership observation, not an admission cap.
@@ -179,16 +182,25 @@ constructor reservation uses the same host pool, never a separate or larger
 pool. Qualified hosts also bind the authoritative `ExchangeLimits::retention`
 ActivityLog pointer, which must outlive ImageExchange. Its effective policy is
 used for both admission and reporting, not an independent Image ledger limit.
-New hosts default to 4 GiB recovery, without preallocation. Normal entries fit
+New hosts default to 4 GiB soft recovery and an 8 GiB single-entry hard cap,
+without preallocation. Configure launch-local uint64 values with
+`--agentRestorationBytes` and `--agentRestorationHardBytes` (hard >= soft).
+Normal entries fit
 by evicting complete batches FIFO only at successful publication; status reads,
 replay, no-ops and failed/cancelled preparation never renew or evict history.
 The disclosed 32-entry bound uses that same FIFO. Metadata/results remain
 separately bounded by 16 MiB/1024 records, with eligible recovery protected
 from ordinary metadata churn. Explicit host physical leases allow retained and
-prepared ownership overlap (twice the soft target plus 256 MiB, saturated to
-addressable size); the rendering library default remains 256 MiB. See
-[shared retention](mesh-exchange.md) for effective limits and lifetime semantics.
-Oversized-entry admission/above-cap approval are not implemented in this slice.
+prepared ownership overlap (twice the larger of soft and hard plus the unchanged
+256 MiB transient allowance, saturated to addressable size); the rendering
+library default remains 256 MiB. An entry above soft and at most hard is retained
+alone only at successful publication. The next ordinary entry returns history
+to soft-budget FIFO. Exactly soft and exactly hard are inclusive. Above hard
+refuses nonmutatingly with the required charge, effective soft/hard limits,
+`approval_required:true` and `approval_available:false`; the bounded operator
+approval path is not implemented yet. See [shared retention](mesh-exchange.md)
+for exact refusal/receipt fields, independent allocation safeguards and lifetime
+semantics. No file, payload, decoder or transport limits have been raised.
 
 Call `vsr_image_import` with `request_id`, `scene_id`, the Array `handle`, its
 inspected `data_version`, and a confined PNG `file_name`. No prior export is
@@ -254,8 +266,10 @@ reserves the shared recovery/publication resources, then reserves transient
 E+D+W+S. The recovery charge includes T, the ImageSnapshot and a conservative
 106,496-byte allowance for request/store/receipt ownership. Pending reservations
 are distinct from eligible history; the final successful publication serializes
-FIFO against current history. Above-soft charges refuse without old-history
-loss. Session/global lifetime ledgers are not separate admission caps.
+FIFO against current history, retaining an above-soft entry alone when at most
+hard. Above-hard charges refuse without old-history loss and report the approval
+requirement; no operator override is implemented yet. Session/global lifetime
+ledgers are not separate admission caps.
 S is physically allocated
 once and its lease transfers to retention. Scratch releases only after buffers,
 worker stack, task and future die; control/result/history charges survive their
@@ -263,7 +277,7 @@ producer. Transient use of S ends at commit without releasing its physical lease
 3,212,800 bytes and the retained snapshot is 262,144 bytes (host lease overhead is
 separate). Session charges survive disconnect, remain attributed to the original
 session, and release on recovery/conflict/global eviction, not PNG deletion.
-Reconnect gets a distinct 64 MiB session ceiling but not a distinct global pool.
+Reconnect gets distinct ownership attribution, not a distinct ceiling or pool.
 Default activity/store limits remain unchanged. Available capacities are
 observations, never future admission guarantees.
 

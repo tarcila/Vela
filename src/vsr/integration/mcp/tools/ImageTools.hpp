@@ -64,7 +64,7 @@ inline void addMeshImportTool(std::vector<Tool> &tools, ImageDeps deps)
   Tool tool;
   tool.name = "vsr_mesh_import";
   tool.description =
-      "Replace count-preserving positions on one exposed triangle Geometry from a confined .vmesh. Requires current READ+EDIT and enabled agent edits. Copy current target_version and complete dependencies from Mesh Export; descriptive bundle source is not authority and export provenance is not required. Other fields must preserve; no count, state or optional field changes yet. Poll mesh_import for committed, current evidence and normal batch_ref for vsr_restore. Old shared Arrays are never overwritten. See docs/mesh-exchange.md.";
+      "Replace count-preserving positions on one exposed triangle Geometry from a confined .vmesh. Requires current READ+EDIT and enabled agent edits. Copy current target_version and complete dependencies from Mesh Export; descriptive bundle source is not authority and export provenance is not required. Other fields must preserve; no count, state or optional field changes yet. Poll mesh_import for committed, current evidence and normal batch_ref for vsr_restore. Old shared Arrays are never overwritten. Recovery shares the effective host soft/hard limits (4 GiB/8 GiB defaults): above-soft entries at most hard retain alone, and the next normal change uses soft again. Above-hard refusal reports required bytes and limits without mutation or eviction; bounded operator approval is not implemented. See docs/mesh-exchange.md.";
   tool.inputSchemaJson = std::string("{\"type\":\"object\",\"properties\":{")
       + requestIdSchema()
       + ",\"scene_id\":{\"type\":\"integer\",\"minimum\":0},\"handle\":{\"type\":\"string\"},"
@@ -155,7 +155,11 @@ inline void addImageTools(std::vector<Tool> &tools, ImageDeps deps)
       "resizing or prior-export provenance. Poll image_import status for fresh "
       "data_version, scene_revision and normal batch_ref for vsr_restore. "
       "Recovery is conditional and capacity-based, not permanent. PNG removal "
-      "does not release the undo snapshot; restore/eviction does not remove PNGs.";
+      "does not release the undo snapshot; restore/eviction does not remove PNGs. "
+      "Recovery shares effective host soft/hard limits (4 GiB/8 GiB defaults). "
+      "Above-soft entries at most hard retain alone; the next normal change uses "
+      "soft again. Above-hard refusal reports required bytes and limits without "
+      "mutation or eviction; bounded operator approval is not implemented.";
   import.inputSchemaJson = std::string("{\"type\":\"object\",\"properties\":{")
       + requestIdSchema()
       + ",\"scene_id\":{\"type\":\"integer\",\"minimum\":0},"
