@@ -230,8 +230,26 @@ Avoid features that obscure intent or have poor tooling support.
 | Compile-time invariants | `static_assert(condition, "message")` |
 | Recoverable / expected failure | Return `bool` or `std::optional` |
 
-Do not use `try`/`catch` inside library code — let exceptions propagate to the
-application layer.
+Do not use `try`/`catch` inside ordinary library code — let exceptions propagate
+to the application layer. There are only two narrow transaction-safety exceptions:
+
+- **Completion-before-rethrow notification fanout** (§17): catch a consumer's
+  exception only to notify the remaining consumers in registration order, once
+  each, then rethrow the original first exception unchanged. Do not translate,
+  suppress or replace that failure, or retry a consumer.
+- **Host transaction barriers**: at the agent host's preparation, commit,
+  publication and synchronization boundaries, contain a failure only to preserve
+  the transaction's truthful outcome. Before commit, failure must leave Scene
+  data and existing recovery eligibility unchanged and be reported as a
+  nonmutating failure (or propagate). After commit, failure must preserve the
+  committed mark and the promised new recovery entry, complete coherent retention
+  publication, and report synchronization/publication failure rather than success
+  or a nonmutating rejection. Prepare the necessary ownership and publication
+  resources before writes; a catch is not a substitute for that preparation.
+
+These exceptions do not authorize general library error-to-success conversion or
+relax validation, authority, allocation or memory limits. Prefer allocation-free
+RAII when only cleanup is needed; a cleanup-only catch/rethrow is unnecessary.
 
 ### Fallible Returns
 
@@ -414,6 +432,15 @@ change.
   without writing fan-out logic yourself.
 - Never bypass the delegate system by mutating scene objects and then calling
   renderer internals directly — that breaks the synchronization contract.
+- `MultiUpdateDelegate::signalParameterBatchUpdated`,
+  `signalLayerStructureUpdated` and `signalUpdateBatchEnd` use the bounded
+  completion-before-rethrow exception in §11. These notifications follow completed
+  writes: an earlier consumer's failure must not hide them from later consumers,
+  including identity/version tracking needed for exact recovery. All consumers
+  are notified once in registration order, and a direct caller receives the
+  original first exception after fanout completes. Notification failure does not
+  undo the writes. Other hooks retain ordinary exception propagation; this is not
+  permission to add catches throughout the delegate system.
 - `vsr::core::DataTreeObserver` is a separate, peer mechanism covering
   `DataTree` mutations, not a scene one: a tree notifies at most one Observer,
   registered non-owning via `DataTree::setObserver()`. Use it for consumers of
