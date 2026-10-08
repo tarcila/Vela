@@ -149,31 +149,38 @@ inline const char *finiteValues(
  * Bound dynamic strings and enumeration storage before any detached
  * map/snapshot copy. The charged four-header allowance covers prior metadata,
  * the expected map and proposed map, including restored/added Parameters. */
+inline bool addParameterCopyBytes(
+    const scene::Parameter &parameter, std::size_t &bytes)
+{
+  const auto add = [&](std::size_t size) {
+    if (bytes > HEADER_CAP || size > HEADER_CAP - bytes)
+      return false;
+    bytes += size;
+    return true;
+  };
+  if (!add(sizeof(scene::Parameter) + sizeof(scene::Token))
+      || !add(parameter.description().size()) || !add(1))
+    return false;
+  for (const auto *value :
+      {&parameter.value(), &parameter.min(), &parameter.max()})
+    if (value->type() == ANARI_STRING
+        && (!add(value->getStringView().size()) || !add(1)))
+      return false;
+  for (const auto &value : parameter.stringValues())
+    if (!add(sizeof(std::string)) || !add(value.size()) || !add(1))
+      return false;
+  return true;
+}
+
 inline bool boundedParameters(
     const scene::Geometry &geometry, std::size_t addedControls = 0)
 {
   if (addedControls > HEADER_CAP)
     return false;
   std::size_t bytes = addedControls;
-  const auto add = [&](std::size_t size) {
-    if (size > HEADER_CAP - bytes)
+  for (std::size_t i = 0; i < geometry.numParameters(); ++i)
+    if (!addParameterCopyBytes(geometry.parameterAt(i), bytes))
       return false;
-    bytes += size;
-    return true;
-  };
-  for (std::size_t i = 0; i < geometry.numParameters(); ++i) {
-    const auto &parameter = geometry.parameterAt(i);
-    if (!add(sizeof(scene::Parameter) + sizeof(scene::Token))
-        || !add(parameter.description().size()))
-      return false;
-    for (const auto *value :
-        {&parameter.value(), &parameter.min(), &parameter.max()})
-      if (value->type() == ANARI_STRING && !add(value->getStringView().size()))
-        return false;
-    for (const auto &value : parameter.stringValues())
-      if (!add(sizeof(std::string)) || !add(value.size()))
-        return false;
-  }
   return true;
 }
 

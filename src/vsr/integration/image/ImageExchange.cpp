@@ -652,6 +652,15 @@ std::string ImageExchange::State::limitsJson(
     const Bounds *b, const std::string &sessionId) const
 {
   std::lock_guard<std::mutex> lock(mutex);
+  std::size_t physicalAvailable = 0;
+  {
+    std::lock_guard<std::mutex> retentionLock(retentionLedger->mutex);
+    physicalAvailable = limits.globalRetentionBytes
+        - std::min(limits.globalRetentionBytes, retentionLedger->bytes);
+  }
+  // Eligibility can be consumed/evicted while copied recovery owners or
+  // not-yet-drained Scene pins still retain the actual storage.
+  const auto available = std::min(availableRetention, physicalAvailable);
   std::string result = "{\"file_cap\":1024,\"byte_cap\":268435456,\"files_used\":"
       + std::to_string(usage.files) + ",\"bytes_used\":" + std::to_string(usage.bytes)
       + ",\"usage_complete\":" + (usage.complete ? "true" : "false")
@@ -660,7 +669,7 @@ std::string ImageExchange::State::limitsJson(
       + ",\"session_snapshot_byte_cap\":67108864,\"effective_global_retention_byte_cap\":"
       + std::to_string(limits.globalRetentionBytes)
       + ",\"available_global_retention_bytes\":"
-      + std::to_string(availableRetention);
+      + std::to_string(available);
   if (b)
     result += ",\"max_encoded_file_bytes\":" + std::to_string(b->encoded)
         + ",\"max_codec_work_bytes\":" + std::to_string(b->work);
@@ -725,7 +734,8 @@ Step ImageExchange::State::read(Job &job)
       || before.st_size < 0 || (job.mesh && (before.st_mode & 07777) != 0600))
     return reject(Outcome::INVALID_REQUEST, "file_rejected");
   if (std::uint64_t(before.st_size) > job.bound.encoded)
-    return reject(Outcome::INVALID_REQUEST, "invalid_png");
+    return reject(
+        Outcome::INVALID_REQUEST, job.mesh ? "mesh_file_limit" : "invalid_png");
   if (job.mesh) {
     const auto bytes = std::size_t(before.st_size);
     job.decodeLease = limits.reservePhysicalMemory(bytes);
@@ -1644,11 +1654,23 @@ operations::Admission ImageExchange::submitMeshImport(
       auto retentionCharge =
           charge(state->retentionLedger, state->limits.globalRetentionBytes);
       if (!sessionCharge || !retentionCharge) {
+        // No retained storage has been allocated. Remove partial reservations
+        // before reporting the originating session's actual available ceiling.
+        sessionCharge.reset();
+        retentionCharge.reset();
+        std::size_t availableSession = 0;
+        {
+          std::lock_guard<std::mutex> lock(ledger->mutex);
+          availableSession =
+              67108864 - std::min<std::size_t>(67108864, ledger->bytes);
+        }
         auto rejected = fail(Outcome::BUSY, "restore_budget_exhausted");
         rejected.result =
             "{\"reason\":\"restore_budget_exhausted\",\"required_capacity_bytes\":"
             + std::to_string(retainedBytes) + ",\"configured_capacity_bytes\":"
-            + std::to_string(state->limits.globalRetentionBytes) + "}";
+            + std::to_string(state->limits.globalRetentionBytes)
+            + ",\"configured_session_capacity_bytes\":67108864,\"available_session_snapshot_bytes\":"
+            + std::to_string(availableSession) + "}";
         return rejected;
       }
       auto snapshot = std::make_shared<edit::MeshSnapshot>();

@@ -47,6 +47,7 @@
 #include <csignal>
 #include <cstdarg>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -94,7 +95,8 @@ extern "C" ssize_t write(int fd, const void *buffer, size_t bytes)
     const auto link = "/proc/self/fd/" + std::to_string(fd);
     const auto length = ::readlink(link.c_str(), path, sizeof(path) - 1);
     if (::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && length > 0
-        && std::string(path).find("/image-") != std::string::npos
+        && (std::string(path).find("/image-") != std::string::npos
+            || std::string(path).find("/mesh-") != std::string::npos)
         && interceptExportWrite.exchange(false))
       afterExportWrite(fd);
   }
@@ -110,7 +112,9 @@ extern "C" ssize_t read(int fd, void *buffer, size_t bytes)
     char path[4096]{};
     const auto link = "/proc/self/fd/" + std::to_string(fd);
     const auto length = ::readlink(link.c_str(), path, sizeof(path) - 1);
-    if (length > 0 && std::string(path).find("/agent.png") != std::string::npos
+    if (length > 0
+        && (std::string(path).find("/agent.png") != std::string::npos
+            || std::string(path).find("/edited.vmesh") != std::string::npos)
         && interceptImportRead.exchange(false))
       afterImportRead(fd);
   }
@@ -6702,6 +6706,723 @@ SCENARIO(
       == f.positions.data());
 }
 
+SCENARIO(
+    "MCP retained recovery owners do not advertise physically unavailable capacity",
+    "[integration][mcp][mesh-import][mesh-pressure][mesh-pressure-owners]")
+{
+  image::ExchangeLimits limits;
+  limits.globalRetentionBytes = 400000;
+  PositionFixture f(limits);
+  auto uv = f.scene.createArray(ANARI_FLOAT32_VEC2, 3);
+  const float coordinates[] = {0, 0, 1, 0, 0, 1};
+  uv->setData(static_cast<const void *>(coordinates));
+  f.geometry->setParameterObject("vertex.attribute0", *uv)
+      ->setDescription(std::string(24000, 'u').c_str());
+  const auto a = f.attach();
+  const auto evidence = f.working(a, "tracer", true);
+  f.importPositions(a, 2, *evidence.result());
+  const auto imported = f.await(a, 2);
+  REQUIRE(imported.flag("committed"));
+  const auto batch = *imported.result()->get("batch_ref");
+  // Normal restoration retention can outlive eligibility, just like a worker
+  // or copied result. Observe the consequences through public operations.
+  auto retained = f.edits->restorations().find(
+      {batch.get("launch_id")->s, batch.get("batch_id")->s});
+  REQUIRE(retained);
+  const auto oldUV = f.sceneIds->handleOf(uv.data());
+  f.other->removeParameter("vertex.position");
+  f.restoreBatch(a, 3, batch);
+  REQUIRE(f.await(a, 3).flag("committed"));
+  REQUIRE(f.rpc("vsr/detach", "{}", &a).status == 200);
+  const auto b = f.attach();
+  f.tool(b, "vsr_discover", "{\"request_id\":1}");
+  const auto discovered = f.await(b, 1);
+  const auto *capacity = discovered.result()
+                             ->get("items")
+                             ->a.at(0)
+                             .get("image_exchange")
+                             ->get("exchange_limits");
+  CHECK(capacity->get("effective_global_retention_byte_cap")->n == 400000);
+  CHECK(capacity->get("available_global_retention_bytes")->n < 140000);
+  f.scene.removeUnusedObjects();
+  f.scene.defragmentObjectStorage();
+  REQUIRE(f.sceneIds->resolve(oldUV));
+  CHECK(f.geometry->parameter("vertex.attribute0")->description()
+      == std::string(24000, 'u'));
+  f.exportMesh(b, 2, f.geometry.data());
+  const auto fresh = f.await(b, 2);
+  REQUIRE(fresh.str("outcome") == "ok");
+  f.importPositions(b, 3, *fresh.result());
+  const auto busy = f.await(b, 3);
+  REQUIRE(busy.str("outcome") == "busy");
+  CHECK_FALSE(busy.flag("committed"));
+  CHECK(busy.result()->get("reason")->s == "restore_budget_exhausted");
+  CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == f.sceneIds->resolve(f.sceneIds->handleOf(f.positions.data())));
+  std::thread release([&] { retained.reset(); });
+  release.join();
+  f.images->pump();
+  f.importPositions(b, 4, *fresh.result());
+  REQUIRE(f.await(b, 4).flag("committed"));
+  f.restoreBatch(b, 5, *f.status(b, b.id, 4).result()->get("batch_ref"));
+  REQUIRE(f.await(b, 5).flag("committed"));
+  CHECK(f.geometry->parameter("vertex.attribute0")->description()
+      == std::string(24000, 'u'));
+}
+
+SCENARIO(
+    "MCP restore bounds the union of current and recovered Parameter copies",
+    "[integration][mcp][mesh-import][mesh-pressure][mesh-pressure-metadata]")
+{
+  const auto metadata = GENERATE(0, 1, 2);
+  PositionFixture f;
+  auto uv = f.scene.createArray(ANARI_FLOAT32_VEC2, 3);
+  const float coordinates[] = {0, 0, 1, 0, 0, 1};
+  uv->setData(static_cast<const void *>(coordinates));
+  auto *prior = f.geometry->setParameterObject("vertex.attribute0", *uv);
+  if (metadata == 0)
+    prior->setDescription(std::string(40000, 'u').c_str());
+  else if (metadata == 1)
+    prior->setStringValues({std::string(20000, 'u'), std::string(20000, 'v')});
+  else
+    prior->setMin(vsr::core::Any(std::string(20000, 'u')))
+        .setMax(vsr::core::Any(std::string(20000, 'v')));
+  f.geometry->setParameter("custom", 17.f);
+  const auto s = f.attach();
+  const auto evidence = f.working(s, "tracer", true);
+  f.importPositions(s, 2, *evidence.result());
+  const auto imported = f.await(s, 2);
+  REQUIRE(imported.flag("committed"));
+  const auto batch = *imported.result()->get("batch_ref");
+  // Unversioned, unrelated UI metadata must not be lost. Each source map fits
+  // individually, but copying their union must also fit the enforced bound.
+  f.geometry->parameter("custom")->setDescription(
+      std::string(40000, 'c').c_str());
+  const auto version = f.geometry->lastParameterChange();
+  const auto positions = f.sceneIds->handleOf(
+      f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position"));
+  f.restoreBatch(s, 3, batch);
+  const auto busy = f.await(s, 3);
+  REQUIRE(busy.str("outcome") == "busy");
+  CHECK_FALSE(busy.flag("committed"));
+  CHECK(f.geometry->lastParameterChange() == version);
+  CHECK_FALSE(f.geometry->parameter("vertex.attribute0"));
+  CHECK(f.sceneIds->handleOf(
+            f.geometry->parameterValueAsObject<vsr::scene::Array>(
+                "vertex.position"))
+      == positions);
+  CHECK(f.geometry->parameter("custom")->description()
+      == std::string(40000, 'c'));
+  f.geometry->parameter("custom")->setDescription("later UI metadata");
+  f.restoreBatch(s, 4, batch);
+  REQUIRE(f.await(s, 4).flag("committed"));
+  const auto *recovered = f.geometry->parameter("vertex.attribute0");
+  REQUIRE(recovered);
+  if (metadata == 0)
+    CHECK(recovered->description() == std::string(40000, 'u'));
+  else if (metadata == 1) {
+    REQUIRE(recovered->stringValues().size() == 2);
+    CHECK(recovered->stringValues()[0] == std::string(20000, 'u'));
+    CHECK(recovered->stringValues()[1] == std::string(20000, 'v'));
+  } else {
+    CHECK(recovered->min().getStringView() == std::string(20000, 'u'));
+    CHECK(recovered->max().getStringView() == std::string(20000, 'v'));
+  }
+  CHECK(f.geometry->parameter("custom")->description() == "later UI metadata");
+}
+
+SCENARIO("MCP repeated compound restore collects only unadopted Arrays",
+    "[integration][mcp][mesh-import][mesh-pressure][mesh-pressure-lifetimes]")
+{
+  PositionFixture f;
+  auto uv = f.scene.createArray(ANARI_FLOAT32_VEC2, 3);
+  const float coordinates[] = {0, 0, 1, 0, 0, 1};
+  uv->setData(static_cast<const void *>(coordinates));
+  f.geometry->setParameterObject("vertex.attribute0", *uv);
+  f.geometry->setParameterObject("vertex.attribute1", *uv)->setEnabled(false);
+  const auto originalPositions = f.sceneIds->handleOf(f.positions.data());
+  const auto originalUV = f.sceneIds->handleOf(uv.data());
+  const auto s = f.attach();
+  std::uint64_t id = 0;
+  json::Value firstBatch;
+  std::vector<identity::ObjectHandle> adopted;
+  for (unsigned cycle = 0; cycle < 6; ++cycle) {
+    const auto exportId = ++id;
+    f.exportMesh(s, exportId, f.geometry.data());
+    const auto evidence = f.await(s, exportId);
+    REQUIRE(evidence.str("outcome") == "ok");
+    const auto path = f.exchangePath();
+    REQUIRE(std::system((std::string(VSR_MESH_TEST_PYTHON) + " "
+                + VSR_MESH_TEST_SOURCE + "/scripts/test-mesh-topology.py '"
+                + path + "/" + evidence.result()->get("file_name")->s + "' '"
+                + path + "/edited.vmesh' tracer")
+                    .c_str())
+        == 0);
+    const auto importId = ++id;
+    f.importPositions(s, importId, *evidence.result());
+    const auto imported = f.await(s, importId);
+    REQUIRE(imported.flag("committed"));
+    const auto batch = *imported.result()->get("batch_ref");
+    if (!cycle)
+      firstBatch = batch;
+    std::vector<identity::ObjectHandle> replacements;
+    for (std::size_t i = 0; i < f.geometry->numParameters(); ++i) {
+      const auto &parameter = f.geometry->parameterAt(i);
+      if (!anari::isArray(parameter.value().type()))
+        continue;
+      auto *array = f.geometry->parameterValueAsObject<vsr::scene::Array>(
+          parameter.name());
+      replacements.push_back(f.sceneIds->handleOf(array));
+      if (!cycle)
+        f.other->setParameterObject(parameter.name(), *array)
+            ->setEnabled(parameter.isEnabled());
+    }
+    f.scene.removeUnusedObjects();
+    for (unsigned i = 0; i < 150; ++i)
+      f.scene.createArray(ANARI_FLOAT32_VEC3, 3);
+    f.scene.removeUnusedObjects();
+    f.scene.defragmentObjectStorage();
+    REQUIRE(f.sceneIds->resolve(originalPositions));
+    REQUIRE(f.sceneIds->resolve(originalUV));
+    const auto restoreId = ++id;
+    f.restoreBatch(s, restoreId, batch);
+    const auto restored = f.await(s, restoreId);
+    REQUIRE(restored.flag("committed"));
+    f.images->pump();
+    f.scene.removeUnusedObjects();
+    f.scene.defragmentObjectStorage();
+    CHECK(f.sceneIds->handleOf(
+              f.geometry->parameterValueAsObject<vsr::scene::Array>(
+                  "vertex.position"))
+        == originalPositions);
+    CHECK(f.sceneIds->handleOf(
+              f.geometry->parameterValueAsObject<vsr::scene::Array>(
+                  "vertex.attribute0"))
+        == originalUV);
+    CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>(
+              "vertex.attribute0")
+        == f.geometry->parameterValueAsObject<vsr::scene::Array>(
+            "vertex.attribute1"));
+    CHECK_FALSE(f.geometry->parameter("vertex.attribute1")->isEnabled());
+    CHECK(std::memcmp(f.geometry
+                          ->parameterValueAsObject<vsr::scene::Array>(
+                              "vertex.attribute0")
+                          ->data(),
+              coordinates,
+              sizeof(coordinates))
+        == 0);
+    for (const auto &handle : replacements)
+      CHECK(bool(f.sceneIds->resolve(handle)) == (cycle == 0));
+    if (!cycle) {
+      adopted = replacements;
+      f.exportMesh(s, ++id, f.other.data());
+      REQUIRE(f.await(s, id).str("outcome") == "ok");
+    }
+    for (const auto &handle : adopted)
+      REQUIRE(f.sceneIds->resolve(handle));
+    CHECK(f.scene.numberOfObjects(ANARI_ARRAY) <= 8);
+    f.restoreBatch(s, ++id, firstBatch);
+    CHECK(f.await(s, id).str("outcome") == "already_restored");
+    REQUIRE(
+        f.importPositions(s, importId, *evidence.result()).flag("replayed"));
+    CHECK(f.sceneIds->handleOf(
+              f.geometry->parameterValueAsObject<vsr::scene::Array>(
+                  "vertex.position"))
+        == originalPositions);
+    REQUIRE(
+        ::unlink((path + "/" + evidence.result()->get("file_name")->s).c_str())
+        == 0);
+    CHECK(std::filesystem::exists(path + "/edited.vmesh"));
+  }
+}
+
+SCENARIO(
+    "MCP preserved dependencies and target change back permanently conflict",
+    "[integration][mcp][mesh-import][mesh-pressure][mesh-pressure-conflicts]")
+{
+  const auto kind = GENERATE(0, 1, 2, 3);
+  PositionFixture f;
+  auto uv = f.scene.createArray(ANARI_FLOAT32_VEC2, 3);
+  const float coordinates[] = {0, 0, 1, 0, 0, 1};
+  uv->setData(static_cast<const void *>(coordinates));
+  f.geometry->setParameterObject("vertex.attribute0", *uv);
+  f.other->setParameterObject("vertex.attribute0", *uv);
+  const auto s = f.attach();
+  const auto evidence = f.working(s);
+  f.importPositions(s, 2, *evidence.result());
+  const auto imported = f.await(s, 2);
+  REQUIRE(imported.flag("committed"));
+  const auto batch = *imported.result()->get("batch_ref");
+  const auto replacementHandle = f.sceneIds->handleOf(
+      f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position"));
+  if (kind == 0) {
+    auto *parameter = f.geometry->parameter("vertex.position");
+    parameter->setEnabled(false);
+    parameter->setEnabled(true);
+  } else if (kind == 1) {
+    auto *shared =
+        f.other->parameterValueAsObject<vsr::scene::Array>("vertex.attribute0");
+    const float changed[] = {7, 8, 9, 10, 11, 12};
+    shared->setData(static_cast<const void *>(changed));
+    shared->setData(static_cast<const void *>(coordinates));
+  } else if (kind == 2) {
+    auto *array = f.geometry->parameterValueAsObject<vsr::scene::Array>(
+        "vertex.position");
+    auto bytes = std::vector<unsigned char>(
+        static_cast<const unsigned char *>(array->data()),
+        static_cast<const unsigned char *>(array->data()) + 36);
+    array->setData(static_cast<const void *>(PositionFixture::POINTS));
+    array->setData(static_cast<const void *>(bytes.data()));
+  } else {
+    const auto old = f.sceneIds->handleOf(uv.data());
+    f.scene.removeObject(uv.data());
+    auto replacement = f.scene.createArray(ANARI_FLOAT32_VEC2, 3);
+    replacement->setData(static_cast<const void *>(coordinates));
+    f.geometry->setParameterObject("vertex.attribute0", *replacement);
+    f.other->setParameterObject("vertex.attribute0", *replacement);
+    CHECK(f.sceneIds->handleOf(replacement.data()) != old);
+  }
+  for (std::uint64_t id = 3; id < 6; ++id) {
+    const auto version = f.geometry->lastParameterChange();
+    f.restoreBatch(s, id, batch);
+    const auto conflict = f.await(s, id);
+    CHECK(conflict.str("outcome") == "conflict");
+    CHECK_FALSE(conflict.flag("committed"));
+    CHECK(f.geometry->lastParameterChange() == version);
+    CHECK(f.sceneIds->handleOf(
+              f.geometry->parameterValueAsObject<vsr::scene::Array>(
+                  "vertex.position"))
+        == replacementHandle);
+    auto *currentUV = f.geometry->parameterValueAsObject<vsr::scene::Array>(
+        "vertex.attribute0");
+    CHECK(
+        std::memcmp(currentUV->data(), coordinates, sizeof(coordinates)) == 0);
+  }
+  f.exportMesh(s, 6, f.geometry.data());
+  CHECK(f.await(s, 6).str("outcome") == "ok");
+}
+
+SCENARIO(
+    "MCP copied receipts and recovery retain capacity across offthread teardown",
+    "[integration][mcp][mesh-import][mesh-pressure][mesh-pressure-teardown]")
+{
+  const auto memory = std::make_shared<vsr::rendering::FrameBudget>(8u << 20);
+  image::ExchangeLimits limits;
+  limits.reservePhysicalMemory = [memory](std::size_t bytes) {
+    return memory->reserve(bytes);
+  };
+  auto f = std::make_unique<PositionFixture>(limits);
+  const auto s = f->attach();
+  const auto evidence = f->working(s, "tracer", true);
+  f->importPositions(s, 2, *evidence.result());
+  const auto imported = f->await(s, 2);
+  REQUIRE(imported.flag("committed"));
+  const auto batch = *imported.result()->get("batch_ref");
+  const operations::Credentials credentials{
+      f->authority->launchCredential(), s.id, s.secret};
+  std::optional<operations::Status> heldStatus =
+      f->engine->status(credentials, {s.id, 2});
+  REQUIRE(heldStatus->committed);
+  auto entries = f->imageActivity->snapshot();
+  auto retained = f->edits->restorations().find(
+      {batch.get("launch_id")->s, batch.get("batch_id")->s});
+  REQUIRE(retained);
+  const auto receipt = heldStatus->result;
+  f->exportMesh(s, 3, f->geometry.data());
+  REQUIRE(
+      f->integration.service() > 0); // Starts a real worker before shutdown.
+  std::thread teardown([&] { f.reset(); });
+  teardown.join();
+  CHECK(heldStatus->result == receipt);
+  // A second isolated host shares the physical pool, not Scene/authority.
+  // Keep finite external pressure, then observe reservation refusal/recovery
+  // through READ export rather than interpreting a private byte counter.
+  auto pressure = memory->reserve(26u << 18);
+  REQUIRE(pressure);
+  PositionFixture next(limits);
+  const auto b = next.attach();
+  next.exportMesh(b, 1, next.geometry.data());
+  const auto busy = next.await(b, 1);
+  CHECK(busy.str("outcome") == "busy");
+  CHECK_FALSE(busy.flag("committed"));
+  CHECK(std::filesystem::is_empty(next.exchangePath()));
+  std::thread release([&] {
+    heldStatus.reset();
+    entries.clear();
+    retained.reset();
+  });
+  release.join();
+  next.exportMesh(b, 2, next.geometry.data());
+  const auto exported = next.await(b, 2);
+  REQUIRE(exported.str("outcome") == "ok");
+  CHECK(std::filesystem::exists(
+      next.exchangePath() + "/" + exported.result()->get("file_name")->s));
+}
+
+SCENARIO(
+    "MCP compound late withdrawal cancellation and replay never invent rollback",
+    "[integration][mcp][mesh-import][mesh-pressure][mesh-pressure-delivery]")
+{
+  const auto kind = GENERATE(0, 1, 2);
+  PositionFixture f;
+  const auto s = f.attach();
+  const auto evidence = f.working(s, "tracer", true);
+  const auto path = f.exchangePath();
+  const operations::Credentials credentials{
+      f.authority->launchCredential(), s.id, s.secret};
+  auto *observer = f.scene.updateDelegate().emplace<ObserveMeshPublication>();
+  bool once = false;
+  observer->observe = [&] {
+    if (once)
+      return;
+    once = true;
+    if (kind < 2)
+      f.authority->restrict(session::Target::scene(f.sceneId),
+          kind == 0 ? session::Capability::READ : session::Capability::EDIT);
+    else
+      f.engine->cancel(credentials, {s.id, 2});
+  };
+  f.importPositions(s, 2, *evidence.result());
+  const auto completed = f.await(s, 2);
+  REQUIRE(once);
+  REQUIRE(completed.flag("committed"));
+  CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+            ->size()
+      == 4);
+  if (kind == 0) {
+    CHECK_FALSE(completed.flag("result_visible"));
+    CHECK_FALSE(completed.result());
+    f.authority->relax(
+        session::Target::scene(f.sceneId), session::Capability::READ);
+  } else
+    REQUIRE(completed.result()->get("batch_ref"));
+  if (kind == 1) {
+    // Late EDIT withdrawal still permits READ, but neither another import
+    // nor restoration. The existing commit remains truthfully observable.
+    f.exportMesh(s, 3, f.geometry.data());
+    CHECK(f.await(s, 3).str("outcome") == "ok");
+    const auto batch = *completed.result()->get("batch_ref");
+    CHECK(f.restoreBatch(s, 4, batch).errorCode() == "forbidden");
+    f.authority->relax(
+        session::Target::scene(f.sceneId), session::Capability::EDIT);
+  }
+  const auto historical = f.status(s, s.id, 2);
+  REQUIRE(historical.flag("committed"));
+  REQUIRE(historical.result()->get("batch_ref"));
+  const auto batch = *historical.result()->get("batch_ref");
+  observer->observe = {};
+  REQUIRE(
+      ::unlink((path + "/" + evidence.result()->get("file_name")->s).c_str())
+      == 0);
+  REQUIRE(::unlink((path + "/edited.vmesh").c_str()) == 0);
+  CHECK(f.exportMesh(s, 1, f.geometry.data()).flag("replayed"));
+  CHECK_FALSE(std::filesystem::exists(
+      path + "/" + evidence.result()->get("file_name")->s));
+  f.restoreBatch(s, 5, batch);
+  const auto restored = f.await(s, 5);
+  REQUIRE(restored.flag("committed"));
+  CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == f.positions.data());
+  CHECK(f.importPositions(s, 2, *evidence.result()).flag("replayed"));
+  CHECK_FALSE(std::filesystem::exists(path + "/edited.vmesh"));
+  f.restoreBatch(s, 6, batch);
+  CHECK(f.await(s, 6).str("outcome") == "already_restored");
+  CHECK(f.status(s, s.id, 2).flag("committed"));
+}
+
+SCENARIO(
+    "MCP evicted mesh recovery stays charged without removing working files",
+    "[integration][mcp][mesh-import][mesh-pressure][mesh-pressure-eviction]")
+{
+  image::ExchangeLimits limits;
+  limits.globalRetentionBytes = 400000;
+  PositionFixture f(limits);
+  const auto a = f.attach();
+  const auto evidence = f.working(a, "tracer", true);
+  const auto file =
+      f.exchangePath() + "/" + evidence.result()->get("file_name")->s;
+  const auto size = std::filesystem::file_size(file);
+  f.importPositions(a, 2, *evidence.result());
+  const auto imported = f.await(a, 2);
+  REQUIRE(imported.flag("committed"));
+  const auto batch = *imported.result()->get("batch_ref");
+  auto held = f.edits->restorations().find(
+      {batch.get("launch_id")->s, batch.get("batch_id")->s});
+  REQUIRE(held);
+  for (unsigned i = 0; i < 1024; ++i)
+    REQUIRE(f.imageActivity->append(activity::Entry{}));
+  REQUIRE(f.rpc("vsr/detach", "{}", &a).status == 200);
+  const auto b = f.attach();
+  f.restoreBatch(b, 1, batch);
+  const auto expired = f.await(b, 1);
+  CHECK(expired.str("outcome") == "outcome_unavailable");
+  CHECK(expired.result()->get("reason")->s == "expired");
+  CHECK_FALSE(expired.flag("committed"));
+  CHECK(std::filesystem::file_size(file) == size);
+  CHECK(std::filesystem::exists(f.exchangePath() + "/edited.vmesh"));
+  f.tool(b, "vsr_discover", "{\"request_id\":2}");
+  const auto discovery = f.await(b, 2);
+  CHECK(discovery.result()
+            ->get("items")
+            ->a.at(0)
+            .get("image_exchange")
+            ->get("exchange_limits")
+            ->get("available_global_retention_bytes")
+            ->n
+      < 140000);
+  // The second Geometry still holds the original mesh. It is independently
+  // addressable, not an approximation or rebinding of the expired target.
+  f.geometry = f.other;
+  f.exportMesh(b, 3, f.geometry.data());
+  const auto fresh = f.await(b, 3);
+  REQUIRE(fresh.str("outcome") == "ok");
+  f.importPositions(b, 4, *fresh.result());
+  const auto busy = f.await(b, 4);
+  CHECK(busy.str("outcome") == "busy");
+  CHECK_FALSE(busy.flag("committed"));
+  held.reset();
+  f.images->pump();
+  f.importPositions(b, 5, *fresh.result());
+  const auto next = f.await(b, 5);
+  REQUIRE(next.flag("committed"));
+  f.restoreBatch(b, 6, *next.result()->get("batch_ref"));
+  REQUIRE(f.await(b, 6).flag("committed"));
+  f.restoreBatch(b, 7, batch);
+  CHECK(f.await(b, 7).str("outcome") == "outcome_unavailable");
+  CHECK(std::filesystem::file_size(file) == size);
+}
+
+SCENARIO("MCP mesh publication race cleanup never follows replacement links",
+    "[integration][mcp][mesh-export][mesh-pressure][mesh-pressure-cleanup]")
+{
+  const auto race = GENERATE(0, 1, 2, 3, 4, 5);
+  PositionFixture f;
+  TempDir outside;
+  const auto sentinel = outside.path + "/source.obj";
+  std::ofstream(sentinel) << "sentinel";
+  const auto s = f.attach();
+  const auto directory = f.exchangePath();
+  std::string name;
+  std::atomic<bool> raceApplied{false};
+  const operations::Credentials credentials{
+      f.authority->launchCredential(), s.id, s.secret};
+  struct ClearWriteHook
+  {
+    ~ClearWriteHook()
+    {
+      interceptExportWrite = false;
+      afterExportWrite = {};
+    }
+  } clear;
+  afterExportWrite = [&](int fd) {
+    char text[4096]{};
+    const auto link = "/proc/self/fd/" + std::to_string(fd);
+    if (::readlink(link.c_str(), text, sizeof(text) - 1) <= 0)
+      return;
+    name = text;
+    if (race == 0)
+      raceApplied = ::unlink(name.c_str()) == 0
+          && ::symlink(sentinel.c_str(), name.c_str()) == 0;
+    else if (race == 1)
+      raceApplied =
+          ::link(name.c_str(), (directory + "/alias.vmesh").c_str()) == 0;
+    else if (race == 2)
+      raceApplied = ::ftruncate(fd, 1) == 0;
+    else if (race == 3)
+      raceApplied = ::fchmod(fd, 0644) == 0;
+    else if (race == 4)
+      raceApplied =
+          ::rename(directory.c_str(), (directory + "-old").c_str()) == 0
+          && ::symlink(outside.path.c_str(), directory.c_str()) == 0;
+    else {
+      raceApplied = true;
+      f.engine->cancel(credentials, {s.id, 1});
+    }
+  };
+  interceptExportWrite = true;
+  f.exportMesh(s, 1, f.geometry.data());
+  const auto rejected = f.await(s, 1);
+  REQUIRE(raceApplied.load());
+  CHECK_FALSE(interceptExportWrite.load());
+  CHECK(
+      rejected.str("outcome") == (race == 5 ? "cancelled" : "invalid_request"));
+  CHECK_FALSE(rejected.flag("committed"));
+  CHECK(std::filesystem::file_size(sentinel) == 8);
+  std::ifstream source(sentinel);
+  std::string bytes;
+  source >> bytes;
+  CHECK(bytes == "sentinel");
+  if (race == 0)
+    CHECK(std::filesystem::is_symlink(name));
+  else if (race == 5) {
+    // Cancellation can publish its receipt before the owned worker drains.
+    // Cleanup must still complete at the ordinary owning-thread pump boundary.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::filesystem::exists(name)) {
+      f.drain();
+      REQUIRE(std::chrono::steady_clock::now() < deadline);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK_FALSE(std::filesystem::exists(name));
+  }
+  CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == f.positions.data());
+}
+
+SCENARIO(
+    "MCP restore cancellation before and after publication preserves one-way truth",
+    "[integration][mcp][mesh-import][mesh-pressure][mesh-pressure-restore-cancel]")
+{
+  const auto boundary = GENERATE(0, 1, 2);
+  PositionFixture f;
+  const auto s = f.attach();
+  const auto evidence = f.working(s, "tracer", true);
+  f.importPositions(s, 2, *evidence.result());
+  const auto imported = f.await(s, 2);
+  REQUIRE(imported.flag("committed"));
+  const auto batch = *imported.result()->get("batch_ref");
+  const operations::Credentials credentials{
+      f.authority->launchCredential(), s.id, s.secret};
+  auto *observer = f.scene.updateDelegate().emplace<ObserveMeshPublication>();
+  if (boundary == 0)
+    f.restores->setFaultInjector([&] {
+      f.engine->cancel(credentials, {s.id, 3});
+      return false;
+    });
+  else
+    observer->observe = [&] {
+      if (boundary == 1)
+        f.engine->cancel(credentials, {s.id, 3});
+      else
+        f.authority->restrict(
+            session::Target::scene(f.sceneId), session::Capability::READ);
+    };
+  f.restoreBatch(s, 3, batch);
+  const auto result = f.await(s, 3);
+  CHECK(result.flag("committed") == (boundary != 0));
+  if (boundary == 0) {
+    CHECK(result.str("outcome") == "cancelled");
+    CHECK(
+        f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+            ->size()
+        == 4);
+  } else {
+    CHECK(
+        f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+        == f.positions.data());
+    if (boundary == 2) {
+      CHECK_FALSE(result.flag("result_visible"));
+      CHECK_FALSE(result.result());
+      f.authority->relax(
+          session::Target::scene(f.sceneId), session::Capability::READ);
+    }
+  }
+  f.restores->setFaultInjector({});
+  observer->observe = {};
+  f.restoreBatch(s, 4, batch);
+  const auto next = f.await(s, 4);
+  CHECK(next.str("outcome") == (boundary == 0 ? "ok" : "already_restored"));
+  CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == f.positions.data());
+  CHECK(f.restoreBatch(s, 3, batch).flag("replayed"));
+  CHECK(f.status(s, s.id, 3).flag("committed") == (boundary != 0));
+}
+
+SCENARIO(
+    "MCP decoder cancellation releases capacity without modifying working files",
+    "[integration][mcp][mesh-import][mesh-pressure][mesh-pressure-worker]")
+{
+  PositionFixture f;
+  const auto s = f.attach();
+  const auto evidence = f.working(s, "tracer", true);
+  const auto file = f.exchangePath() + "/edited.vmesh";
+  const auto size = std::filesystem::file_size(file);
+  const operations::Credentials credentials{
+      f.authority->launchCredential(), s.id, s.secret};
+  struct ClearReadHook
+  {
+    ~ClearReadHook()
+    {
+      interceptImportRead = false;
+      afterImportRead = {};
+    }
+  } clear;
+  afterImportRead = [&](int) { f.engine->cancel(credentials, {s.id, 2}); };
+  interceptImportRead = true;
+  f.importPositions(s, 2, *evidence.result());
+  const auto cancelled = f.await(s, 2);
+  CHECK_FALSE(interceptImportRead.load());
+  CHECK(cancelled.str("outcome") == "cancelled");
+  CHECK_FALSE(cancelled.flag("committed"));
+  CHECK(f.scene.numberOfObjects(ANARI_ARRAY) == 1);
+  CHECK(std::filesystem::file_size(file) == size);
+  CHECK(f.importPositions(s, 2, *evidence.result()).flag("replayed"));
+  f.importPositions(s, 3, *evidence.result());
+  const auto imported = f.await(s, 3);
+  REQUIRE(imported.flag("committed"));
+  f.restoreBatch(s, 4, *imported.result()->get("batch_ref"));
+  REQUIRE(f.await(s, 4).flag("committed"));
+  CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == f.positions.data());
+  CHECK(std::filesystem::file_size(file) == size);
+}
+
+SCENARIO(
+    "MCP mesh capacity charges unique actual old storage rather than bindings",
+    "[integration][mcp][mesh-import][mesh-pressure][mesh-pressure-accounting]")
+{
+  constexpr std::size_t COUNT = 12288;
+  constexpr std::size_t PAYLOAD = COUNT * 12;
+  std::vector<float> points(COUNT * 3);
+  for (std::size_t i = 0; i < points.size(); ++i)
+    points[i] = PositionFixture::POINTS[i % 9];
+  std::vector<double> requirements;
+  for (unsigned independent = 0; independent < 2; ++independent) {
+    image::ExchangeLimits limits;
+    limits.globalRetentionBytes = 4096;
+    PositionFixture f(limits);
+    auto positions = f.scene.createArray(ANARI_FLOAT32_VEC3, COUNT);
+    positions->setData(static_cast<const void *>(points.data()));
+    auto normals = independent ? f.scene.createArray(ANARI_FLOAT32_VEC3, COUNT)
+                               : positions;
+    if (independent)
+      normals->setData(static_cast<const void *>(points.data()));
+    f.geometry->setParameterObject("vertex.position", *positions);
+    f.geometry->setParameterObject("vertex.normal", *normals)
+        ->setEnabled(false);
+    f.geometry->setParameterObject("vertex.attribute0", *normals);
+    f.geometry->setParameterObject("vertex.attribute1", *normals);
+    const auto s = f.attach();
+    const auto evidence = f.working(s, "split");
+    const auto revision = f.sceneIds->sceneRevision();
+    const auto objects = f.scene.numberOfObjects(ANARI_ARRAY);
+    f.importPositions(s, 2, *evidence.result());
+    const auto rejected = f.await(s, 2);
+    REQUIRE(rejected.str("outcome") == "busy");
+    REQUIRE(rejected.result()->get("required_capacity_bytes"));
+    requirements.push_back(
+        rejected.result()->get("required_capacity_bytes")->n);
+    CHECK(requirements.back() > 2 * PAYLOAD);
+    CHECK(rejected.result()->get("configured_capacity_bytes")->n == 4096);
+    CHECK_FALSE(rejected.flag("committed"));
+    CHECK(f.sceneIds->sceneRevision() == revision);
+    CHECK(f.scene.numberOfObjects(ANARI_ARRAY) == objects);
+    CHECK(
+        f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+        == positions.data());
+    CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.normal")
+        == normals.data());
+    CHECK(std::memcmp(positions->data(), points.data(), PAYLOAD) == 0);
+    CHECK(std::memcmp(normals->data(), points.data(), PAYLOAD) == 0);
+  }
+  // The second unique old Array costs its real bytes plus bounded lifetime
+  // controls. Extra aliases of that Array cannot multiply or erase this cost.
+  REQUIRE(requirements.size() == 2);
+  CHECK(requirements[1] - requirements[0] > PAYLOAD);
+  CHECK(requirements[1] - requirements[0] < PAYLOAD + 16384);
+}
+
 SCENARIO("MCP mesh import changes Helide pixels and restores identities",
     "[integration][mcp][mesh-import][mesh-topology][mesh-tool]")
 {
@@ -10611,5 +11332,263 @@ SCENARIO("Engine and Activity evict Image owners independently",
         == Outcome::OUTCOME_UNAVAILABLE);
   }
 }
+
+SCENARIO("MCP mixed Image Mesh history keeps the originating session ceiling",
+    "[integration][mcp][mesh-import][mesh-pressure][mesh-pressure-session]")
+{
+  image::ExchangeLimits limits;
+  limits.globalRetentionBytes = 128u << 20;
+  PositionFixture f(limits);
+  const auto a = f.attach();
+  const auto evidence = f.working(a, "tracer", true);
+  constexpr std::size_t BYTES = 16u << 20;
+  const std::vector<unsigned char> before(BYTES, 71), rows(BYTES + 2048, 0);
+  writeInput(f.exchangePath() + "/agent.png", inputPng(2048, 2048, 6, rows));
+  std::vector<vsr::scene::ArrayRef> images;
+  json::Value firstImageBatch, imageBatch;
+  for (std::uint64_t id = 2; id < 6; ++id) {
+    auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 2048, 2048);
+    image->setData(static_cast<const void *>(before.data()));
+    images.push_back(image);
+    const auto handle = f.sceneIds->handleOf(image.data());
+    f.importImage(a,
+        id,
+        f.objectHandle(image.data()),
+        *f.sceneIds->imageDataVersion(handle),
+        "agent.png");
+    const auto imported = f.await(a, id);
+    REQUIRE(imported.flag("committed"));
+    imageBatch = *imported.result()->get("batch_ref");
+    if (id == 2)
+      firstImageBatch = imageBatch;
+  }
+  f.tool(a, "vsr_discover", "{\"request_id\":6}");
+  const auto discovery = f.await(a, 6);
+  const auto *capacity = discovery.result()
+                             ->get("items")
+                             ->a.at(0)
+                             .get("image_exchange")
+                             ->get("exchange_limits");
+  CHECK(capacity->get("effective_global_retention_byte_cap")->n == 134217728);
+  CHECK(capacity->get("available_session_snapshot_bytes")->n == 0);
+  f.importPositions(a, 7, *evidence.result());
+  const auto busy = f.await(a, 7);
+  REQUIRE(busy.str("outcome") == "busy");
+  CHECK_FALSE(busy.flag("committed"));
+  CHECK(busy.result()->get("reason")->s == "restore_budget_exhausted");
+  REQUIRE(busy.result()->get("configured_session_capacity_bytes"));
+  CHECK(busy.result()->get("configured_session_capacity_bytes")->n == 67108864);
+  CHECK(busy.result()->get("available_session_snapshot_bytes")->n == 0);
+  CHECK(busy.result()->get("required_capacity_bytes")->n > 262144);
+  CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == f.positions.data());
+  f.restoreBatch(a, 8, firstImageBatch);
+  REQUIRE(f.await(a, 8).flag("committed"));
+  CHECK(std::memcmp(images.front()->data(), before.data(), BYTES) == 0);
+  f.importPositions(a, 9, *evidence.result());
+  const auto sameOrigin = f.await(a, 9);
+  REQUIRE(sameOrigin.flag("committed"));
+  f.restoreBatch(a, 10, *sameOrigin.result()->get("batch_ref"));
+  REQUIRE(f.await(a, 10).flag("committed"));
+  f.tool(a, "vsr_discover", "{\"request_id\":11}");
+  const auto recovered = f.await(a, 11);
+  CHECK(recovered.result()
+            ->get("items")
+            ->a.at(0)
+            .get("image_exchange")
+            ->get("exchange_limits")
+            ->get("available_session_snapshot_bytes")
+            ->n
+      == 16777216);
+  REQUIRE(f.rpc("vsr/detach", "{}", &a).status == 200);
+  const auto b = f.attach();
+  f.restoreBatch(b, 1, imageBatch);
+  REQUIRE(f.await(b, 1).flag("committed"));
+  CHECK(std::memcmp(images.back()->data(), before.data(), BYTES) == 0);
+  f.tool(b, "vsr_discover", "{\"request_id\":2}");
+  const auto discovered = f.await(b, 2);
+  CHECK(discovered.result()
+            ->get("items")
+            ->a.at(0)
+            .get("image_exchange")
+            ->get("exchange_limits")
+            ->get("available_session_snapshot_bytes")
+            ->n
+      == 67108864);
+  f.exportMesh(b, 3, f.geometry.data());
+  const auto fresh = f.await(b, 3);
+  REQUIRE(fresh.str("outcome") == "ok");
+  f.importPositions(b, 4, *fresh.result());
+  const auto imported = f.await(b, 4);
+  REQUIRE(imported.flag("committed"));
+  f.restoreBatch(b, 5, *imported.result()->get("batch_ref"));
+  REQUIRE(f.await(b, 5).flag("committed"));
+  CHECK(std::memcmp(f.positions->data(),
+            PositionFixture::POINTS,
+            sizeof(PositionFixture::POINTS))
+      == 0);
+}
+
+SCENARIO("MCP compound mesh ownership failures leave no published staging",
+    "[integration][mcp][mesh-import][mesh-pressure][mesh-pressure-failures]")
+{
+  const auto seam = GENERATE(4096u, 65536u, 262144u);
+  bool failing = false, preparing = false, refused = false;
+  const auto memory = std::make_shared<vsr::rendering::FrameBudget>(16u << 20);
+  image::ExchangeLimits limits;
+  limits.reservePhysicalMemory = [&, memory](std::size_t bytes) {
+    if (failing && bytes == 4096)
+      preparing = true;
+    if (failing
+        && (seam == 262144u ? bytes > 262144u && bytes < 294912u
+                            : bytes == seam && (seam != 65536u || preparing))) {
+      failing = false;
+      refused = true;
+      return std::shared_ptr<const void>{};
+    }
+    return memory->reserve(bytes);
+  };
+  PositionFixture f(limits);
+  f.geometry->setParameter("custom", 17.f);
+  const auto s = f.attach();
+  const auto evidence = f.working(s, "tracer", true);
+  const auto revision = f.sceneIds->sceneRevision();
+  const auto objects = f.scene.numberOfObjects(ANARI_ARRAY);
+  failing = true;
+  const auto admission = f.importPositions(s, 2, *evidence.result());
+  if (admission.errorCode().empty()) {
+    const auto rejected = f.await(s, 2);
+    CHECK(rejected.str("outcome") == "busy");
+    CHECK_FALSE(rejected.flag("committed"));
+  } else
+    CHECK(admission.errorCode() == "busy");
+  CHECK(refused);
+  CHECK(f.sceneIds->sceneRevision() == revision);
+  CHECK(f.scene.numberOfObjects(ANARI_ARRAY) == objects);
+  CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == f.positions.data());
+  CHECK_FALSE(f.geometry->parameter("primitive.index"));
+  CHECK(f.geometry->parameter("custom")->value().get<float>() == 17.f);
+  failing = false;
+  f.importPositions(s, 3, *evidence.result());
+  const auto imported = f.await(s, 3);
+  REQUIRE(imported.flag("committed"));
+  const auto batch = *imported.result()->get("batch_ref");
+  f.restores->setFaultInjector([] { return true; });
+  f.restoreBatch(s, 4, batch);
+  const auto busy = f.await(s, 4);
+  CHECK(busy.str("outcome") == "busy");
+  CHECK_FALSE(busy.flag("committed"));
+  f.restores->setFaultInjector({});
+  f.restoreBatch(s, 5, batch);
+  REQUIRE(f.await(s, 5).flag("committed"));
+  f.exportMesh(s, 6, f.geometry.data());
+  CHECK(f.await(s, 6).str("outcome") == "ok");
+}
+
+SCENARIO(
+    "MCP mesh input races and oversized carriers preserve the complete Scene",
+    "[integration][mcp][mesh-import][mesh-pressure][mesh-pressure-files]")
+{
+  PositionFixture f;
+  const auto s = f.attach();
+  const auto evidence = f.working(s, "tracer", true);
+  const auto path = f.exchangePath() + "/edited.vmesh";
+  const auto envelope = [&](const std::string &header) {
+    std::vector<unsigned char> bytes{'V', 'M', 'E', 'S', 'H', '0', '1', '\n'};
+    const auto length = std::uint32_t(header.size());
+    for (unsigned i = 0; i < 4; ++i)
+      bytes.push_back((length >> (8 * i)) & 255);
+    bytes.insert(bytes.end(), header.begin(), header.end());
+    writeInput(path, bytes);
+  };
+  bool race = false;
+  bool metadataPressure = false;
+  std::atomic<bool> raceApplied{false};
+  SECTION("unlink and replace the opened name")
+  {
+    race = true;
+    afterImportRead = [&, path](int) {
+      raceApplied = ::rename(path.c_str(), (path + ".old").c_str()) == 0
+          && ::symlink((path + ".old").c_str(), path.c_str()) == 0;
+    };
+  }
+  SECTION("the opened inode gains an external hard link")
+  {
+    race = true;
+    afterImportRead = [&, path](int) {
+      raceApplied = ::link(path.c_str(), (path + ".link").c_str()) == 0;
+    };
+  }
+  SECTION("private file permissions change during read")
+  {
+    race = true;
+    afterImportRead = [&](int fd) { raceApplied = ::fchmod(fd, 0400) == 0; };
+  }
+  SECTION("sparse oversized carrier is rejected before decode")
+  {
+    REQUIRE(::truncate(path.c_str(), (64u << 20) + 65536 + 13) == 0);
+  }
+  SECTION("structural expansion is bounded before JSON allocation")
+  {
+    std::string header =
+        "{\"revision\":1,\"byte_order\":\"little\",\"fields\":{},\"arrays\":{},\"source\":[0";
+    for (unsigned i = 0; i < 5000; ++i)
+      header += ",0";
+    envelope(header + "]}");
+    metadataPressure = true;
+  }
+  SECTION("an oversized declared header cannot expand a tiny carrier")
+  {
+    writeInput(
+        path, {'V', 'M', 'E', 'S', 'H', '0', '1', '\n', 255, 255, 255, 255});
+  }
+  SECTION("payload shape cannot allocate its declared missing bytes")
+  {
+    envelope(
+        "{\"revision\":1,\"byte_order\":\"little\",\"fields\":{\"vertex.position\":{\"action\":\"replace\",\"enabled\":true,\"association\":\"vertex\",\"payload\":\"a\"}},\"arrays\":{\"a\":{\"element_type\":\"ANARI_FLOAT64_VEC3\",\"count\":18446744073709551615,\"byte_length\":18446744073709551615}}}");
+  }
+  SECTION("an archive external member is not an exchange field")
+  {
+    const std::string header =
+        "{\"revision\":1,\"byte_order\":\"little\",\"fields\":{},\"arrays\":{},\"members\":[\"../../source.obj\"]}";
+    envelope(header);
+  }
+  struct ClearReadHook
+  {
+    ~ClearReadHook()
+    {
+      interceptImportRead = false;
+      afterImportRead = {};
+    }
+  } clear;
+  interceptImportRead = race;
+  const auto revision = f.sceneIds->sceneRevision();
+  const auto arrayCount = f.scene.numberOfObjects(ANARI_ARRAY);
+  f.importPositions(s, 2, *evidence.result());
+  const auto rejected = f.await(s, 2);
+  REQUIRE(rejected.str("outcome") == "invalid_request");
+  CHECK_FALSE(rejected.flag("committed"));
+  CHECK_FALSE(interceptImportRead.load());
+  if (race)
+    REQUIRE(raceApplied.load());
+  CHECK(f.sceneIds->sceneRevision() == revision);
+  CHECK(f.scene.numberOfObjects(ANARI_ARRAY) == arrayCount);
+  CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == f.positions.data());
+  CHECK(f.other->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == f.positions.data());
+  CHECK(std::memcmp(f.positions->data(),
+            PositionFixture::POINTS,
+            sizeof(PositionFixture::POINTS))
+      == 0);
+  CHECK_FALSE(f.geometry->parameter("primitive.index"));
+  if (!race && std::filesystem::file_size(path) > (64u << 20))
+    CHECK(rejected.result()->get("reason")->s == "mesh_file_limit");
+  if (metadataPressure)
+    CHECK(rejected.result()->get("reason")->s == "mesh_metadata_limit");
+}
+
+#include "MeshDeviceQualification.inc"
 
 #endif

@@ -595,7 +595,15 @@ inline RestoreResult RestoreService::commit(
           markConflicting(request.targetBatchRef, ctx);
         return res;
       }
-      if (!mesh::boundedParameters(*geometry)
+      // Removed prior Parameters and unrelated later UI metadata can each fit
+      // separately while their prepared union exceeds the charged map bound.
+      // Check all recovered string/control storage before making any copy.
+      std::size_t recoveredBytes = 0;
+      for (const auto &binding : snapshot->bindings)
+        if (binding.prior && !geometry->parameter(binding.name)
+            && !mesh::addParameterCopyBytes(*binding.prior, recoveredBytes))
+          throw std::bad_alloc();
+      if (!mesh::boundedParameters(*geometry, recoveredBytes)
           || !scene::detail::PreparedMeshBinding::available(*geometry))
         throw std::bad_alloc();
       transaction =

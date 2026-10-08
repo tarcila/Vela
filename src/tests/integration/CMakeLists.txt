@@ -25,4 +25,13 @@ add_test(NAME vsr::mesh-helper
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/test-mesh-bundle.py)
 add_test(NAME vsr::mesh-tool-helper
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/test-mesh-trimesh.py)
+add_test(NAME vsr::mesh-device-edit-helper
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/test-mesh-device-edit.py)
+if (VSR_USE_INTEGRATION_MCP AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # Always run the real-device fast control. Required GPU qualification is an
+  # explicit [.mesh-device] run for EACH required library, never a skip/pass.
+  add_test(NAME vsr::mesh-device-helide COMMAND ${PROJECT_NAME} "[.mesh-device]")
+  set_tests_properties(vsr::mesh-device-helide PROPERTIES ENVIRONMENT
+    "VSR_MESH_QUALIFICATION_LIBRARY=helide")
+endif()
 

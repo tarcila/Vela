@@ -15,7 +15,7 @@ machine-readable field, and `message` strings are explanatory only.
   | `tools/QueryTools.hpp` | `vsr_discover`, `vsr_inspect` | 103 |
   | `tools/LookupTools.hpp` | `vsr_operation_status`, `vsr_cancel` | 103 |
   | `tools/EditTools.hpp` | `vsr_edit`, `vsr_restore` | 104 |
-  | `tools/ImageTools.hpp` | `vsr_image_export`, `vsr_image_import`, `vsr_mesh_export` | Confined Image and Mesh exchange |
+  | `tools/ImageTools.hpp` | `vsr_image_export`, `vsr_image_import`, `vsr_mesh_export`, `vsr_mesh_import` | Confined Image and Mesh exchange |
   | `tools/RenderTools.hpp` | `vsr_render`, `vsr_render_image`, `vsr_select_device`, `vsr_set_view_camera`, `vsr_resynchronize` | 105 |
 
 ## Payload placement
@@ -65,7 +65,7 @@ form:
 | Field | Presence | Meaning |
 |---|---|---|
 | `operation_ref` | always | `{session_id, request_id}`. It is the complete qualified reference, including when the lookup names an earlier session's record |
-| `kind` | always | Retained operation kind: `discover`, `inspect`, `edit`, `restore`, `image_export`, `image_import`, `mesh_export`, `render`, `select_device`, `set_view_camera`, `resynchronize`. Preserved for lookups from later sessions |
+| `kind` | always | Retained operation kind: `discover`, `inspect`, `edit`, `restore`, `image_export`, `image_import`, `mesh_export`, `mesh_import`, `render`, `select_device`, `set_view_camera`, `resynchronize`. Preserved for lookups from later sessions |
 | `state` | always | `pending` or `terminal` |
 | `progress` | while a slot is held | A frozen non-terminal name (see below). `awaiting_cleanup` can coexist with `state: terminal` |
 | `outcome` | once terminal | A frozen code (see below) |
@@ -347,7 +347,6 @@ for launch-wide reservations, exhaustion and lifetime-safe cache resolution.
 | Tool | Arguments | Capability | Slot / ID |
 |---|---|---|---|
 | `vsr_image_export` | `request_id`, `scene_id`, `handle` | Scene READ | one normal scene slot, one request ID; no render encoder slot |
-| `vsr_mesh_export` | `request_id`, `scene_id`, `handle` | Scene READ | one normal scene slot, one request ID; no render encoder slot. Triangle Geometry only; [typed bundle/helper contract](../../../../docs/mesh-exchange.md). Mesh Import unavailable |
 
 All three arguments are required; additional properties reject before admission.
 The handle addresses an Array, not a Sampler. Status kind is `image_export` on
@@ -404,6 +403,46 @@ reservations or the normal RestoreService binding keep Import absent.
 See [PNG exchange](../../../../docs/image-png-exchange.md)
 for every limit field, encoder peak/output proof, Linux confinement and the
 separate explicit PNG-versus-undo cleanup policies.
+
+## Mesh Export and Import
+
+| Tool | Required arguments | Capability | Slot / ID |
+|---|---|---|---|
+| `vsr_mesh_export` | `request_id`, `scene_id`, `handle` | Scene READ | one normal scene slot and request ID; no render encoder slot |
+| `vsr_mesh_import` | `request_id`, `scene_id`, `handle`, `target_version`, `dependencies`, `file_name` | Scene READ+EDIT, enabled agent edits | one normal scene slot and request ID |
+
+Both address an exposed existing triangle Geometry, not an Array, Surface or
+Node. Unknown argument properties reject before admission. Each dependency is
+`{payload, handle, data_version}`; copy the complete list and `target_version`
+from a fresh export. Payload IDs are descriptive bundle-local keys, never
+permission to bind arbitrary live objects. `file_name` is a confined `.vmesh`
+basename, not a path. No bulk Array data appears in MCP text.
+
+Export status kind is `mesh_export`; its result includes `handle`, `file_name`,
+`target_version`, `dependencies` and `exchange_limits`. Inspect fields/Arrays
+with the documented helper on the working bundle, not from inline payloads.
+Import kind is `mesh_import`; changed success returns current `target_version`,
+`dependencies`, `scene_revision`, normal `batch_ref` and restoration policy.
+An equivalent import returns `unchanged: true`, committed=false, without a
+restoration batch. Postcommit synchronization failure is
+`applied_with_sync_failure`, committed=true, not rollback. Recover using ordinary
+`vsr_restore` and that `batch_ref`; the restore receipt supplies resulting
+`mesh_versions` as well as the existing version lists. Restore is conditional
+on required target/old/new bindings and data, not on the working file.
+
+Discovery/descriptor `image_exchange` metadata additionally reports
+`mesh_export`, `mesh_import`, `mesh_revision`, `mesh_exchange_directory`,
+`mesh_payload_byte_cap`, `mesh_header_byte_cap` and `mesh_field_cap`.
+Import tools are registered only for qualified recovery/reservation hosts;
+current authority is still checked at execution and delivery. There is no new
+mesh permission switch. Replay returns historical status without repeating
+import or rewriting/deleting a file.
+
+See [Mesh Exchange](../../../../docs/mesh-exchange.md) for the revision-1
+profile, exact action/alias semantics, finite ownership/file/decode limits,
+freshness, cleanup and refusal contracts; the linked installed cookbook and
+persistence guide cover external authoring and ordinary Scene Archive save/load.
+No general Object Archive or foreign asset import is exposed by these tools.
 
 ## Viewport WORLD bounds (ticket 09, partial qualification)
 
