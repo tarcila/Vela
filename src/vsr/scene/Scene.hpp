@@ -246,6 +246,7 @@ struct Scene
   void removeDefragCallback(size_t token);
 
  private:
+  friend class detail::PreparedPositionBinding;
   friend struct Layer;
   friend struct LayerNodeData;
   friend bool ::vsr::io::deserialize_CameraArchive(
@@ -268,6 +269,15 @@ struct Scene
   std::shared_ptr<detail::SceneDependencyState> m_dependencyState;
   ObjectDatabase m_db;
   std::shared_ptr<ArrayWriteSequence> m_imageWrites;
+
+  struct RetainedArrays
+  {
+    std::weak_ptr<const void> owner;
+    std::shared_ptr<const void> lease;
+    std::vector<std::weak_ptr<ArrayLifetime>> arrays;
+  };
+  std::vector<RetainedArrays> m_retainedArrays;
+  void drainRetainedArrays();
 
   struct DefaultObjects
   {

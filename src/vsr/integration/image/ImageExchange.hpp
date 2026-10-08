@@ -81,6 +81,14 @@ class ImageExchange
       const operations::OperationRef &ref,
       SceneId scene,
       identity::ObjectHandle handle);
+  operations::Admission submitMeshImport(
+      const session::Credentials &credentials,
+      const operations::OperationRef &ref,
+      SceneId scene,
+      identity::ObjectHandle handle,
+      std::string targetVersion,
+      std::string dependencies,
+      std::string fileName);
   operations::Admission submitImport(const session::Credentials &credentials,
       const operations::OperationRef &ref,
       SceneId scene,

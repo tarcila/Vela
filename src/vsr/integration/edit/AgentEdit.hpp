@@ -447,6 +447,30 @@ struct ImageSnapshot
   scene::Scene *scene{nullptr};
 };
 
+struct MeshSnapshot : ImageSnapshot
+{
+  struct Dependency
+  {
+    std::weak_ptr<scene::ArrayLifetime> lifetime;
+    std::uint64_t write{0};
+  };
+  struct Binding
+  {
+    core::Token name;
+    std::optional<scene::Parameter> prior;
+    std::weak_ptr<scene::ArrayLifetime> before;
+    std::weak_ptr<scene::ArrayLifetime> after;
+    bool present{false};
+    bool enabled{true};
+  };
+  ObjectHandle target;
+  scene::ObjectVersion targetVersion{0};
+  std::vector<Binding> bindings;
+  std::vector<Dependency> dependencies;
+  std::shared_ptr<const void> pinOwner;
+  std::size_t retainedBytes{0};
+};
+
 struct RestorationRecord
 {
   BatchRef ref;
@@ -457,6 +481,8 @@ struct RestorationRecord
   std::vector<ParameterVersionToken> resultingVersions;
   std::vector<NodeChange> nodeChanges;
   std::shared_ptr<ImageSnapshot> image;
+  // Mesh reuses Image's prepared bounded store/scope/receipt ownership.
+  std::shared_ptr<MeshSnapshot> mesh;
 };
 
 // Bounded restorable-batch store (spec §5: 32 by default). Publishing past

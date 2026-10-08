@@ -55,6 +55,7 @@ enum class OperationKind
   SET_VIEW_CAMERA,
   IMAGE_EXPORT,
   MESH_EXPORT,
+  MESH_IMPORT,
   IMAGE_IMPORT,
   EDIT,
   RESTORE,
@@ -77,6 +78,8 @@ inline const char *operationKindName(OperationKind k)
     return "image_export";
   case OperationKind::MESH_EXPORT:
     return "mesh_export";
+  case OperationKind::MESH_IMPORT:
+    return "mesh_import";
   case OperationKind::IMAGE_IMPORT:
     return "image_import";
   case OperationKind::EDIT:
@@ -318,6 +321,7 @@ inline OperationKind operationKindOf(const std::string &kind)
            OperationKind::SET_VIEW_CAMERA,
            OperationKind::IMAGE_EXPORT,
            OperationKind::MESH_EXPORT,
+           OperationKind::MESH_IMPORT,
            OperationKind::IMAGE_IMPORT,
            OperationKind::EDIT,
            OperationKind::RESTORE,

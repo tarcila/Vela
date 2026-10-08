@@ -5,7 +5,7 @@
 #include "catch.hpp"
 // vsr_integration
 #include "vsr/integration/mesh/MeshBundle.hpp"
-#include "vsr/integration/mesh/PositionReplacement.hpp"
+#include "vsr/integration/mesh/MeshReplacement.hpp"
 // std
 #include <cstring>
 #include <limits>
@@ -110,7 +110,7 @@ TEST_CASE("Mesh decoding bounds metadata before building a JSON tree",
   REQUIRE(bundle.fields.empty());
 }
 
-TEST_CASE("Position replacement validates the complete proposed triangle",
+TEST_CASE("Mesh replacement validates the complete proposed triangle",
     "[integration][mesh-bundle]")
 {
   vsr::scene::Scene scene;
@@ -133,9 +133,9 @@ TEST_CASE("Position replacement validates the complete proposed triangle",
       header, {-0.25f, -0.25f, 0.f, 0.25f, -0.25f, 0.f, 0.f, 0.25f, 0.f});
   mesh::Bundle bundle;
   REQUIRE(mesh::decodeBundle(std::move(bytes), bundle) == nullptr);
-  mesh::PositionReplacement replacement;
-  REQUIRE(mesh::preparePositions(*geometry, bundle, replacement) == nullptr);
-  REQUIRE(replacement.payload == 0);
+  mesh::MeshReplacement replacement;
+  REQUIRE(mesh::prepareMesh(*geometry, bundle, replacement) == nullptr);
+  REQUIRE(replacement.needed[0]);
   REQUIRE(replacement.changed);
   REQUIRE(geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
       == positions.data());
@@ -148,20 +148,20 @@ TEST_CASE("Position replacement validates the complete proposed triangle",
     auto shortNormals = scene.createArray(ANARI_FLOAT32_VEC3, 2);
     shortNormals->setData(normalData.data());
     geometry->setParameterObject("vertex.normal", *shortNormals);
-    REQUIRE(std::string(mesh::preparePositions(*geometry, bundle, replacement))
+    REQUIRE(std::string(mesh::prepareMesh(*geometry, bundle, replacement))
         == "attribute_count_mismatch");
   }
-  SECTION("a count change rejects explicitly")
+  SECTION("a count change without matching bytes rejects")
   {
     bundle.arrays[0].count = 6;
-    REQUIRE(std::string(mesh::preparePositions(*geometry, bundle, replacement))
-        == "count_change_unsupported");
+    REQUIRE(std::string(mesh::prepareMesh(*geometry, bundle, replacement))
+        == "invalid_payload_length");
   }
-  SECTION("an optional replacement rejects rather than applying positions")
+  SECTION("an optional replacement shares its declared position payload")
   {
     bundle.fields.push_back({"vertex.normal", mesh::Action::REPLACE, true, 0});
-    REQUIRE(std::string(mesh::preparePositions(*geometry, bundle, replacement))
-        == "field_action_unsupported");
+    REQUIRE(mesh::prepareMesh(*geometry, bundle, replacement) == nullptr);
+    REQUIRE(replacement.newCount == 1);
   }
   SECTION("disabled stored attributes remain part of final validation")
   {
@@ -169,7 +169,7 @@ TEST_CASE("Position replacement validates the complete proposed triangle",
     auto nonfinite = normalData;
     nonfinite[0] = std::numeric_limits<float>::infinity();
     normals->setData(nonfinite.data());
-    REQUIRE(std::string(mesh::preparePositions(*geometry, bundle, replacement))
+    REQUIRE(std::string(mesh::prepareMesh(*geometry, bundle, replacement))
         == "nonfinite_mesh_value");
   }
   SECTION("indices are checked against the proposed vertex count")
@@ -178,16 +178,16 @@ TEST_CASE("Position replacement validates the complete proposed triangle",
     const std::uint32_t invalid[] = {0, 1, 3};
     indices->setData(static_cast<const void *>(invalid));
     geometry->setParameterObject("primitive.index", *indices);
-    REQUIRE(std::string(mesh::preparePositions(*geometry, bundle, replacement))
+    REQUIRE(std::string(mesh::prepareMesh(*geometry, bundle, replacement))
         == "index_out_of_range");
   }
-  SECTION("an equivalent explicit replacement does not split bindings")
+  SECTION("an equivalent deliberately split payload retains split intent")
   {
     auto exact = carrier(header, original);
     REQUIRE(mesh::decodeBundle(std::move(exact), bundle) == nullptr);
     geometry->setParameterObject("vertex.normal", *positions);
-    REQUIRE(mesh::preparePositions(*geometry, bundle, replacement) == nullptr);
-    REQUIRE_FALSE(replacement.changed);
+    REQUIRE(mesh::prepareMesh(*geometry, bundle, replacement) == nullptr);
+    REQUIRE(replacement.changed);
     REQUIRE(geometry->parameterValueAsObject<vsr::scene::Array>("vertex.normal")
         == positions.data());
   }
@@ -196,17 +196,17 @@ TEST_CASE("Position replacement validates the complete proposed triangle",
     auto nonfinite = original;
     nonfinite[0] = std::numeric_limits<float>::infinity();
     positions->setData(nonfinite.data());
-    REQUIRE(mesh::preparePositions(*geometry, bundle, replacement) == nullptr);
+    REQUIRE(mesh::prepareMesh(*geometry, bundle, replacement) == nullptr);
     // Splitting an alias does not repair an unchanged field that still uses
     // the old samples.
     geometry->setParameterObject("vertex.normal", *positions);
-    REQUIRE(std::string(mesh::preparePositions(*geometry, bundle, replacement))
+    REQUIRE(std::string(mesh::prepareMesh(*geometry, bundle, replacement))
         == "nonfinite_mesh_value");
   }
   SECTION("mapping any retained dependency refuses preflight")
   {
     normals->map();
-    REQUIRE(std::string(mesh::preparePositions(*geometry, bundle, replacement))
+    REQUIRE(std::string(mesh::prepareMesh(*geometry, bundle, replacement))
         == "array_mapped");
     normals->unmap();
   }

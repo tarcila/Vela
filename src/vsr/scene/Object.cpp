@@ -15,7 +15,6 @@
 #include <algorithm>
 #include <cstring>
 #include <iomanip>
-#include <tuple>
 #if VSR_USE_CUDA
 #include <cuda_runtime.h>
 #endif
@@ -146,6 +145,7 @@ Object::Object(Object &&o)
   m_metadata = std::move(o.m_metadata);
   m_useCounts = std::move(o.m_useCounts);
   m_rendererDeviceName = std::move(o.m_rendererDeviceName);
+  m_versions.parameter = o.m_versions.parameter;
   for (auto &p : m_parameters)
     p.second.setObserver(this);
 }
@@ -164,6 +164,7 @@ Object &Object::operator=(Object &&o)
   m_metadata = std::move(o.m_metadata);
   m_useCounts = std::move(o.m_useCounts);
   m_rendererDeviceName = std::move(o.m_rendererDeviceName);
+  m_versions.parameter = o.m_versions.parameter;
   for (auto &p : m_parameters)
     p.second.setObserver(this);
   return *this;
@@ -504,11 +505,10 @@ void Object::endParameterBatch()
   std::sort(bp.begin(), bp.end());
   bp.erase(std::unique(bp.begin(), bp.end()), bp.end());
 
-  // Flush updates through delegate
+  // Record the write before downstream callbacks, which may throw.
+  m_versions.parameter++;
   if (m_updateDelegate)
     m_updateDelegate->signalParameterBatchUpdated(this, bp);
-
-  m_versions.parameter++;
 
   bp.clear();
 }
@@ -593,6 +593,8 @@ void Object::metadataChanged(std::string_view name)
 
 void Object::parameterChanged(const Parameter *p, const Any &oldValue)
 {
+  if (!m_inParameterBatch)
+    m_versions.parameter++;
   if (m_scene) {
     if (auto *obj = m_scene->getObject(oldValue); obj != nullptr)
       obj->decUseCount(UseKind::PARAMETER);
@@ -602,7 +604,6 @@ void Object::parameterChanged(const Parameter *p, const Any &oldValue)
     m_batchedParameters.push_back(p);
   } else if (m_updateDelegate) {
     m_updateDelegate->signalParameterUpdated(this, p);
-    m_versions.parameter++;
   }
 }
 

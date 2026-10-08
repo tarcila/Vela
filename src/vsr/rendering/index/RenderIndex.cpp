@@ -157,6 +157,19 @@ void RenderIndex::signalParameterRemoved(const Object *o, const Parameter *p)
 void RenderIndex::signalParameterBatchUpdated(
     const Object *o, const std::vector<const Parameter *> &ps)
 {
+  // Triangle topology/count changes require one coherent ANARI commit,
+  // including fields removed from the CPU Geometry. Do not commit new positions
+  // against old indices/attributes while refilling the existing object.
+  if (o->type() == ANARI_GEOMETRY
+      && o->subtype() == tokens::geometry::triangle) {
+    if (anari::Object obj = m_cache.getHandle(o, false); obj) {
+      auto d = device();
+      anari::unsetAllParameters(d, obj);
+      o->updateAllANARIParameters(d, obj, &m_cache);
+      anari::commitParameters(d, obj);
+    }
+    return;
+  }
   for (auto *p : ps)
     signalParameterUpdated(o, p);
 }

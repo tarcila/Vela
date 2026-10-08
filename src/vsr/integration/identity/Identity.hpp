@@ -14,6 +14,10 @@
 #include <random>
 #include <unordered_map>
 
+namespace vsr::integration::mesh {
+class MeshCommitAccess;
+}
+
 namespace vsr::integration::identity {
 
 /*
@@ -317,6 +321,7 @@ class SceneIdentity
 
   class Observer;
   friend class Observer;
+  friend class ::vsr::integration::mesh::MeshCommitAccess;
 
   static anari::DataType normalize(anari::DataType t);
   static bool isViewObject(anari::DataType t);
@@ -881,6 +886,12 @@ inline void SceneIdentity::track(const scene::Object *o)
   if (!o)
     return;
   const Key key{normalize(o->type()), o->index()};
+  // Prepared unpublished Arrays may already have reserved their identity.
+  if (const auto *array = dynamic_cast<const scene::Array *>(o))
+    if (auto *entry = entryOf(o))
+      if (const auto lifetime = entry->arrayLifetime.lock();
+          lifetime && lifetime->array == array)
+        return;
   // A stale mapping at a reused slot must never carry over to the newcomer.
   if (auto it = m_serialOf.find(key); it != m_serialOf.end())
     m_entries.erase(it->second);

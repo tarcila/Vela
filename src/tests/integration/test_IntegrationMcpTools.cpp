@@ -5389,6 +5389,1520 @@ SCENARIO(
       metadata.get("exchange_limits")->get("available_session_snapshot_bytes"));
 }
 
+struct PositionFixture : Fixture
+{
+  vsr::scene::ArrayRef positions;
+  vsr::scene::GeometryRef geometry;
+  vsr::scene::GeometryRef other;
+  static constexpr float POINTS[] = {-1, -1, 0, 1, -1, 0, 0, 1, 0};
+  PositionFixture(image::ExchangeLimits limits = {});
+  Reply working(const Session &session,
+      const std::string &mode = "",
+      bool topology = false);
+  Reply importPositions(const Session &session,
+      std::uint64_t id,
+      const json::Value &evidence,
+      const std::string &file = "edited.vmesh");
+};
+
+PositionFixture::PositionFixture(image::ExchangeLimits limits)
+    : Fixture({}, true, false, false, 120., true, UINT64_MAX, limits, true)
+{
+  auto hole = scene.createArray(ANARI_FLOAT32_VEC3, 1);
+  positions = scene.createArray(ANARI_FLOAT32_VEC3, 3);
+  scene.removeObject(hole.data());
+  positions->setData(static_cast<const void *>(POINTS));
+  geometry = scene.createObject<vsr::scene::Geometry>("triangle");
+  geometry->setParameterObject("vertex.position", *positions);
+  other = scene.createObject<vsr::scene::Geometry>("triangle");
+  other->setParameterObject("vertex.position", *positions);
+  auto material = scene.createObject<vsr::scene::Material>("matte");
+  auto root = scene.defaultLayer()->root();
+  scene.insertChildObjectNode(
+      root, scene.createSurface("target", geometry, material));
+  scene.insertChildObjectNode(
+      root, scene.createSurface("other", other, material));
+}
+
+Reply PositionFixture::working(
+    const Session &session, const std::string &mode, bool topology)
+{
+  REQUIRE(exportMesh(session, 1, geometry.data()).str("kind") == "mesh_export");
+  auto exported = await(session, 1);
+  REQUIRE(exported.str("outcome") == "ok");
+  const auto path = exchangePath();
+  const auto command = std::string(VSR_MESH_TEST_PYTHON) + " "
+      + VSR_MESH_TEST_SOURCE
+      + (topology ? "/scripts/test-mesh-topology.py '"
+                  : "/scripts/test-mesh-position.py '")
+      + path + "/" + exported.result()->get("file_name")->s + "' '" + path
+      + "/edited.vmesh' " + mode;
+  REQUIRE(std::system(command.c_str()) == 0);
+  return exported;
+}
+
+Reply PositionFixture::importPositions(const Session &session,
+    std::uint64_t id,
+    const json::Value &evidence,
+    const std::string &file)
+{
+  return tool(session,
+      "vsr_mesh_import",
+      "{\"request_id\":" + std::to_string(id)
+          + ",\"scene_id\":" + std::to_string(sceneId) + ",\"handle\":"
+          + json::quote(objectHandle(geometry.data())) + ",\"target_version\":"
+          + json::write(*evidence.get("target_version"))
+          + ",\"dependencies\":" + json::write(*evidence.get("dependencies"))
+          + ",\"file_name\":" + json::quote(file) + "}");
+}
+
+SCENARIO("MCP position import checks scoped freshness before I/O and commit",
+    "[integration][mcp][mesh-import][mesh-import-guards]")
+{
+  PositionFixture f;
+  const auto session = f.attach();
+  const auto evidence = f.working(session);
+  const auto arrayCount = f.scene.numberOfObjects(ANARI_ARRAY);
+  std::string expected = "conflict";
+  bool disableAtExecution = false;
+  SECTION("ordinary dependency writes and change back do not revive evidence")
+  {
+    f.positions->setData(static_cast<const void *>(PositionFixture::POINTS));
+  }
+  SECTION("binding change back does not revive target evidence")
+  {
+    f.geometry->parameter("vertex.position")->setEnabled(false);
+    f.geometry->parameter("vertex.position")->setEnabled(true);
+  }
+  SECTION("a required ordinary map stays open")
+  {
+    REQUIRE(f.positions->map());
+    expected = "busy";
+  }
+  SECTION("unrelated Geometry and camera work does not invalidate evidence")
+  {
+    f.other->setParameter("unrelated", 1.f);
+    auto camera = f.scene.createObject<vsr::scene::Camera>("perspective");
+    camera->setParameter("position", vsr::math::float3(4, 5, 6));
+    expected = "ok";
+  }
+  SECTION("agent edits disabled at execution forbids before file errors")
+  {
+    disableAtExecution = true;
+    expected = "forbidden";
+  }
+  REQUIRE(f.importPositions(session, 2, *evidence.result()).str("kind")
+      == "mesh_import");
+  if (disableAtExecution)
+    f.authority->setAgentEditsDisabled(true);
+  const auto result = f.await(session, 2);
+  CHECK(result.str("outcome") == expected);
+  if (expected != "ok") {
+    CHECK_FALSE(result.flag("committed"));
+    CHECK(
+        f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+        == f.positions.data());
+    CHECK(f.scene.numberOfObjects(ANARI_ARRAY) == arrayCount);
+    CHECK(f.edits->restorations().size() == 0);
+  }
+  if (f.positions->isMapped())
+    f.positions->unmap();
+}
+
+SCENARIO("MCP position restoration protects both old and replacement data",
+    "[integration][mcp][mesh-import][mesh-import-restore]")
+{
+  PositionFixture f;
+  const auto session = f.attach();
+  const auto evidence = f.working(session);
+  f.importPositions(session, 2, *evidence.result());
+  const auto imported = f.await(session, 2);
+  REQUIRE(imported.flag("committed"));
+  const auto batch = *imported.result()->get("batch_ref");
+  auto *replacement =
+      f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position");
+  const auto replacementHandle = f.sceneIds->handleOf(replacement);
+  const auto priorHandle = f.sceneIds->handleOf(f.positions.data());
+  std::string expected = "conflict";
+  SECTION("another Geometry mutates retained old positions")
+  {
+    f.other->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+        ->setData(static_cast<const void *>(PositionFixture::POINTS));
+  }
+  SECTION("replacement data changes back")
+  {
+    const auto bytes = std::vector<std::uint8_t>(
+        static_cast<const std::uint8_t *>(replacement->data()),
+        static_cast<const std::uint8_t *>(replacement->data())
+            + sizeof(PositionFixture::POINTS));
+    replacement->setData(static_cast<const void *>(PositionFixture::POINTS));
+    replacement->setData(static_cast<const void *>(bytes.data()));
+  }
+  SECTION("explicit old Array deletion cannot be repaired by cloning")
+  {
+    f.scene.removeObject(f.positions.data());
+  }
+  SECTION("mapped prior data remains busy and eligible")
+  {
+    REQUIRE(f.positions->map());
+    expected = "busy";
+  }
+  SECTION("unrelated user adopts replacement and survives exact restore")
+  {
+    f.other->setParameterObject("vertex.position", *replacement);
+    expected = "ok";
+  }
+  SECTION("ordinary GC and Array relocation cannot collect retained identities")
+  {
+    f.other->removeParameter("vertex.position");
+    for (int i = 0; i < 150; ++i)
+      f.scene.createArray(ANARI_FLOAT32_VEC3, 3);
+    f.scene.removeUnusedObjects();
+    f.scene.defragmentObjectStorage();
+    expected = "ok";
+  }
+  f.restoreBatch(session, 3, batch);
+  const auto result = f.await(session, 3);
+  CHECK(result.str("outcome") == expected);
+  CHECK(result.flag("committed") == (expected == "ok"));
+  if (expected == "conflict") {
+    f.restoreBatch(session, 4, batch);
+    CHECK(f.await(session, 4).str("outcome") == "conflict");
+  } else if (expected == "ok") {
+    CHECK(f.sceneIds->handleOf(
+              f.geometry->parameterValueAsObject<vsr::scene::Array>(
+                  "vertex.position"))
+        == priorHandle);
+    CHECK(std::memcmp(
+              f.geometry
+                  ->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+                  ->data(),
+              PositionFixture::POINTS,
+              sizeof(PositionFixture::POINTS))
+        == 0);
+    f.restoreBatch(session, 4, batch);
+    CHECK(f.await(session, 4).str("outcome") == "already_restored");
+  } else {
+    CHECK(f.restores->eligible(
+        {batch.get("launch_id")->s, batch.get("batch_id")->s}));
+    f.positions->unmap();
+  }
+  // Adoption preserves replacement identity; unadopted data is collectible.
+  if (expected == "ok") {
+    const auto *adopter =
+        f.other->parameterValueAsObject<vsr::scene::Array>("vertex.position");
+    const bool adopted =
+        adopter && adopter == f.sceneIds->resolve(replacementHandle);
+    f.images->pump();
+    f.scene.removeUnusedObjects();
+    CHECK((f.sceneIds->resolve(replacementHandle) != nullptr) == adopted);
+  }
+}
+
+SCENARIO(
+    "MCP position import preserves aliases and accepts independently authored data",
+    "[integration][mcp][mesh-import]")
+{
+  PositionFixture f;
+  std::string mode = "independent";
+  SECTION("independent source has no export receipt metadata") {}
+  SECTION("selective replacement splits only the declared position alias")
+  {
+    f.geometry->setParameterObject("vertex.normal", *f.positions);
+    f.geometry->parameter("vertex.normal")->setEnabled(false);
+    mode = "split";
+  }
+  const auto session = f.attach();
+  const auto evidence = f.working(session, mode);
+  f.importPositions(session, 2, *evidence.result());
+  auto result = f.await(session, 2);
+  REQUIRE(result.flag("committed"));
+  if (mode == "split") {
+    CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.normal")
+        == f.positions.data());
+    CHECK_FALSE(f.geometry->parameter("vertex.normal")->isEnabled());
+    REQUIRE(result.result()->get("dependencies")->a.size() == 2);
+  }
+  // Returned evidence is immediately usable; equivalent data is a no-op.
+  f.importPositions(session, 3, *result.result());
+  const auto unchanged = f.await(session, 3);
+  INFO(json::write(unchanged.json));
+  INFO(json::write(result.json));
+  REQUIRE(unchanged.str("outcome") == "ok");
+  CHECK_FALSE(unchanged.flag("committed"));
+  f.restoreBatch(session, 4, *result.result()->get("batch_ref"));
+  CHECK(f.await(session, 4).flag("committed"));
+  CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == f.positions.data());
+}
+
+SCENARIO(
+    "MCP position import refuses insufficient retained capacity before publication",
+    "[integration][mcp][mesh-import][mesh-import-capacity]")
+{
+  image::ExchangeLimits limits;
+  limits.globalRetentionBytes = 4096;
+  PositionFixture f(limits);
+  const auto session = f.attach();
+  const auto evidence = f.working(session);
+  const auto arrayCount = f.scene.numberOfObjects(ANARI_ARRAY);
+  f.importPositions(session, 2, *evidence.result());
+  const auto result = f.await(session, 2);
+  REQUIRE(result.str("outcome") == "busy");
+  CHECK_FALSE(result.flag("committed"));
+  REQUIRE(result.result()->get("required_capacity_bytes"));
+  CHECK(result.result()->get("required_capacity_bytes")->n > 4096);
+  CHECK(result.result()->get("configured_capacity_bytes")->n == 4096);
+  CHECK(f.scene.numberOfObjects(ANARI_ARRAY) == arrayCount);
+  CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == f.positions.data());
+  CHECK(f.edits->restorations().size() == 0);
+}
+
+struct ThrowMeshNotifications : vsr::scene::EmptyUpdateDelegate
+{
+  bool fail{true};
+  void signalParameterUpdated(
+      const vsr::scene::Object *object, const vsr::scene::Parameter *) override;
+  void signalParameterBatchUpdated(const vsr::scene::Object *object,
+      const std::vector<const vsr::scene::Parameter *> &) override;
+};
+
+void ThrowMeshNotifications::signalParameterBatchUpdated(
+    const vsr::scene::Object *object,
+    const std::vector<const vsr::scene::Parameter *> &)
+{
+  signalParameterUpdated(object, nullptr);
+}
+
+void ThrowMeshNotifications::signalParameterUpdated(
+    const vsr::scene::Object *object, const vsr::scene::Parameter *)
+{
+  if (fail && object->type() == ANARI_GEOMETRY)
+    throw std::runtime_error("test downstream mesh notification failure");
+}
+
+SCENARIO(
+    "MCP position synchronization failure remains committed and restorable",
+    "[integration][mcp][mesh-import][mesh-import-notification]")
+{
+  const bool topology = GENERATE(false, true);
+  PositionFixture f;
+  const auto session = f.attach();
+  const auto evidence = f.working(session, topology ? "tracer" : "", topology);
+  auto *notifications =
+      f.scene.updateDelegate().emplace<ThrowMeshNotifications>();
+  SECTION("downstream Geometry notification fails") {}
+  SECTION("normal synchronization hook fails")
+  {
+    notifications->fail = false;
+    f.hookOk = false;
+  }
+  f.importPositions(session, 2, *evidence.result());
+  const auto imported = f.await(session, 2);
+  REQUIRE(imported.flag("committed"));
+  REQUIRE(imported.str("outcome") == "applied_with_sync_failure");
+  const auto batch = *imported.result()->get("batch_ref");
+  CHECK(f.restores->eligible(
+      {batch.get("launch_id")->s, batch.get("batch_id")->s}));
+  f.restoreBatch(session, 3, batch);
+  const auto restored = f.await(session, 3);
+  REQUIRE(restored.flag("committed"));
+  CHECK(restored.str("outcome") == "applied_with_sync_failure");
+  CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == f.positions.data());
+  CHECK(std::memcmp(f.positions->data(),
+            PositionFixture::POINTS,
+            sizeof(PositionFixture::POINTS))
+      == 0);
+  f.restoreBatch(session, 4, batch);
+  CHECK(f.await(session, 4).str("outcome") == "already_restored");
+}
+
+SCENARIO(
+    "MCP position reservations expose no staging and unwind precommit refusal",
+    "[integration][mcp][mesh-import][mesh-import-memory]")
+{
+  const bool topology = GENERATE(false, true);
+  PositionFixture *host = nullptr;
+  bool observe = false, escaped = false, deny = false,
+       allocationFailure = false;
+  bool preparing = false, stale = false, map = false;
+  const auto physical =
+      std::make_shared<vsr::rendering::FrameBudget>(16u << 20);
+  image::ExchangeLimits limits;
+  limits.reservePhysicalMemory =
+      [&](std::size_t bytes) -> std::shared_ptr<const void> {
+    if (observe && host) {
+      if (host->geometry->parameterValueAsObject<vsr::scene::Array>(
+              "vertex.position")
+          == host->positions.data())
+        escaped = escaped || host->scene.numberOfObjects(ANARI_ARRAY) != 1;
+      if (bytes == 4096)
+        preparing = true;
+      if (bytes == 65536 && preparing && stale) {
+        stale = false;
+        host->positions->setData(
+            static_cast<const void *>(PositionFixture::POINTS));
+      }
+      if (bytes == 65536 && preparing && map) {
+        map = false;
+        REQUIRE(host->positions->map());
+      }
+      if (bytes == 65536 && preparing && deny) {
+        deny = false;
+        host->authority->setAgentEditsDisabled(true);
+      }
+      if (bytes == 4096 && allocationFailure) {
+        allocationFailure = false;
+        return {};
+      }
+    }
+    return physical->reserve(bytes);
+  };
+  PositionFixture f(limits);
+  host = &f;
+  const auto session = f.attach();
+  const auto evidence = f.working(session, topology ? "tracer" : "", topology);
+  observe = true;
+  std::string expected = "ok";
+  SECTION("reentrant host reservations only enumerate published objects") {}
+  SECTION("authority withdrawal during preparation forbids before publication")
+  {
+    deny = true;
+    expected = "forbidden";
+  }
+  SECTION("a required Array becoming mapped at receipt preparation rejects")
+  {
+    map = true;
+    expected = "busy";
+  }
+  SECTION("a dependency write at receipt preparation is stale")
+  {
+    stale = true;
+    expected = "conflict";
+  }
+  SECTION("control allocation failure unwinds before publication")
+  {
+    allocationFailure = true;
+    expected = "busy";
+  }
+  f.importPositions(session, 2, *evidence.result());
+  const auto result = f.await(session, 2);
+  CHECK(result.str("outcome") == expected);
+  CHECK_FALSE(escaped);
+  if (expected != "ok") {
+    CHECK_FALSE(result.flag("committed"));
+    CHECK(f.scene.numberOfObjects(ANARI_ARRAY) == 1);
+    CHECK(f.edits->restorations().size() == 0);
+    CHECK(
+        f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+        == f.positions.data());
+    f.authority->setAgentEditsDisabled(false);
+    observe = false;
+    if (f.positions->isMapped())
+      f.positions->unmap();
+    if (expected != "conflict" && expected != "busy") {
+      f.importPositions(session, 3, *evidence.result());
+      CHECK(f.await(session, 3).flag("committed"));
+    }
+    json::Value metadata;
+    REQUIRE(json::parse(f.images->metadata(f.sceneId, session.id), metadata));
+    if (expected == "busy" || expected == "conflict")
+      CHECK(metadata.get("exchange_limits")
+                ->get("available_session_snapshot_bytes")
+                ->n
+          == 67108864);
+  }
+}
+
+SCENARIO("MCP position restoration rechecks authority after preparation",
+    "[integration][mcp][mesh-import][mesh-import-guards]")
+{
+  PositionFixture f;
+  const auto session = f.attach();
+  const auto evidence = f.working(session);
+  f.importPositions(session, 2, *evidence.result());
+  const auto imported = f.await(session, 2);
+  REQUIRE(imported.flag("committed"));
+  const auto batch = *imported.result()->get("batch_ref");
+  f.restores->setFaultInjector([&] {
+    f.authority->setAgentEditsDisabled(true);
+    return false;
+  });
+  f.restoreBatch(session, 3, batch);
+  const auto rejected = f.await(session, 3);
+  CHECK(rejected.str("outcome") == "forbidden");
+  CHECK_FALSE(rejected.flag("committed"));
+  CHECK(f.restores->eligible(
+      {batch.get("launch_id")->s, batch.get("batch_id")->s}));
+  f.restores->setFaultInjector({});
+  f.authority->setAgentEditsDisabled(false);
+  f.restoreBatch(session, 4, batch);
+  CHECK(f.await(session, 4).flag("committed"));
+}
+
+SCENARIO(
+    "MCP position import refuses unsafe confined files without publishing objects",
+    "[integration][mcp][mesh-import][mesh-import-files]")
+{
+  PositionFixture f;
+  const auto session = f.attach();
+  const auto evidence = f.working(session);
+  std::string file = "edited.vmesh";
+  bool envelope = false;
+  SECTION("traversal is not a bundle name")
+  {
+    file = "../edited.vmesh";
+    envelope = true;
+  }
+  SECTION("absolute paths are not authority")
+  {
+    file = f.exchangePath() + "/edited.vmesh";
+    envelope = true;
+  }
+  SECTION("symbolic links are never followed")
+  {
+    REQUIRE(
+        ::symlink("edited.vmesh", (f.exchangePath() + "/link.vmesh").c_str())
+        == 0);
+    file = "link.vmesh";
+  }
+  SECTION("hard links cannot supply an input")
+  {
+    REQUIRE(::link((f.exchangePath() + "/edited.vmesh").c_str(),
+                (f.exchangePath() + "/linked.vmesh").c_str())
+        == 0);
+    file = "linked.vmesh";
+  }
+  SECTION("malformed bundles cannot publish a staging Array")
+  {
+    std::ofstream(f.exchangePath() + "/edited.vmesh", std::ios::binary)
+        << "VMESH01\nmalformed";
+  }
+  const auto admission =
+      f.importPositions(session, 2, *evidence.result(), file);
+  if (envelope)
+    CHECK(admission.errorCode() == "invalid_request");
+  else {
+    const auto result = f.await(session, 2);
+    CHECK(result.str("outcome") == "invalid_request");
+    CHECK_FALSE(result.flag("committed"));
+  }
+  CHECK(f.scene.numberOfObjects(ANARI_ARRAY) == 1);
+  CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == f.positions.data());
+}
+
+SCENARIO(
+    "MCP position import rejects exhausted tracking without a binding write",
+    "[integration][mcp][mesh-import][mesh-import-exhaustion]")
+{
+  const bool topology = GENERATE(false, true);
+  // The compound case permits two detached payload writes, then exhausts
+  // admission. Even partially prepared Arrays must never enter the Scene.
+  Fixture f({}, true, false, false, 120., true, topology ? 3 : 1, {}, true);
+  auto positions = f.scene.createArray(ANARI_FLOAT32_VEC3, 3);
+  positions->setData(static_cast<const void *>(PositionFixture::POINTS));
+  auto geometry = f.scene.createObject<vsr::scene::Geometry>("triangle");
+  geometry->setParameterObject("vertex.position", *positions);
+  const auto session = f.attach();
+  f.exportMesh(session, 1, geometry.data());
+  const auto evidence = f.await(session, 1);
+  REQUIRE(evidence.str("outcome") == "ok");
+  const auto path = f.exchangePath();
+  REQUIRE(std::system(
+              (std::string(VSR_MESH_TEST_PYTHON) + " " + VSR_MESH_TEST_SOURCE
+                  + (topology ? "/scripts/test-mesh-topology.py '"
+                              : "/scripts/test-mesh-position.py '")
+                  + path + "/" + evidence.result()->get("file_name")->s + "' '"
+                  + path + "/edited.vmesh'")
+                  .c_str())
+      == 0);
+  f.tool(session,
+      "vsr_mesh_import",
+      "{\"request_id\":2,\"scene_id\":" + std::to_string(f.sceneId)
+          + ",\"handle\":" + json::quote(f.objectHandle(geometry.data()))
+          + ",\"target_version\":"
+          + json::write(*evidence.result()->get("target_version"))
+          + ",\"dependencies\":"
+          + json::write(*evidence.result()->get("dependencies"))
+          + ",\"file_name\":\"edited.vmesh\"}");
+  const auto rejected = f.await(session, 2);
+  REQUIRE_FALSE(rejected.flag("committed"));
+  CHECK(rejected.str("outcome") == "busy");
+  CHECK(f.scene.numberOfObjects(ANARI_ARRAY) == 1);
+  CHECK(geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == positions.data());
+  CHECK(std::memcmp(positions->data(),
+            PositionFixture::POINTS,
+            sizeof(PositionFixture::POINTS))
+      == 0);
+  CHECK(f.edits->restorations().size() == 0);
+}
+
+SCENARIO("MCP position import shares Image retention and directory quotas",
+    "[integration][mcp][mesh-import][mesh-import-capacity]")
+{
+  image::ExchangeLimits limits;
+  limits.globalRetentionBytes = 20000;
+  PositionFixture f(limits);
+  const auto session = f.attach();
+  const auto evidence = f.working(session);
+  std::string expected = "busy";
+  SECTION("an eligible Image snapshot consumes the same retained-data pool")
+  {
+    auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 64, 64);
+    const auto handle = f.objectHandle(image.data());
+    f.exportImage(session, 2, handle);
+    const auto exported = f.await(session, 2);
+    REQUIRE(exported.str("outcome") == "ok");
+    f.importImage(session,
+        3,
+        handle,
+        exported.result()->get("data_version")->s,
+        exported.result()->get("file_name")->s);
+    const auto imported = f.await(session, 3);
+    REQUIRE(imported.flag("committed"));
+    REQUIRE(f.edits->restorations().size() == 1);
+  }
+  SECTION("agent-created working files cannot bypass the shared finite quota")
+  {
+    for (int i = 0; i < 1024; ++i)
+      std::ofstream(f.exchangePath() + "/quota-" + std::to_string(i) + ".png")
+          << 'x';
+  }
+  f.importPositions(session, 4, *evidence.result());
+  const auto rejected = f.await(session, 4);
+  CHECK(rejected.str("outcome") == expected);
+  CHECK_FALSE(rejected.flag("committed"));
+  CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == f.positions.data());
+  CHECK(std::memcmp(f.positions->data(),
+            PositionFixture::POINTS,
+            sizeof(PositionFixture::POINTS))
+      == 0);
+}
+
+SCENARIO(
+    "MCP position cancellation never fabricates rollback after publication",
+    "[integration][mcp][mesh-import][mesh-import-cancellation]")
+{
+  PositionFixture f;
+  const auto session = f.attach();
+  const auto evidence = f.working(session);
+  f.importPositions(session, 2, *evidence.result());
+  bool afterCommit = false;
+  SECTION("cancel before capture") {}
+  SECTION("cancel after binding publication but before synchronization")
+  {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (
+        f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+        == f.positions.data()) {
+      f.images->pump();
+      f.integration.service();
+      REQUIRE(std::chrono::steady_clock::now() < deadline);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    afterCommit = true;
+  }
+  f.tool(
+      session, "vsr_cancel", "{\"operation_ref\":" + ref(session.id, 2) + "}");
+  const auto result = f.await(session, 2);
+  CHECK(result.flag("committed") == afterCommit);
+  CHECK(
+      (f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+          != f.positions.data())
+      == afterCommit);
+  if (afterCommit) {
+    REQUIRE(result.result());
+    REQUIRE(result.result()->get("batch_ref"));
+    f.restoreBatch(session, 3, *result.result()->get("batch_ref"));
+    CHECK(f.await(session, 3).flag("committed"));
+  } else {
+    CHECK(result.str("outcome") == "cancelled");
+    CHECK(f.edits->restorations().size() == 0);
+  }
+}
+
+SCENARIO("MCP mesh import rejects incoherent actions without partial writes",
+    "[integration][mcp][mesh-import][mesh-import-actions]")
+{
+  PositionFixture f;
+  std::string mode;
+  SECTION("count changes require compatible retained attributes")
+  {
+    f.geometry->setParameterObject("vertex.normal", *f.positions);
+    mode = "count";
+  }
+  SECTION("enabled state changes are not position data edits")
+  {
+    mode = "state";
+  }
+  SECTION("per-primitive additions require primitive cardinality")
+  {
+    mode = "primitive";
+  }
+  const auto session = f.attach();
+  const auto evidence = f.working(session, mode);
+  const auto revision = f.sceneIds->sceneRevision();
+  f.importPositions(session, 2, *evidence.result());
+  const auto rejected = f.await(session, 2);
+  CHECK(rejected.str("outcome") == "invalid_request");
+  CHECK_FALSE(rejected.flag("committed"));
+  CHECK(f.sceneIds->sceneRevision() == revision);
+  CHECK(f.scene.numberOfObjects(ANARI_ARRAY) == 1);
+  CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == f.positions.data());
+  CHECK(f.geometry->parameter("vertex.position")->isEnabled());
+  CHECK(bool(f.geometry->parameter("vertex.normal")) == (mode == "count"));
+  CHECK_FALSE(f.geometry->parameter("primitive.color"));
+}
+
+struct ObserveMeshPublication : vsr::scene::EmptyUpdateDelegate
+{
+  std::function<void()> observe;
+  void signalObjectAdded(const vsr::scene::Object *) override;
+  void signalParameterBatchUpdated(const vsr::scene::Object *,
+      const std::vector<const vsr::scene::Parameter *> &) override;
+  void signalParameterUpdated(
+      const vsr::scene::Object *, const vsr::scene::Parameter *) override;
+  void signalParameterRemoved(
+      const vsr::scene::Object *, const vsr::scene::Parameter *) override;
+};
+
+void ObserveMeshPublication::signalParameterBatchUpdated(
+    const vsr::scene::Object *,
+    const std::vector<const vsr::scene::Parameter *> &)
+{
+  if (observe)
+    observe();
+}
+
+void ObserveMeshPublication::signalObjectAdded(const vsr::scene::Object *)
+{
+  if (observe)
+    observe();
+}
+void ObserveMeshPublication::signalParameterUpdated(
+    const vsr::scene::Object *, const vsr::scene::Parameter *)
+{
+  if (observe)
+    observe();
+}
+void ObserveMeshPublication::signalParameterRemoved(
+    const vsr::scene::Object *, const vsr::scene::Parameter *)
+{
+  if (observe)
+    observe();
+}
+
+SCENARIO(
+    "MCP compound mesh updates preserve associations and exact prior presence",
+    "[integration][mcp][mesh-import][mesh-compound]")
+{
+  PositionFixture f;
+  auto uv = f.scene.createArray(ANARI_FLOAT32_VEC2, 3);
+  const float coordinates[] = {0, 0, 1, 0, 0, 1};
+  uv->setData(static_cast<const void *>(coordinates));
+  f.geometry->setParameterObject("vertex.attribute0", *uv)
+      ->setDescription("original gathered UV binding")
+      .setEnabled(false);
+  f.geometry->setParameterObject("vertex.attribute1", *uv);
+  f.other->setParameterObject("vertex.attribute0", *uv);
+  const auto oldUV = f.sceneIds->handleOf(uv.data());
+  const auto oldPositions = f.sceneIds->handleOf(f.positions.data());
+  std::string mode = "tracer";
+  SECTION("indexed open triangles and optional aliases") {}
+  SECTION("nonindexed count change with explicit attribute removals")
+  {
+    mode = "nonindexed";
+  }
+  SECTION("nonmanifold overlaps and degeneracy remain structural data")
+  {
+    mode = "nonmanifold";
+  }
+  SECTION("explicit enabled state and independent equal payloads")
+  {
+    mode = "enabled";
+  }
+  SECTION(
+      "replacement changes numeric widths and retains fixed-point semantics")
+  {
+    mode = "typed64";
+  }
+  const auto session = f.attach();
+  const auto evidence = f.working(session, mode, true);
+  auto *observer = f.scene.updateDelegate().emplace<ObserveMeshPublication>();
+  bool observed = false, coherent = true;
+  observer->observe = [&] {
+    observed = true;
+    const auto *positions =
+        f.geometry->parameterValueAsObject<vsr::scene::Array>(
+            "vertex.position");
+    const auto *indices = f.geometry->parameterValueAsObject<vsr::scene::Array>(
+        "primitive.index");
+    coherent = coherent && positions && positions != f.positions.data()
+        && positions->size() == (mode == "nonindexed" ? 6 : 4)
+        && !f.geometry->parameter("vertex.attribute0")
+        && !f.geometry->parameter("vertex.attribute1");
+    coherent = coherent
+        && (mode == "nonindexed" ? !indices
+                                 : indices
+                    && indices->size() == (mode == "nonmanifold" ? 4 : 2));
+  };
+  f.importPositions(session, 2, *evidence.result());
+  const auto imported = f.await(session, 2);
+  INFO(json::write(imported.json));
+  REQUIRE(imported.flag("committed"));
+  REQUIRE(imported.str("outcome") == "ok");
+  CHECK(observed);
+  CHECK(coherent);
+  observer->observe = {};
+  CHECK(f.sceneIds->handleOf(f.other->parameterValueAsObject<vsr::scene::Array>(
+            "vertex.position"))
+      == oldPositions);
+  CHECK(f.sceneIds->handleOf(f.other->parameterValueAsObject<vsr::scene::Array>(
+            "vertex.attribute0"))
+      == oldUV);
+  CHECK(std::memcmp(uv->data(), coordinates, sizeof(coordinates)) == 0);
+  if (mode == "nonindexed") {
+    const float expected[] = {
+        9, -1, 0, 9, -1, 0, 11, -1, 0, 11, -1, 0, 10, 1, 0, 10, 1, 0};
+    CHECK(std::memcmp(
+              f.geometry
+                  ->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+                  ->data(),
+              expected,
+              sizeof(expected))
+        == 0);
+  }
+  if (mode == "typed64") {
+    const auto *positions =
+        f.geometry->parameterValueAsObject<vsr::scene::Array>(
+            "vertex.position");
+    const auto *indices = f.geometry->parameterValueAsObject<vsr::scene::Array>(
+        "primitive.index");
+    const auto *colors =
+        f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.color");
+    REQUIRE(colors);
+    CHECK(positions->elementType() == ANARI_FLOAT64_VEC3);
+    CHECK(static_cast<const double *>(positions->data())[0] == -0.4);
+    CHECK(indices->elementType() == ANARI_UINT64_VEC3);
+    const std::uint64_t expected[] = {0, 1, 2, 0, 2, 3};
+    CHECK(std::memcmp(indices->data(), expected, sizeof(expected)) == 0);
+    CHECK(colors->elementType() == ANARI_UFIXED8_VEC4);
+    const unsigned char expectedColor[] = {0, 1, 254, 255};
+    CHECK(
+        std::memcmp(colors->data(), expectedColor, sizeof(expectedColor)) == 0);
+    CHECK_FALSE(f.geometry->parameter("vertex.color")->isEnabled());
+  }
+  if (mode == "nonmanifold") {
+    const std::uint32_t expected[] = {0, 1, 2, 0, 1, 3, 0, 1, 2, 0, 0, 0};
+    const auto *indices = f.geometry->parameterValueAsObject<vsr::scene::Array>(
+        "primitive.index");
+    CHECK(indices->elementType() == ANARI_UINT32_VEC3);
+    CHECK(std::memcmp(indices->data(), expected, sizeof(expected)) == 0);
+  }
+  if (mode != "nonindexed") {
+    const auto *corner = f.geometry->parameterValueAsObject<vsr::scene::Array>(
+        "faceVarying.attribute2");
+    REQUIRE(corner);
+    CHECK(corner->elementType() == ANARI_INT16_VEC2);
+    CHECK(corner->size() == (mode == "nonmanifold" ? 12 : 6));
+    CHECK(static_cast<const std::int16_t *>(corner->data())[1] == 1);
+    CHECK_FALSE(f.geometry->parameter("faceVarying.attribute2")->isEnabled());
+    const auto *tangent =
+        f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.tangent");
+    REQUIRE(tangent);
+    CHECK(tangent->elementType() == ANARI_FLOAT64_VEC4);
+    CHECK(static_cast<const double *>(tangent->data())[3] == -1);
+    const auto *color = f.geometry->parameterValueAsObject<vsr::scene::Array>(
+        "primitive.color");
+    const auto *alias = f.geometry->parameterValueAsObject<vsr::scene::Array>(
+        "primitive.attribute1");
+    CHECK((color == alias) == (mode != "enabled"));
+    CHECK(f.geometry->parameter("primitive.attribute1")->isEnabled()
+        == (mode == "enabled"));
+  }
+  const auto batch = *imported.result()->get("batch_ref");
+  f.scene.removeUnusedObjects();
+  f.scene.defragmentObjectStorage();
+  f.restoreBatch(session, 3, batch);
+  const auto restored = f.await(session, 3);
+  INFO(json::write(restored.json));
+  REQUIRE(restored.flag("committed"));
+  CHECK(f.sceneIds->handleOf(
+            f.geometry->parameterValueAsObject<vsr::scene::Array>(
+                "vertex.position"))
+      == oldPositions);
+  CHECK(f.sceneIds->handleOf(
+            f.geometry->parameterValueAsObject<vsr::scene::Array>(
+                "vertex.attribute0"))
+      == oldUV);
+  CHECK(
+      f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.attribute0")
+      == f.geometry->parameterValueAsObject<vsr::scene::Array>(
+          "vertex.attribute1"));
+  CHECK_FALSE(f.geometry->parameter("vertex.attribute0")->isEnabled());
+  CHECK(f.geometry->parameter("vertex.attribute0")->description()
+      == "original gathered UV binding");
+  CHECK_FALSE(f.geometry->parameter("primitive.index"));
+  CHECK_FALSE(f.geometry->parameter("primitive.color"));
+  CHECK_FALSE(f.geometry->parameter("primitive.attribute1"));
+  CHECK_FALSE(f.geometry->parameter("faceVarying.attribute2"));
+  CHECK_FALSE(f.geometry->parameter("vertex.tangent"));
+  CHECK_FALSE(f.geometry->parameter("vertex.color"));
+}
+
+SCENARIO("MCP mesh rejects incompatible whole final state before publication",
+    "[integration][mcp][mesh-import][mesh-compound]")
+{
+  PositionFixture f;
+  auto uv = f.scene.createArray(ANARI_FLOAT32_VEC2, 3);
+  const float coordinates[] = {0, 0, 1, 0, 0, 1};
+  uv->setData(static_cast<const void *>(coordinates));
+  f.geometry->setParameterObject("vertex.attribute0", *uv);
+  std::string mode;
+  SECTION("omitted incompatible vertex attributes remain retained")
+  {
+    mode = "retain";
+  }
+  SECTION("index equal to vertex count is out of range")
+  {
+    mode = "range";
+  }
+  SECTION("disabled corner data still requires corner cardinality")
+  {
+    mode = "corner-count";
+  }
+  SECTION("disabled indices require implicit triangle cardinality")
+  {
+    mode = "index-off";
+  }
+  const auto session = f.attach();
+  const auto evidence = f.working(session, mode, true);
+  const auto revision = f.sceneIds->sceneRevision();
+  const auto arrayCount = f.scene.numberOfObjects(ANARI_ARRAY);
+  f.importPositions(session, 2, *evidence.result());
+  const auto result = f.await(session, 2);
+  REQUIRE(result.str("outcome") == "invalid_request");
+  CHECK_FALSE(result.flag("committed"));
+  CHECK(f.sceneIds->sceneRevision() == revision);
+  CHECK(f.scene.numberOfObjects(ANARI_ARRAY) == arrayCount);
+  CHECK(
+      f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.attribute0")
+      == uv.data());
+  CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == f.positions.data());
+  CHECK(f.edits->restorations().size() == 0);
+}
+
+SCENARIO("MCP compound restore conflicts on every required old and new buffer",
+    "[integration][mcp][mesh-import][mesh-compound]")
+{
+  PositionFixture f;
+  auto uv = f.scene.createArray(ANARI_FLOAT32_VEC2, 3);
+  const float coordinates[] = {0, 0, 1, 0, 0, 1};
+  uv->setData(static_cast<const void *>(coordinates));
+  f.geometry->setParameterObject("vertex.attribute0", *uv);
+  f.other->setParameterObject("vertex.attribute0", *uv);
+  const auto session = f.attach();
+  const auto evidence = f.working(session, "tracer", true);
+  f.importPositions(session, 2, *evidence.result());
+  const auto imported = f.await(session, 2);
+  REQUIRE(imported.flag("committed"));
+  auto *replacement =
+      f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position");
+  const auto replacementIdentity = f.sceneIds->handleOf(replacement);
+  vsr::scene::Array *changed = nullptr;
+  bool remove = false;
+  SECTION("old positions through another Geometry")
+  {
+    changed = f.positions.data();
+  }
+  SECTION("removed old UV through another Geometry")
+  {
+    changed = uv.data();
+  }
+  SECTION("old removed dependency retired")
+  {
+    changed = uv.data();
+    remove = true;
+  }
+  SECTION("new position data")
+  {
+    changed = replacement;
+  }
+  SECTION("new index data")
+  {
+    changed = f.geometry->parameterValueAsObject<vsr::scene::Array>(
+        "primitive.index");
+  }
+  SECTION("new alias data")
+  {
+    changed = f.geometry->parameterValueAsObject<vsr::scene::Array>(
+        "primitive.attribute1");
+  }
+  SECTION("new disabled corner data")
+  {
+    changed = f.geometry->parameterValueAsObject<vsr::scene::Array>(
+        "faceVarying.attribute2");
+  }
+  SECTION("new disabled tangent data")
+  {
+    changed =
+        f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.tangent");
+  }
+  REQUIRE(changed);
+  if (remove)
+    f.scene.removeObject(changed);
+  else {
+    // Even a byte-exact write/change-back cannot revive restoration
+    // eligibility.
+    REQUIRE(changed->map());
+    changed->unmap();
+  }
+  f.restoreBatch(session, 3, *imported.result()->get("batch_ref"));
+  const auto refused = f.await(session, 3);
+  CHECK(refused.str("outcome") == "conflict");
+  CHECK_FALSE(refused.flag("committed"));
+  CHECK(f.sceneIds->handleOf(
+            f.geometry->parameterValueAsObject<vsr::scene::Array>(
+                "vertex.position"))
+      == replacementIdentity);
+  CHECK_FALSE(f.geometry->parameter("vertex.attribute0"));
+  f.restoreBatch(session, 4, *imported.result()->get("batch_ref"));
+  CHECK(f.await(session, 4).str("outcome") == "conflict");
+}
+
+SCENARIO("MCP mesh no-change and deliberate alias actions preserve intent",
+    "[integration][mcp][mesh-import][mesh-compound]")
+{
+  PositionFixture f;
+  f.geometry->setParameterObject("vertex.normal", *f.positions)
+      ->setEnabled(false);
+  const auto old = f.sceneIds->handleOf(f.positions.data());
+  std::string mode;
+  SECTION("lossless preserved alias no-op")
+  {
+    mode = "noop";
+  }
+  SECTION("equivalent explicit full alias replacement is a no-op")
+  {
+    mode = "equivalent";
+  }
+  SECTION("helper write replaces the full alias group")
+  {
+    mode = "alias-write";
+  }
+  SECTION("byte-equivalent deliberate split still splits")
+  {
+    mode = "split-equal";
+  }
+  SECTION("selective data replacement splits only declared field")
+  {
+    mode = "split";
+  }
+  const auto session = f.attach();
+  const auto evidence = f.working(session, mode, true);
+  const auto arrayCount = f.scene.numberOfObjects(ANARI_ARRAY);
+  const auto revision = f.sceneIds->sceneRevision();
+  f.importPositions(session, 2, *evidence.result());
+  const auto imported = f.await(session, 2);
+  REQUIRE(imported.str("outcome") == "ok");
+  const bool unchanged = mode == "noop" || mode == "equivalent";
+  CHECK(imported.flag("committed") == !unchanged);
+  const auto *positions =
+      f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position");
+  const auto *normals =
+      f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.normal");
+  CHECK((positions == normals) == (unchanged || mode == "alias-write"));
+  CHECK_FALSE(f.geometry->parameter("vertex.normal")->isEnabled());
+  if (unchanged) {
+    CHECK(f.scene.numberOfObjects(ANARI_ARRAY) == arrayCount);
+    CHECK(f.sceneIds->sceneRevision() == revision);
+    CHECK(f.sceneIds->handleOf(positions) == old);
+    CHECK_FALSE(imported.result()->get("batch_ref"));
+  } else {
+    CHECK(f.sceneIds->handleOf(positions) != old);
+    if (mode != "alias-write")
+      CHECK(f.sceneIds->handleOf(normals) == old);
+    f.restoreBatch(session, 3, *imported.result()->get("batch_ref"));
+    REQUIRE(f.await(session, 3).flag("committed"));
+    CHECK(
+        f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+        == f.geometry->parameterValueAsObject<vsr::scene::Array>(
+            "vertex.normal"));
+    CHECK(f.sceneIds->handleOf(
+              f.geometry->parameterValueAsObject<vsr::scene::Array>(
+                  "vertex.position"))
+        == old);
+  }
+}
+
+SCENARIO("MCP compound mesh rejects malformed action and numeric envelopes",
+    "[integration][mcp][mesh-import][mesh-compound]")
+{
+  const auto mode = GENERATE("malformed-preserve",
+      "malformed-field",
+      "malformed-type",
+      "malformed-revision",
+      "malformed-overflow",
+      "malformed-length",
+      "malformed-nonfinite",
+      "malformed-duplicate");
+  PositionFixture f;
+  const auto session = f.attach();
+  const auto evidence = f.working(session, mode, true);
+  const auto revision = f.sceneIds->sceneRevision();
+  f.importPositions(session, 2, *evidence.result());
+  const auto rejected = f.await(session, 2);
+  INFO(mode);
+  INFO(json::write(rejected.json));
+  CHECK(rejected.str("outcome") == "invalid_request");
+  CHECK_FALSE(rejected.flag("committed"));
+  CHECK(f.sceneIds->sceneRevision() == revision);
+  CHECK(f.scene.numberOfObjects(ANARI_ARRAY) == 1);
+  CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == f.positions.data());
+  CHECK(f.edits->restorations().size() == 0);
+}
+
+SCENARIO("MCP mesh bounds copied Parameter metadata before preparation",
+    "[integration][mcp][mesh-import][mesh-compound]")
+{
+  PositionFixture f;
+  std::size_t length = 65536;
+  SECTION("existing metadata alone exceeds the copy bound") {}
+  SECTION("added controls must leave the final target immediately restorable")
+  {
+    length = 64000;
+  }
+  f.geometry->setParameter("notes", std::string(length, 'x'));
+  const auto session = f.attach();
+  const auto evidence = f.working(session, "tracer", true);
+  const auto revision = f.sceneIds->sceneRevision();
+  f.importPositions(session, 2, *evidence.result());
+  const auto rejected = f.await(session, 2);
+  CHECK(rejected.str("outcome") == "invalid_request");
+  CHECK(rejected.result()->get("reason")->s == "mesh_parameter_limit");
+  CHECK_FALSE(rejected.flag("committed"));
+  CHECK(f.scene.numberOfObjects(ANARI_ARRAY) == 1);
+  CHECK(f.sceneIds->sceneRevision() == revision);
+  CHECK(
+      f.geometry->parameter("notes")->value().getStringView().size() == length);
+}
+
+SCENARIO("MCP mesh respects active ordinary Parameter batches",
+    "[integration][mcp][mesh-import][mesh-compound]")
+{
+  PositionFixture f;
+  const auto session = f.attach();
+  const auto evidence = f.working(session, "tracer", true);
+  const auto count = f.scene.numberOfObjects(ANARI_ARRAY);
+  f.geometry->beginParameterBatch();
+  f.importPositions(session, 2, *evidence.result());
+  const auto rejected = f.await(session, 2);
+  CHECK_FALSE(rejected.flag("committed"));
+  CHECK(rejected.result()->get("reason")->s == "parameter_batch_active");
+  CHECK(f.scene.numberOfObjects(ANARI_ARRAY) == count);
+  CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == f.positions.data());
+  f.geometry->endParameterBatch();
+  CHECK(f.edits->restorations().size() == 0);
+}
+
+SCENARIO(
+    "MCP compound preparation captures removed metadata without overwriting unrelated edits",
+    "[integration][mcp][mesh-import][mesh-compound]")
+{
+  PositionFixture *host = nullptr;
+  bool preparing = false, update = false, updated = false;
+  const auto physical =
+      std::make_shared<vsr::rendering::FrameBudget>(16u << 20);
+  image::ExchangeLimits limits;
+  limits.reservePhysicalMemory =
+      [&](std::size_t bytes) -> std::shared_ptr<const void> {
+    if (host && update) {
+      if (bytes == 4096)
+        preparing = true;
+      if (preparing && bytes == 65536
+          && host->geometry->parameter("vertex.attribute0")) {
+        update = false;
+        updated = true;
+        host->geometry->parameter("vertex.attribute0")
+            ->setDescription("latest old metadata");
+        host->geometry->parameter("custom")->setDescription(
+            "unrelated metadata");
+      }
+    }
+    return physical->reserve(bytes);
+  };
+  PositionFixture f(limits);
+  host = &f;
+  auto uv = f.scene.createArray(ANARI_FLOAT32_VEC2, 3);
+  const float coordinates[] = {0, 0, 1, 0, 0, 1};
+  uv->setData(static_cast<const void *>(coordinates));
+  f.geometry->setParameterObject("vertex.attribute0", *uv)
+      ->setDescription("initial metadata");
+  f.geometry->setParameter("custom", 17.f);
+  const auto session = f.attach();
+  const auto evidence = f.working(session, "tracer", true);
+  update = true;
+  f.importPositions(session, 2, *evidence.result());
+  const auto imported = f.await(session, 2);
+  REQUIRE(imported.flag("committed"));
+  CHECK(updated);
+  CHECK(f.geometry->parameter("custom")->description() == "unrelated metadata");
+  f.geometry->parameter("vertex.position")
+      ->setDescription("post-import unrelated metadata");
+  f.restoreBatch(session, 3, *imported.result()->get("batch_ref"));
+  REQUIRE(f.await(session, 3).flag("committed"));
+  CHECK(f.geometry->parameter("vertex.attribute0")->description()
+      == "latest old metadata");
+  CHECK(f.geometry->parameter("vertex.position")->description()
+      == "post-import unrelated metadata");
+  CHECK(f.geometry->parameter("custom")->description() == "unrelated metadata");
+  CHECK(f.geometry->parameter("custom")->value().get<float>() == 17.f);
+}
+
+SCENARIO(
+    "MCP mesh can change an optional enabled state without allocating Arrays",
+    "[integration][mcp][mesh-import][mesh-compound]")
+{
+  PositionFixture f;
+  f.geometry->setParameterObject("vertex.normal", *f.positions)
+      ->setEnabled(false);
+  const auto session = f.attach();
+  const auto evidence = f.working(session, "normal-on", true);
+  const auto count = f.scene.numberOfObjects(ANARI_ARRAY);
+  f.importPositions(session, 2, *evidence.result());
+  const auto imported = f.await(session, 2);
+  REQUIRE(imported.flag("committed"));
+  CHECK(f.scene.numberOfObjects(ANARI_ARRAY) == count);
+  CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == f.positions.data());
+  CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.normal")
+      == f.positions.data());
+  CHECK(f.geometry->parameter("vertex.normal")->isEnabled());
+  f.restoreBatch(session, 3, *imported.result()->get("batch_ref"));
+  REQUIRE(f.await(session, 3).flag("committed"));
+  CHECK_FALSE(f.geometry->parameter("vertex.normal")->isEnabled());
+  CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.normal")
+      == f.positions.data());
+  CHECK(f.scene.numberOfObjects(ANARI_ARRAY) == count);
+}
+
+SCENARIO("MCP mesh receipts retain charged owners safely past Scene teardown",
+    "[integration][mcp][mesh-import][mesh-import-owners]")
+{
+  auto memory = std::make_shared<vsr::rendering::FrameBudget>(16u << 20);
+  const auto baseline = memory->used();
+  image::ExchangeLimits limits;
+  limits.reservePhysicalMemory = [memory](std::size_t bytes) {
+    return memory->reserve(bytes);
+  };
+  auto f = std::make_unique<PositionFixture>(limits);
+  const auto session = f->attach();
+  const auto evidence = f->working(session);
+  f->importPositions(session, 2, *evidence.result());
+  REQUIRE(f->await(session, 2).flag("committed"));
+  const operations::Credentials credentials{
+      f->authority->launchCredential(), session.id, session.secret};
+  std::optional<operations::Status> held =
+      f->engine->status(credentials, {session.id, 2});
+  REQUIRE(held->committed);
+  const auto live = memory->used();
+  auto entries = f->imageActivity->snapshot();
+  REQUIRE(entries.size() == 2);
+  CHECK(entries[1].entry.kind == activity::OperationKind::MESH_IMPORT);
+  std::optional<activity::Entry> copied = entries[1].entry;
+  CHECK(memory->used() > live);
+  auto oldLifetime = f->positions->lifetime();
+  auto replacementLifetime =
+      f->geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+          ->lifetime();
+  const auto bytes = held->result;
+  f.reset();
+  CHECK(oldLifetime.expired());
+  CHECK(replacementLifetime.expired());
+  CHECK(memory->used() > 0);
+  CHECK(held->result == bytes);
+  std::thread release([&] {
+    held.reset();
+    entries.clear();
+    copied.reset();
+  });
+  release.join();
+  CHECK(memory->used() == baseline);
+}
+
+SCENARIO(
+    "MCP position import checks identity exposure and strict envelopes before file I/O",
+    "[integration][mcp][mesh-import][mesh-import-authority]")
+{
+  PositionFixture f;
+  const auto session = f.attach();
+  const auto evidence = f.working(session);
+  identity::SceneIdentity foreignIds(f.ids, f.hidden);
+  f.images->attachScene(f.hiddenId, foreignIds);
+  auto foreign = f.hidden.createObject<vsr::scene::Geometry>("triangle");
+  auto handle = f.objectHandle(f.geometry.data());
+  std::string extra, expected = "invalid_request";
+  bool schema = false, withdraw = false;
+  SECTION("wrong kind rejects before missing-file disclosure")
+  {
+    handle = f.objectHandle(f.scene.getObject<vsr::scene::Material>(0).data());
+  }
+  SECTION("unknown handle rejects before missing-file disclosure")
+  {
+    handle = "ffffffffffffffffffffffffffffffff";
+  }
+  SECTION("foreign Scene Geometry rejects before missing-file disclosure")
+  {
+    const auto h = foreignIds.handleOf(foreign.data());
+    handle = edit::detail::hex64(h.domain) + edit::detail::hex64(h.serial);
+  }
+  SECTION("unknown envelope fields do not gain reference-edit authority")
+  {
+    extra = ",\"array_ref\":\"arbitrary-live-array\"";
+    schema = true;
+  }
+  SECTION("READ withdrawal at execution wins over file errors")
+  {
+    withdraw = true;
+    expected = "forbidden";
+  }
+  const auto args =
+      "{\"request_id\":2,\"scene_id\":" + std::to_string(f.sceneId)
+      + ",\"handle\":" + json::quote(handle) + ",\"target_version\":"
+      + json::write(*evidence.result()->get("target_version"))
+      + ",\"dependencies\":"
+      + json::write(*evidence.result()->get("dependencies"))
+      + ",\"file_name\":\"missing.vmesh\"" + extra + "}";
+  const auto admission = f.tool(session, "vsr_mesh_import", args);
+  if (schema)
+    CHECK(admission.errorCode() == "invalid_request");
+  else {
+    REQUIRE(admission.str("kind") == "mesh_import");
+    if (withdraw)
+      f.authority->restrict(
+          session::Target::scene(f.sceneId), session::Capability::READ);
+    const auto rejected = f.await(session, 2);
+    CHECK(rejected.str("outcome") == expected);
+    CHECK_FALSE(rejected.flag("committed"));
+    if (!withdraw)
+      CHECK(rejected.result()->get("reason")->s != "file_rejected");
+  }
+  CHECK(f.scene.numberOfObjects(ANARI_ARRAY) == 1);
+  CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == f.positions.data());
+}
+
+SCENARIO("MCP mesh import changes Helide pixels and restores identities",
+    "[integration][mcp][mesh-import][mesh-topology]")
+{
+  bool topology = false, retainedPrimitive = false;
+  SECTION("count-preserving positions") {}
+  SECTION("count-changing topology, removal, addition and aliases")
+  {
+    topology = true;
+  }
+  SECTION("vertex count changes retain per-primitive rendered appearance")
+  {
+    topology = true;
+    retainedPrimitive = true;
+  }
+  Helide helide;
+  REQUIRE(helide.device);
+  Fixture f({}, true, false, false, 120., true, UINT64_MAX, {}, true);
+  auto positions = f.scene.createArray(ANARI_FLOAT32_VEC3, 3);
+  const float points[] = {-1, -1, 0, 1, -1, 0, 0, 1, 0};
+  positions->setData(static_cast<const void *>(points));
+  auto geometry = f.scene.createObject<vsr::scene::Geometry>("triangle");
+  geometry->setName("editable triangle");
+  geometry->setParameterObject("vertex.position", *positions);
+  auto other = f.scene.createObject<vsr::scene::Geometry>("triangle");
+  other->setParameterObject("vertex.position", *positions);
+  auto material = f.scene.createObject<vsr::scene::Material>("matte");
+  material->setParameter("color", vsr::math::float3(1, 0, 0));
+  vsr::scene::ArrayRef priorColor;
+  if (retainedPrimitive) {
+    priorColor = f.scene.createArray(ANARI_FLOAT32_VEC3, 1);
+    const float red[] = {1, 0, 0};
+    priorColor->setData(static_cast<const void *>(red));
+    geometry->setParameterObject("primitive.color", *priorColor);
+    other->setParameterObject("primitive.color", *priorColor);
+    material->setParameter("color", "color");
+  }
+  auto first = f.scene.createSurface("first", geometry, material);
+  auto second = f.scene.createSurface("second", geometry, material);
+  auto root = f.scene.defaultLayer()->root();
+  auto leftMatrix = vsr::math::IDENTITY_MAT4;
+  auto rightMatrix = vsr::math::IDENTITY_MAT4;
+  leftMatrix[3].x = -1.5f;
+  rightMatrix[3].x = 1.5f;
+  auto leftNode = f.scene.insertChildTransformNode(root, leftMatrix);
+  auto rightNode = f.scene.insertChildTransformNode(root, rightMatrix);
+  f.scene.insertChildObjectNode(leftNode, first);
+  f.scene.insertChildObjectNode(rightNode, second);
+  auto indices = f.scene.createArray(ANARI_UINT32_VEC3, 1);
+  const std::uint32_t triangle[] = {0, 1, 2};
+  indices->setData(static_cast<const void *>(triangle));
+  geometry->setParameterObject("primitive.index", *indices);
+  auto coordinates = f.scene.createArray(ANARI_FLOAT32_VEC2, 3);
+  const float uv[] = {0, 0, 1, 0, 0.5, 1};
+  coordinates->setData(static_cast<const void *>(uv));
+  geometry->setParameterObject("vertex.attribute0", *coordinates);
+  geometry->setParameter("custom", 17.f);
+  auto camera = f.scene.createObject<vsr::scene::Camera>("perspective");
+  camera->setParameter("position", vsr::math::float3(0, 0, 5));
+  camera->setParameter("direction", vsr::math::float3(0, 0, -1));
+  camera->setParameter("up", vsr::math::float3(0, 1, 0));
+  auto *index =
+      f.scene.updateDelegate().emplace<vsr::rendering::RenderIndexAllLayers>(
+          f.scene, vsr::core::Token("mesh-helide"), helide.device);
+  index->populate();
+  HelideBackend backend;
+  backend.d = helide.device;
+  backend.index = index;
+  backend.cameraIndex = camera.index();
+  backend.renderer =
+      anari::newObject<anari::Renderer>(helide.device, "default");
+  anari::setParameter(helide.device,
+      backend.renderer,
+      "background",
+      vsr::math::float4(0, 0, 0, 1));
+  anari::commitParameters(helide.device, backend.renderer);
+  const auto pixels = [&] {
+    REQUIRE(backend.begin(64, 48));
+    anari::wait(helide.device, backend.frame);
+    const auto image = backend.image();
+    const auto *data = static_cast<const std::uint8_t *>(image.pixels);
+    std::vector<std::uint8_t> result(data, data + 64 * 48 * 4);
+    REQUIRE(backend.release());
+    return result;
+  };
+  const auto colored =
+      [](const std::vector<std::uint8_t> &image, int begin, int end) {
+        std::size_t count = 0;
+        for (int y = 0; y < 48; ++y)
+          for (int x = begin; x < end; ++x) {
+            const auto p = (y * 64 + x) * 4;
+            if (image[p] > image[p + 1] + 10 && image[p] > image[p + 2] + 10)
+              ++count;
+          }
+        return count;
+      };
+  const auto before = pixels();
+  REQUIRE(colored(before, 0, 32) > 20);
+  REQUIRE(colored(before, 32, 64) > 20);
+  const auto s = f.attach();
+  REQUIRE(f.exportMesh(s, 1, geometry.data()).str("kind") == "mesh_export");
+  const auto exported = f.await(s, 1);
+  REQUIRE(exported.str("outcome") == "ok");
+  const auto path = f.exchangePath();
+  const auto command = std::string(VSR_MESH_TEST_PYTHON) + " "
+      + VSR_MESH_TEST_SOURCE
+      + (topology ? "/scripts/test-mesh-topology.py '"
+                  : "/scripts/test-mesh-position.py '")
+      + path + "/" + exported.result()->get("file_name")->s + "' '" + path
+      + "/edited.vmesh'" + (retainedPrimitive ? " retain-primitive" : "");
+  REQUIRE(std::system(command.c_str()) == 0);
+  const auto arguments = "{\"request_id\":2,\"scene_id\":"
+      + std::to_string(f.sceneId) + ",\"handle\":"
+      + json::quote(f.objectHandle(geometry.data())) + ",\"target_version\":"
+      + json::write(*exported.result()->get("target_version"))
+      + ",\"dependencies\":"
+      + json::write(*exported.result()->get("dependencies"))
+      + ",\"file_name\":\"edited.vmesh\"}";
+  REQUIRE(f.tool(s, "vsr_mesh_import", arguments).str("kind") == "mesh_import");
+  const auto imported = f.await(s, 2);
+  REQUIRE(imported.flag("committed"));
+  REQUIRE(imported.str("outcome") == "ok");
+  auto replacement =
+      geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position");
+  REQUIRE(replacement != positions.data());
+  CHECK(std::memcmp(positions->data(), points, sizeof(points)) == 0);
+  CHECK(other->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == positions.data());
+  CHECK(first->parameterValueAsObject<vsr::scene::Geometry>("geometry")
+      == geometry.data());
+  CHECK(second->parameterValueAsObject<vsr::scene::Geometry>("geometry")
+      == geometry.data());
+  CHECK(geometry->name() == "editable triangle");
+  if (topology) {
+    CHECK(replacement->size() == 4);
+    CHECK(geometry->parameterValueAsObject<vsr::scene::Array>("primitive.index")
+              ->size()
+        == (retainedPrimitive ? 1 : 2));
+    if (retainedPrimitive) {
+      CHECK(
+          geometry->parameterValueAsObject<vsr::scene::Array>("primitive.color")
+          == priorColor.data());
+      CHECK(other->parameterValueAsObject<vsr::scene::Array>("primitive.color")
+          == priorColor.data());
+      CHECK(material->parameter("color")->value().getString() == "color");
+    }
+    CHECK_FALSE(geometry->parameter("vertex.attribute0"));
+    CHECK(geometry->parameterValueAsObject<vsr::scene::Array>("primitive.color")
+        == geometry->parameterValueAsObject<vsr::scene::Array>(
+            "primitive.attribute1"));
+    CHECK_FALSE(geometry->parameter("primitive.attribute1")->isEnabled());
+  } else {
+    CHECK(geometry->parameterValueAsObject<vsr::scene::Array>("primitive.index")
+        == indices.data());
+    CHECK(
+        geometry->parameterValueAsObject<vsr::scene::Array>("vertex.attribute0")
+        == coordinates.data());
+  }
+  CHECK(std::memcmp(indices->data(), triangle, sizeof(triangle)) == 0);
+  CHECK(std::memcmp(coordinates->data(), uv, sizeof(uv)) == 0);
+  CHECK(geometry->parameter("custom")->value().get<float>() == 17.f);
+  CHECK(leftNode->value().getTransform() == leftMatrix);
+  CHECK(rightNode->value().getTransform() == rightMatrix);
+  const auto changed = pixels();
+  CHECK(changed != before);
+  if (topology) {
+    CHECK(colored(changed, 0, 32) > 0);
+    CHECK(colored(changed, 32, 64) > 0);
+    CHECK(colored(changed, 0, 32) < colored(before, 0, 32));
+    CHECK(colored(changed, 32, 64) < colored(before, 32, 64));
+  } else {
+    CHECK(colored(changed, 0, 32) == 0);
+    CHECK(colored(changed, 32, 64) == 0);
+  }
+  CHECK(f.tool(s, "vsr_mesh_import", arguments).flag("replayed"));
+  CHECK(geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == replacement);
+  REQUIRE(f.restoreBatch(s, 3, *imported.result()->get("batch_ref")).str("kind")
+      == "restore");
+  const auto restored = f.await(s, 3);
+  REQUIRE(restored.flag("committed"));
+  REQUIRE(restored.str("outcome") == "ok");
+  CHECK(geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == positions.data());
+  CHECK(std::memcmp(positions->data(), points, sizeof(points)) == 0);
+  CHECK(geometry->parameterValueAsObject<vsr::scene::Array>("primitive.index")
+      == indices.data());
+  CHECK(geometry->parameterValueAsObject<vsr::scene::Array>("vertex.attribute0")
+      == coordinates.data());
+  if (retainedPrimitive)
+    CHECK(geometry->parameterValueAsObject<vsr::scene::Array>("primitive.color")
+        == priorColor.data());
+  else
+    CHECK_FALSE(geometry->parameter("primitive.color"));
+  CHECK_FALSE(geometry->parameter("primitive.attribute1"));
+  CHECK_FALSE(geometry->parameter("faceVarying.attribute2"));
+  CHECK_FALSE(geometry->parameter("vertex.tangent"));
+  CHECK(pixels() == before);
+  anari::release(helide.device, backend.renderer);
+  f.scene.updateDelegate().erase(index);
+}
+
 SCENARIO("MCP Mesh Export provides a READ-only lossless working bundle",
     "[integration][mcp][mesh-export]")
 {
@@ -5715,11 +7229,11 @@ SCENARIO(
   const auto tools = f.rpc("tools/list", "{}");
   const auto listed = json::write(tools.json);
   CHECK(listed.find("vsr_mesh_export") != std::string::npos);
-  CHECK(listed.find("vsr_mesh_import") == std::string::npos);
+  CHECK(listed.find("vsr_mesh_import") != std::string::npos);
   json::Value metadata;
   REQUIRE(json::parse(f.images->metadata(f.sceneId), metadata));
   CHECK(metadata.get("mesh_export")->b);
-  CHECK_FALSE(metadata.get("mesh_import")->b);
+  CHECK(metadata.get("mesh_import")->b);
   CHECK(metadata.get("mesh_field_cap")->n == 64);
   SECTION("READ denied at admission")
   {
@@ -6948,8 +8462,9 @@ SCENARIO(
   std::vector<mcp::Tool> tools;
   mcp::tools::addImageTools(tools, {f.ids, *f.images});
   CHECK(std::none_of(tools.begin(), tools.end(), [](const auto &tool) {
-    return tool.name == "vsr_image_import";
+    return tool.name == "vsr_image_import" || tool.name == "vsr_mesh_import";
   }));
+  CHECK_FALSE(metadata.get("mesh_import")->b);
 }
 
 SCENARIO("MCP Image Import replaces shared samples and restores once",

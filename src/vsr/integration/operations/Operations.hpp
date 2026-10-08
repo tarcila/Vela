@@ -854,8 +854,9 @@ inline ActivityEvent OperationEngine::eventOf(
   e.kind = r.kind;
   e.target = r.target;
   e.covered = r.covered;
-  const bool borrowed =
-      r.resourceLease && (r.kind == "image_import" || r.kind == "restore");
+  const bool borrowed = r.resourceLease
+      && (r.kind == "image_import" || r.kind == "mesh_import"
+          || r.kind == "restore");
   e.status = describe(r, !borrowed, now);
   if (borrowed)
     e.resultPayload = &r.result;

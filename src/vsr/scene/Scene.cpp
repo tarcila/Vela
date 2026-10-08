@@ -309,7 +309,12 @@ Scene::~Scene()
   reportObjectUsages(m_db.material);
   reportObjectUsages(m_db.sampler);
   reportObjectUsages(m_db.field);
+  for (const auto &retained : m_retainedArrays)
+    for (const auto &weak : retained.arrays)
+      if (const auto lifetime = weak.lock(); lifetime && lifetime->array)
+        lifetime->array->decUseCount(Object::UseKind::INTERNAL);
   reportObjectUsages(m_db.array);
+  m_retainedArrays.clear();
   reportObjectUsages(m_db.camera);
   reportObjectUsages(m_db.renderer);
 }
@@ -1003,8 +1008,26 @@ void Scene::signalObjectLayerUseCountZero(const Object *obj)
   m_updateDelegate.signalObjectLayerUseCountZero(obj);
 }
 
+void Scene::drainRetainedArrays()
+{
+  if (m_imageWrites && !m_imageWrites->isOwningThread())
+    throw std::runtime_error("Scene retention release on wrong thread");
+  auto it = m_retainedArrays.begin();
+  while (it != m_retainedArrays.end()) {
+    if (!it->owner.expired()) {
+      ++it;
+      continue;
+    }
+    for (const auto &weak : it->arrays)
+      if (const auto lifetime = weak.lock(); lifetime && lifetime->array)
+        lifetime->array->decUseCount(Object::UseKind::INTERNAL);
+    it = m_retainedArrays.erase(it);
+  }
+}
+
 void Scene::removeUnusedObjects(bool includeRenderersAndCameras)
 {
+  drainRetainedArrays();
   vsr::core::logDebug("Removing unused context objects");
 
   // Always keep around the default material + default camera //

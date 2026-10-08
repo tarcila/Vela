@@ -13,6 +13,10 @@
 #include <vector>
 
 namespace vsr::scene {
+namespace detail {
+class PreparedPositionBinding;
+class PreparedMeshBinding;
+} // namespace detail
 
 using namespace vsr::core;
 
@@ -113,6 +117,8 @@ struct Parameter
   VSR_DEFAULT_COPYABLE(Parameter)
 
  private:
+  friend class detail::PreparedPositionBinding;
+  friend class detail::PreparedMeshBinding;
   friend struct Object;
   friend struct Scene;
 

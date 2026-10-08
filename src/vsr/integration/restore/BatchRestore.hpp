@@ -8,6 +8,9 @@
 
 // vsr_integration
 #include "vsr/integration/edit/AgentEdit.hpp"
+#include "vsr/integration/mesh/MeshCommit.hpp"
+// vsr_scene
+#include "vsr/scene/detail/PreparedMeshBinding.hpp"
 // std
 #include <algorithm>
 #include <functional>
@@ -18,6 +21,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace vsr::integration::restore {
@@ -531,6 +535,155 @@ inline RestoreResult RestoreService::commit(
         && request.targetBatchRef.launchId == m_edits.launchId()
         && (logExpired
             || m_edits.restorations().expired(request.targetBatchRef));
+    return res;
+  }
+
+  if (record->mesh) {
+    const auto &snapshot = record->mesh;
+    auto *geometry = ident && ident->scene() == &scene
+        ? dynamic_cast<scene::Geometry *>(ident->resolve(snapshot->target))
+        : nullptr;
+    const auto check = [&]() { return mesh::restorable(*snapshot, geometry); };
+    if (!scene.imageWriteSequence()
+        || !scene.imageWriteSequence()->isEnabled()) {
+      res.outcome = Outcome::BUSY;
+      res.reason = "host_write_contract_unavailable";
+      return res;
+    }
+    const auto *reason = ident ? check() : "conflict";
+    if (reason) {
+      if (std::strcmp(reason, "array_mapped") == 0) {
+        res.outcome = Outcome::BUSY;
+        res.reason = reason;
+      } else {
+        markConflicting(request.targetBatchRef, ctx);
+        res.outcome = Outcome::CONFLICT;
+      }
+      return res;
+    }
+    std::unique_ptr<scene::detail::PreparedMeshBinding> transaction;
+    std::vector<scene::Array *> oldArrays;
+    std::vector<std::pair<std::weak_ptr<scene::ArrayLifetime>, std::size_t>>
+        preparedIndices;
+    try {
+      if (fault && fault())
+        throw std::bad_alloc();
+      res.ownership = operations::ResultOwnership(snapshot->reserveResult);
+      res.wireLease = snapshot->reserveResult();
+      if (!res.wireLease)
+        throw std::bad_alloc();
+      res.imageReceipt = "{\"target_batch_ref\":"
+          + edit::detail::batchRefJson(request.targetBatchRef)
+          + ",\"committed\":true,\"restored\":true,\"versions\":[],\"node_versions\":[],\"target_version\":"
+          + mcp::json::quote(
+              mesh::targetVersion(*geometry, snapshot->target, true));
+      res.imageReceipt.reserve(res.imageReceipt.size() + 256);
+      if (!ctx.prepareActivityResult
+          || !ctx.prepareActivityResult(
+              res.imageReceipt.size() + 256, snapshot->reserveResult))
+        throw std::bad_alloc();
+      m_edits.syncStates().prepareScene(request.scene);
+      // Prepare presence, complete Parameter metadata and current prior indices
+      // before the final host callback; restoration never rewrites Array bytes.
+      geometry =
+          dynamic_cast<scene::Geometry *>(ident->resolve(snapshot->target));
+      if ((reason = check())) {
+        res.outcome = std::strcmp(reason, "array_mapped") == 0
+            ? Outcome::BUSY
+            : Outcome::CONFLICT;
+        if (res.outcome == Outcome::CONFLICT)
+          markConflicting(request.targetBatchRef, ctx);
+        return res;
+      }
+      if (!mesh::boundedParameters(*geometry)
+          || !scene::detail::PreparedMeshBinding::available(*geometry))
+        throw std::bad_alloc();
+      transaction =
+          std::make_unique<scene::detail::PreparedMeshBinding>(*geometry);
+      oldArrays.reserve(snapshot->dependencies.size());
+      preparedIndices.reserve(snapshot->dependencies.size());
+      for (const auto &dependency : snapshot->dependencies) {
+        auto *array = dependency.lifetime.lock()->array;
+        oldArrays.push_back(array);
+        preparedIndices.push_back({dependency.lifetime, array->index()});
+      }
+      for (const auto &binding : snapshot->bindings) {
+        // Restore missing old Parameters exactly; for still-present bindings,
+        // preserve unrelated UI metadata edited since import.
+        if (!binding.prior || !geometry->parameter(binding.name))
+          transaction->set(binding.name, binding.prior);
+        if (binding.prior)
+          transaction->bind(binding.name,
+              binding.before.lock()->array,
+              binding.prior->isEnabled());
+      }
+      transaction->prepareNotifications();
+    } catch (const std::bad_alloc &) {
+      res.outcome = Outcome::BUSY;
+      res.reason = "resource_limit";
+      return res;
+    }
+    if (!ctx.beforeWrite) {
+      res.outcome = Outcome::FORBIDDEN;
+      return res;
+    }
+    res.outcome = ctx.beforeWrite();
+    if (res.outcome != Outcome::OK)
+      return res;
+    geometry =
+        dynamic_cast<scene::Geometry *>(ident->resolve(snapshot->target));
+    if ((reason = check())) {
+      if (std::strcmp(reason, "array_mapped") == 0) {
+        res.outcome = Outcome::BUSY;
+        res.reason = reason;
+      } else {
+        markConflicting(request.targetBatchRef, ctx);
+        res.outcome = Outcome::CONFLICT;
+      }
+      return res;
+    }
+    if (!transaction->isCurrent(*geometry)) {
+      res.outcome = Outcome::BUSY;
+      res.reason = "prepared_state_changed";
+      return res;
+    }
+    for (std::size_t i = 0; i < preparedIndices.size(); ++i) {
+      auto *array = preparedIndices[i].first.lock()->array;
+      if (array->index() != preparedIndices[i].second) {
+        res.outcome = Outcome::BUSY;
+        res.reason = "dependency_relocated";
+        return res;
+      }
+      oldArrays[i] = array;
+    }
+    transaction->commit(*geometry);
+    res.committed = true;
+    mesh::MeshCommitAccess::committed(*ident, *geometry);
+    m_edits.restorations().setImageState(
+        request.targetBatchRef, edit::RestorationStore::ImageState::RESTORED);
+    m_edits.restorations().release(request.targetBatchRef);
+    if (ctx.markRestored)
+      ctx.markRestored(
+          request.targetBatchRef.launchId, request.targetBatchRef.batchId);
+    if (mesh::notify(
+            scene, *geometry, *transaction, snapshot->bindings, {}, oldArrays))
+      res.outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
+    res.sceneRevision = ident->sceneRevision();
+    const auto &revision = *res.sceneRevision;
+    char suffix[256];
+    std::snprintf(suffix,
+        sizeof(suffix),
+        ",\"scene_revision\":\"%llu.%llu.%llu.%llu\"}",
+        (unsigned long long)revision.launch.activation,
+        (unsigned long long)revision.launch.nonce,
+        (unsigned long long)revision.domain,
+        (unsigned long long)revision.value);
+    res.imageReceipt.append(suffix);
+    try {
+      m_edits.syncStates().beginHook(request.scene);
+    } catch (...) {
+      res.outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
+    }
     return res;
   }
 

@@ -10,6 +10,7 @@
 // std
 #include <algorithm>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -53,7 +54,41 @@ struct RecordingDelegate : public vsr::scene::EmptyUpdateDelegate
   std::vector<std::string> order;
 };
 
+struct ThrowingParameterDelegate : public vsr::scene::EmptyUpdateDelegate
+{
+  void signalParameterUpdated(
+      const vsr::scene::Object *, const vsr::scene::Parameter *) override;
+};
+
+void ThrowingParameterDelegate::signalParameterUpdated(
+    const vsr::scene::Object *, const vsr::scene::Parameter *)
+{
+  throw std::runtime_error("parameter notification failed");
+}
+
 } // namespace
+
+SCENARIO("A throwing notification cannot revive parameter evidence",
+    "[Object][parameter-version]")
+{
+  vsr::scene::Scene scene;
+  auto geometry = scene.createObject<vsr::scene::Geometry>("triangle");
+  geometry->setParameter("test", 1);
+  const auto original = geometry->lastParameterChange();
+  ThrowingParameterDelegate delegate;
+  geometry->setUpdateDelegate(&delegate);
+
+  REQUIRE_THROWS_AS(geometry->setParameter("test", 2), std::runtime_error);
+  REQUIRE(geometry->parameterValueAs<int>("test").value() == 2);
+  const auto changed = geometry->lastParameterChange();
+  REQUIRE(changed != original);
+
+  REQUIRE_THROWS_AS(geometry->setParameter("test", 1), std::runtime_error);
+  REQUIRE(geometry->parameterValueAs<int>("test").value() == 1);
+  REQUIRE(geometry->lastParameterChange() != original);
+  REQUIRE(geometry->lastParameterChange() != changed);
+  geometry->setUpdateDelegate(nullptr);
+}
 
 SCENARIO("vsr::Object interface", "[Object]")
 {

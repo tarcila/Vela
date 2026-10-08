@@ -7,7 +7,11 @@
 #include "vsr/integration/image/PngImport.hpp"
 #include "vsr/integration/mcp/Json.hpp"
 #include "vsr/integration/mesh/MeshCapture.hpp"
+#include "vsr/integration/mesh/MeshCommit.hpp"
+#include "vsr/integration/mesh/MeshReplacement.hpp"
 #include "vsr/integration/restore/BatchRestore.hpp"
+// vsr_scene
+#include "vsr/scene/detail/PreparedPositionBinding.hpp"
 // posix
 #if defined(__linux__)
 #include <dirent.h>
@@ -352,10 +356,11 @@ SessionCharge::~SessionCharge()
   ledger->bytes -= bytes;
 }
 
-bool confinedName(const std::string &name)
+bool confinedName(const std::string &name, bool mesh = false)
 {
   if (name.empty() || name.size() > 128 || name[0] == '.' || name.size() < 5
-      || name.compare(name.size() - 4, 4, ".png"))
+      || (mesh ? (name.size() < 7 || name.compare(name.size() - 6, 6, ".vmesh"))
+               : name.compare(name.size() - 4, 4, ".png")))
     return false;
   for (const unsigned char c : name)
     if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
@@ -383,13 +388,16 @@ struct ImageExchange::State
   struct Job
   {
     explicit Job(std::pmr::memory_resource *allocator)
-        : pixels(allocator), encoded(allocator)
+        : pixels(allocator), encoded(allocator), bundle(allocator)
     {}
     std::shared_ptr<State> state;
     std::shared_ptr<const void> controlLease;
     std::shared_ptr<const void> physicalLease;
     ByteBuffer pixels;
     ByteBuffer encoded;
+    mesh::Bundle bundle;
+    std::shared_ptr<const void> decodeLease;
+    std::string expectedDependencies;
     Bounds bound;
     bool importing{false};
     bool mesh{false};
@@ -432,6 +440,8 @@ struct ImageExchange::State
   restore::RestoreService *restores{nullptr};
   std::weak_ptr<const void> restoresLifetime;
   std::map<std::string, std::shared_ptr<SessionLedger>> ledgers;
+  std::shared_ptr<SessionLedger> retentionLedger{
+      std::make_shared<SessionLedger>()};
   std::vector<std::weak_ptr<Job>> jobs;
   mutable std::mutex mutex;
   std::mutex fileMutex;
@@ -548,7 +558,10 @@ void ImageExchange::State::Job::releaseTransient(bool keepPhysicalLease)
     pixels.swap(empty);
     ByteBuffer emptyEncoded(encoded.get_allocator().resource());
     encoded.swap(emptyEncoded);
+    mesh::Bundle emptyBundle(pixels.get_allocator().resource());
+    bundle = std::move(emptyBundle);
   }
+  decodeLease.reset();
 #if defined(__linux__)
   task = {};
 #endif
@@ -667,18 +680,64 @@ std::string ImageExchange::State::limitsJson(
 Step ImageExchange::State::read(Job &job)
 {
 #if defined(__linux__)
-  if (!current() || !confinedName(job.name))
+  if (!current() || !confinedName(job.name, job.mesh))
     return reject(Outcome::INVALID_REQUEST, "file_rejected");
+  if (job.mesh) {
+    descriptor::detail::Fd scanFd(
+        ::openat(imagesFd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    DIR *raw = ::fdopendir(scanFd.fd);
+    if (!raw)
+      return reject(Outcome::BUSY, "resource_limit");
+    scanFd.release();
+    std::unique_ptr<DIR, decltype(&::closedir)> scan(raw, ::closedir);
+    std::size_t entries = 0, files = 0, bytes = 0;
+    for (;;) {
+      if (job.abandoned())
+        return reject(Outcome::CANCELLED, "cancelled");
+      errno = 0;
+      auto *entry = ::readdir(scan.get());
+      if (!entry) {
+        if (errno)
+          return reject(Outcome::BUSY, "resource_limit");
+        break;
+      }
+      if (!std::strcmp(entry->d_name, ".") || !std::strcmp(entry->d_name, ".."))
+        continue;
+      if (++entries > ENTRY_CAP)
+        return reject(Outcome::BUSY, "resource_limit");
+      struct stat observed{};
+      if (::fstatat(imagesFd, entry->d_name, &observed, AT_SYMLINK_NOFOLLOW))
+        return reject(Outcome::INVALID_REQUEST, "file_rejected");
+      if (S_ISREG(observed.st_mode)) {
+        if (++files > FILE_CAP || observed.st_size < 0
+            || std::uint64_t(observed.st_size) > BYTE_CAP - bytes)
+          return reject(Outcome::BUSY, "resource_limit");
+        bytes += std::size_t(observed.st_size);
+      }
+    }
+  }
   descriptor::detail::Fd file(::openat(imagesFd,
       job.name.c_str(),
       O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC));
   struct stat before{}, after{};
   if (file.fd < 0 || ::fstat(file.fd, &before) != 0 || !S_ISREG(before.st_mode)
       || before.st_uid != ::geteuid() || before.st_nlink != 1
-      || before.st_size < 0)
+      || before.st_size < 0 || (job.mesh && (before.st_mode & 07777) != 0600))
     return reject(Outcome::INVALID_REQUEST, "file_rejected");
   if (std::uint64_t(before.st_size) > job.bound.encoded)
     return reject(Outcome::INVALID_REQUEST, "invalid_png");
+  if (job.mesh) {
+    const auto bytes = std::size_t(before.st_size);
+    job.decodeLease = limits.reservePhysicalMemory(bytes);
+    if (!job.decodeLease)
+      return reject(Outcome::BUSY, "resource_limit");
+    std::lock_guard<std::mutex> lock(mutex);
+    if (bytes > limits.transientBytes
+        || reserved > limits.transientBytes - bytes)
+      return reject(Outcome::BUSY, "resource_limit");
+    reserved += bytes;
+    job.bound.peak += bytes;
+  }
   job.encoded.resize(std::size_t(before.st_size));
   for (std::size_t offset = 0; offset < job.encoded.size();) {
     if (job.abandoned())
@@ -702,6 +761,19 @@ Step ImageExchange::State::read(Job &job)
       || before.st_ctim.tv_sec != after.st_ctim.tv_sec
       || before.st_ctim.tv_nsec != after.st_ctim.tv_nsec || !current())
     return reject(Outcome::INVALID_REQUEST, "file_rejected");
+  if (job.mesh) {
+    job.fileIdentity = after;
+    job.encodedSize = std::size_t(after.st_size);
+    if (!fileCurrent(job))
+      return reject(Outcome::INVALID_REQUEST, "file_rejected");
+    if (const auto *reason = mesh::decodeBundle(
+            std::move(job.encoded), job.bundle, job.abandoned))
+      return reject(std::strcmp(reason, "cancelled") == 0
+              ? Outcome::CANCELLED
+              : Outcome::INVALID_REQUEST,
+          reason);
+    return Step{};
+  }
   const auto decoded = decodePng(job.encoded,
       job.width,
       job.height,
@@ -1064,7 +1136,8 @@ std::string ImageExchange::metadata(
       + ",\"data_tracking\":" + (tracking ? "true" : "false")
       + ",\"mesh_export\":"
       + (enabled && m_state->limits.reservePhysicalMemory ? "true" : "false")
-      + ",\"mesh_import\":false,\"mesh_revision\":1,\"mesh_payload_byte_cap\":67108864,"
+      + ",\"mesh_import\":" + (enabled && importAvailable() ? "true" : "false")
+      + ",\"mesh_revision\":1,\"mesh_payload_byte_cap\":67108864,"
         "\"mesh_header_byte_cap\":65536,\"mesh_field_cap\":64"
       + (enabled ? ",\"mesh_exchange_directory\":" + quote(m_state->path) : "")
       + (enabled ? ",\"image_exchange_directory\":" + quote(m_state->path)
@@ -1087,6 +1160,10 @@ std::string ImageExchange::unavailableReason(SceneId scene) const
 void ImageExchange::pump()
 {
   m_state->pruneRestorations();
+  for (const auto &source : m_state->sources)
+    if (!source.lifetime.expired())
+      vsr::scene::detail::PreparedPositionBinding::drain(
+          *source.identity->scene());
   {
     std::lock_guard<std::mutex> lock(m_state->mutex);
     for (auto it = m_state->ledgers.begin(); it != m_state->ledgers.end();) {
@@ -1338,6 +1415,547 @@ operations::Admission ImageExchange::submitCapture(
       return reject(Outcome::BUSY, "resource_limit");
     } catch (const std::system_error &) {
       return reject(Outcome::BUSY, "resource_limit");
+    }
+  };
+  return m_engine->submit(credentials, ref, std::move(request));
+}
+
+operations::Admission ImageExchange::submitMeshImport(
+    const session::Credentials &credentials,
+    const operations::OperationRef &ref,
+    SceneId scene,
+    identity::ObjectHandle handle,
+    std::string targetVersion,
+    std::string dependencies,
+    std::string fileName)
+{
+  operations::Admission invalid;
+  invalid.code = Outcome::INVALID_REQUEST;
+  mcp::json::Value evidence;
+  if (!importAvailable() || targetVersion.empty() || targetVersion.size() > 256
+      || dependencies.size() > mesh::HEADER_CAP || !confinedName(fileName, true)
+      || !mesh::detail::boundedMetadata(dependencies))
+    return invalid;
+  auto state = m_state;
+  auto control = state->limits.reservePhysicalMemory(
+      IMPORT_CONTROL_BYTES + 4 * mesh::HEADER_CAP);
+  if (!control) {
+    invalid.code = Outcome::BUSY;
+    return invalid;
+  }
+  if (!mcp::json::parse(dependencies, evidence)
+      || evidence.type != mcp::json::Value::Type::ARRAY
+      || evidence.a.size() > mesh::FIELD_CAP)
+    return invalid;
+  for (const auto &entry : evidence.a) {
+    if (!entry.isObject() || entry.o.size() != 3)
+      return invalid;
+    for (const auto *key : {"payload", "handle", "data_version"}) {
+      const auto *value = entry.get(key);
+      if (!value || !value->isString() || value->s.empty()
+          || value->s.size() > 256)
+        return invalid;
+    }
+  }
+  auto job = std::make_shared<State::Job>(state->limits.allocator);
+  job->state = state;
+  job->controlLease = std::move(control);
+  job->importing = true;
+  job->mesh = true;
+  job->sessionId = credentials.sessionId;
+  job->name = std::move(fileName);
+  job->expectedVersion = std::move(targetVersion);
+  job->expectedDependencies = std::move(dependencies);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->jobs.erase(std::remove_if(state->jobs.begin(),
+                          state->jobs.end(),
+                          [](const auto &weak) { return weak.expired(); }),
+        state->jobs.end());
+    state->jobs.push_back(job);
+  }
+  operations::Request request;
+  request.kind = "mesh_import";
+  request.resourceLease = job->controlLease;
+  request.reserveStatus = [reserve = state->limits.reservePhysicalMemory] {
+    return reserve(IMPORT_RESULT_BYTES);
+  };
+  request.target = session::Target::scene(scene);
+  request.capability = session::Capability::EDIT;
+  request.boundSceneRead = true;
+  request.deadlineSeconds = 30.;
+  request.canonicalArguments = std::to_string(scene) + ":" + handleName(handle)
+      + ":" + job->expectedVersion + ":" + job->expectedDependencies + ":"
+      + job->name;
+  request.executor = [state, job, scene, handle, integration = m_integration](
+                         operations::StepContext &ctx) {
+    if (job->committed) {
+      Step result;
+      result.committed = true;
+      try {
+        result.outcome = state->edits->synchronizeCommitted(scene);
+      } catch (...) {
+        result.outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
+      }
+      if (job->notificationFailed)
+        result.outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
+      result.result = std::move(job->receipt);
+      result.resourceLease = job->controlLease;
+      result.reserveStatus = [reserve = state->limits.reservePhysicalMemory] {
+        return reserve(IMPORT_RESULT_BYTES);
+      };
+      return result;
+    }
+    const auto releasePins = [](vsr::scene::Scene *ownedScene) {
+      vsr::scene::detail::PreparedPositionBinding::drain(*ownedScene);
+    };
+    std::unique_ptr<vsr::scene::Scene, decltype(releasePins)> pinDrain(
+        &ctx.scene, releasePins);
+    const auto fail = [&](Outcome outcome, const char *reason) {
+      if (job->storePrepared) {
+        if (!state->editsLifetime.expired())
+          state->edits->restorations().cancelImage(job->batch);
+        job->storePrepared = false;
+      }
+      job->snapshot.reset();
+      if (ctx.cancelRestoration)
+        ctx.cancelRestoration();
+      return reject(outcome, reason);
+    };
+    try {
+      if (job->future.valid()
+          && job->future.wait_for(std::chrono::seconds(0))
+              != std::future_status::ready) {
+        Step pending;
+        pending.status = Step::Status::BACKEND_PENDING;
+        return pending;
+      }
+      if (ctx.abandoned || ctx.isAbandoned())
+        return fail(Outcome::CANCELLED, "cancelled");
+      if (state->editsLifetime.expired() || state->restoresLifetime.expired())
+        return fail(Outcome::BUSY, "resource_limit");
+      identity::SceneIdentity *ids = nullptr;
+      std::weak_ptr<const void> registration;
+      for (const auto &source : state->sources) {
+        if (source.lifetime.expired())
+          continue;
+        if (source.scene == scene) {
+          ids = source.identity;
+          registration = source.lifetime;
+        } else if (auto *foreign = source.identity->resolve(handle))
+          return fail(Outcome::INVALID_REQUEST,
+              dynamic_cast<vsr::scene::Geometry *>(foreign) ? "foreign_scene"
+                                                            : "invalid_handle");
+      }
+      auto *geometry = ids
+          ? dynamic_cast<vsr::scene::Geometry *>(ids->resolve(handle))
+          : nullptr;
+      if (!geometry || ids->scene() != &ctx.scene)
+        return fail(Outcome::INVALID_REQUEST, "invalid_handle");
+      if (!integration->imageTrackingAvailable(scene))
+        return fail(
+            Outcome::INVALID_REQUEST, "host_write_contract_unavailable");
+      mcp::json::Value dependencies;
+      if (!mcp::json::parse(job->expectedDependencies, dependencies))
+        return fail(Outcome::INVALID_REQUEST, "invalid_evidence");
+      mesh::CapturePlan plan;
+      const auto *reason = mesh::plan(*geometry, plan, false);
+      if (reason)
+        return fail(std::strcmp(reason, "array_mapped") == 0
+                ? Outcome::BUSY
+                : Outcome::INVALID_REQUEST,
+            reason);
+      if ((reason = mesh::current(
+               *geometry, *ids, plan, job->expectedVersion, dependencies)))
+        return fail(Outcome::CONFLICT, reason);
+      if (!state->current())
+        return fail(Outcome::INVALID_REQUEST, "file_rejected");
+      if (!job->future.valid()) {
+        constexpr auto WORK =
+            32 * mesh::HEADER_CAP + WORKER_STACK_BYTES + WORKER_GUARD_BYTES;
+        job->physicalLease = state->limits.reservePhysicalMemory(WORK);
+        if (!job->physicalLease)
+          return fail(Outcome::BUSY, "resource_limit");
+        {
+          std::lock_guard<std::mutex> lock(state->mutex);
+          if (WORK > state->limits.transientBytes
+              || state->reserved > state->limits.transientBytes - WORK)
+            return fail(Outcome::BUSY, "resource_limit");
+          state->reserved += WORK;
+          job->bound.peak = WORK;
+          job->bound.encoded = mesh::PAYLOAD_CAP + mesh::HEADER_CAP + 12;
+        }
+        job->registration = registration;
+        job->abandoned = [state, check = ctx.isAbandoned] {
+          return state->stopping.load() || check();
+        };
+        job->wake = ctx.wake;
+        if (!job->start())
+          return fail(Outcome::BUSY, "resource_limit");
+        Step pending;
+        pending.status = Step::Status::BACKEND_PENDING;
+        return pending;
+      }
+      auto decoded = job->future.get();
+      job->join();
+      if (decoded.outcome != Outcome::OK)
+        return decoded;
+      if (job->registration.expired() || !state->fileCurrent(*job))
+        return fail(Outcome::CONFLICT, "file_rejected");
+      mesh::MeshReplacement replacement;
+      if ((reason = mesh::prepareMesh(*geometry, job->bundle, replacement)))
+        return fail(Outcome::INVALID_REQUEST, reason);
+      if (!replacement.changed) {
+        Step unchanged;
+        unchanged.result = "{\"committed\":false,\"unchanged\":true,\"handle\":"
+            + quote(handleName(handle))
+            + ",\"target_version\":" + quote(job->expectedVersion)
+            + ",\"dependencies\":" + job->expectedDependencies + "}";
+        return unchanged;
+      }
+      const auto retainedBytes = replacement.dependencies.payloadBytes
+          + replacement.newBytes
+          + (replacement.dependencies.arrayCount + replacement.newCount)
+              * (sizeof(vsr::scene::Array) + 4096)
+          + sizeof(edit::MeshSnapshot) + 4 * mesh::HEADER_CAP;
+      state->pruneRestorations();
+      vsr::scene::detail::PreparedPositionBinding::drain(ctx.scene);
+      std::shared_ptr<SessionLedger> ledger;
+      {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        auto &entry = state->ledgers[job->sessionId];
+        if (!entry)
+          entry = std::make_shared<SessionLedger>();
+        ledger = entry;
+      }
+      const auto charge =
+          [&](const std::shared_ptr<SessionLedger> &account,
+              std::size_t limit) -> std::shared_ptr<SessionCharge> {
+        auto result = std::make_shared<SessionCharge>();
+        result->ledger = account;
+        std::lock_guard<std::mutex> lock(account->mutex);
+        if (retainedBytes > limit || account->bytes > limit - retainedBytes)
+          return {};
+        account->bytes += retainedBytes;
+        result->bytes = retainedBytes;
+        return result;
+      };
+      auto sessionCharge = charge(ledger, 67108864);
+      auto retentionCharge =
+          charge(state->retentionLedger, state->limits.globalRetentionBytes);
+      if (!sessionCharge || !retentionCharge) {
+        auto rejected = fail(Outcome::BUSY, "restore_budget_exhausted");
+        rejected.result =
+            "{\"reason\":\"restore_budget_exhausted\",\"required_capacity_bytes\":"
+            + std::to_string(retainedBytes) + ",\"configured_capacity_bytes\":"
+            + std::to_string(state->limits.globalRetentionBytes) + "}";
+        return rejected;
+      }
+      auto snapshot = std::make_shared<edit::MeshSnapshot>();
+      job->snapshot = snapshot;
+      snapshot->controlOwnership = operations::ResultOwnership(
+          [reserve = state->limits.reservePhysicalMemory] {
+            return reserve(IMPORT_STORE_BYTES);
+          });
+      snapshot->scopeLease =
+          state->limits.reservePhysicalMemory(IMPORT_STORE_BYTES);
+      snapshot->physicalLease =
+          state->limits.reservePhysicalMemory(retainedBytes);
+      if (!snapshot->scopeLease || !snapshot->physicalLease)
+        return fail(Outcome::BUSY, "resource_limit");
+      snapshot->reserveResult = [reserve =
+                                        state->limits.reservePhysicalMemory] {
+        return reserve(IMPORT_RESULT_BYTES);
+      };
+      snapshot->sessionLease = sessionCharge;
+      snapshot->registration = registration;
+      snapshot->scene = &ctx.scene;
+      snapshot->target = handle;
+      snapshot->retainedBytes = retainedBytes;
+      snapshot->pinOwner = std::make_shared<int>(0);
+      geometry = dynamic_cast<vsr::scene::Geometry *>(ids->resolve(handle));
+      if ((reason = mesh::currentPlan(
+               geometry, *ids, plan, job->expectedVersion, dependencies)))
+        return fail(reason && std::strcmp(reason, "array_mapped") == 0
+                ? Outcome::BUSY
+                : Outcome::CONFLICT,
+            reason ? reason : "stale_target_version");
+      snapshot->dependencies.reserve(plan.arrayCount + replacement.newCount);
+      std::vector<std::weak_ptr<vsr::scene::ArrayLifetime>> pins;
+      pins.reserve(plan.arrayCount + replacement.newCount);
+      for (std::size_t i = 0; i < plan.arrayCount; ++i) {
+        pins.push_back(plan.arrays[i]->lifetime());
+        snapshot->dependencies.push_back(
+            {pins.back(), *plan.arrays[i]->dataWriteSequence()});
+      }
+      if (!mesh::boundedParameters(*geometry))
+        return fail(Outcome::INVALID_REQUEST, "mesh_parameter_limit");
+      snapshot->bindings.reserve(mesh::FIELD_CAP);
+      for (std::size_t i = 0; i < plan.fieldCount; ++i) {
+        const auto *field = plan.fields[i];
+        snapshot->bindings.push_back({field->name(),
+            *field,
+            plan.arrays[plan.aliases[i]]->lifetime(),
+            {},
+            false,
+            true});
+      }
+      for (const auto &field : replacement.fields)
+        if (!geometry->parameter(field.name.c_str()))
+          snapshot->bindings.push_back(
+              {vsr::core::Token(field.name.c_str()), {}, {}, {}, false, true});
+      const auto batchId = state->edits->newBatchId();
+      if (!batchId)
+        return fail(Outcome::BUSY, "resource_limit");
+      job->batch = {state->launchId, *batchId};
+      if (!ctx.reserveRestoration
+          || !ctx.reserveRestoration(
+              retainedBytes, state->launchId, *batchId)) {
+        auto rejected = fail(Outcome::BUSY, "restore_budget_exhausted");
+        rejected.result =
+            "{\"reason\":\"restore_budget_exhausted\",\"required_capacity_bytes\":"
+            + std::to_string(retainedBytes) + ",\"configured_capacity_bytes\":"
+            + std::to_string(state->limits.globalRetentionBytes) + "}";
+        return rejected;
+      }
+      edit::RestorationRecord record;
+      record.ref = job->batch;
+      record.scene = scene;
+      record.image = snapshot;
+      record.mesh = snapshot;
+      if (!state->edits->restorations().prepareImage(std::move(record)))
+        return fail(Outcome::BUSY, "resource_limit");
+      job->storePrepared = true;
+      state->edits->syncStates().prepareScene(scene);
+      using StagedArray = vsr::scene::detail::PreparedPositionBinding;
+      std::vector<std::unique_ptr<StagedArray>> stagedArrays;
+      stagedArrays.reserve(replacement.newCount);
+      std::array<vsr::scene::Array *, mesh::FIELD_CAP> payloadArrays{};
+      for (std::size_t p = 0; p < job->bundle.arrays.size(); ++p) {
+        if (!replacement.needed[p])
+          continue;
+        if (replacement.reuse[p]) {
+          payloadArrays[p] =
+              const_cast<vsr::scene::Array *>(replacement.reuse[p]);
+          continue;
+        }
+        const auto &payload = job->bundle.arrays[p];
+        stagedArrays.push_back(std::make_unique<StagedArray>(ctx.scene,
+            payload.elementType,
+            payload.count,
+            job->bundle.data(payload)));
+        auto *array = stagedArrays.back()->array();
+        if (!array)
+          return fail(Outcome::CONFLICT, "stale_dependencies");
+        payloadArrays[p] = array;
+        pins.push_back(array->lifetime());
+        snapshot->dependencies.push_back(
+            {pins.back(), *array->dataWriteSequence()});
+      }
+      struct RetentionOwners
+      {
+        std::shared_ptr<const void> physical, session, global;
+      };
+      auto owners = std::make_shared<RetentionOwners>(RetentionOwners{
+          snapshot->physicalLease, sessionCharge, retentionCharge});
+      vsr::scene::detail::PreparedPositionBinding::retain(
+          ctx.scene, snapshot->pinOwner, owners, std::move(pins));
+      job->receipt.reserve(mesh::HEADER_CAP);
+      if (!ctx.prepareActivityResult
+          || !ctx.prepareActivityResult(16384, snapshot->reserveResult))
+        return fail(Outcome::BUSY, "resource_limit");
+      if (!ctx.beforeWrite)
+        return fail(Outcome::FORBIDDEN, "authority_unavailable");
+      const auto authority = ctx.beforeWrite();
+      if (authority != Outcome::OK)
+        return fail(authority, "authority_withdrawn");
+      // No Scene notifications before publication. Detached preparation and
+      // reserved identity remain unresolvable through either final guard.
+      const auto discardIdentities = [&stagedArrays](
+                                         identity::SceneIdentity *ids) {
+        for (const auto &array : stagedArrays)
+          if (array->array())
+            mesh::MeshCommitAccess::discard(*ids, *array->array());
+      };
+      // Borrowed identity owner: the deleter only unwinds reserved entries,
+      // never deletes the host identity service.
+      std::unique_ptr<identity::SceneIdentity, decltype(discardIdentities)>
+          identityStage(ids, discardIdentities);
+      std::vector<identity::ObjectHandle> newHandles;
+      newHandles.reserve(stagedArrays.size());
+      for (std::size_t i = 0; i < stagedArrays.size(); ++i) {
+        stagedArrays[i]->prepareSlot(i, stagedArrays.size());
+        newHandles.push_back(
+            mesh::MeshCommitAccess::prepare(*ids, *stagedArrays[i]->array()));
+      }
+      // Pool reservation can relocate Arrays; final evidence is reacquired.
+      geometry = dynamic_cast<vsr::scene::Geometry *>(ids->resolve(handle));
+      mesh::CapturePlan finalPlan;
+      if ((reason = mesh::currentPlan(
+               geometry, *ids, finalPlan, job->expectedVersion, dependencies)))
+        return fail(reason && std::strcmp(reason, "array_mapped") == 0
+                ? Outcome::BUSY
+                : Outcome::CONFLICT,
+            reason ? reason : "stale_target_version");
+      // Rebuild after every callback/pool relocation; no plan pointers from
+      // before host reservations may reach publication.
+      if ((reason = mesh::prepareMesh(*geometry, job->bundle, replacement)))
+        return fail(Outcome::INVALID_REQUEST, reason);
+      vsr::scene::detail::PreparedMeshBinding transaction(*geometry);
+      std::vector<vsr::scene::Array *> oldArrays, addedArrays;
+      oldArrays.reserve(finalPlan.arrayCount);
+      addedArrays.reserve(stagedArrays.size());
+      for (std::size_t i = 0; i < finalPlan.arrayCount; ++i)
+        oldArrays.push_back(
+            const_cast<vsr::scene::Array *>(finalPlan.arrays[i]));
+      for (const auto &array : stagedArrays)
+        addedArrays.push_back(array->array());
+      for (std::size_t p = 0; p < job->bundle.arrays.size(); ++p)
+        if (replacement.reuse[p])
+          payloadArrays[p] =
+              const_cast<vsr::scene::Array *>(replacement.reuse[p]);
+      for (auto &binding : snapshot->bindings) {
+        // Host preparation may edit unversioned UI metadata without changing
+        // binding evidence. Capture the actual prepublication removed state.
+        if (binding.prior)
+          binding.prior = *geometry->parameter(binding.name);
+        const auto found = std::find_if(replacement.fields.begin(),
+            replacement.fields.end(),
+            [&](const auto &field) {
+              return binding.name.str() == field.name;
+            });
+        auto *array = found == replacement.fields.end() ? nullptr
+            : found->retained ? const_cast<vsr::scene::Array *>(found->retained)
+                              : payloadArrays[found->payload];
+        binding.present = array;
+        binding.enabled =
+            found == replacement.fields.end() ? true : found->enabled;
+        if (array)
+          binding.after = array->lifetime();
+        transaction.bind(binding.name, array, binding.enabled);
+      }
+      transaction.prepareNotifications();
+      std::string resulting = "[";
+      std::vector<const vsr::scene::Array *> postArrays;
+      postArrays.reserve(replacement.fields.size());
+      for (const auto &field : replacement.fields) {
+        const auto *array =
+            field.retained ? field.retained : payloadArrays[field.payload];
+        if (std::find(postArrays.begin(), postArrays.end(), array)
+            == postArrays.end())
+          postArrays.push_back(array);
+      }
+      for (std::size_t i = 0; i < postArrays.size(); ++i) {
+        const auto *array = postArrays[i];
+        auto h = ids->handleOf(array);
+        for (std::size_t n = 0; n < stagedArrays.size(); ++n)
+          if (array == stagedArrays[n]->array())
+            h = newHandles[n];
+        const auto dataVersion = "array:" + std::to_string(h.launch.activation)
+            + "." + std::to_string(h.launch.nonce) + "."
+            + std::to_string(h.domain) + "." + std::to_string(h.serial) + "."
+            + std::to_string(*array->dataWriteSequence());
+        if (i)
+          resulting += ',';
+        resulting += "{\"payload\":\"a" + std::to_string(i)
+            + "\",\"handle\":" + quote(handleName(h))
+            + ",\"data_version\":" + quote(dataVersion) + "}";
+      }
+      job->receipt = "{\"handle\":" + quote(handleName(handle))
+          + ",\"batch_ref\":" + edit::detail::batchRefJson(job->batch)
+          + ",\"target_version\":"
+          + quote(mesh::targetVersion(*geometry, handle, true))
+          + ",\"dependencies\":" + resulting + "],\"committed\":true";
+      if (job->receipt.size() + 256 > 16384)
+        return fail(Outcome::BUSY, "resource_limit");
+      job->receipt.reserve(job->receipt.size() + 256);
+      geometry = dynamic_cast<vsr::scene::Geometry *>(ids->resolve(handle));
+      mesh::CapturePlan safePlan;
+      if ((reason = mesh::currentPlan(
+               geometry, *ids, safePlan, job->expectedVersion, dependencies))
+          || !state->fileCurrent(*job) || registration.expired())
+        return fail(reason && std::strcmp(reason, "array_mapped") == 0
+                ? Outcome::BUSY
+                : Outcome::CONFLICT,
+            reason ? reason : "stale_target_version");
+      const auto expectedCore = geometry->lastParameterChange();
+      std::vector<std::size_t> expectedIndices;
+      expectedIndices.reserve(snapshot->dependencies.size());
+      for (const auto &dependency : snapshot->dependencies)
+        expectedIndices.push_back(dependency.lifetime.lock()->array->index());
+      const auto finalAuthority = ctx.beforeWrite();
+      if (finalAuthority != Outcome::OK)
+        return fail(finalAuthority, "authority_withdrawn");
+      geometry = dynamic_cast<vsr::scene::Geometry *>(ids->resolve(handle));
+      if (!geometry || geometry->lastParameterChange() != expectedCore
+          || !transaction.isCurrent(*geometry)
+          || (!stagedArrays.empty() && !stagedArrays.front()->slotAvailable())
+          || registration.expired() || !state->fileCurrent(*job)
+          || !integration->imageTrackingAvailable(scene)
+          || (reason = mesh::dependenciesCurrent(*snapshot)))
+        return fail(reason && std::strcmp(reason, "array_mapped") == 0
+                ? Outcome::BUSY
+                : Outcome::CONFLICT,
+            reason ? reason : "stale_target_version");
+      for (std::size_t i = 0; i < snapshot->dependencies.size(); ++i)
+        if (snapshot->dependencies[i].lifetime.lock()->array->index()
+            != expectedIndices[i])
+          return fail(Outcome::CONFLICT, "stale_dependencies");
+      // Pool backing can relocate at the final host guard, without changing
+      // logical indices. Notification pointers are reacquired without
+      // allocation.
+      for (std::size_t i = 0; i < oldArrays.size(); ++i)
+        oldArrays[i] = snapshot->dependencies[i].lifetime.lock()->array;
+      for (std::size_t i = 0; i < stagedArrays.size(); ++i) {
+        stagedArrays[i]->publish();
+        addedArrays[i] = stagedArrays[i]->array();
+      }
+      transaction.commit(*geometry);
+      // Publication transfers all identity ownership out of the abort guard.
+      (void)identityStage.release();
+      job->committed = true;
+      snapshot->targetVersion = geometry->lastParameterChange();
+      mesh::MeshCommitAccess::committed(*ids, *geometry);
+      state->edits->restorations().publishImage(job->batch);
+      job->storePrepared = false;
+      if (ctx.publishRestoration)
+        ctx.publishRestoration();
+      job->notificationFailed = mesh::notify(ctx.scene,
+          *geometry,
+          transaction,
+          snapshot->bindings,
+          addedArrays,
+          oldArrays);
+      const auto revision = ids->sceneRevision();
+      char suffix[256];
+      std::snprintf(suffix,
+          sizeof(suffix),
+          ",\"scene_revision\":\"%llu.%llu.%llu.%llu\"}",
+          (unsigned long long)revision.launch.activation,
+          (unsigned long long)revision.launch.nonce,
+          (unsigned long long)revision.domain,
+          (unsigned long long)revision.value);
+      job->receipt.append(suffix);
+      job->snapshot.reset();
+      job->releaseTransient();
+      try {
+        state->edits->syncStates().beginHook(scene);
+      } catch (...) {
+        job->notificationFailed = true;
+      }
+      Step committed;
+      committed.committed = true;
+      committed.status = Step::Status::SYNCHRONIZING;
+      return committed;
+    } catch (...) {
+      if (job->committed) {
+        job->notificationFailed = true;
+        Step committed;
+        committed.committed = true;
+        committed.status = Step::Status::SYNCHRONIZING;
+        return committed;
+      }
+      return fail(Outcome::BUSY, "resource_limit");
     }
   };
   return m_engine->submit(credentials, ref, std::move(request));
@@ -1621,6 +2239,24 @@ operations::Admission ImageExchange::submitImport(
             [&](const edit::BatchRef &ref) {
               return ctx.restorationRetained(ref.launchId, ref.batchId);
             });
+      auto globalCharge = std::make_shared<SessionCharge>();
+      globalCharge->ledger = state->retentionLedger;
+      {
+        std::lock_guard<std::mutex> lock(state->retentionLedger->mutex);
+        if (b->texels > state->limits.globalRetentionBytes
+            || state->retentionLedger->bytes
+                > state->limits.globalRetentionBytes - b->texels)
+          return fail(Outcome::BUSY, "restore_budget_exhausted");
+        state->retentionLedger->bytes += b->texels;
+        globalCharge->bytes = b->texels;
+      }
+      struct SnapshotCharges
+      {
+        std::shared_ptr<const void> session, global;
+      };
+      job->snapshot->sessionLease =
+          std::make_shared<SnapshotCharges>(SnapshotCharges{
+              job->snapshot->sessionLease, std::move(globalCharge)});
       edit::RestorationRecord record;
       record.ref = job->batch;
       record.scene = scene;

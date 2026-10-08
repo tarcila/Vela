@@ -145,12 +145,43 @@ inline const char *finiteValues(
   return nullptr;
 }
 
-// A positions-only, count-preserving proposal has the same triangle/index
-// and attribute cardinalities as the current bindings. Validate those in full,
-// substituting only the declared position samples in the finite-value check.
+/* Compound preparation copies Parameter metadata as well as numeric bindings.
+ * Bound dynamic strings and enumeration storage before any detached
+ * map/snapshot copy. The charged four-header allowance covers prior metadata,
+ * the expected map and proposed map, including restored/added Parameters. */
+inline bool boundedParameters(
+    const scene::Geometry &geometry, std::size_t addedControls = 0)
+{
+  if (addedControls > HEADER_CAP)
+    return false;
+  std::size_t bytes = addedControls;
+  const auto add = [&](std::size_t size) {
+    if (size > HEADER_CAP - bytes)
+      return false;
+    bytes += size;
+    return true;
+  };
+  for (std::size_t i = 0; i < geometry.numParameters(); ++i) {
+    const auto &parameter = geometry.parameterAt(i);
+    if (!add(sizeof(scene::Parameter) + sizeof(scene::Token))
+        || !add(parameter.description().size()))
+      return false;
+    for (const auto *value :
+        {&parameter.value(), &parameter.min(), &parameter.max()})
+      if (value->type() == ANARI_STRING && !add(value->getStringView().size()))
+        return false;
+    for (const auto &value : parameter.stringValues())
+      if (!add(sizeof(std::string)) || !add(value.size()))
+        return false;
+  }
+  return true;
+}
+
+// Export validates the live Geometry. Import's currency inventory deliberately
+// skips structural/sample checks that belong to its complete final-state plan.
 inline const char *plan(const scene::Geometry &geometry,
     CapturePlan &result,
-    const PositionData *replacement = nullptr)
+    bool validateResult = true)
 {
   const std::uint16_t endian = 1;
   if (*reinterpret_cast<const unsigned char *>(&endian) != 1)
@@ -214,6 +245,11 @@ inline const char *plan(const scene::Geometry &geometry,
       geometry.parameterValueAsObject<scene::Array>("vertex.position");
   if (!positions || !positionField || !positionField->isEnabled())
     return "missing_positions";
+  // Currency inventory includes all required storage, but cardinalities,
+  // index ranges and finite samples belong to the complete proposed result.
+  // Explicit replacements/removals may repair incompatible prior bindings.
+  if (!validateResult)
+    return nullptr;
   const auto *indexField = geometry.parameter("primitive.index");
   const auto *indices =
       geometry.parameterValueAsObject<scene::Array>("primitive.index");
@@ -240,35 +276,9 @@ inline const char *plan(const scene::Geometry &geometry,
     if (array->size() != count)
       return "attribute_count_mismatch";
   }
-  bool retainedPositions = false;
-  for (std::size_t i = 0; i < result.fieldCount; ++i)
-    if (result.arrays[result.aliases[i]] == positions
-        && result.fields[i]->name() != "vertex.position")
-      retainedPositions = true;
-  if (replacement) {
-    const auto repr = representation(replacement->elementType);
-    if (!replacement->data || !repr.floating || repr.components != 3)
-      return "unsupported_element_type";
-    if (replacement->count != positions->size())
-      return "count_change_unsupported";
-    const auto elementBytes = repr.components * repr.scalarBytes;
-    if (replacement->count > PAYLOAD_CAP / elementBytes
-        || replacement->byteLength != replacement->count * elementBytes)
-      return "invalid_payload_length";
-    const auto retainedBytes = result.payloadBytes
-        - (retainedPositions ? 0
-                             : positions->size() * positions->elementSize());
-    if (retainedBytes > PAYLOAD_CAP - replacement->byteLength)
-      return "resource_limit";
-    if (const auto *reason = finiteValues(*replacement))
-      return reason;
-  }
-  // Validate shared storage once. A split position alias leaves the old data
-  // in every preserved field and therefore still needs validation there.
+  // Export validates shared storage once, including disabled dependencies.
   for (std::size_t i = 0; i < result.arrayCount; ++i) {
     const auto *array = result.arrays[i];
-    if (replacement && array == positions && !retainedPositions)
-      continue;
     if (const auto *reason = finiteValues({array->data(),
             array->elementType(),
             array->size(),
@@ -291,7 +301,7 @@ inline const char *capture(const scene::Geometry &geometry,
   const auto targetVersion = "mesh:" + std::to_string(handle.launch.activation)
       + "." + std::to_string(handle.launch.nonce) + "."
       + std::to_string(handle.domain) + "." + std::to_string(handle.serial)
-      + "." + std::to_string(version->version);
+      + "." + std::to_string(geometry.lastParameterChange());
   std::string fields = "{", arrays = "{", dependencies = "[";
   for (std::size_t i = 0; i < plan.fieldCount; ++i) {
     const auto *field = plan.fields[i];

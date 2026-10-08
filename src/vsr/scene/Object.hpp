@@ -19,6 +19,10 @@
 #include <type_traits>
 
 namespace vsr::scene {
+namespace detail {
+class PreparedPositionBinding;
+class PreparedMeshBinding;
+} // namespace detail
 struct Object;
 } // namespace vsr::scene
 
@@ -175,6 +179,8 @@ struct Object : public ParameterObserver
   Token m_rendererDeviceName{}; // only used by Renderer
 
  private:
+  friend class detail::PreparedPositionBinding;
+  friend class detail::PreparedMeshBinding;
   friend struct Scene;
   void incObjectUseCountParameter(const Parameter *p);
   void decObjectUseCountParameter(const Parameter *p);

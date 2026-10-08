@@ -43,7 +43,8 @@ struct ObjectPool
   T &operator[](size_t i) const; // raw access
   ObjectPoolRef<T> at(size_t i) const; // safe access
 
-  size_t size() const;
+  size_t size() const; // occupied slots
+  // Logical slot extent, including empty slots; not backing vector capacity.
   size_t capacity() const;
   bool empty() const;
 
@@ -62,6 +63,8 @@ struct ObjectPool
   bool erase(size_t i);
 
   void clear();
+  // Reserve backing values/markers/free indices without changing the logical
+  // slot extent, occupancy or available indices. Existing pointers may move.
   void reserve(size_t size);
 
   std::vector<ObjectPoolRemapping> defragment();
@@ -300,6 +303,7 @@ inline void ObjectPool<T>::reserve(size_t size)
 {
   m_values.reserve(size);
   m_slots.reserve(size);
+  m_freeIndices.reserve(size);
 }
 
 template <typename T>
