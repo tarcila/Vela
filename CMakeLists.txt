@@ -128,6 +128,11 @@ endif()
 add_subdirectory(external)
 add_subdirectory(src)
 
+if (VSR_USE_INTEGRATION)
+  install(FILES python/vsr_mesh.py DESTINATION share/vela/python)
+  install(FILES docs/mesh-exchange.md DESTINATION share/vela/docs)
+endif()
+
 ## Cleanup CMake variables ##
 
 include(cmake/mark_cache_variables_as_advanced.cmake)

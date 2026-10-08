@@ -76,6 +76,11 @@ class ImageExchange
       const operations::OperationRef &ref,
       SceneId scene,
       identity::ObjectHandle handle);
+  operations::Admission submitMeshExport(
+      const session::Credentials &credentials,
+      const operations::OperationRef &ref,
+      SceneId scene,
+      identity::ObjectHandle handle);
   operations::Admission submitImport(const session::Credentials &credentials,
       const operations::OperationRef &ref,
       SceneId scene,
@@ -84,6 +89,11 @@ class ImageExchange
       std::string fileName);
 
  private:
+  operations::Admission submitCapture(const session::Credentials &credentials,
+      const operations::OperationRef &ref,
+      SceneId scene,
+      identity::ObjectHandle handle,
+      bool mesh);
   struct State;
   std::shared_ptr<State> m_state;
   Integration *m_integration{nullptr};

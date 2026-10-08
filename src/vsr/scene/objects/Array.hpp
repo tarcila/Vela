@@ -24,7 +24,7 @@ struct ArrayLifetime
   Array *array{nullptr};
 };
 
-/* Owning-thread write admission clock shared by every tracked Image in one
+/* Owning-thread write admission clock shared by tracked host Arrays in one
  * host launch. A smaller ceiling tests exhaustion, never wraps the clock.
  * Reservations are burned; publication belongs to Array. */
 class ArrayWriteSequence
@@ -98,8 +98,10 @@ struct Array : public Object
   bool isProxy() const;
   bool isMapped() const;
   bool isImage() const;
+  bool supportsHostWriteTracking() const;
   std::weak_ptr<ArrayLifetime> lifetime() const;
   std::optional<std::uint64_t> dataWriteSequence() const;
+  // Historical API name; enrolls both supported Images and host mesh Arrays.
   bool trackImageWrites(const std::shared_ptr<ArrayWriteSequence> &sequence);
 
   void convertProxyToHost();

@@ -15,4 +15,12 @@ if (TARGET vsr_ui_imgui)
   target_compile_definitions(${PROJECT_NAME} PRIVATE VSR_TEST_VIEWER_UI)
 endif()
 
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+  VSR_MESH_TEST_PYTHON="${Python3_EXECUTABLE}"
+  VSR_MESH_TEST_SOURCE="${CMAKE_SOURCE_DIR}"
+)
 add_test(NAME vsr::integration COMMAND ${PROJECT_NAME} "[integration]")
+add_test(NAME vsr::mesh-helper
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/test-mesh-bundle.py)
+

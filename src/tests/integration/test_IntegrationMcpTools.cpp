@@ -526,6 +526,10 @@ struct Fixture
     return metadata.get("image_exchange_directory")->s;
   }
 
+  std::string objectHandle(const vsr::scene::Object *object);
+  Reply exportMesh(
+      const Session &s, std::uint64_t id, const vsr::scene::Geometry *geometry);
+
   Reply exportImage(
       const Session &s, std::uint64_t id, const std::string &handle)
   {
@@ -652,6 +656,44 @@ struct Fixture
         .get<float>();
   }
 };
+
+std::string Fixture::objectHandle(const vsr::scene::Object *object)
+{
+  const auto handle = sceneIds->handleOf(object);
+  char text[33];
+  std::snprintf(text,
+      sizeof(text),
+      "%016llx%016llx",
+      (unsigned long long)handle.domain,
+      (unsigned long long)handle.serial);
+  return text;
+}
+
+Reply Fixture::exportMesh(
+    const Session &s, std::uint64_t id, const vsr::scene::Geometry *geometry)
+{
+  return tool(s,
+      "vsr_mesh_export",
+      "{\"request_id\":" + std::to_string(id)
+          + ",\"scene_id\":" + std::to_string(sceneId)
+          + ",\"handle\":" + json::quote(objectHandle(geometry)) + "}");
+}
+
+struct MeshEntropyScope
+{
+  MeshEntropyScope();
+  ~MeshEntropyScope();
+};
+
+MeshEntropyScope::MeshEntropyScope()
+{
+  fixedExportEntropy = true;
+}
+
+MeshEntropyScope::~MeshEntropyScope()
+{
+  fixedExportEntropy = false;
+}
 
 } // namespace
 
@@ -5345,6 +5387,552 @@ SCENARIO(
   REQUIRE(json::parse(published.imageExchange, metadata));
   CHECK_FALSE(
       metadata.get("exchange_limits")->get("available_session_snapshot_bytes"));
+}
+
+SCENARIO("MCP Mesh Export provides a READ-only lossless working bundle",
+    "[integration][mcp][mesh-export]")
+{
+  Fixture f({}, false, false, false, 120., true, UINT64_MAX, {}, true);
+  auto positions = f.scene.createArray(ANARI_FLOAT32_VEC3, 3);
+  const float points[] = {0, 0, 0, 1, 0, 0, 0, 1, 0};
+  positions->setData(static_cast<const void *>(points));
+  auto geometry = f.scene.createObject<vsr::scene::Geometry>("triangle");
+  geometry->setParameterObject("vertex.position", *positions);
+  geometry->setParameterObject("vertex.normal", *positions);
+  geometry->parameter("vertex.normal")->setEnabled(false);
+  const auto identity = f.sceneIds->handleOf(geometry.data());
+  char wire[33];
+  std::snprintf(wire,
+      sizeof(wire),
+      "%016llx%016llx",
+      (unsigned long long)identity.domain,
+      (unsigned long long)identity.serial);
+  const std::string handle = wire;
+  const auto s = f.attach();
+  const auto args = "{\"request_id\":1,\"scene_id\":"
+      + std::to_string(f.sceneId) + ",\"handle\":" + json::quote(handle) + "}";
+  REQUIRE(f.tool(s, "vsr_mesh_export", args).str("kind") == "mesh_export");
+  auto done = f.await(s, 1);
+  REQUIRE(done.str("outcome") == "ok");
+  CHECK_FALSE(done.flag("committed"));
+  REQUIRE(done.result()->get("file_name"));
+  const auto path = f.exchangePath() + "/" + done.result()->get("file_name")->s;
+  const auto command = std::string(VSR_MESH_TEST_PYTHON) + " "
+      + VSR_MESH_TEST_SOURCE + "/scripts/test-mesh-export.py '" + path + "'";
+  REQUIRE(std::system(command.c_str()) == 0);
+  CHECK(std::memcmp(positions->data(), points, sizeof(points)) == 0);
+  CHECK(f.tool(s, "vsr_mesh_export", args).flag("replayed"));
+  // Helper changed the working copy; a historical replay must not rewrite it.
+  REQUIRE(std::system((command + " --edited").c_str()) == 0);
+}
+
+SCENARIO("MCP Mesh Export preserves indexed typed attributes and associations",
+    "[integration][mcp][mesh-export]")
+{
+  Fixture f({}, false, false, false, 120., true, UINT64_MAX, {}, true);
+  auto geometry = f.scene.createObject<vsr::scene::Geometry>("triangle");
+  auto positions = f.scene.createArray(ANARI_FLOAT64_VEC3, 4);
+  const double points[] = {0, 0, 0, 1, 0, 0, 0, 1, 0, 3, 4, 5};
+  positions->setData(static_cast<const void *>(points));
+  geometry->setParameterObject("vertex.position", *positions);
+  auto indices = f.scene.createArray(ANARI_UINT64_VEC3, 1);
+  const std::uint64_t triangle[] = {0, 1, 2};
+  indices->setData(static_cast<const void *>(triangle));
+  geometry->setParameterObject("primitive.index", *indices);
+  auto uv = f.scene.createArray(ANARI_FLOAT32_VEC2, 3);
+  const float coordinates[] = {0, 0, 1, 0, 0, 1};
+  uv->setData(static_cast<const void *>(coordinates));
+  geometry->setParameterObject("faceVarying.attribute0", *uv);
+  geometry->setParameterObject("faceVarying.attribute1", *uv);
+  auto primitive = f.scene.createArray(ANARI_INT16, 1);
+  const std::int16_t value = -123;
+  primitive->setData(static_cast<const void *>(&value));
+  geometry->setParameterObject("primitive.attribute2", *primitive);
+  auto colors = f.scene.createArray(ANARI_UFIXED8_VEC4, 4);
+  const unsigned char rgba[] = {
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 252, 253, 254, 255};
+  colors->setData(static_cast<const void *>(rgba));
+  geometry->setParameterObject("vertex.color", *colors);
+  auto tangents = f.scene.createArray(ANARI_FLOAT32_VEC4, 4);
+  const float tangent[] = {1, 0, 0, -1, 1, 0, 0, 1, 1, 0, 0, -1, 1, 0, 0, 1};
+  tangents->setData(static_cast<const void *>(tangent));
+  geometry->setParameterObject("vertex.tangent", *tangents);
+  auto independent = f.scene.createArray(ANARI_FLOAT32_VEC2, 3);
+  independent->setData(static_cast<const void *>(coordinates));
+  geometry->setParameterObject("faceVarying.attribute3", *independent);
+  const auto s = f.attach();
+  REQUIRE(f.exportMesh(s, 1, geometry.data()).str("kind") == "mesh_export");
+  const auto done = f.await(s, 1);
+  REQUIRE(done.str("outcome") == "ok");
+  const auto path = f.exchangePath() + "/" + done.result()->get("file_name")->s;
+  const auto command = std::string(VSR_MESH_TEST_PYTHON) + " "
+      + VSR_MESH_TEST_SOURCE + "/scripts/test-mesh-export.py '" + path
+      + "' --indexed";
+  REQUIRE(std::system(command.c_str()) == 0);
+  CHECK(geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == positions.data());
+}
+
+SCENARIO("MCP Mesh Export refuses complete unsupported or incoherent meshes",
+    "[integration][mcp][mesh-export]")
+{
+  Fixture f({}, false, false, false, 120., true, UINT64_MAX, {}, true);
+  auto geometry = f.scene.createObject<vsr::scene::Geometry>("triangle");
+  auto positions = f.scene.createArray(ANARI_FLOAT32_VEC3, 3);
+  const float points[] = {0, 0, 0, 1, 0, 0, 0, 1, 0};
+  positions->setData(static_cast<const void *>(points));
+  geometry->setParameterObject("vertex.position", *positions);
+  std::string reason;
+  SECTION("unknown disabled dependency")
+  {
+    geometry->setParameterObject("vertex.unsupported", *positions);
+    geometry->parameter("vertex.unsupported")->setEnabled(false);
+    reason = "unsupported_dependency";
+  }
+  SECTION("object reference dependency")
+  {
+    auto material = f.scene.createObject<vsr::scene::Material>("matte");
+    geometry->setParameterObject("material", *material);
+    reason = "unsupported_dependency";
+  }
+  SECTION("mapped storage")
+  {
+    positions->map();
+    reason = "array_mapped";
+  }
+  SECTION("proxy")
+  {
+    auto proxy = f.scene.createArrayProxy(ANARI_FLOAT32_VEC3, 3);
+    geometry->setParameterObject("vertex.position", *proxy);
+    reason = "unsupported_storage";
+  }
+#if VSR_USE_CUDA
+  SECTION("CUDA residency")
+  {
+    auto cuda = f.scene.createArrayCUDA(ANARI_FLOAT32_VEC3, 3);
+    geometry->setParameterObject("vertex.position", *cuda);
+    reason = "unsupported_storage";
+  }
+#endif
+  SECTION("two dimensional numeric layout")
+  {
+    auto multidimensional = f.scene.createArray(ANARI_FLOAT32_VEC3, 3, 1);
+    geometry->setParameterObject("vertex.position", *multidimensional);
+    reason = "unsupported_layout";
+  }
+  SECTION("payload byte ceiling")
+  {
+    auto oversized = f.scene.createArray(ANARI_FLOAT32, (64u << 20) / 4 + 1);
+    geometry->setParameterObject("vertex.attribute0", *oversized);
+    reason = "resource_limit";
+  }
+  SECTION("wrong subtype")
+  {
+    geometry = f.scene.createObject<vsr::scene::Geometry>("quad");
+    reason = "unsupported_geometry";
+  }
+  SECTION("missing positions")
+  {
+    geometry->removeParameter("vertex.position");
+    reason = "missing_positions";
+  }
+  SECTION("invalid attribute cardinality")
+  {
+    auto attribute = f.scene.createArray(ANARI_FLOAT32_VEC2, 2);
+    const float uv[] = {0, 0, 1, 1};
+    attribute->setData(static_cast<const void *>(uv));
+    geometry->setParameterObject("vertex.attribute0", *attribute);
+    reason = "attribute_count_mismatch";
+  }
+  SECTION("nonfinite positions")
+  {
+    auto *mapped = positions->mapAs<vsr::math::float3>();
+    mapped[0].x = std::numeric_limits<float>::infinity();
+    positions->unmap();
+    reason = "nonfinite_mesh_value";
+  }
+  SECTION("out of range index")
+  {
+    auto index = f.scene.createArray(ANARI_UINT32_VEC3, 1);
+    const std::uint32_t triangle[] = {0, 1, 3};
+    index->setData(static_cast<const void *>(triangle));
+    geometry->setParameterObject("primitive.index", *index);
+    reason = "index_out_of_range";
+  }
+  SECTION("corner normals require three components even with heap-backed names")
+  {
+    auto normals = f.scene.createArray(ANARI_FLOAT32_VEC2, 3);
+    const float values[] = {0, 1, 0, 1, 0, 1};
+    normals->setData(static_cast<const void *>(values));
+    geometry->setParameterObject("faceVarying.normal", *normals);
+    reason = "unsupported_element_type";
+  }
+  SECTION("tangents require four components")
+  {
+    geometry->setParameterObject("vertex.tangent", *positions);
+    reason = "unsupported_element_type";
+  }
+  SECTION("colours require three or four components")
+  {
+    auto colors = f.scene.createArray(ANARI_UINT8, 3);
+    const unsigned char values[] = {0, 1, 2};
+    colors->setData(static_cast<const void *>(values));
+    geometry->setParameterObject("vertex.color", *colors);
+    reason = "unsupported_element_type";
+  }
+  SECTION("tracked numeric families outside the bundle profile fail closed")
+  {
+    const auto type = GENERATE(ANARI_FIXED64, ANARI_UFIXED64, ANARI_FLOAT16);
+    auto attribute = f.scene.createArray(type, 3);
+    geometry->setParameterObject("vertex.attribute0", *attribute);
+    reason = "unsupported_element_type";
+  }
+  SECTION("unsupported numeric type")
+  {
+    auto reference = f.scene.createArray(ANARI_ARRAY1D, 3);
+    geometry->setParameterObject("vertex.attribute0", *reference);
+    reason = "unsupported_element_type";
+  }
+  const auto s = f.attach();
+  f.exportMesh(s, 1, geometry.data());
+  const auto done = f.await(s, 1);
+  REQUIRE(done.str("outcome") != "ok");
+  REQUIRE(done.result());
+  CHECK(done.result()->get("reason")->s == reason);
+  CHECK_FALSE(done.result()->get("file_name"));
+  CHECK(std::filesystem::is_empty(f.exchangePath()));
+  if (positions->isMapped())
+    positions->unmap();
+}
+
+SCENARIO(
+    "MCP Mesh Export evidence cannot revive after ordinary writes or binding changes",
+    "[integration][mcp][mesh-export]")
+{
+  Fixture f({}, false, false, false, 120., true, UINT64_MAX, {}, true);
+  auto geometry = f.scene.createObject<vsr::scene::Geometry>("triangle");
+  auto positions = f.scene.createArray(ANARI_FLOAT32_VEC3, 3);
+  const float points[] = {0, 0, 0, 1, 0, 0, 0, 1, 0};
+  positions->setData(static_cast<const void *>(points));
+  geometry->setParameterObject("vertex.position", *positions);
+  const auto s = f.attach();
+  f.exportMesh(s, 1, geometry.data());
+  const auto first = f.await(s, 1);
+  REQUIRE(first.str("outcome") == "ok");
+  const auto evidence = json::write(*first.result()->get("dependencies"));
+  const auto target = first.result()->get("target_version")->s;
+  auto unrelated = f.scene.createObject<vsr::scene::Geometry>("sphere");
+  unrelated->setParameter("radius", 1.f);
+  f.exportMesh(s, 2, geometry.data());
+  const auto second = f.await(s, 2);
+  REQUIRE(second.str("outcome") == "ok");
+  CHECK(json::write(*second.result()->get("dependencies")) == evidence);
+  CHECK(second.result()->get("target_version")->s == target);
+  positions->setData(static_cast<const void *>(points));
+  f.exportMesh(s, 3, geometry.data());
+  const auto third = f.await(s, 3);
+  REQUIRE(third.str("outcome") == "ok");
+  CHECK(json::write(*third.result()->get("dependencies")) != evidence);
+  CHECK(third.result()->get("target_version")->s == target);
+  geometry->parameter("vertex.position")->setEnabled(false);
+  geometry->parameter("vertex.position")->setEnabled(true);
+  f.exportMesh(s, 4, geometry.data());
+  const auto fourth = f.await(s, 4);
+  REQUIRE(fourth.str("outcome") == "ok");
+  CHECK(fourth.result()->get("target_version")->s != target);
+  auto replacement = f.scene.createArray(ANARI_FLOAT32_VEC3, 3);
+  replacement->setData(static_cast<const void *>(points));
+  geometry->setParameterObject("vertex.position", *replacement);
+  geometry->setParameterObject("vertex.position", *positions);
+  f.exportMesh(s, 5, geometry.data());
+  const auto fifth = f.await(s, 5);
+  REQUIRE(fifth.str("outcome") == "ok");
+  CHECK(fifth.result()->get("target_version")->s
+      != fourth.result()->get("target_version")->s);
+  CHECK(json::write(*fifth.result()->get("dependencies"))
+      == json::write(*fourth.result()->get("dependencies")));
+  f.scene.removeObject(positions.data());
+  auto recreated = f.scene.createArray(ANARI_FLOAT32_VEC3, 3);
+  recreated->setData(static_cast<const void *>(points));
+  geometry->setParameterObject("vertex.position", *recreated);
+  f.exportMesh(s, 6, geometry.data());
+  const auto sixth = f.await(s, 6);
+  REQUIRE(sixth.str("outcome") == "ok");
+  CHECK(json::write(*sixth.result()->get("dependencies"))
+      != json::write(*fifth.result()->get("dependencies")));
+}
+
+SCENARIO(
+    "MCP Mesh Export freezes bytes at capture and honors disabled agent edits",
+    "[integration][mcp][mesh-export]")
+{
+  Fixture f({}, false, false, false, 120., true, UINT64_MAX, {}, true);
+  auto geometry = f.scene.createObject<vsr::scene::Geometry>("triangle");
+  auto positions = f.scene.createArray(ANARI_FLOAT32_VEC3, 3);
+  const float original[] = {0, 0, 0, 1, 0, 0, 0, 1, 0};
+  positions->setData(static_cast<const void *>(original));
+  geometry->setParameterObject("vertex.position", *positions);
+  geometry->setParameterObject("vertex.normal", *positions);
+  geometry->parameter("vertex.normal")->setEnabled(false);
+  const auto s = f.attach();
+  f.authority->setAgentEditsDisabled(true);
+  f.exportMesh(s, 1, geometry.data());
+  REQUIRE(f.integration.service() > 0);
+  const float later[] = {10, 0, 0, 11, 0, 0, 10, 1, 0};
+  positions->setData(static_cast<const void *>(later));
+  const auto done = f.await(s, 1);
+  REQUIRE(done.str("outcome") == "ok");
+  const auto path = f.exchangePath() + "/" + done.result()->get("file_name")->s;
+  const auto command = std::string(VSR_MESH_TEST_PYTHON) + " "
+      + VSR_MESH_TEST_SOURCE + "/scripts/test-mesh-export.py '" + path + "'";
+  REQUIRE(std::system(command.c_str()) == 0);
+  CHECK(std::memcmp(positions->data(), later, sizeof(later)) == 0);
+}
+
+SCENARIO(
+    "MCP Mesh Export checks authority identity and strict request envelopes",
+    "[integration][mcp][mesh-export]")
+{
+  Fixture f({}, false, false, false, 120., true, UINT64_MAX, {}, true);
+  auto geometry = f.scene.createObject<vsr::scene::Geometry>("triangle");
+  auto positions = f.scene.createArray(ANARI_FLOAT32_VEC3, 3);
+  const float points[] = {0, 0, 0, 1, 0, 0, 0, 1, 0};
+  positions->setData(static_cast<const void *>(points));
+  geometry->setParameterObject("vertex.position", *positions);
+  const auto s = f.attach();
+  const auto base =
+      "{\"request_id\":1,\"scene_id\":" + std::to_string(f.sceneId)
+      + ",\"handle\":" + json::quote(f.objectHandle(geometry.data()));
+  for (const auto &extra :
+      {",\"file_name\":\"../asset.vmesh\"}", ",\"unknown\":true}"})
+    CHECK(f.tool(s, "vsr_mesh_export", base + extra).errorCode()
+        == "invalid_request");
+  CHECK(f.tool(s,
+             "vsr_mesh_export",
+             "{\"request_id\":true,\"scene_id\":0,\"handle\":null}")
+            .errorCode()
+      == "invalid_request");
+  const auto tools = f.rpc("tools/list", "{}");
+  const auto listed = json::write(tools.json);
+  CHECK(listed.find("vsr_mesh_export") != std::string::npos);
+  CHECK(listed.find("vsr_mesh_import") == std::string::npos);
+  json::Value metadata;
+  REQUIRE(json::parse(f.images->metadata(f.sceneId), metadata));
+  CHECK(metadata.get("mesh_export")->b);
+  CHECK_FALSE(metadata.get("mesh_import")->b);
+  CHECK(metadata.get("mesh_field_cap")->n == 64);
+  SECTION("READ denied at admission")
+  {
+    f.authority->restrict(
+        session::Target::scene(f.sceneId), session::Capability::READ);
+    CHECK(f.exportMesh(s, 1, geometry.data()).errorCode() == "forbidden");
+  }
+  SECTION("wrong kind")
+  {
+    const auto args =
+        "{\"request_id\":1,\"scene_id\":" + std::to_string(f.sceneId)
+        + ",\"handle\":" + json::quote(f.objectHandle(positions.data())) + "}";
+    f.tool(s, "vsr_mesh_export", args);
+    CHECK(f.await(s, 1).str("outcome") == "invalid_request");
+  }
+  SECTION("unknown handle")
+  {
+    f.tool(s,
+        "vsr_mesh_export",
+        "{\"request_id\":1,\"scene_id\":0,\"handle\":\"00000000000000000000000000000000\"}");
+    CHECK(f.await(s, 1).str("outcome") == "invalid_request");
+  }
+  CHECK(std::filesystem::is_empty(f.exchangePath()));
+}
+
+SCENARIO("MCP Mesh Export removes unpublished output on late denial and races",
+    "[integration][mcp][mesh-export]")
+{
+  ImageAllocator allocator;
+  allocator.remaining = 1;
+  image::ExchangeLimits limits;
+  limits.allocator = &allocator;
+  Fixture f({}, false, false, false, 120., true, UINT64_MAX, limits, true);
+  auto geometry = f.scene.createObject<vsr::scene::Geometry>("triangle");
+  auto positions = f.scene.createArray(ANARI_FLOAT32_VEC3, 3);
+  const float points[] = {0, 0, 0, 1, 0, 0, 0, 1, 0};
+  positions->setData(static_cast<const void *>(points));
+  geometry->setParameterObject("vertex.position", *positions);
+  const auto s = f.attach();
+  const auto path = f.exchangePath();
+  f.exportMesh(s, 1, geometry.data());
+  REQUIRE(f.integration.service() > 0);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!allocator.deallocations.load()) {
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  REQUIRE_FALSE(std::filesystem::is_empty(path));
+  const auto file = std::filesystem::directory_iterator(path)->path();
+  std::string outcome = "invalid_request";
+  SECTION("READ withdrawal")
+  {
+    f.authority->restrict(
+        session::Target::scene(f.sceneId), session::Capability::READ);
+    outcome = "forbidden";
+  }
+  SECTION("cancellation")
+  {
+    f.tool(s, "vsr_cancel", "{\"operation_ref\":" + ref(s.id, 1) + "}");
+    outcome = "cancelled";
+  }
+  SECTION("deadline")
+  {
+    f.now += 31.;
+    outcome = "timeout";
+  }
+  SECTION("working file changed")
+  {
+    std::ofstream(file, std::ios::binary | std::ios::trunc) << "changed";
+  }
+  SECTION("Geometry lifetime withdrawn")
+  {
+    f.scene.removeObject(geometry.data());
+  }
+  SECTION("directory identity replaced")
+  {
+    REQUIRE(::rename(path.c_str(), (path + "-old").c_str()) == 0);
+    REQUIRE(::mkdir(path.c_str(), 0700) == 0);
+  }
+  const auto done = f.await(s, 1);
+  CHECK(done.str("outcome") == outcome);
+  CHECK_FALSE(done.flag("committed"));
+  f.drain();
+  CHECK_FALSE(std::filesystem::exists(file));
+}
+
+SCENARIO("MCP Mesh Export bounds physical allocations before file creation",
+    "[integration][mcp][mesh-export]")
+{
+  ImageAllocator allocator;
+  image::ExchangeLimits limits;
+  SECTION("payload allocator failure")
+  {
+    limits.allocator = &allocator;
+  }
+  SECTION("transient ceiling")
+  {
+    limits.transientBytes = 1;
+  }
+  SECTION("physical ceiling")
+  {
+    auto memory = std::make_shared<vsr::rendering::FrameBudget>(1024);
+    limits.reservePhysicalMemory = [memory](std::size_t bytes) {
+      return memory->reserve(bytes);
+    };
+  }
+  Fixture f({}, false, false, false, 120., true, UINT64_MAX, limits, true);
+  auto geometry = f.scene.createObject<vsr::scene::Geometry>("triangle");
+  auto positions = f.scene.createArray(ANARI_FLOAT32_VEC3, 3);
+  const float points[] = {0, 0, 0, 1, 0, 0, 0, 1, 0};
+  positions->setData(static_cast<const void *>(points));
+  geometry->setParameterObject("vertex.position", *positions);
+  const auto s = f.attach();
+  f.exportMesh(s, 1, geometry.data());
+  const auto done = f.await(s, 1);
+  REQUIRE(done.str("outcome") == "busy");
+  CHECK(done.result()->get("reason")->s == "resource_limit");
+  CHECK_FALSE(done.flag("committed"));
+  CHECK(std::filesystem::is_empty(f.exchangePath()));
+}
+
+SCENARIO("Mesh receipt and Activity copies retain bounded physical ownership",
+    "[integration][mcp][mesh-export]")
+{
+  auto memory = std::make_shared<vsr::rendering::FrameBudget>(8u << 20);
+  const auto baseline = memory->used();
+  auto probe = memory->reserve(1);
+  const auto overhead = memory->used() - baseline - 1;
+  probe.reset();
+  image::ExchangeLimits limits;
+  limits.reservePhysicalMemory = [memory](std::size_t bytes) {
+    return memory->reserve(bytes);
+  };
+  auto f = std::make_unique<Fixture>(inspection::PageLimits{},
+      false,
+      false,
+      false,
+      120.,
+      true,
+      UINT64_MAX,
+      limits,
+      true);
+  auto geometry = f->scene.createObject<vsr::scene::Geometry>("triangle");
+  auto positions = f->scene.createArray(ANARI_FLOAT32_VEC3, 3);
+  const float points[] = {0, 0, 0, 1, 0, 0, 0, 1, 0};
+  positions->setData(static_cast<const void *>(points));
+  geometry->setParameterObject("vertex.position", *positions);
+  const auto s = f->attach();
+  f->exportMesh(s, 1, geometry.data());
+  REQUIRE(f->await(s, 1).str("outcome") == "ok");
+  const operations::Credentials credentials{
+      f->authority->launchCredential(), s.id, s.secret};
+  std::optional<operations::Status> held =
+      f->engine->status(credentials, {s.id, 1});
+  REQUIRE(held->terminal == Outcome::OK);
+  const auto usage = memory->used();
+  std::optional<operations::Status> copy = *held;
+  CHECK(memory->used() == usage + 65536 + overhead);
+  auto entries = f->imageActivity->snapshot();
+  REQUIRE(entries.size() == 1);
+  CHECK(entries[0].entry.kind == activity::OperationKind::MESH_EXPORT);
+  std::optional<activity::Entry> entryCopy = entries[0].entry;
+  REQUIRE_FALSE(entryCopy->batchRef);
+  f.reset();
+  CHECK(memory->used() == baseline + 4 * (65536 + overhead));
+  CHECK(copy->result == held->result);
+  held.reset();
+  copy.reset();
+  entries.clear();
+  entryCopy.reset();
+  CHECK(memory->used() == baseline);
+}
+
+SCENARIO(
+    "MCP Mesh Export shares finite file quota without overwriting working copies",
+    "[integration][mcp][mesh-export]")
+{
+  Fixture f({}, false, false, false, 120., true, UINT64_MAX, {}, true);
+  auto geometry = f.scene.createObject<vsr::scene::Geometry>("triangle");
+  auto positions = f.scene.createArray(ANARI_FLOAT32_VEC3, 3);
+  const float points[] = {0, 0, 0, 1, 0, 0, 0, 1, 0};
+  positions->setData(static_cast<const void *>(points));
+  geometry->setParameterObject("vertex.position", *positions);
+  const auto s = f.attach();
+  SECTION("shared directory file ceiling")
+  {
+    const auto directory = f.exchangePath();
+    for (unsigned i = 0; i < 1024; ++i)
+      std::ofstream(directory + "/retained-" + std::to_string(i) + ".png")
+          << "keep";
+    f.exportMesh(s, 1, geometry.data());
+    CHECK(f.await(s, 1).str("outcome") == "busy");
+    CHECK(std::distance(std::filesystem::directory_iterator(directory),
+              std::filesystem::directory_iterator{})
+        == 1024);
+  }
+  SECTION("exclusive collision attempts")
+  {
+    MeshEntropyScope entropy;
+    f.exportMesh(s, 1, geometry.data());
+    const auto first = f.await(s, 1);
+    REQUIRE(first.str("outcome") == "ok");
+    const auto path =
+        f.exchangePath() + "/" + first.result()->get("file_name")->s;
+    std::ofstream(path, std::ios::binary | std::ios::trunc) << "keep";
+    f.exportMesh(s, 2, geometry.data());
+    CHECK(f.await(s, 2).str("outcome") == "busy");
+    std::ifstream file(path);
+    std::string content;
+    file >> content;
+    CHECK(content == "keep");
+  }
 }
 
 SCENARIO("MCP Image Export captures sharing without mutating texels",

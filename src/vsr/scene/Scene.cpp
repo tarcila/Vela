@@ -1142,7 +1142,7 @@ bool Scene::trackImageWrites(
     return false;
   bool ready = true;
   foreach_item_const(m_db.array, [&](const Array *array) {
-    if (array && array->isImage() && array->isMapped())
+    if (array && array->supportsHostWriteTracking() && array->isMapped())
       ready = false;
   });
   if (!ready)

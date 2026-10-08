@@ -261,8 +261,31 @@ inline bool validImageExchange(std::string_view text, std::string_view launchId)
       || (value.get("import")->b && !enabled)
       || (enabled && !value.get("data_tracking")->b))
     return false;
-  if (value.o.size() != 7)
+  const bool meshMetadata = value.get("mesh_export") != nullptr;
+  if (value.o.size() != 7 + (meshMetadata ? (enabled ? 7 : 6) : 0))
     return false;
+  if (meshMetadata) {
+    if (!flag("mesh_export") || !flag("mesh_import")
+        || (value.get("mesh_export")->b && !enabled)
+        || (value.get("mesh_import")->b && !value.get("mesh_export")->b))
+      return false;
+    const auto exact = [&](const char *name, double expected) {
+      const auto *v = value.get(name);
+      return v && v->isNumber() && v->n == expected;
+    };
+    if (!exact("mesh_revision", 1) || !exact("mesh_payload_byte_cap", 67108864)
+        || !exact("mesh_header_byte_cap", 65536)
+        || !exact("mesh_field_cap", 64))
+      return false;
+    if (enabled) {
+      const auto *meshDirectory = value.get("mesh_exchange_directory");
+      const auto *imageDirectory = value.get("image_exchange_directory");
+      if (!meshDirectory || !meshDirectory->isString() || !imageDirectory
+          || !imageDirectory->isString()
+          || meshDirectory->s != imageDirectory->s)
+        return false;
+    }
+  }
   if (enabled) {
     const auto *directory = value.get("image_exchange_directory");
     if (!directory || !directory->isString() || directory->s.empty()

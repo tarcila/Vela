@@ -15,7 +15,7 @@ machine-readable field, and `message` strings are explanatory only.
   | `tools/QueryTools.hpp` | `vsr_discover`, `vsr_inspect` | 103 |
   | `tools/LookupTools.hpp` | `vsr_operation_status`, `vsr_cancel` | 103 |
   | `tools/EditTools.hpp` | `vsr_edit`, `vsr_restore` | 104 |
-  | `tools/ImageTools.hpp` | `vsr_image_export`, `vsr_image_import` | Image exchange |
+  | `tools/ImageTools.hpp` | `vsr_image_export`, `vsr_image_import`, `vsr_mesh_export` | Confined Image and Mesh exchange |
   | `tools/RenderTools.hpp` | `vsr_render`, `vsr_render_image`, `vsr_select_device`, `vsr_set_view_camera`, `vsr_resynchronize` | 105 |
 
 ## Payload placement
@@ -65,7 +65,7 @@ form:
 | Field | Presence | Meaning |
 |---|---|---|
 | `operation_ref` | always | `{session_id, request_id}`. It is the complete qualified reference, including when the lookup names an earlier session's record |
-| `kind` | always | Retained operation kind: `discover`, `inspect`, `edit`, `restore`, `image_export`, `image_import`, `render`, `select_device`, `set_view_camera`, `resynchronize`. Preserved for lookups from later sessions |
+| `kind` | always | Retained operation kind: `discover`, `inspect`, `edit`, `restore`, `image_export`, `image_import`, `mesh_export`, `render`, `select_device`, `set_view_camera`, `resynchronize`. Preserved for lookups from later sessions |
 | `state` | always | `pending` or `terminal` |
 | `progress` | while a slot is held | A frozen non-terminal name (see below). `awaiting_cleanup` can coexist with `state: terminal` |
 | `outcome` | once terminal | A frozen code (see below) |
@@ -347,6 +347,7 @@ for launch-wide reservations, exhaustion and lifetime-safe cache resolution.
 | Tool | Arguments | Capability | Slot / ID |
 |---|---|---|---|
 | `vsr_image_export` | `request_id`, `scene_id`, `handle` | Scene READ | one normal scene slot, one request ID; no render encoder slot |
+| `vsr_mesh_export` | `request_id`, `scene_id`, `handle` | Scene READ | one normal scene slot, one request ID; no render encoder slot. Triangle Geometry only; [typed bundle/helper contract](../../../../docs/mesh-exchange.md). Mesh Import unavailable |
 
 All three arguments are required; additional properties reject before admission.
 The handle addresses an Array, not a Sampler. Status kind is `image_export` on

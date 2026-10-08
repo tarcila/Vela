@@ -261,6 +261,7 @@ class SceneIdentity
   // Completed texel-write token, separate from parameter versions. Unknown,
   // retired/reused Arrays and unenrolled identities have no token.
   std::optional<std::string> imageDataVersion(const ObjectHandle &h) const;
+  std::optional<std::string> arrayDataVersion(const ObjectHandle &h) const;
 
   // Revisions //
 
@@ -758,6 +759,19 @@ inline std::optional<std::string> SceneIdentity::imageDataVersion(
   if (!sequence || !array->isImage())
     return {};
   return "image:" + std::to_string(h.launch.activation) + "."
+      + std::to_string(h.launch.nonce) + "." + std::to_string(h.domain) + "."
+      + std::to_string(h.serial) + "." + std::to_string(*sequence);
+}
+
+inline std::optional<std::string> SceneIdentity::arrayDataVersion(
+    const ObjectHandle &h) const
+{
+  const auto *array = dynamic_cast<const scene::Array *>(resolve(h));
+  const auto sequence =
+      array ? array->dataWriteSequence() : std::optional<std::uint64_t>{};
+  if (!sequence || !array->isHost())
+    return {};
+  return "array:" + std::to_string(h.launch.activation) + "."
       + std::to_string(h.launch.nonce) + "." + std::to_string(h.domain) + "."
       + std::to_string(h.serial) + "." + std::to_string(*sequence);
 }

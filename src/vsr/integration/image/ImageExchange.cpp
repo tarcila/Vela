@@ -6,6 +6,7 @@
 #include "vsr/integration/edit/AgentEdit.hpp"
 #include "vsr/integration/image/PngImport.hpp"
 #include "vsr/integration/mcp/Json.hpp"
+#include "vsr/integration/mesh/MeshCapture.hpp"
 #include "vsr/integration/restore/BatchRestore.hpp"
 // posix
 #if defined(__linux__)
@@ -391,6 +392,7 @@ struct ImageExchange::State
     ByteBuffer encoded;
     Bounds bound;
     bool importing{false};
+    bool mesh{false};
     bool committed{false};
     bool notificationFailed{false};
     bool storePrepared{false};
@@ -767,12 +769,13 @@ Step ImageExchange::State::write(Job &job)
       || observed.bytes > BYTE_CAP
       || job.bound.encoded > BYTE_CAP - observed.bytes)
     return reject(Outcome::BUSY, "resource_limit");
-  auto png = encode(job.pixels,
-      job.width,
-      job.height,
-      job.channels,
-      job.bound,
-      job.abandoned);
+  auto png = job.mesh ? std::move(job.pixels)
+                      : encode(job.pixels,
+                            job.width,
+                            job.height,
+                            job.channels,
+                            job.bound,
+                            job.abandoned);
   if (png.empty() || job.abandoned())
     return reject(Outcome::CANCELLED, "resource_limit");
   descriptor::detail::Fd file;
@@ -780,7 +783,8 @@ Step ImageExchange::State::write(Job &job)
     std::string random;
     if (!descriptor::detail::randomHex(random, 16))
       return reject(Outcome::BUSY, "resource_limit");
-    const auto name = "image-" + random + ".png";
+    const auto name = (job.mesh ? "mesh-" : "image-") + random
+        + (job.mesh ? ".vmesh" : ".png");
     if (!current())
       return reject(Outcome::INVALID_REQUEST, "file_rejected");
     file.fd = ::openat(imagesFd,
@@ -1058,6 +1062,11 @@ std::string ImageExchange::metadata(
       + ",\"export\":" + (enabled ? "true" : "false")
       + ",\"import\":" + (enabled && importAvailable() ? "true" : "false")
       + ",\"data_tracking\":" + (tracking ? "true" : "false")
+      + ",\"mesh_export\":"
+      + (enabled && m_state->limits.reservePhysicalMemory ? "true" : "false")
+      + ",\"mesh_import\":false,\"mesh_revision\":1,\"mesh_payload_byte_cap\":67108864,"
+        "\"mesh_header_byte_cap\":65536,\"mesh_field_cap\":64"
+      + (enabled ? ",\"mesh_exchange_directory\":" + quote(m_state->path) : "")
       + (enabled ? ",\"image_exchange_directory\":" + quote(m_state->path)
                  : ",\"reason\":"
                   + quote(!tracking ? "host_write_contract_unavailable"
@@ -1110,6 +1119,25 @@ operations::Admission ImageExchange::submitExport(
     SceneId scene,
     identity::ObjectHandle handle)
 {
+  return submitCapture(credentials, ref, scene, handle, false);
+}
+
+operations::Admission ImageExchange::submitMeshExport(
+    const session::Credentials &credentials,
+    const operations::OperationRef &ref,
+    SceneId scene,
+    identity::ObjectHandle handle)
+{
+  return submitCapture(credentials, ref, scene, handle, true);
+}
+
+operations::Admission ImageExchange::submitCapture(
+    const session::Credentials &credentials,
+    const operations::OperationRef &ref,
+    SceneId scene,
+    identity::ObjectHandle handle,
+    bool mesh)
+{
   auto state = m_state;
   auto job = std::make_shared<State::Job>(state->limits.allocator);
   job->state = state;
@@ -1123,12 +1151,18 @@ operations::Admission ImageExchange::submitExport(
     state->jobs.push_back(job);
   }
   operations::Request request;
-  request.kind = "image_export";
+  job->mesh = mesh;
+  request.kind = mesh ? "mesh_export" : "image_export";
   request.target = session::Target::scene(scene);
   request.capability = session::Capability::READ;
   request.deadlineSeconds = 30.;
   request.canonicalArguments = std::to_string(scene) + ":" + handleName(handle);
-  request.executor = [state, job, scene, handle, integration = m_integration](
+  request.executor = [state,
+                         job,
+                         scene,
+                         handle,
+                         mesh,
+                         integration = m_integration](
                          operations::StepContext &ctx) {
     try {
       if (job->future.valid()) {
@@ -1148,6 +1182,24 @@ operations::Admission ImageExchange::submitExport(
         }
         if (result.outcome == Outcome::OK && !state->fileCurrent(*job))
           return reject(Outcome::INVALID_REQUEST, "file_rejected");
+        if (mesh && result.outcome == Outcome::OK) {
+          bool exposed = false;
+          for (const auto &source : state->sources)
+            if (source.scene == scene && !source.lifetime.expired())
+              exposed = source.identity->resolve(handle) != nullptr;
+          if (!exposed || !integration->imageTrackingAvailable(scene))
+            return reject(Outcome::INVALID_REQUEST, "invalid_handle");
+          result.resourceLease = state->limits.reservePhysicalMemory(65536);
+          if (!result.resourceLease)
+            return reject(Outcome::BUSY, "resource_limit");
+          result.reserveStatus = [reserve =
+                                         state->limits.reservePhysicalMemory] {
+            return reserve(65536);
+          };
+          if (!ctx.prepareActivityResult(
+                  result.result.size() + 512, result.reserveStatus))
+            return reject(Outcome::BUSY, "resource_limit");
+        }
         if (result.outcome == Outcome::OK && !ctx.isAbandoned())
           result.onAccepted = [job] { job->retained = true; };
         return result;
@@ -1162,16 +1214,64 @@ operations::Admission ImageExchange::submitExport(
           ids = source.identity;
         else if (auto *foreign = source.identity->resolve(handle))
           return reject(Outcome::INVALID_REQUEST,
-              dynamic_cast<vsr::scene::Array *>(foreign) ? "foreign_scene"
-                                                         : "invalid_handle");
+              (dynamic_cast<vsr::scene::Array *>(foreign)
+                  || (mesh && dynamic_cast<vsr::scene::Geometry *>(foreign)))
+                  ? "foreign_scene"
+                  : "invalid_handle");
       }
       auto *object = ids ? ids->resolve(handle) : nullptr;
       auto *array = dynamic_cast<vsr::scene::Array *>(object);
-      if (!array)
+      auto *geometry = dynamic_cast<vsr::scene::Geometry *>(object);
+      if (mesh ? !geometry : !array)
         return reject(Outcome::INVALID_REQUEST, "invalid_handle");
       if (!integration->imageTrackingAvailable(scene))
         return reject(
             Outcome::INVALID_REQUEST, "host_write_contract_unavailable");
+      if (mesh) {
+        if (!state->current())
+          return reject(Outcome::INVALID_REQUEST, "file_rejected");
+        if (!state->limits.reservePhysicalMemory)
+          return reject(
+              Outcome::INVALID_REQUEST, "physical_ownership_unavailable");
+        constexpr auto CONTROL_BYTES = 8 * mesh::HEADER_CAP + WORKER_STACK_BYTES
+            + WORKER_GUARD_BYTES + 65536;
+        job->controlLease = state->limits.reservePhysicalMemory(CONTROL_BYTES);
+        if (!job->controlLease)
+          return reject(Outcome::BUSY, "resource_limit");
+        mesh::CapturePlan plan;
+        if (const auto *reason = mesh::plan(*geometry, plan))
+          return reject(std::strcmp(reason, "array_mapped") == 0
+                  ? Outcome::BUSY
+                  : Outcome::INVALID_REQUEST,
+              reason);
+        Bounds bound;
+        bound.encoded = plan.payloadBytes + mesh::HEADER_CAP + 12;
+        bound.peak = bound.encoded + CONTROL_BYTES;
+        {
+          std::lock_guard<std::mutex> lock(state->mutex);
+          if (bound.peak > state->limits.transientBytes
+              || state->reserved > state->limits.transientBytes - bound.peak)
+            return reject(Outcome::BUSY, "resource_limit");
+          state->reserved += bound.peak;
+          job->bound = bound;
+        }
+        job->physicalLease = state->limits.reservePhysicalMemory(bound.encoded);
+        if (!job->physicalLease)
+          return reject(Outcome::BUSY, "resource_limit");
+        if (const auto *reason =
+                mesh::capture(*geometry, *ids, plan, job->pixels, job->receipt))
+          return reject(Outcome::INVALID_REQUEST, reason);
+        job->receipt += ",\"handle\":" + quote(handleName(handle));
+        job->abandoned = [state, check = ctx.isAbandoned] {
+          return state->stopping.load() || check();
+        };
+        job->wake = ctx.wake;
+        if (!job->start())
+          return reject(Outcome::BUSY, "resource_limit");
+        Step pending;
+        pending.status = Step::Status::BACKEND_PENDING;
+        return pending;
+      }
       if (!array->isImage())
         return reject(Outcome::INVALID_REQUEST, "unsupported_image");
       if (array->isMapped())

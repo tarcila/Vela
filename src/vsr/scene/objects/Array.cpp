@@ -188,6 +188,17 @@ bool Array::isImage() const
       && data();
 }
 
+bool Array::supportsHostWriteTracking() const
+{
+  // The SDK's scalar/vector interval also includes FIXED64, UFIXED64 and
+  // FLOAT16. Tracking is write evidence, not an exchange eligibility test:
+  // MeshCapture validates its narrower profile; Image callers require isImage.
+  return isImage()
+      || (isHost() && type() == ANARI_ARRAY1D && data()
+          && elementType() >= ANARI_INT8
+          && elementType() <= ANARI_FLOAT64_VEC4);
+}
+
 std::weak_ptr<ArrayLifetime> Array::lifetime() const
 {
   return m_lifetime;
@@ -202,7 +213,9 @@ std::optional<std::uint64_t> Array::dataWriteSequence() const
 bool Array::trackImageWrites(
     const std::shared_ptr<ArrayWriteSequence> &sequence)
 {
-  if (!isImage())
+  // Enroll host numeric mesh storage as well as the historical Image
+  // whitelist. Unsupported exchange types may still be honestly tracked.
+  if (!supportsHostWriteTracking())
     return true;
   if (m_writeSequence == sequence)
     return true;
@@ -248,7 +261,7 @@ void *Array::map()
   if (m_writeSequence) {
     const auto reserved = m_writeSequence->reserve();
     if (!reserved)
-      throw std::runtime_error("Array::map() - Image write admission refused");
+      throw std::runtime_error("Array::map() - Array write admission refused");
     m_reservedWrite = *reserved;
   }
   if (auto *ud = updateDelegate(); ud != nullptr)

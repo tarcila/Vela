@@ -19,8 +19,47 @@ struct ImageDeps
   image::ImageExchange *images{nullptr};
 };
 
+inline void addMeshExportTool(std::vector<Tool> &tools, ImageDeps deps)
+{
+  Tool tool;
+  tool.name = "vsr_mesh_export";
+  tool.description =
+      "Export one exposed triangle Geometry to a lossless confined .vmesh "
+      "working bundle. Requires current Scene READ, not EDIT. Poll mesh_export "
+      "status for file_name, target_version and dependency evidence. Use the "
+      "documented vsr_mesh Python/NumPy helper to inspect/read/write typed "
+      "Arrays. Unsupported dependencies refuse the whole export. No live "
+      "Scene mutation, GPU transfer or restoration retention. Replay returns "
+      "the historical receipt and never rewrites files. Mesh Import is not "
+      "available. See docs/mesh-exchange.md for profile and finite limits.";
+  tool.inputSchemaJson = std::string("{\"type\":\"object\",\"properties\":{")
+      + requestIdSchema()
+      + ",\"scene_id\":{\"type\":\"integer\",\"minimum\":0},"
+        "\"handle\":{\"type\":\"string\"}},"
+        "\"required\":[\"request_id\",\"scene_id\",\"handle\"],"
+        "\"additionalProperties\":false}";
+  tool.handler = [deps](
+                     const session::Credentials &c, const json::Value &args) {
+    const auto id = requestIdArg(args.get("request_id"));
+    const auto scene = targetIdArg(args, "scene_id");
+    const auto handle =
+        detail::handleArg(args.get("handle"), deps.identities->launch());
+    for (const auto &argument : args.o)
+      if (argument.first != "request_id" && argument.first != "scene_id"
+          && argument.first != "handle")
+        return rejected(operations::Outcome::INVALID_REQUEST);
+    if (!id || !scene || !handle)
+      return rejected(operations::Outcome::INVALID_REQUEST);
+    const operations::OperationRef ref{c.sessionId, *id};
+    return detail::ack(
+        ref, deps.images->submitMeshExport(c, ref, *scene, *handle));
+  };
+  tools.push_back(std::move(tool));
+}
+
 inline void addImageTools(std::vector<Tool> &tools, ImageDeps deps)
 {
+  addMeshExportTool(tools, deps);
   Tool tool;
   tool.name = "vsr_image_export";
   tool.description =
