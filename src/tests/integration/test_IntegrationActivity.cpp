@@ -110,6 +110,7 @@ SCENARIO("Default activity budgets match the spec", "[integration]")
 {
   Limits l;
   REQUIRE(l.bytes == 16u * 1024 * 1024);
+  REQUIRE(l.retentionBytes == UINT64_C(4294967296));
   REQUIRE(l.entries == 1024);
   REQUIRE(l.restorableBatches == 32);
   REQUIRE(l.imageBytes == 32u * 1024 * 1024);
@@ -135,15 +136,15 @@ SCENARIO("Smaller limits: payload bytes count and oldest safe evicts first",
 {
   Fixture f;
   Limits l;
-  l.entries = 100;
+  l.entries = 3;
   l.restorableBatches = 2;
-  l.bytes = 4 * (ENTRY_OVERHEAD + 512);
+  l.bytes = 4 * (ENTRY_OVERHEAD + 1024);
   ActivityLog log(l);
   const std::string launch = f.authority->launchId();
 
   auto a = log.append(f.edit(1, hex(1), 400));
   REQUIRE(a);
-  REQUIRE(log.usage().bytes >= 400);
+  REQUIRE(log.usage().retentionBytes == 400);
   REQUIRE(log.append(f.edit(2, hex(2), 400)));
   // A third restorable batch expires the oldest one, releasing its payload.
   const auto before = log.usage().bytes;
@@ -151,14 +152,74 @@ SCENARIO("Smaller limits: payload bytes count and oldest safe evicts first",
   REQUIRE(log.eligibility({launch, hex(1)}) == Eligibility::EXPIRED);
   REQUIRE(log.get(*a)->restorationBytes == 0);
   REQUIRE(log.usage().restorableBatches == 2);
-  REQUIRE(log.usage().bytes < before + ActivityLog::cost(f.edit(3, hex(3), 400)));
+  REQUIRE(
+      log.usage().bytes == before + ActivityLog::cost(f.edit(3, hex(3), 400)));
+  REQUIRE(log.usage().retentionBytes == 800);
 
-  // A large payload forces byte eviction of the oldest records.
-  Entry big = f.edit(4, hex(4), 1500);
-  big.eligibility = Eligibility::NONE;
+  // Metadata pressure discards only non-recovery records.
+  Entry big = f.render(4, 0);
+  big.result.assign(1500, 'x');
   REQUIRE(log.append(big));
   REQUIRE(log.usage().bytes <= l.bytes);
   REQUIRE_FALSE(log.eligibility({launch, hex(1)}));
+  REQUIRE(log.eligibility({launch, hex(2)}) == Eligibility::ELIGIBLE);
+}
+
+TEST_CASE("Wide recovery accounting never preallocates the soft target",
+    "[integration][retention-accounting]")
+{
+  if (sizeof(std::size_t) < 8)
+    return;
+  ActivityLog log;
+  const auto first = log.append(Entry{});
+  REQUIRE(first);
+  REQUIRE(log.reserveRestoration(
+      *first, std::size_t(UINT64_C(4294967296)), {"launch", "wide"}));
+  CHECK(log.usage().retentionBytes == 0);
+  CHECK(log.usage().reservedRetentionBytes == UINT64_C(4294967296));
+  log.publishRestoration(*first);
+  CHECK(log.usage().retentionBytes == UINT64_C(4294967296));
+  const auto next = log.append(Entry{});
+  REQUIRE(next);
+  REQUIRE(log.reserveRestoration(*next, 1, {"launch", "new"}));
+  CHECK(log.eligibility({"launch", "wide"}) == Eligibility::ELIGIBLE);
+  log.publishRestoration(*next);
+  CHECK(log.eligibility({"launch", "wide"}) == Eligibility::EXPIRED);
+  CHECK(log.usage().retentionBytes == 1);
+  CHECK(log.usage().reservedRetentionBytes == 0);
+  CHECK(log.usage().bytes < 4096); // bookkeeping only, not GiB allocations
+}
+
+TEST_CASE("Recovery FIFO follows publication rather than preparation",
+    "[integration][retention-accounting]")
+{
+  Limits limits;
+  limits.retentionBytes = 1000;
+  ActivityLog log(limits);
+  auto early = log.append(Entry{});
+  auto late = log.append(Entry{});
+  REQUIRE(early);
+  REQUIRE(late);
+  REQUIRE(log.reserveRestoration(*early, 600, {"launch", "early"}));
+  REQUIRE(log.reserveRestoration(*late, 600, {"launch", "late"}));
+  CHECK(log.usage().retentionBytes == 0);
+  CHECK(log.usage().reservedRetentionBytes == 1200);
+  log.publishRestoration(*late);
+  CHECK(log.eligibility({"launch", "late"}) == Eligibility::ELIGIBLE);
+  REQUIRE(log.get(*late));
+  log.publishRestoration(*early);
+  CHECK(log.eligibility({"launch", "late"}) == Eligibility::EXPIRED);
+  CHECK(log.eligibility({"launch", "early"}) == Eligibility::ELIGIBLE);
+  CHECK(log.usage().retentionBytes == 600);
+  CHECK(log.usage().reservedRetentionBytes == 0);
+  const auto failed = log.append(Entry{});
+  REQUIRE(failed);
+  REQUIRE(log.reserveRestoration(*failed, 1000, {"launch", "failed"}));
+  CHECK(log.eligibility({"launch", "early"}) == Eligibility::ELIGIBLE);
+  log.cancelRestoration(*failed);
+  CHECK(log.eligibility({"launch", "early"}) == Eligibility::ELIGIBLE);
+  CHECK(log.usage().retentionBytes == 600);
+  CHECK(log.usage().reservedRetentionBytes == 0);
 }
 
 SCENARIO("Active work is never evicted", "[integration]")
@@ -170,12 +231,13 @@ SCENARIO("Active work is never evicted", "[integration]")
   ActivityLog log(l);
   Entry active = f.edit(1, hex(1));
   active.active = true;
+  active.eligibility = Eligibility::NONE;
+  active.restorationBytes = 0;
   active.terminal.reset();
   active.progress = Progress::RUNNING;
   auto a = log.append(active);
   REQUIRE(a);
-  // The only restorable batch is active: no room for another.
-  REQUIRE_FALSE(log.append(f.edit(2, hex(2))));
+  // Pending active work is protected independently of the recovery count.
   Entry plain = f.render(3, 0);
   REQUIRE(log.append(plain));
   REQUIRE(log.append(f.render(4, 0))); // evicts 3, not the active one
@@ -204,8 +266,8 @@ SCENARIO("Retained images use their own budget", "[integration]")
   REQUIRE(log.get(*b)->image.size() == 600);
 }
 
-SCENARIO("Restoration consumes eligibility and releases payload",
-    "[integration]")
+SCENARIO(
+    "Restoration consumes eligibility and releases payload", "[integration]")
 {
   Fixture f;
   ActivityLog log;
@@ -351,12 +413,16 @@ SCENARIO("Operation status: cross-session lookup needs read on the record",
     return r;
   };
   const std::string old = f.creds.sessionId;
-  REQUIRE(engine->submit(f.creds, {old, 1},
-                    req(Target::scene(f.sceneId), Capability::READ))
+  REQUIRE(engine
+              ->submit(f.creds,
+                  {old, 1},
+                  req(Target::scene(f.sceneId), Capability::READ))
               .code
       == Outcome::OK);
-  REQUIRE(engine->submit(f.creds, {old, 2},
-                    req(Target::view(f.viewId), Capability::RENDER))
+  REQUIRE(engine
+              ->submit(f.creds,
+                  {old, 2},
+                  req(Target::view(f.viewId), Capability::RENDER))
               .code
       == Outcome::OK);
   f.integration.service();
@@ -374,8 +440,8 @@ SCENARIO("Operation status: cross-session lookup needs read on the record",
   auto p = engine->status(f.creds, {old, 2});
   REQUIRE(p.code == Outcome::FORBIDDEN);
   REQUIRE(p.result.empty());
-  REQUIRE(engine->status(f.creds, {old, 9}).code
-      == Outcome::OUTCOME_UNAVAILABLE);
+  REQUIRE(
+      engine->status(f.creds, {old, 9}).code == Outcome::OUTCOME_UNAVAILABLE);
 }
 
 namespace {
@@ -410,9 +476,8 @@ struct EngineFixture : Fixture
     r.target = Target::scene(sceneId);
     r.capability = Capability::READ;
     r.canonicalArguments = "{}";
-    r.executor = [script, runs](operations::StepContext &) {
-      return script(++*runs);
-    };
+    r.executor = [script, runs](
+                     operations::StepContext &) { return script(++*runs); };
     return r;
   }
 
@@ -434,25 +499,23 @@ struct EngineFixture : Fixture
 
 } // namespace
 
-SCENARIO("Engine admission rejects busy when the activity log is full of "
-         "active work",
+SCENARIO(
+    "Engine admission rejects busy when the activity log is full of "
+    "active work",
     "[integration]")
 {
   Limits l;
   l.entries = 2;
   EngineFixture f(l);
-  REQUIRE(f.engine->submit(f.creds, {f.creds.sessionId, 1}, f.pending())
-              .code
+  REQUIRE(f.engine->submit(f.creds, {f.creds.sessionId, 1}, f.pending()).code
       == Outcome::OK);
-  REQUIRE(f.engine->submit(f.creds, {f.creds.sessionId, 2}, f.pending())
-              .code
+  REQUIRE(f.engine->submit(f.creds, {f.creds.sessionId, 2}, f.pending()).code
       == Outcome::OK);
   f.integration.service();
   REQUIRE(f.log->usage().entries == 2);
 
   // Both entries are active: nothing may be evicted, nothing admitted.
-  REQUIRE(f.engine->submit(f.creds, {f.creds.sessionId, 3}, f.pending())
-              .code
+  REQUIRE(f.engine->submit(f.creds, {f.creds.sessionId, 3}, f.pending()).code
       == Outcome::BUSY);
   REQUIRE(f.engine->submitLocal(f.pending()).code == Outcome::BUSY);
   REQUIRE(f.engine->slotsInUse() == 2);
@@ -473,9 +536,8 @@ SCENARIO("Engine admission rejects busy when the activity log is full of "
   REQUIRE(f.engine->slotsInUse() == 0);
   REQUIRE_FALSE(f.log->get(1)->active);
   REQUIRE_FALSE(f.log->get(2)->active);
-  auto local = f.engine->submitLocal(f.request([](int) {
-    return operations::Step{};
-  }));
+  auto local =
+      f.engine->submitLocal(f.request([](int) { return operations::Step{}; }));
   REQUIRE(local.code == Outcome::OK);
   REQUIRE_FALSE(f.log->get(1));
   REQUIRE(f.log->get(2));

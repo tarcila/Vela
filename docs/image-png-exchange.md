@@ -107,16 +107,19 @@ unbounded compression fallback or output-vector growth.
 `exchange_limits` reports `file_cap=1024`, `byte_cap=268435456`,
 `files_used`, `bytes_used`, `usage_complete`, `quota_scan_entry_cap=4096`,
 `max_ancillary_bytes=65536`, `transient_image_byte_cap`,
-`session_snapshot_byte_cap=67108864`, `effective_global_retention_byte_cap`
-and `available_global_retention_bytes`. Export observations additionally
-report `max_encoded_file_bytes=E` and `max_codec_work_bytes=W`.
-Authenticated discovery and export observations also report
-`available_session_snapshot_bytes` for the requesting session: the 67108864-byte
-ceiling minus that session's retained and reserved snapshots, clamped at zero.
-Disconnect does not release its ledger charges; a new session has a distinct
-ledger but shares global capacity. Session-specific availability is not included
-in unauthenticated launch metadata. Available capacities are observations,
-not future-admission guarantees.
+`effective_global_retention_byte_cap`, `available_global_retention_bytes`,
+`retention_order:publication_fifo`, `retention_entry_cap`,
+`activity_metadata_byte_cap`, `activity_entry_cap`, `physical_byte_cap` and
+`retained_physical_bytes`. Global availability means soft target minus eligible
+recovery charges, not physical free space. Physical ledger charges measure
+snapshot/pin ownership, not the entire shared host pool or process RSS; they can
+outlive eligibility through copies/pins. Authenticated observations add
+`session_retained_physical_bytes`, an ownership observation, not an admission cap.
+There is no separate 64 MiB session ceiling. Disconnect does not release
+ownership; a new session shares the same FIFO policy. Session ownership is not
+included in unauthenticated launch metadata. Export additionally reports
+`max_encoded_file_bytes=E` and `max_codec_work_bytes=W`. These observations never
+guarantee future allocation success.
 
 ## Confined files and cleanup
 
@@ -173,7 +176,19 @@ existing shared FrameBudget and authoritative Activity retention/availability
 callbacks. Import stays absent on hosts lacking any of these prerequisites or
 normal RestoreService's bounded result reservation. The optional RestoreService
 constructor reservation uses the same host pool, never a separate or larger
-pool. Default logical retention and physical limits are not raised.
+pool. Qualified hosts also bind the authoritative `ExchangeLimits::retention`
+ActivityLog pointer, which must outlive ImageExchange. Its effective policy is
+used for both admission and reporting, not an independent Image ledger limit.
+New hosts default to 4 GiB recovery, without preallocation. Normal entries fit
+by evicting complete batches FIFO only at successful publication; status reads,
+replay, no-ops and failed/cancelled preparation never renew or evict history.
+The disclosed 32-entry bound uses that same FIFO. Metadata/results remain
+separately bounded by 16 MiB/1024 records, with eligible recovery protected
+from ordinary metadata churn. Explicit host physical leases allow retained and
+prepared ownership overlap (twice the soft target plus 256 MiB, saturated to
+addressable size); the rendering library default remains 256 MiB. See
+[shared retention](mesh-exchange.md) for effective limits and lifetime semantics.
+Oversized-entry admission/above-cap approval are not implemented in this slice.
 
 Call `vsr_image_import` with `request_id`, `scene_id`, the Array `handle`, its
 inspected `data_version`, and a confined PNG `file_name`. No prior export is
@@ -234,8 +249,14 @@ codec/profile allocation or unchecked general-purpose image decode is used.
 Along with the private 512 KiB worker stack/64 KiB guard, this is below W=4F+1 MiB;
 the partitioned owner reservations below cover the remaining controls.
 
-Preparation reserves the originating session's S=T ceiling first, then existing
-shared activity/store capacity, then transient E+D+W+S. S is physically allocated
+Preparation records originating-session physical ownership, non-destructively
+reserves the shared recovery/publication resources, then reserves transient
+E+D+W+S. The recovery charge includes T, the ImageSnapshot and a conservative
+106,496-byte allowance for request/store/receipt ownership. Pending reservations
+are distinct from eligible history; the final successful publication serializes
+FIFO against current history. Above-soft charges refuse without old-history
+loss. Session/global lifetime ledgers are not separate admission caps.
+S is physically allocated
 once and its lease transfers to retention. Scratch releases only after buffers,
 worker stack, task and future die; control/result/history charges survive their
 producer. Transient use of S ends at commit without releasing its physical lease. For a 256x256 RGBA target the conservative bound is

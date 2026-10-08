@@ -181,9 +181,7 @@ ArchiveHost::ArchiveHost()
   limits.reservePhysicalMemory = [physical](std::size_t bytes) {
     return physical->reserve(bytes);
   };
-  limits.availableGlobalRetention = [this] {
-    return activity.limits().bytes - activity.usage().bytes;
-  };
+  limits.retention = &activity;
   limits.restorationRetained = [this](const std::string &launch,
                                    const std::string &batch) {
     return activity.eligibility({launch, batch})

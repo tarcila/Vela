@@ -494,13 +494,13 @@ class Application : public VSRApplication
   Application(int argc,
       const char *argv[],
       bool agentIntegrationRequested,
-      std::size_t restorationBytes)
+      std::uint64_t restorationBytes)
       : VSRApplication(argc, argv)
   {
 #ifdef VSR_USE_INTEGRATION
     // Opt-in: nothing is exposed to agents unless the operator asks.
     m_agentIntegrationRequested = agentIntegrationRequested;
-    m_activityLimits.bytes = restorationBytes;
+    m_activityLimits.retentionBytes = restorationBytes;
 #else
     (void)agentIntegrationRequested;
     (void)restorationBytes;
@@ -1091,7 +1091,8 @@ void Application::setupIntegration()
   m_translations = std::make_unique<vi::edit::TranslationService>(
       *m_integration, *m_authority, *m_engine, *m_edits);
   m_translations->attachScene(*sceneId, *m_identity);
-  const auto hostImageMemory = std::make_shared<vsr::rendering::FrameBudget>();
+  const auto hostImageMemory = std::make_shared<vsr::rendering::FrameBudget>(
+      vsr::app::agentPhysicalByteCap(m_activityLimits.retentionBytes));
   m_restores = std::make_unique<vi::restore::RestoreService>(*m_engine,
       *m_edits,
       [hostImageMemory] { return hostImageMemory->reserve(65536); });
@@ -1157,12 +1158,8 @@ void Application::setupIntegration()
   imageLimits.reservePhysicalMemory = [hostImageMemory](std::size_t bytes) {
     return hostImageMemory->reserve(bytes);
   };
-  imageLimits.globalRetentionBytes = m_activity->limits().bytes;
-  imageLimits.availableGlobalRetention = [this] {
-    const auto cap = m_activity->limits().bytes;
-    const auto used = m_activity->usage().bytes;
-    return used < cap ? cap - used : 0;
-  };
+  imageLimits.retention = m_activity.get();
+  imageLimits.globalRetentionBytes = m_activity->limits().retentionBytes;
   imageLimits.restorationRetained = [this](const std::string &launch,
                                         const std::string &batch) {
     return m_activity->eligibility({launch, batch})

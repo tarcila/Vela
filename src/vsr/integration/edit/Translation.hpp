@@ -697,6 +697,10 @@ inline operations::Request TranslationService::makeCommitRequest(
       + preview.previewId + ";" + std::to_string(preview.scene);
   std::weak_ptr<int> alive = m_alive;
   auto committed = std::make_shared<std::optional<EditResult>>();
+  work.onSynchronizationFailure = [this, alive, scene = preview.scene] {
+    if (alive.lock() && !m_editLifetime.expired())
+      m_edits->syncStates().finishHook(scene, false);
+  };
   const auto budget = m_budget;
   const auto deadlineAt = m_clock() + m_limits.deadlineSeconds;
   work.executor = [this,
@@ -706,8 +710,11 @@ inline operations::Request TranslationService::makeCommitRequest(
                       preview = std::move(preview),
                       owner = std::move(owner),
                       committed,
-                      reservation = std::move(reservation)](
-                      operations::StepContext &ctx) {
+                      reservation = std::move(reservation),
+                      reserveStatus =
+                          operations::ResultOwnership::Reserve{[budget] {
+                            return reserve(budget, 2 * RESULT_BYTES);
+                          }}](operations::StepContext &ctx) mutable {
     operations::Step step;
     const bool usable = alive.lock() && !m_editLifetime.expired();
     if (!*committed) {
@@ -737,17 +744,16 @@ inline operations::Request TranslationService::makeCommitRequest(
       step.status = operations::Step::Status::SYNCHRONIZING;
       return step;
     }
-    const auto &result = **committed;
+    auto &result = **committed;
     step.committed = true;
-    step.outcome = usable ? m_edits->synchronizeCommitted(preview.scene)
-                          : Outcome::APPLIED_WITH_SYNC_FAILURE;
-    step.result = "{\"batch_ref\":" + detail::batchRefJson(*result.batchRef)
-        + ","
-        + detail::commitDetailJson(
-            true, result.sceneRevision, result.versions, result.nodeVersions)
-        + "}";
+    const auto synchronized = usable
+        ? m_edits->synchronizeCommitted(preview.scene)
+        : Outcome::APPLIED_WITH_SYNC_FAILURE;
+    step.outcome =
+        result.outcome == Outcome::OK ? synchronized : result.outcome;
+    step.result = std::move(result.receipt);
     step.resourceLease = reservation;
-    step.reserveStatus = [budget] { return reserve(budget, 2 * RESULT_BYTES); };
+    step.reserveStatus = std::move(reserveStatus);
     return step;
   };
   return work;

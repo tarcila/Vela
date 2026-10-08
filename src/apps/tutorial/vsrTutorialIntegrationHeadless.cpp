@@ -386,7 +386,8 @@ int main(int argc, const char *argv[])
   host->translations = std::make_unique<vi::edit::TranslationService>(
       integration, *host->authority, *host->engine, *host->edits);
   host->translations->attachScene(*sceneId, *host->identity);
-  const auto hostImageMemory = std::make_shared<vsr::rendering::FrameBudget>();
+  const auto hostImageMemory = std::make_shared<vsr::rendering::FrameBudget>(
+      vsr::app::agentPhysicalByteCap(agentOptions.restorationBytes));
   host->restores = std::make_unique<vi::restore::RestoreService>(*host->engine,
       *host->edits,
       [hostImageMemory] { return hostImageMemory->reserve(65536); });
@@ -394,7 +395,7 @@ int main(int argc, const char *argv[])
   host->sync = std::make_unique<vi::sync::SyncService>(
       integration, *host->engine, host->edits->syncStates());
   vi::activity::Limits activityLimits;
-  activityLimits.bytes = agentOptions.restorationBytes;
+  activityLimits.retentionBytes = agentOptions.restorationBytes;
   host->activity = std::make_unique<vi::activity::ActivityLog>(activityLimits);
   host->activitySink = std::make_unique<vi::activity::EngineActivitySink>(
       *host->activity, integration);
@@ -425,12 +426,8 @@ int main(int argc, const char *argv[])
   imageLimits.reservePhysicalMemory = [hostImageMemory](std::size_t bytes) {
     return hostImageMemory->reserve(bytes);
   };
-  imageLimits.globalRetentionBytes = host->activity->limits().bytes;
-  imageLimits.availableGlobalRetention = [&host] {
-    const auto cap = host->activity->limits().bytes;
-    const auto used = host->activity->usage().bytes;
-    return used < cap ? cap - used : 0;
-  };
+  imageLimits.retention = host->activity.get();
+  imageLimits.globalRetentionBytes = host->activity->limits().retentionBytes;
   imageLimits.restorationRetained = [&host](const std::string &launch,
                                         const std::string &batch) {
     return host->activity->eligibility({launch, batch})

@@ -444,14 +444,12 @@ struct Fixture
         };
       }
       activity::Limits activityLimits;
-      activityLimits.bytes = exchangeLimits.globalRetentionBytes;
+      activityLimits.retentionBytes = exchangeLimits.globalRetentionBytes;
       imageActivity = std::make_unique<activity::ActivityLog>(activityLimits);
       imageActivitySink = std::make_unique<activity::EngineActivitySink>(
           *imageActivity, integration);
       engine->setActivitySink(imageActivitySink.get());
-      exchangeLimits.availableGlobalRetention = [this] {
-        return imageActivity->limits().bytes - imageActivity->usage().bytes;
-      };
+      exchangeLimits.retention = imageActivity.get();
       exchangeLimits.restorationRetained = [this](const std::string &launch,
                                                const std::string &batch) {
         return imageActivity->eligibility({launch, batch})
@@ -5383,14 +5381,14 @@ SCENARIO(
   REQUIRE_FALSE(items.empty());
   const auto *limits =
       items.at(0).get("image_exchange")->get("exchange_limits");
-  REQUIRE(limits->get("available_session_snapshot_bytes"));
-  CHECK(limits->get("available_session_snapshot_bytes")->n == 67108864);
+  REQUIRE(limits->get("session_retained_physical_bytes"));
+  CHECK(limits->get("session_retained_physical_bytes")->n == 0);
   descriptor::Descriptor published;
   REQUIRE(descriptor::read(f.server->published().path(), published).ok());
   json::Value metadata;
   REQUIRE(json::parse(published.imageExchange, metadata));
   CHECK_FALSE(
-      metadata.get("exchange_limits")->get("available_session_snapshot_bytes"));
+      metadata.get("exchange_limits")->get("session_retained_physical_bytes"));
 }
 
 struct PositionFixture : Fixture
@@ -5399,7 +5397,7 @@ struct PositionFixture : Fixture
   vsr::scene::GeometryRef geometry;
   vsr::scene::GeometryRef other;
   static constexpr float POINTS[] = {-1, -1, 0, 1, -1, 0, 0, 1, 0};
-  PositionFixture(image::ExchangeLimits limits = {});
+  PositionFixture(image::ExchangeLimits limits = {}, bool nodeEdits = false);
   Reply working(const Session &session,
       const std::string &mode = "",
       bool topology = false);
@@ -5409,8 +5407,8 @@ struct PositionFixture : Fixture
       const std::string &file = "edited.vmesh");
 };
 
-PositionFixture::PositionFixture(image::ExchangeLimits limits)
-    : Fixture({}, true, false, false, 120., true, UINT64_MAX, limits, true)
+PositionFixture::PositionFixture(image::ExchangeLimits limits, bool nodeEdits)
+    : Fixture({}, true, nodeEdits, false, 120., true, UINT64_MAX, limits, true)
 {
   auto hole = scene.createArray(ANARI_FLOAT32_VEC3, 1);
   positions = scene.createArray(ANARI_FLOAT32_VEC3, 3);
@@ -5458,6 +5456,137 @@ Reply PositionFixture::importPositions(const Session &session,
           + json::write(*evidence.get("target_version"))
           + ",\"dependencies\":" + json::write(*evidence.get("dependencies"))
           + ",\"file_name\":" + json::quote(file) + "}");
+}
+
+namespace {
+std::vector<unsigned char> inputPng(std::size_t width,
+    std::size_t height,
+    unsigned char colorType,
+    const std::vector<unsigned char> &filtered,
+    const std::vector<std::pair<std::string, std::vector<unsigned char>>>
+        &chunks);
+void writeInput(
+    const std::string &path, const std::vector<unsigned char> &bytes);
+} // namespace
+
+TEST_CASE("Public mixed recovery retains the newest complete FIFO suffix",
+    "[integration][mcp][retention-fifo]")
+{
+  image::ExchangeLimits limits;
+  limits.globalRetentionBytes = 400000;
+  PositionFixture f(limits, true);
+  const bool failSync = GENERATE(false, true);
+  const auto a = f.attach();
+  const auto evidence = f.working(a);
+  constexpr std::size_t BYTES = 262144;
+  const std::vector<unsigned char> before(BYTES, 71), rows(BYTES + 256, 0);
+  auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 256, 256);
+  image->setData(static_cast<const void *>(before.data()));
+  writeInput(f.exchangePath() + "/agent.png", inputPng(256, 256, 6, rows, {}));
+  const auto h = f.sceneIds->handleOf(image.data());
+  f.importImage(a,
+      2,
+      f.objectHandle(image.data()),
+      *f.sceneIds->imageDataVersion(h),
+      "agent.png");
+  const auto first = f.await(a, 2);
+  REQUIRE(first.flag("committed"));
+  const auto firstBatch = *first.result()->get("batch_ref");
+  auto pinned = f.edits->restorations().find(
+      {firstBatch.get("launch_id")->s, firstBatch.get("batch_id")->s});
+  REQUIRE(pinned);
+  REQUIRE(f.rpc("vsr/detach", "{}", &a).status == 200);
+  const auto b = f.attach();
+  // A status read from another session must not renew the old entry's age.
+  REQUIRE(f.status(b, a.id, 2).flag("committed"));
+  f.importPositions(b, 1, *evidence.result());
+  const auto mesh = f.await(b, 1);
+  REQUIRE(mesh.flag("committed"));
+  const auto meshBatch = *mesh.result()->get("batch_ref");
+  json::Value ownership;
+  REQUIRE(json::parse(f.images->metadata(f.sceneId, b.id), ownership));
+  CHECK(ownership.get("exchange_limits")->get("retained_physical_bytes")->n
+      > limits.globalRetentionBytes);
+  CHECK(ownership.get("exchange_limits")
+            ->get("available_global_retention_bytes")
+            ->n
+      < limits.globalRetentionBytes);
+  f.restoreBatch(b, 3, firstBatch);
+  CHECK(f.await(b, 3).str("outcome") == "outcome_unavailable");
+  CHECK(std::memcmp(image->data(), rows.data(), BYTES) == 0);
+
+  auto *layer = f.scene.defaultLayer();
+  auto node = layer->root()->insert_last_child(
+      vsr::scene::LayerNodeData(layer, "fifo-node"));
+  REQUIRE(
+      f.tool(b,
+           "vsr_inspect",
+           "{\"request_id\":4,\"scene_id\":" + std::to_string(f.sceneId)
+               + ",\"kind\":\"nodes\",\"name\":\"fifo-node\"}")
+          .errorCode()
+          .empty());
+  const auto inspected = f.await(b, 4);
+  const auto item = inspected.result()->get("items")->a.at(0);
+  REQUIRE(
+      f.tool(b,
+           "vsr_edit",
+           "{\"request_id\":5,\"scene_id\":" + std::to_string(f.sceneId)
+               + ",\"edits\":[{\"target_kind\":\"node\",\"handle\":"
+               + json::write(*item.get("handle"))
+               + ",\"version\":" + json::write(*item.get("node_edit_version"))
+               + ",\"structural_version\":"
+               + json::write(*item.get("structural_version"))
+               + ",\"parameter\":\"enabled\",\"value\":false}]}")
+          .errorCode()
+          .empty());
+  const auto generic = f.await(b, 5);
+  REQUIRE(generic.flag("committed"));
+  CHECK_FALSE(node->value().isEnabled());
+  const auto genericBatch = *generic.result()->get("batch_ref");
+  // Reading the older Mesh after the Node must not turn FIFO into LRU.
+  CHECK(f.status(b, b.id, 1).flag("committed"));
+  // Next Image publication evicts Mesh, not the newer small Node batch.
+  std::vector<unsigned char> changedRows(BYTES + 256, 0);
+  for (std::size_t y = 0; y < 256; ++y)
+    std::fill_n(changedRows.begin() + y * 1025 + 1, 1024, 23);
+  writeInput(
+      f.exchangePath() + "/next.png", inputPng(256, 256, 6, changedRows, {}));
+  f.hookOk = !failSync;
+  f.importImage(b,
+      6,
+      f.objectHandle(image.data()),
+      *f.sceneIds->imageDataVersion(h),
+      "next.png");
+  const auto newest = f.await(b, 6);
+  REQUIRE(newest.flag("committed"));
+  CHECK(
+      newest.str("outcome") == (failSync ? "applied_with_sync_failure" : "ok"));
+  f.hookOk = true;
+  f.restoreBatch(b, 7, meshBatch);
+  CHECK(f.await(b, 7).str("outcome") == "outcome_unavailable");
+  REQUIRE(f.importPositions(b, 1, *evidence.result()).flag("replayed"));
+  f.restoreBatch(b, 8, genericBatch);
+  REQUIRE(f.await(b, 8).flag("committed"));
+  CHECK(node->value().isEnabled());
+  f.restoreBatch(b, 9, *newest.result()->get("batch_ref"));
+  REQUIRE(f.await(b, 9).flag("committed"));
+  const std::vector<unsigned char> zero(BYTES, 0);
+  CHECK(std::memcmp(image->data(), zero.data(), BYTES) == 0);
+  CHECK(f.other->parameterValueAsObject<vsr::scene::Array>("vertex.position")
+      == f.positions.data());
+  CHECK(std::memcmp(f.positions->data(),
+            PositionFixture::POINTS,
+            sizeof(PositionFixture::POINTS))
+      == 0);
+  CHECK(std::filesystem::exists(f.exchangePath() + "/agent.png"));
+  CHECK(std::filesystem::exists(f.exchangePath() + "/edited.vmesh"));
+  CHECK(std::memcmp(pinned->image->bytes.data(), before.data(), BYTES) == 0);
+  std::thread release([&] { pinned.reset(); });
+  release.join();
+  f.images->pump();
+  REQUIRE(json::parse(f.images->metadata(f.sceneId, b.id), ownership));
+  CHECK(
+      ownership.get("exchange_limits")->get("retained_physical_bytes")->n == 0);
 }
 
 SCENARIO("MCP position import checks scoped freshness before I/O and commit",
@@ -5814,9 +5943,9 @@ SCENARIO(
     REQUIRE(json::parse(f.images->metadata(f.sceneId, session.id), metadata));
     if (expected == "busy" || expected == "conflict")
       CHECK(metadata.get("exchange_limits")
-                ->get("available_session_snapshot_bytes")
+                ->get("session_retained_physical_bytes")
                 ->n
-          == 67108864);
+          == 0);
   }
 }
 
@@ -5949,14 +6078,16 @@ SCENARIO("MCP position import shares Image retention and directory quotas",
     "[integration][mcp][mesh-import][mesh-import-capacity]")
 {
   image::ExchangeLimits limits;
-  limits.globalRetentionBytes = 20000;
+  limits.globalRetentionBytes = 200000;
   PositionFixture f(limits);
   const auto session = f.attach();
   const auto evidence = f.working(session);
   std::string expected = "busy";
-  SECTION("an eligible Image snapshot consumes the same retained-data pool")
+  SECTION("an identical Image import creates no recovery or eviction")
   {
     auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 64, 64);
+    const std::vector<unsigned char> oldPixels(16384, 71);
+    image->setData(static_cast<const void *>(oldPixels.data()));
     const auto handle = f.objectHandle(image.data());
     f.exportImage(session, 2, handle);
     const auto exported = f.await(session, 2);
@@ -5967,8 +6098,9 @@ SCENARIO("MCP position import shares Image retention and directory quotas",
         exported.result()->get("data_version")->s,
         exported.result()->get("file_name")->s);
     const auto imported = f.await(session, 3);
-    REQUIRE(imported.flag("committed"));
-    REQUIRE(f.edits->restorations().size() == 1);
+    CHECK_FALSE(imported.flag("committed")); // identical exported bytes
+    CHECK(imported.result()->get("unchanged")->b);
+    CHECK(f.edits->restorations().size() == 0);
   }
   SECTION("agent-created working files cannot bypass the shared finite quota")
   {
@@ -6706,12 +6838,11 @@ SCENARIO(
       == f.positions.data());
 }
 
-SCENARIO(
-    "MCP retained recovery owners do not advertise physically unavailable capacity",
+SCENARIO("MCP eligible space and pinned physical recovery are distinct",
     "[integration][mcp][mesh-import][mesh-pressure][mesh-pressure-owners]")
 {
   image::ExchangeLimits limits;
-  limits.globalRetentionBytes = 400000;
+  limits.globalRetentionBytes = 600000;
   PositionFixture f(limits);
   auto uv = f.scene.createArray(ANARI_FLOAT32_VEC2, 3);
   const float coordinates[] = {0, 0, 1, 0, 0, 1};
@@ -6742,8 +6873,9 @@ SCENARIO(
                              ->a.at(0)
                              .get("image_exchange")
                              ->get("exchange_limits");
-  CHECK(capacity->get("effective_global_retention_byte_cap")->n == 400000);
-  CHECK(capacity->get("available_global_retention_bytes")->n < 140000);
+  CHECK(capacity->get("effective_global_retention_byte_cap")->n == 600000);
+  CHECK(capacity->get("available_global_retention_bytes")->n == 600000);
+  CHECK(capacity->get("retained_physical_bytes")->n > 262144);
   f.scene.removeUnusedObjects();
   f.scene.defragmentObjectStorage();
   REQUIRE(f.sceneIds->resolve(oldUV));
@@ -6753,18 +6885,14 @@ SCENARIO(
   const auto fresh = f.await(b, 2);
   REQUIRE(fresh.str("outcome") == "ok");
   f.importPositions(b, 3, *fresh.result());
-  const auto busy = f.await(b, 3);
-  REQUIRE(busy.str("outcome") == "busy");
-  CHECK_FALSE(busy.flag("committed"));
-  CHECK(busy.result()->get("reason")->s == "restore_budget_exhausted");
+  const auto admitted = f.await(b, 3);
+  REQUIRE(admitted.flag("committed"));
   CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
-      == f.sceneIds->resolve(f.sceneIds->handleOf(f.positions.data())));
+      != f.sceneIds->resolve(f.sceneIds->handleOf(f.positions.data())));
   std::thread release([&] { retained.reset(); });
   release.join();
   f.images->pump();
-  f.importPositions(b, 4, *fresh.result());
-  REQUIRE(f.await(b, 4).flag("committed"));
-  f.restoreBatch(b, 5, *f.status(b, b.id, 4).result()->get("batch_ref"));
+  f.restoreBatch(b, 5, *admitted.result()->get("batch_ref"));
   REQUIRE(f.await(b, 5).flag("committed"));
   CHECK(f.geometry->parameter("vertex.attribute0")->description()
       == std::string(24000, 'u'));
@@ -7149,19 +7277,30 @@ SCENARIO(
   auto held = f.edits->restorations().find(
       {batch.get("launch_id")->s, batch.get("batch_id")->s});
   REQUIRE(held);
-  for (unsigned i = 0; i < 1024; ++i)
-    REQUIRE(f.imageActivity->append(activity::Entry{}));
   REQUIRE(f.rpc("vsr/detach", "{}", &a).status == 200);
   const auto b = f.attach();
-  f.restoreBatch(b, 1, batch);
-  const auto expired = f.await(b, 1);
+  auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 256, 256);
+  const std::vector<unsigned char> imageBefore(262144, 71),
+      imageRows(262400, 0);
+  image->setData(static_cast<const void *>(imageBefore.data()));
+  writeInput(
+      f.exchangePath() + "/fifo.png", inputPng(256, 256, 6, imageRows, {}));
+  f.importImage(b,
+      1,
+      f.objectHandle(image.data()),
+      *f.sceneIds->imageDataVersion(f.sceneIds->handleOf(image.data())),
+      "fifo.png");
+  const auto imageImport = f.await(b, 1);
+  REQUIRE(imageImport.flag("committed"));
+  f.restoreBatch(b, 2, batch);
+  const auto expired = f.await(b, 2);
   CHECK(expired.str("outcome") == "outcome_unavailable");
   CHECK(expired.result()->get("reason")->s == "expired");
   CHECK_FALSE(expired.flag("committed"));
   CHECK(std::filesystem::file_size(file) == size);
   CHECK(std::filesystem::exists(f.exchangePath() + "/edited.vmesh"));
-  f.tool(b, "vsr_discover", "{\"request_id\":2}");
-  const auto discovery = f.await(b, 2);
+  f.tool(b, "vsr_discover", "{\"request_id\":3}");
+  const auto discovery = f.await(b, 3);
   CHECK(discovery.result()
             ->get("items")
             ->a.at(0)
@@ -7173,17 +7312,13 @@ SCENARIO(
   // The second Geometry still holds the original mesh. It is independently
   // addressable, not an approximation or rebinding of the expired target.
   f.geometry = f.other;
-  f.exportMesh(b, 3, f.geometry.data());
-  const auto fresh = f.await(b, 3);
+  f.exportMesh(b, 4, f.geometry.data());
+  const auto fresh = f.await(b, 4);
   REQUIRE(fresh.str("outcome") == "ok");
-  f.importPositions(b, 4, *fresh.result());
-  const auto busy = f.await(b, 4);
-  CHECK(busy.str("outcome") == "busy");
-  CHECK_FALSE(busy.flag("committed"));
-  held.reset();
-  f.images->pump();
   f.importPositions(b, 5, *fresh.result());
   const auto next = f.await(b, 5);
+  held.reset();
+  f.images->pump();
   REQUIRE(next.flag("committed"));
   f.restoreBatch(b, 6, *next.result()->get("batch_ref"));
   REQUIRE(f.await(b, 6).flag("committed"));
@@ -8398,7 +8533,7 @@ SCENARIO("MCP Image Export preserves every raw channel and Color Space",
     CHECK(limits.get("files_used")->n == 1);
     CHECK(limits.get("bytes_used")->n == png.size());
     CHECK(limits.get("usage_complete")->b);
-    CHECK(limits.get("available_session_snapshot_bytes")->n == 67108864);
+    CHECK(limits.get("session_retained_physical_bytes")->n == 0);
     REQUIRE(::unlink(path.c_str()) == 0);
     CHECK(f.exportImage(s, 2, handle).flag("replayed"));
     CHECK(f.status(s, s.id, 2).result()->get("file_name")->s
@@ -9325,12 +9460,11 @@ SCENARIO("MCP Image Import replaces shared samples and restores once",
   const auto *policy = imported.result()->get("restoration_policy");
   REQUIRE(policy);
   REQUIRE(policy->get("mode"));
-  REQUIRE(policy->get("session_snapshot_ceiling_bytes"));
+  CHECK_FALSE(policy->get("session_snapshot_ceiling_bytes"));
   REQUIRE(policy->get("effective_global_limit_bytes"));
   REQUIRE(policy->get("eviction_possible"));
-  CHECK(policy->get("mode")->s == "capacity_based");
-  CHECK(policy->get("session_snapshot_ceiling_bytes")->n == 67108864);
-  CHECK(policy->get("effective_global_limit_bytes")->n == 16777216);
+  CHECK(policy->get("mode")->s == "publication_fifo");
+  CHECK(policy->get("effective_global_limit_bytes")->n == 4294967296.);
   CHECK(policy->get("eviction_possible")->b);
   CHECK_FALSE(imported.json.get("result")->get("isError")->b);
   bool foundImportActivity = false;
@@ -9345,10 +9479,9 @@ SCENARIO("MCP Image Import replaces shared samples and restores once",
   CHECK(foundImportActivity);
   json::Value capacity;
   REQUIRE(json::parse(f.images->metadata(f.sceneId, s.id), capacity));
-  CHECK(capacity.get("exchange_limits")
-            ->get("available_session_snapshot_bytes")
-            ->n
-      == 67108848);
+  CHECK(
+      capacity.get("exchange_limits")->get("session_retained_physical_bytes")->n
+      == 16);
   CHECK(std::memcmp(image->data(), after, sizeof(after)) == 0);
   REQUIRE(imported.result()->get("batch_ref"));
   const auto batch = *imported.result()->get("batch_ref");
@@ -9361,10 +9494,9 @@ SCENARIO("MCP Image Import replaces shared samples and restores once",
   REQUIRE(restored.str("outcome") == "ok");
   CHECK(restored.flag("committed"));
   REQUIRE(json::parse(f.images->metadata(f.sceneId, s.id), capacity));
-  CHECK(capacity.get("exchange_limits")
-            ->get("available_session_snapshot_bytes")
-            ->n
-      == 67108864);
+  CHECK(
+      capacity.get("exchange_limits")->get("session_retained_physical_bytes")->n
+      == 0);
   CHECK(std::memcmp(image->data(), before, sizeof(before)) == 0);
   CHECK(restored.result()->get("versions")->a.empty());
   CHECK(restored.result()->get("node_versions")->a.empty());
@@ -9626,13 +9758,12 @@ SCENARIO("MCP Image Import applies individual encoded and ancillary ceilings",
   }
 }
 
-SCENARIO(
-    "MCP Image admission checks session capacity before global or file limits",
+SCENARIO("MCP Image transient limits remain distinct from recovery policy",
     "[integration][mcp][image-import][image-import-limits]")
 {
   Fixture f({}, true, false, false, 120., true, UINT64_MAX, {}, true);
-  // A single snapshot is four bytes over 64 MiB; the unchanged default
-  // 16 MiB global ceiling, transient ceiling and absent file must not win.
+  // Above the old 64 MiB snapshot ceiling but within the default soft budget.
+  // The unchanged transient-work safeguard, not session retention, wins.
   auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 16777217, 1);
   image->setName("tracked-image");
   const auto s = f.attach();
@@ -9644,15 +9775,15 @@ SCENARIO(
       "absent.png");
   const auto result = f.await(s, 2);
   CHECK(result.str("outcome") == "busy");
-  CHECK(result.result()->get("reason")->s == "restore_budget_exhausted");
+  CHECK(result.result()->get("reason")->s == "resource_limit");
   CHECK_FALSE(result.flag("committed"));
   CHECK_FALSE(image->isMapped());
   CHECK(image->dataWriteSequence() == 0);
   json::Value metadata;
   REQUIRE(json::parse(f.images->metadata(f.sceneId, s.id), metadata));
   const auto *limits = metadata.get("exchange_limits");
-  CHECK(limits->get("effective_global_retention_byte_cap")->n == 16777216);
-  CHECK(limits->get("available_session_snapshot_bytes")->n == 67108864);
+  CHECK(limits->get("effective_global_retention_byte_cap")->n == 4294967296.);
+  CHECK(limits->get("session_retained_physical_bytes")->n == 0);
   CHECK(f.imageActivity->limits().entries == 1024);
   CHECK(f.imageActivity->limits().restorableBatches == 32);
   CHECK(activity::ENTRY_OVERHEAD == 256);
@@ -9805,9 +9936,9 @@ SCENARIO(
     json::Value metadata;
     REQUIRE(json::parse(f.images->metadata(f.sceneId, s.id), metadata));
     CHECK(metadata.get("exchange_limits")
-              ->get("available_session_snapshot_bytes")
+              ->get("session_retained_physical_bytes")
               ->n
-        == 67108864);
+        == 0);
     CHECK(f.edits->restorations().size() == 0);
   }
 }
@@ -10329,9 +10460,9 @@ SCENARIO("MCP Image notifications burn reservations without losing recovery",
     json::Value metadata;
     REQUIRE(json::parse(f.images->metadata(f.sceneId, s.id), metadata));
     CHECK(metadata.get("exchange_limits")
-              ->get("available_session_snapshot_bytes")
+              ->get("session_retained_physical_bytes")
               ->n
-        == 67108864);
+        == 0);
     fault->failMap = false;
     f.importImage(s, 3, handle, version, "agent.png");
     const auto imported = f.await(s, 3);
@@ -10438,8 +10569,7 @@ SCENARIO("MCP Image notifications burn reservations without losing recovery",
   f.scene.updateDelegate().erase(fault);
 }
 
-SCENARIO(
-    "MCP Image Import shares the originating session ceiling across Images",
+SCENARIO("MCP Image Import retains more than the legacy 64 MiB session ceiling",
     "[integration][mcp][image-import][image-import-session]")
 {
   image::ExchangeLimits limits;
@@ -10456,7 +10586,7 @@ SCENARIO(
   const auto a = f.attach();
   writeInput(f.exchangePath() + "/agent.png", inputPng(2048, 2048, 6, rows));
   json::Value lastBatch;
-  for (std::uint64_t id = 1; id <= 4; ++id) {
+  for (std::uint64_t id = 1; id <= 5; ++id) {
     const auto handle = f.sceneIds->handleOf(images[id - 1].data());
     const auto wire =
         edit::detail::hex64(handle.domain) + edit::detail::hex64(handle.serial);
@@ -10468,47 +10598,36 @@ SCENARIO(
   }
   json::Value metadata;
   REQUIRE(json::parse(f.images->metadata(f.sceneId, a.id), metadata));
-  CHECK(metadata.get("exchange_limits")
-            ->get("available_session_snapshot_bytes")
-            ->n
-      == 0);
-  const auto fifth = f.sceneIds->handleOf(images[4].data());
-  f.importImage(a,
-      5,
-      edit::detail::hex64(fifth.domain) + edit::detail::hex64(fifth.serial),
-      *f.sceneIds->imageDataVersion(fifth),
-      "agent.png");
-  const auto rejected = f.await(a, 5);
-  REQUIRE(rejected.str("outcome") == "busy");
-  CHECK(rejected.result()->get("reason")->s == "restore_budget_exhausted");
-  CHECK(f.edits->restorations().size() == 4); // No session-only eviction.
-  CHECK(std::memcmp(images[4]->data(), before.data(), before.size()) == 0);
+  CHECK(
+      metadata.get("exchange_limits")->get("session_retained_physical_bytes")->n
+      == 5 * T);
+  CHECK_FALSE(
+      metadata.get("exchange_limits")->get("session_snapshot_byte_cap"));
+  CHECK(f.edits->restorations().size() == 5);
+  const std::vector<unsigned char> zero(T, 0);
+  CHECK(std::memcmp(images[4]->data(), zero.data(), T) == 0);
   REQUIRE(f.rpc("vsr/detach", "{}", &a).status == 200);
   const auto b = f.attach();
   REQUIRE(b.id != a.id);
   REQUIRE(json::parse(f.images->metadata(f.sceneId, b.id), metadata));
-  CHECK(metadata.get("exchange_limits")
-            ->get("available_session_snapshot_bytes")
-            ->n
-      == 67108864);
-  REQUIRE(json::parse(f.images->metadata(f.sceneId, a.id), metadata));
-  CHECK(metadata.get("exchange_limits")
-            ->get("available_session_snapshot_bytes")
-            ->n
+  CHECK(
+      metadata.get("exchange_limits")->get("session_retained_physical_bytes")->n
       == 0);
+  REQUIRE(json::parse(f.images->metadata(f.sceneId, a.id), metadata));
+  CHECK(
+      metadata.get("exchange_limits")->get("session_retained_physical_bytes")->n
+      == 5 * T);
   f.restoreBatch(b, 1, lastBatch);
   REQUIRE(f.await(b, 1).str("outcome") == "ok");
-  CHECK(std::memcmp(images[3]->data(), before.data(), before.size()) == 0);
+  CHECK(std::memcmp(images[4]->data(), before.data(), before.size()) == 0);
   REQUIRE(json::parse(f.images->metadata(f.sceneId, a.id), metadata));
-  CHECK(metadata.get("exchange_limits")
-            ->get("available_session_snapshot_bytes")
-            ->n
-      == 16777216);
+  CHECK(
+      metadata.get("exchange_limits")->get("session_retained_physical_bytes")->n
+      == 4 * T);
   REQUIRE(json::parse(f.images->metadata(f.sceneId, b.id), metadata));
-  CHECK(metadata.get("exchange_limits")
-            ->get("available_session_snapshot_bytes")
-            ->n
-      == 67108864);
+  CHECK(
+      metadata.get("exchange_limits")->get("session_retained_physical_bytes")->n
+      == 0);
 }
 
 SCENARIO(
@@ -10517,6 +10636,12 @@ SCENARIO(
 {
   image::ExchangeLimits limits;
   limits.globalRetentionBytes = 3u << 20;
+  const auto physical = std::make_shared<vsr::rendering::FrameBudget>();
+  bool refuseSnapshot = false;
+  limits.reservePhysicalMemory = [&, physical](std::size_t bytes) {
+    return refuseSnapshot && bytes == 1048576 ? std::shared_ptr<const void>{}
+                                              : physical->reserve(bytes);
+  };
   Fixture f({}, true, false, false, 120., true, UINT64_MAX, limits, true);
   const std::vector<unsigned char> before(1048576, 71), rows(1048640, 0);
   std::vector<vsr::scene::ArrayRef> images;
@@ -10541,21 +10666,58 @@ SCENARIO(
     return *imported.result()->get("batch_ref");
   };
   const auto first = import(a, 1, 0);
+  const auto second = import(a, 2, 1);
+  // Each failed attempt starts with a full recoverable pool.
+  const auto failure = GENERATE(0, 1, 2, 3, 4);
+  INFO("failure mode=" << failure);
+  writeInput(f.exchangePath() + "/broken.png", {1, 2, 3});
+  const auto thirdHandle = f.sceneIds->handleOf(images[2].data());
+  const auto thirdWire = edit::detail::hex64(thirdHandle.domain)
+      + edit::detail::hex64(thirdHandle.serial);
+  const auto expectedVersion = *f.sceneIds->imageDataVersion(thirdHandle);
+  if (failure == 1)
+    images[2]->setData(static_cast<const void *>(before.data()));
+  refuseSnapshot = failure == 4;
+  f.importImage(a,
+      3,
+      thirdWire,
+      expectedVersion,
+      failure == 0 ? "broken.png" : "agent.png");
+  if (failure == 2)
+    f.authority->setAgentEditsDisabled(true);
+  if (failure == 3)
+    f.tool(a, "vsr_cancel", "{\"operation_ref\":" + ref(a.id, 3) + "}");
+  const auto failed = f.await(a, 3);
+  const char *outcomes[] = {
+      "invalid_request", "conflict", "forbidden", "cancelled", "busy"};
+  CHECK(failed.str("outcome") == outcomes[failure]);
+  f.authority->setAgentEditsDisabled(false);
+  refuseSnapshot = false;
+  CHECK_FALSE(failed.flag("committed"));
+  CHECK(f.edits->restorations().find(
+      {first.get("launch_id")->s, first.get("batch_id")->s}));
+  CHECK(f.edits->restorations().find(
+      {second.get("launch_id")->s, second.get("batch_id")->s}));
+  CHECK(std::memcmp(images[2]->data(), before.data(), before.size()) == 0);
   REQUIRE(f.rpc("vsr/detach", "{}", &a).status == 200);
   const auto b = f.attach();
-  import(b, 1, 1);
-  import(b, 2, 2);
+  const auto newest = import(b, 1, 2);
   f.drain();
   json::Value metadata;
   REQUIRE(json::parse(f.images->metadata(f.sceneId, a.id), metadata));
-  CHECK(metadata.get("exchange_limits")
-            ->get("available_session_snapshot_bytes")
-            ->n
-      == 67108864);
+  CHECK(
+      metadata.get("exchange_limits")->get("session_retained_physical_bytes")->n
+      == 1048576);
   f.restoreBatch(b, 3, first);
   auto expired = f.await(b, 3);
   REQUIRE(expired.str("outcome") == "outcome_unavailable");
   CHECK(expired.result()->get("reason")->s == "expired");
+  f.restoreBatch(b, 4, second);
+  REQUIRE(f.await(b, 4).flag("committed"));
+  CHECK(std::memcmp(images[1]->data(), before.data(), before.size()) == 0);
+  f.restoreBatch(b, 5, newest);
+  REQUIRE(f.await(b, 5).flag("committed"));
+  CHECK(std::memcmp(images[2]->data(), before.data(), before.size()) == 0);
 }
 
 SCENARIO(
@@ -10609,7 +10771,7 @@ SCENARIO(
     "[integration][mcp][image-import][image-import-scope-expiry]")
 {
   image::ExchangeLimits limits;
-  limits.globalRetentionBytes = 8192;
+  limits.globalRetentionBytes = 262144;
   Fixture f({}, true, false, false, 120., true, UINT64_MAX, limits, true);
   auto image = f.scene.createArray(ANARI_UFIXED8_VEC4, 1, 1);
   image->setName("tracked-image");
@@ -10629,9 +10791,9 @@ SCENARIO(
   const auto batch = *imported.result()->get("batch_ref");
   f.restoreBatch(s, 3, batch);
   REQUIRE(f.await(s, 3).str("outcome") == "ok");
-  activity::Entry pressure;
-  pressure.result.assign(7900, 'x');
-  REQUIRE(f.imageActivity->append(std::move(pressure)));
+  // Consumed history is ordinary metadata, unlike eligible recovery.
+  for (unsigned i = 0; i < 1024; ++i)
+    REQUIRE(f.imageActivity->append(activity::Entry{}));
   CHECK_FALSE(f.imageActivity->eligibility(
       {batch.get("launch_id")->s, batch.get("batch_id")->s}));
   identity::SceneIdentity other(f.ids, f.hidden);
@@ -10678,9 +10840,9 @@ SCENARIO(
     json::Value metadata;
     REQUIRE(json::parse(f.images->metadata(f.sceneId, s.id), metadata));
     CHECK(metadata.get("exchange_limits")
-              ->get("available_session_snapshot_bytes")
+              ->get("session_retained_physical_bytes")
               ->n
-        == 67108864);
+        == 0);
     allocator.remaining = 100;
     f.importImage(s, 3, handle, version, "agent.png");
     CHECK(f.await(s, 3).str("outcome") == "ok");
@@ -10977,9 +11139,9 @@ SCENARIO(
     json::Value metadata;
     REQUIRE(json::parse(f.images->metadata(f.sceneId, s.id), metadata));
     CHECK(metadata.get("exchange_limits")
-              ->get("available_session_snapshot_bytes")
+              ->get("session_retained_physical_bytes")
               ->n
-        == 62914560);
+        == 4194304);
   }
   const auto completed = f.await(s, 2);
   if (fits) {
@@ -11312,28 +11474,28 @@ SCENARIO("Engine and Activity evict Image owners independently",
     REQUIRE(f.restores->resultLocal(local.ref)->outcome == Outcome::OK);
     CHECK(std::memcmp(image->data(), before, 4) == 0);
   }
-  SECTION("Activity evicts while Engine keeps receipt")
+  SECTION("Metadata pressure cannot evict eligible recovery")
   {
     for (unsigned i = 0; i < 1024; ++i)
       REQUIRE(f.imageActivity->append(activity::Entry{}));
     CHECK(
-        f.imageActivity->eligibility(batch) != activity::Eligibility::ELIGIBLE);
+        f.imageActivity->eligibility(batch) == activity::Eligibility::ELIGIBLE);
     CHECK(f.status(s, s.id, 2).str("outcome") == "ok");
     json::Value metadata;
     REQUIRE(json::parse(f.images->metadata(f.sceneId, s.id), metadata));
     CHECK(metadata.get("exchange_limits")
-              ->get("available_session_snapshot_bytes")
+              ->get("session_retained_physical_bytes")
               ->n
-        == 67108864);
+        == 4);
     const auto local = f.restores->submitLocal({f.sceneId, batch});
     REQUIRE(local.code == Outcome::OK);
     f.drain();
-    CHECK(f.restores->resultLocal(local.ref)->outcome
-        == Outcome::OUTCOME_UNAVAILABLE);
+    CHECK(f.restores->resultLocal(local.ref)->outcome == Outcome::OK);
+    CHECK(std::memcmp(image->data(), before, 4) == 0);
   }
 }
 
-SCENARIO("MCP mixed Image Mesh history keeps the originating session ceiling",
+SCENARIO("MCP mixed Image Mesh history has no separate session ceiling",
     "[integration][mcp][mesh-import][mesh-pressure][mesh-pressure-session]")
 {
   image::ExchangeLimits limits;
@@ -11370,25 +11532,16 @@ SCENARIO("MCP mixed Image Mesh history keeps the originating session ceiling",
                              .get("image_exchange")
                              ->get("exchange_limits");
   CHECK(capacity->get("effective_global_retention_byte_cap")->n == 134217728);
-  CHECK(capacity->get("available_session_snapshot_bytes")->n == 0);
+  CHECK(capacity->get("session_retained_physical_bytes")->n == 4 * BYTES);
   f.importPositions(a, 7, *evidence.result());
-  const auto busy = f.await(a, 7);
-  REQUIRE(busy.str("outcome") == "busy");
-  CHECK_FALSE(busy.flag("committed"));
-  CHECK(busy.result()->get("reason")->s == "restore_budget_exhausted");
-  REQUIRE(busy.result()->get("configured_session_capacity_bytes"));
-  CHECK(busy.result()->get("configured_session_capacity_bytes")->n == 67108864);
-  CHECK(busy.result()->get("available_session_snapshot_bytes")->n == 0);
-  CHECK(busy.result()->get("required_capacity_bytes")->n > 262144);
+  const auto mesh = f.await(a, 7);
+  REQUIRE(mesh.flag("committed"));
   CHECK(f.geometry->parameterValueAsObject<vsr::scene::Array>("vertex.position")
-      == f.positions.data());
+      != f.positions.data());
   f.restoreBatch(a, 8, firstImageBatch);
   REQUIRE(f.await(a, 8).flag("committed"));
   CHECK(std::memcmp(images.front()->data(), before.data(), BYTES) == 0);
-  f.importPositions(a, 9, *evidence.result());
-  const auto sameOrigin = f.await(a, 9);
-  REQUIRE(sameOrigin.flag("committed"));
-  f.restoreBatch(a, 10, *sameOrigin.result()->get("batch_ref"));
+  f.restoreBatch(a, 10, *mesh.result()->get("batch_ref"));
   REQUIRE(f.await(a, 10).flag("committed"));
   f.tool(a, "vsr_discover", "{\"request_id\":11}");
   const auto recovered = f.await(a, 11);
@@ -11397,9 +11550,9 @@ SCENARIO("MCP mixed Image Mesh history keeps the originating session ceiling",
             ->a.at(0)
             .get("image_exchange")
             ->get("exchange_limits")
-            ->get("available_session_snapshot_bytes")
+            ->get("session_retained_physical_bytes")
             ->n
-      == 16777216);
+      == 3 * BYTES);
   REQUIRE(f.rpc("vsr/detach", "{}", &a).status == 200);
   const auto b = f.attach();
   f.restoreBatch(b, 1, imageBatch);
@@ -11412,9 +11565,9 @@ SCENARIO("MCP mixed Image Mesh history keeps the originating session ceiling",
             ->a.at(0)
             .get("image_exchange")
             ->get("exchange_limits")
-            ->get("available_session_snapshot_bytes")
+            ->get("session_retained_physical_bytes")
             ->n
-      == 67108864);
+      == 0);
   f.exportMesh(b, 3, f.geometry.data());
   const auto fresh = f.await(b, 3);
   REQUIRE(fresh.str("outcome") == "ok");
@@ -11440,7 +11593,7 @@ SCENARIO("MCP compound mesh ownership failures leave no published staging",
     if (failing && bytes == 4096)
       preparing = true;
     if (failing
-        && (seam == 262144u ? bytes > 262144u && bytes < 294912u
+        && (seam == 262144u ? bytes > 327680u && bytes < 524288u
                             : bytes == seam && (seam != 65536u || preparing))) {
       failing = false;
       refused = true;

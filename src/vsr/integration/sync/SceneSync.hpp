@@ -91,12 +91,12 @@ class SyncStates
 
   static SyncState compute(const Scene &s);
   template <typename F>
-  void mutate(SceneId scene, F &&f);
+  bool mutate(SceneId scene, F &&f);
 
   mutable std::mutex m_mutex;
   std::map<SceneId, Scene> m_scenes;
   std::set<ViewId> m_unconfirmed;
-  TransitionListener m_listener;
+  std::shared_ptr<const TransitionListener> m_listener;
 };
 
 struct ResyncResult
@@ -201,9 +201,9 @@ inline SyncState SyncStates::compute(const Scene &s)
 }
 
 template <typename F>
-inline void SyncStates::mutate(SceneId scene, F &&f)
+inline bool SyncStates::mutate(SceneId scene, F &&f)
 {
-  TransitionListener listener;
+  std::shared_ptr<const TransitionListener> listener;
   SyncState from, to;
   {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -213,8 +213,16 @@ inline void SyncStates::mutate(SceneId scene, F &&f)
     to = compute(s);
     listener = m_listener;
   }
-  if (from != to && listener)
-    listener(scene, from, to);
+  if (from != to && listener) {
+    try {
+      (*listener)(scene, from, to);
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      m_scenes.at(scene).failed = true;
+      return false;
+    }
+  }
+  return true;
 }
 
 inline void SyncStates::prepareScene(SceneId scene)
@@ -243,8 +251,11 @@ inline bool SyncStates::viewConfirmed(ViewId view) const
 
 inline void SyncStates::setTransitionListener(TransitionListener listener)
 {
+  auto prepared = listener
+      ? std::make_shared<const TransitionListener>(std::move(listener))
+      : std::shared_ptr<const TransitionListener>{};
   std::lock_guard<std::mutex> lock(m_mutex);
-  m_listener = std::move(listener);
+  m_listener = std::move(prepared);
 }
 
 inline void SyncStates::beginHook(SceneId scene)
@@ -255,7 +266,7 @@ inline void SyncStates::beginHook(SceneId scene)
 inline bool SyncStates::finishHook(SceneId scene, bool confirmed)
 {
   bool ready = false;
-  mutate(scene, [&](Scene &s) {
+  const bool notified = mutate(scene, [&](Scene &s) {
     if (s.pendingHooks)
       s.pendingHooks--;
     // Only explicit Resynchronize clears an earlier failure/needs_sync.
@@ -263,7 +274,7 @@ inline bool SyncStates::finishHook(SceneId scene, bool confirmed)
     if (!confirmed)
       s.failed = true;
   });
-  return ready;
+  return ready && notified;
 }
 
 inline void SyncStates::beginRecovery(SceneId scene)

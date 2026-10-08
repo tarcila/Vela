@@ -12,6 +12,10 @@
 #include <memory_resource>
 #include <string>
 
+namespace vsr::integration::activity {
+class ActivityLog;
+}
+
 namespace vsr::integration::edit {
 class EditService;
 }
@@ -25,7 +29,10 @@ namespace vsr::integration::image {
 struct ExchangeLimits
 {
   std::size_t transientBytes{268435456};
-  std::size_t globalRetentionBytes{16u << 20};
+  // Launch configuration hint for export-only hosts. Qualified Import reads
+  // policy/accounting directly from retention, never from a second ledger cap.
+  std::uint64_t globalRetentionBytes{UINT64_C(4294967296)};
+  const activity::ActivityLog *retention{nullptr};
   // A host-wide physical lease is acquired once before capture and held
   // through buffer destruction; smaller configured host ceilings also apply.
   std::size_t physicalByteCap{268435456};
@@ -33,8 +40,6 @@ struct ExchangeLimits
   // Optional host allocator for deterministic allocation/failure control.
   // Must outlive this service and its engine's active jobs.
   std::pmr::memory_resource *allocator{std::pmr::new_delete_resource()};
-  // Owning-thread observation of the existing global activity/restoration pool.
-  std::function<std::size_t()> availableGlobalRetention;
   std::function<bool(const std::string &, const std::string &)>
       restorationRetained;
 };

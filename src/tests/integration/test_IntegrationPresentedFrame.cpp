@@ -723,7 +723,8 @@ TEST_CASE("CPU observation charges fixed infrastructure before accepting views",
     "[integration][presented-frame][frame-memory]")
 {
   CHECK_THROWS_AS(vsr::rendering::FrameBudget(1), std::runtime_error);
-  CHECK_THROWS_AS(vsr::rendering::FrameBudget(257u << 20), std::runtime_error);
+  CHECK(vsr::rendering::FrameBudget().limit() == (256u << 20));
+  CHECK(vsr::rendering::FrameBudget(257u << 20).limit() == (257u << 20));
   auto budget = std::make_shared<vsr::rendering::FrameBudget>(4096);
   CHECK(budget->used() > 0); // budget object/control block are owned too
   CHECK_FALSE(budget->reserve(4096)); // lease overhead cannot exceed the limit

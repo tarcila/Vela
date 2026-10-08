@@ -334,7 +334,7 @@ Export support alone does not qualify Import. Unsafe directories and unsupported
 advertise unavailable with an explicit reason. The optional strict
 `image_exchange` field in the private launch descriptor publishes the same
 Image-independent directory/limit names as startup observations. It omits
-`available_session_snapshot_bytes`; only authenticated per-request observations
+`session_retained_physical_bytes`; only authenticated per-request observations
 publish that ledger field. Older descriptors without the optional object remain
 valid, while unknown/duplicate fields and malformed nested metadata still reject.
 Hosts without ImageExchange keep `not_implemented`; the tracking prerequisite
@@ -379,11 +379,30 @@ with strict required arguments `request_id`, `scene_id`, `handle`, `data_version
 admission/status/replay and existing `vsr_restore`, not a separate undo tool.
 Success returns `handle`, fresh `data_version`, `scene_revision`, `batch_ref`,
 `affected_samplers`, `affected_users`, `affected_complete` and
-`restoration_policy` (capacity_based, session_snapshot_ceiling_bytes,
-effective_global_limit_bytes, eviction_possible=true). Its terminal PNG/file/storage errors are `invalid_request` with
+`restoration_policy` (mode=publication_fifo, effective_global_limit_bytes,
+eviction_possible=true). Normal Image/Mesh/parameter/Node recovery shares one
+4 GiB default soft target, with a disclosed 32-batch FIFO bound; no separate
+64 MiB session snapshot ceiling remains. Eligible free space is reported
+separately from snapshot/pin physical ownership. Metadata/results retain their
+16 MiB/1024-record bounds, and real physical/transient/transport/allocation
+safeguards remain. FIFO eviction occurs only at successful publication;
+precommit failures, no-ops and replay do not discard recovery. Above-soft
+admission/approval is not implemented in this slice.
+Generic parameter/Node commits prepare both receipt buffers, version storage,
+store publication nodes and synchronization state before the final authority
+and dependency check. Their conservative recovery charge includes this
+publication ownership. Pruning moves keys/leases into a preallocated FIFO of
+1024 expiry tombstones; it neither constructs Batch References nor allocates
+store nodes after writes. A late receipt, notification or synchronization
+failure reports `committed:true` and retains the new exact recovery entry.
+Under allocation failure the prepared fallback can omit richer version fields,
+but still supplies `batch_ref`; inspect fresh versions rather than retrying the
+edit as though it had been rejected. A failed synchronization dispatch also
+finishes truthfully and marks the Scene failed, allowing explicit Resynchronize.
+Its terminal PNG/file/storage errors are `invalid_request` with
 `invalid_png`, `file_rejected`, `unsupported_image`, or `foreign_scene`; stale
 versions use `conflict/stale_data_version`, open maps `busy/image_mapped`,
-session pressure `busy/restore_budget_exhausted`, and other capacity pressure
+above-soft recovery charge `busy/restore_budget_exhausted`, and other capacity pressure
 `busy/resource_limit`. Non-ok terminal outcomes have `isError:true`; committed
 sync failures retain `applied_with_sync_failure` and fresh receipts. Image restore
 returns `image_versions:[{handle,data_version}]`, `versions:[]`, `node_versions:[]`

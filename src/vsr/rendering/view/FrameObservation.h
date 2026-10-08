@@ -23,7 +23,8 @@ namespace vsr::rendering {
 
 // Shared by all sources, retained consumers, encoders and transport drains in
 // one host. A reservation follows ownership, not a cache slot. Rendering/Scene
-// allocations themselves are outside this observation-owned budget.
+// allocations themselves are outside this observation-owned budget. The
+// default remains 256 MiB; an explicit host limit may include recovery owners.
 class FrameBudget : public std::enable_shared_from_this<FrameBudget>
 {
  public:
@@ -104,7 +105,7 @@ inline FrameBudget::Lease::~Lease()
 
 inline FrameBudget::FrameBudget(std::size_t limit) : m_limit(limit)
 {
-  if (limit < sizeof(FrameBudget) + 256 || limit > (256u << 20))
+  if (limit < sizeof(FrameBudget) + 256)
     throw std::runtime_error("invalid frame budget");
   // Includes the budget object, shared control block and allocation headers.
   m_used = sizeof(FrameBudget) + 256;

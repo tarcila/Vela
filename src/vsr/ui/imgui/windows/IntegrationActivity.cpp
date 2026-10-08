@@ -196,12 +196,15 @@ void IntegrationActivity::buildScenes(const IntegrationActivityState &s)
 void IntegrationActivity::buildActivity(const IntegrationActivityState &s)
 {
   ImGui::Text(
-      "Activity (%zu records, %zu bytes, %zu restorable, %zu image "
+      "Activity (%zu records, %zu metadata bytes, %zu restorable, %zu image "
       "bytes)",
       s.usage.entries,
       s.usage.bytes,
       s.usage.restorableBatches,
       s.usage.imageBytes);
+  ImGui::Text("Recovery: %llu eligible bytes; %llu pending bytes (FIFO)",
+      (unsigned long long)s.usage.retentionBytes,
+      (unsigned long long)s.usage.reservedRetentionBytes);
 
   const auto flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg
       | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;

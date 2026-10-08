@@ -113,6 +113,7 @@ struct EditResult
   std::optional<SceneRevision> sceneRevision; // resulting, on commit
   std::vector<ParameterVersionToken> versions; // resulting, per edited object
   std::vector<NodeVersion> nodeVersions;
+  std::string receipt; // storage and fallback prepared before Scene writes
   // On a value rejection: the offending entry and its error.
   std::optional<std::size_t> failedEntry;
   ValueError valueError{ValueError::NONE};
@@ -203,6 +204,81 @@ inline std::string commitDetailJson(bool committed,
     }
   }
   return j;
+}
+
+// Capacity is reserved from the validated entry count before any Scene write.
+// Formatting uses stack scratch, never temporary allocating strings.
+inline void writeCommitReceipt(EditResult &result)
+{
+  auto &out = result.receipt;
+  out.clear();
+  out += "{\"batch_ref\":{\"launch_id\":\"";
+  out += result.batchRef->launchId;
+  out += "\",\"batch_id\":\"";
+  out += result.batchRef->batchId;
+  out += "\"},\"committed\":true";
+  char buffer[512];
+  const auto &revision = *result.sceneRevision;
+  std::snprintf(buffer,
+      sizeof(buffer),
+      ",\"scene_revision\":\"%llu.%llu.%llu.%llu\",\"versions\":[",
+      (unsigned long long)revision.launch.activation,
+      (unsigned long long)revision.launch.nonce,
+      (unsigned long long)revision.domain,
+      (unsigned long long)revision.value);
+  out += buffer;
+  bool first = true;
+  for (const auto &v : result.versions) {
+    std::snprintf(buffer,
+        sizeof(buffer),
+        "%s{\"handle\":\"%016llx%016llx\",\"version\":%llu}",
+        first ? "" : ",",
+        (unsigned long long)v.object.domain,
+        (unsigned long long)v.object.serial,
+        (unsigned long long)v.version);
+    out += buffer;
+    first = false;
+  }
+  out += "]";
+  if (!result.nodeVersions.empty()) {
+    out += ",\"node_versions\":[";
+    first = true;
+    for (const auto &v : result.nodeVersions) {
+      const auto &node = v.expected.node;
+      const auto &d = v.dependencies;
+      char handle[33], layer[33];
+      std::snprintf(handle,
+          sizeof(handle),
+          "%016llx%016llx",
+          (unsigned long long)node.domain,
+          (unsigned long long)node.serial);
+      std::snprintf(layer,
+          sizeof(layer),
+          "%016llx%016llx",
+          (unsigned long long)d.layer.domain,
+          (unsigned long long)d.layer.serial);
+      std::snprintf(buffer,
+          sizeof(buffer),
+          "%s{\"handle\":\"%s\",\"version\":\"ne:%s:%llu\","
+          "\"structural_version\":\"ns:%s:%s:%llu\","
+          "\"ancestry_version\":\"na:%s:%s:%llu:%llu\"}",
+          first ? "" : ",",
+          handle,
+          handle,
+          (unsigned long long)v.expected.version,
+          handle,
+          layer,
+          (unsigned long long)d.structuralVersion,
+          handle,
+          layer,
+          (unsigned long long)d.structuralVersion,
+          (unsigned long long)d.transformVersion);
+      out += buffer;
+      first = false;
+    }
+    out += "]";
+  }
+  out += "}";
 }
 
 inline ValueError prepareSRTField(const scene::LayerNodeData &data,
@@ -480,14 +556,15 @@ struct RestorationRecord
   std::vector<Change> changes;
   std::vector<ParameterVersionToken> resultingVersions;
   std::vector<NodeChange> nodeChanges;
+  std::size_t publicationBytes{0}; // prepared receipt/version ownership
   std::shared_ptr<ImageSnapshot> image;
   // Mesh reuses Image's prepared bounded store/scope/receipt ownership.
   std::shared_ptr<MeshSnapshot> mesh;
 };
 
-// Bounded restorable-batch store (spec §5: 32 by default). Publishing past
-// capacity visibly expires the oldest record; reserved storage for active
-// work is never evicted.
+// Active reservations are bounded (32 by default). Qualified hosts use the
+// ActivityLog's sole publication FIFO authority; this store prunes only entries
+// it makes ineligible. Standalone legacy hosts retain the bounded fallback.
 class RestorationStore
 {
  public:
@@ -497,7 +574,10 @@ class RestorationStore
   // reservations alone fill the store.
   bool reserve();
   void cancelReservation();
-  void publish(RestorationRecord record); // consumes one reservation
+  // Allocate a generic publication node/order storage before Scene writes.
+  bool prepareRecord(const BatchRef &ref);
+  void cancelRecord(const BatchRef &ref);
+  void publish(RestorationRecord record, bool sharedRetention = false);
   // Allocate all store/control state before an Image's write boundary.
   bool prepareImage(RestorationRecord record);
   void publishImage(const BatchRef &ref);
@@ -521,7 +601,8 @@ class RestorationStore
   void release(const BatchRef &ref);
   // Visibly expires every record `retained` rejects; keeps this store in
   // step with an authoritative retention budget (the ActivityLog).
-  void expireUnless(const std::function<bool(const BatchRef &)> &retained);
+  template <typename F>
+  void expireUnless(F &&retained);
   std::size_t size() const;
   std::size_t capacity() const;
 
@@ -538,13 +619,16 @@ class RestorationStore
     ImageState state{ImageState::ELIGIBLE};
   };
   std::map<std::string, ImageScope> m_imageScopes;
-  std::map<std::string, std::shared_ptr<const void>> m_imageExpiredLeases;
   std::vector<std::string> m_imageScopeOrder;
   std::vector<std::string> m_order; // oldest first
-  std::set<std::string> m_expired;
-  std::vector<std::string> m_expiredOrder; // bounded like activity entries
+  struct Expired
+  {
+    std::string id;
+    std::shared_ptr<const void> imageLease;
+  };
+  std::vector<Expired> m_expired; // 1024 allocation-free tombstones
 
-  void expireLocked(std::string id); // by value: may alias m_order
+  void expireLocked(const std::string &id); // may alias m_order
 };
 
 // Bytes charged to the activity budget for a restoration record's payload.
@@ -555,7 +639,10 @@ enum class FaultStage
 {
   PREPARE,
   ALLOCATE,
-  RESERVE_RESTORATION
+  RESERVE_RESTORATION,
+  LAST_PREWRITE,
+  RECEIPT,
+  SYNC
 };
 using FaultInjector = std::function<bool(FaultStage)>;
 
@@ -648,7 +735,9 @@ inline bool operator==(const BatchRef &a, const BatchRef &b)
 
 inline RestorationStore::RestorationStore(std::size_t capacity)
     : m_capacity(capacity)
-{}
+{
+  m_expired.reserve(1024);
+}
 
 inline bool RestorationStore::reserve()
 {
@@ -666,11 +755,39 @@ inline void RestorationStore::cancelReservation()
     --m_reserved;
 }
 
-inline void RestorationStore::publish(RestorationRecord record)
+inline bool RestorationStore::prepareRecord(const BatchRef &ref)
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  m_order.reserve(m_order.size() + m_reserved + 1);
+  RestorationRecord pending;
+  pending.ref = ref;
+  return m_pendingImages.emplace(ref.batchId, std::move(pending)).second;
+}
+
+inline void RestorationStore::cancelRecord(const BatchRef &ref)
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  m_pendingImages.erase(ref.batchId);
+}
+
+inline void RestorationStore::publish(
+    RestorationRecord record, bool sharedRetention)
 {
   std::lock_guard<std::mutex> lock(m_mutex);
   if (m_reserved)
     --m_reserved;
+  if (!sharedRetention)
+    while (!m_order.empty() && m_records.size() + m_reserved >= m_capacity)
+      expireLocked(m_order.front());
+  const auto pending = m_pendingImages.find(record.ref.batchId);
+  if (pending != m_pendingImages.end()) {
+    // The prepared map node and vector capacity make publication nonallocating.
+    m_order.push_back(std::move(pending->second.ref.batchId));
+    pending->second = std::move(record);
+    m_records.insert(m_pendingImages.extract(pending));
+    return;
+  }
+  // Legacy standalone hosts without an Activity sink retain the bounded store.
   auto id = record.ref.batchId;
   while (!m_order.empty() && m_records.size() + m_reserved >= m_capacity)
     expireLocked(m_order.front());
@@ -685,30 +802,20 @@ inline bool RestorationStore::prepareImage(RestorationRecord record)
     return false;
   const auto id = record.ref.batchId;
   const auto scopeKey = record.ref.launchId + "/" + id;
-  while (!m_order.empty() && m_records.size() + m_reserved >= m_capacity)
-    expireLocked(m_order.front());
   // Allocations here may fail; no write has occurred. Rollback the partial
   // control state before propagating an allocation failure to admission.
   try {
     m_order.reserve(m_order.size() + m_capacity + 1);
-    m_imageScopeOrder.reserve(m_imageScopeOrder.size() + 1);
+    m_imageScopeOrder.reserve(m_imageScopeOrder.size() + m_capacity + 1);
     m_imageScopes.emplace(
         scopeKey, ImageScope{record.image->scopeLease, record.scene});
     record.image->batchOrder = id;
     record.image->batchScope = scopeKey;
     m_pendingImages.emplace(id, std::move(record));
-    m_imageScopeOrder.push_back(scopeKey);
   } catch (...) {
     m_pendingImages.erase(id);
     m_imageScopes.erase(scopeKey);
     throw;
-  }
-  // Retire bounded scope history during preparation, never allocate a key
-  // while publishing a completed write. Retained payloads carry their own
-  // authoritative scope even under explicit larger host limits.
-  while (m_imageScopeOrder.size() > 1024) {
-    m_imageScopes.erase(m_imageScopeOrder.front());
-    m_imageScopeOrder.erase(m_imageScopeOrder.begin());
   }
   ++m_reserved;
   return true;
@@ -722,7 +829,14 @@ inline void RestorationStore::publishImage(const BatchRef &ref)
     return;
   --m_reserved;
   m_order.push_back(std::move(it->second.image->batchOrder));
+  m_imageScopeOrder.push_back(std::move(it->second.image->batchScope));
   m_records.insert(m_pendingImages.extract(it));
+  // Historical scope metadata also ages by successful publication. Current
+  // records carry their authoritative scope even under larger host limits.
+  while (m_imageScopeOrder.size() > 1024) {
+    m_imageScopes.erase(m_imageScopeOrder.front());
+    m_imageScopeOrder.erase(m_imageScopeOrder.begin());
+  }
 }
 
 inline void RestorationStore::cancelImage(const BatchRef &ref)
@@ -785,52 +899,56 @@ inline bool RestorationStore::setImageState(
   return true;
 }
 
-inline void RestorationStore::expireLocked(std::string id)
+inline void RestorationStore::expireLocked(const std::string &id)
 {
   const auto record = m_records.find(id);
-  if (record != m_records.end() && record->second.image) {
-    const auto key = record->second.ref.launchId + "/" + id;
-    const auto scope = m_imageScopes.find(key);
-    if (scope != m_imageScopes.end()) {
-      m_imageExpiredLeases.emplace(id, scope->second.lease);
-      m_imageScopes.erase(scope);
+  if (record == m_records.end())
+    return;
+  Expired expired;
+  if (record->second.image) {
+    // Match the already-owned scope key without constructing launch/id.
+    const auto &launch = record->second.ref.launchId;
+    for (auto scope = m_imageScopes.begin(); scope != m_imageScopes.end();
+        ++scope) {
+      const auto &key = scope->first;
+      if (key.size() == launch.size() + 1 + id.size()
+          && key.compare(0, launch.size(), launch) == 0
+          && key[launch.size()] == '/'
+          && key.compare(launch.size() + 1, id.size(), id) == 0) {
+        expired.imageLease = std::move(scope->second.lease);
+        m_imageScopeOrder.erase(
+            std::remove(
+                m_imageScopeOrder.begin(), m_imageScopeOrder.end(), key),
+            m_imageScopeOrder.end());
+        m_imageScopes.erase(scope);
+        break;
+      }
     }
-    m_imageScopeOrder.erase(
-        std::remove(m_imageScopeOrder.begin(), m_imageScopeOrder.end(), key),
-        m_imageScopeOrder.end());
   }
-  for (auto o = m_order.begin(); o != m_order.end(); ++o)
-    if (*o == id) {
-      m_order.erase(o);
-      break;
-    }
-  if (m_records.erase(id) && m_expired.insert(id).second) {
-    m_expiredOrder.push_back(id);
-    if (m_expiredOrder.size() > 1024) {
-      m_imageExpiredLeases.erase(m_expiredOrder.front());
-      m_expired.erase(m_expiredOrder.front());
-      m_expiredOrder.erase(m_expiredOrder.begin());
-    }
-  }
+  // Move independent ownership before erasing a possibly aliased order key.
+  expired.id = std::move(record->second.ref.batchId);
+  m_order.erase(
+      std::remove(m_order.begin(), m_order.end(), expired.id), m_order.end());
+  m_records.erase(record);
+  if (m_expired.size() == 1024)
+    m_expired.erase(m_expired.begin());
+  m_expired.push_back(std::move(expired));
 }
 
-inline void RestorationStore::expireUnless(
-    const std::function<bool(const BatchRef &)> &retained)
+template <typename F>
+inline void RestorationStore::expireUnless(F &&retained)
 {
-  std::vector<BatchRef> refs;
-  {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    for (auto &[id, r] : m_records)
-      refs.push_back(r.ref);
-  }
-  // Evaluated unlocked: `retained` may take other locks.
-  std::vector<std::string> gone;
-  for (auto &ref : refs)
-    if (!retained(ref))
-      gone.push_back(ref.batchId);
+  // Store -> engine -> ActivityLog. Engine/sink callbacks never acquire the
+  // store lock; executors run outside the engine lock. No snapshot allocations
+  // or temporary Batch Reference copies are needed at publication.
   std::lock_guard<std::mutex> lock(m_mutex);
-  for (auto &id : gone)
-    expireLocked(id);
+  for (std::size_t i = 0; i < m_order.size();) {
+    const auto record = m_records.find(m_order[i]);
+    if (record != m_records.end() && !retained(record->second.ref))
+      expireLocked(m_order[i]);
+    else
+      ++i;
+  }
 }
 
 inline std::size_t restorationBytes(const RestorationRecord &record)
@@ -842,6 +960,8 @@ inline std::size_t restorationBytes(const RestorationRecord &record)
       + record.ref.batchId.size()
       + record.resultingVersions.capacity() * sizeof(ParameterVersionToken);
   n += record.nodeChanges.capacity() * sizeof(NodeChange);
+  // Map node, order key and allocation/control bookkeeping.
+  n += 4096 + record.publicationBytes;
   if (record.image)
     n += record.image->bytes.size();
   for (auto &c : record.changes)
@@ -867,7 +987,9 @@ inline void RestorationStore::release(const BatchRef &ref)
 inline bool RestorationStore::expired(const BatchRef &ref) const
 {
   std::lock_guard<std::mutex> lock(m_mutex);
-  return m_expired.count(ref.batchId) != 0;
+  return std::any_of(m_expired.begin(), m_expired.end(), [&](const Expired &e) {
+    return e.id == ref.batchId;
+  });
 }
 
 inline std::optional<RestorationRecord> RestorationStore::find(
@@ -1125,7 +1247,17 @@ inline operations::Request EditService::makeRequest(EditBatch batch, Slot slot)
   r.canonicalArguments = canonicalArguments(batch);
   std::weak_ptr<bool> alive = m_alive;
   auto shared = std::make_shared<EditBatch>(std::move(batch));
-  auto committed = std::make_shared<std::optional<EditResult>>();
+  // One prepared owner serves both the pending committed state and public
+  // result lookup; a failed synchronization dispatch cannot lose its receipt.
+  auto committed = slot;
+  r.onSynchronizationFailure = [this, alive, slot, scene = shared->scene] {
+    if (alive.lock()) {
+      m_sync.finishHook(scene, false);
+      std::lock_guard<std::mutex> lock(m_mutex);
+      if (*slot)
+        (*slot)->outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
+    }
+  };
   r.executor = [this, alive, shared, slot, committed](
                    operations::StepContext &ctx) {
     operations::Step step;
@@ -1151,13 +1283,12 @@ inline operations::Request EditService::makeRequest(EditBatch batch, Slot slot)
       return step;
     }
     EditResult res = std::move(**committed);
-    res.outcome = synchronize(shared->scene);
+    const auto synchronized = synchronize(shared->scene);
+    if (res.outcome == Outcome::OK)
+      res.outcome = synchronized;
     step.outcome = res.outcome;
     step.committed = true;
-    step.result = "{\"batch_ref\":" + detail::batchRefJson(*res.batchRef) + ","
-        + detail::commitDetailJson(
-            true, res.sceneRevision, res.versions, res.nodeVersions)
-        + "}";
+    step.result = std::move(res.receipt);
     *slot = std::move(res);
     return step;
   };
@@ -1482,11 +1613,44 @@ inline EditResult EditService::commitPrepared(SceneId sceneId,
   auto &layers = prepared.layers;
   auto &plan = prepared.objects;
 
+  // Compare the fully validated final state, including latent SRT state.
+  // An equivalent operation has no publication or recovery position.
+  plan.erase(
+      std::remove_if(plan.begin(),
+          plan.end(),
+          [](const Planned &p) { return p.parameter->value() == p.value; }),
+      plan.end());
+  for (auto &p : nodes) {
+    p.changedEnabled =
+        p.changedEnabled && p.enabled != p.node->value().isEnabled();
+    p.changedTransform = p.changedTransform
+        && (p.matrix != p.node->value().getTransform()
+            || p.srt != p.node->value().getTransformSRT());
+  }
+  nodes.erase(std::remove_if(nodes.begin(),
+                  nodes.end(),
+                  [](const PlannedNode &p) {
+                    return !p.changedEnabled && !p.changedTransform;
+                  }),
+      nodes.end());
+  if (plan.empty() && nodes.empty())
+    return res;
+  layers.clear();
+  for (const auto &p : nodes) {
+    const auto *layer = p.node->value().layer();
+    if (std::find(layers.begin(), layers.end(), layer) == layers.end())
+      layers.push_back(layer);
+  }
+
   // 2. Prepare allocations, Batch Reference and restoration storage. //
 
   RestorationRecord record;
   bool reserved = false;
   bool charged = false; // reserved in the activity budget
+  bool publicationPrepared = false;
+  // At most 64 entries; includes decimal uint64 maxima and all fixed syntax.
+  const std::size_t receiptCapacity =
+      m_launchId.size() + 1024 + plan.size() * 192 + nodes.size() * 512;
   std::vector<scene::Object *> objects;
   try {
     if (fault(FaultStage::PREPARE))
@@ -1532,33 +1696,89 @@ inline EditResult EditService::commitPrepared(SceneId sceneId,
     if (fault(FaultStage::RESERVE_RESTORATION) || !m_store.reserve())
       throw std::bad_alloc();
     reserved = true;
-    // Payload bytes plus one restorable-batch slot in the same budget as
-    // operation records (spec §5); busy before commit when it cannot fit.
+    // Preparation reserves the individual recovery charge, not free space in
+    // old history. Only successful publication may replace eligible history.
+    record.publicationBytes = 2 * receiptCapacity
+        + res.versions.capacity() * sizeof(ParameterVersionToken)
+        + res.nodeVersions.capacity() * sizeof(NodeVersion);
     if (ctx.reserveRestoration
         && !ctx.reserveRestoration(
             restorationBytes(record), record.ref.launchId, record.ref.batchId))
       throw std::bad_alloc();
     charged = true;
+    if (!m_store.prepareRecord(record.ref))
+      throw std::bad_alloc();
+    publicationPrepared = true;
+    res.batchRef = record.ref;
+    // This minimal receipt survives failure of richer post-write construction.
+    res.receipt = "{\"batch_ref\":" + detail::batchRefJson(record.ref)
+        + ",\"committed\":true}";
+    res.receipt.reserve(receiptCapacity);
+    if (ctx.prepareCommit)
+      ctx.prepareCommit(res.receipt, receiptCapacity);
+    m_sync.prepareScene(sceneId);
   } catch (const std::bad_alloc &) {
+    if (publicationPrepared)
+      m_store.cancelRecord(record.ref);
     if (charged && ctx.cancelRestoration)
       ctx.cancelRestoration();
     if (reserved)
       m_store.cancelReservation();
     // Admitted ID stays consumed; no commit and no batch.
+    res.batchRef.reset();
+    res.receipt.clear();
     res.outcome = Outcome::BUSY;
     return res;
   }
 
   // The selection path rechecks authority/lifetime/deadline after allocation,
   // at the last no-write boundary. Denial releases every unpublished receipt.
-  if (beforeWrite) {
+  {
     Outcome outcome = Outcome::OK;
     try {
-      outcome = beforeWrite();
-    } catch (const std::bad_alloc &) {
+      if (fault(FaultStage::LAST_PREWRITE))
+        throw std::bad_alloc();
+      if (beforeWrite)
+        outcome = beforeWrite();
+      else if (ctx.beforeWrite)
+        outcome = ctx.beforeWrite();
+      // Preparation callbacks may revoke authority or change a dependency.
+      // Revalidate tokens before touching ephemeral parameter/node pointers.
+      if (outcome == Outcome::OK) {
+        for (const auto &p : plan)
+          if (!ident->isCurrent(p.entry->expected))
+            outcome = Outcome::CONFLICT;
+        std::size_t remaining = 4096;
+        for (const auto &p : nodes) {
+          if (!ident->isCurrent(p.entry->nodeExpected)) {
+            outcome = Outcome::CONFLICT;
+            break;
+          }
+          auto walk = ident->beginNodeDependencies(p.entry->nodeExpected.node);
+          if (!walk) {
+            outcome = Outcome::CONFLICT;
+            break;
+          }
+          while (walk->ancestorSlot && remaining) {
+            --remaining;
+            if (!ident->advanceNodeDependencies(*walk))
+              break;
+          }
+          if (walk->ancestorSlot || !walk->matchesStructure(p.dependencies)
+              || (p.worldEntry && !walk->matchesAncestry(p.dependencies)))
+            outcome = Outcome::CONFLICT;
+        }
+      }
+      if (outcome == Outcome::OK)
+        scene.beginUpdateBatch();
+    } catch (...) {
       outcome = Outcome::BUSY;
     }
     if (outcome != Outcome::OK) {
+      if (publicationPrepared)
+        m_store.cancelRecord(record.ref);
+      res.batchRef.reset();
+      res.receipt.clear();
       if (charged && ctx.cancelRestoration)
         ctx.cancelRestoration();
       if (reserved)
@@ -1570,7 +1790,6 @@ inline EditResult EditService::commitPrepared(SceneId sceneId,
 
   // 3. Commit: store every value, then flush signals. //
 
-  scene.beginUpdateBatch();
   for (auto *o : objects)
     o->beginParameterBatch();
   for (auto &p : plan) {
@@ -1582,11 +1801,30 @@ inline EditResult EditService::commitPrepared(SceneId sceneId,
     if (p.changedEnabled)
       p.node->value().setEnabled(p.enabled);
   }
-  for (auto *o : objects)
-    o->endParameterBatch();
-  for (const auto *layer : layers)
-    scene.signalLayerStructureChanged(layer);
-  scene.endUpdateBatch();
+  res.committed = true;
+  if (ctx.markCommitted)
+    ctx.markCommitted();
+  // Downstream notification failure cannot turn completed Scene writes into a
+  // rejection or prevent other objects/identity observers from seeing them.
+  for (auto *o : objects) {
+    try {
+      o->endParameterBatch();
+    } catch (...) {
+      res.outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
+    }
+  }
+  for (const auto *layer : layers) {
+    try {
+      scene.signalLayerStructureChanged(layer);
+    } catch (...) {
+      res.outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
+    }
+  }
+  try {
+    scene.endUpdateBatch();
+  } catch (...) {
+    res.outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
+  }
 
   for (auto *o : objects) {
     auto v = ident->parameterVersion(ident->handleOf(o));
@@ -1607,10 +1845,9 @@ inline EditResult EditService::commitPrepared(SceneId sceneId,
     res.nodeVersions.push_back(c.resulting);
   }
   res.committed = true;
-  res.batchRef = record.ref;
   res.sceneRevision = ident->sceneRevision();
   res.versions = record.resultingVersions;
-  m_store.publish(std::move(record));
+  m_store.publish(std::move(record), ctx.sharedRetention);
   if (ctx.publishRestoration)
     ctx.publishRestoration();
   if (ctx.restorationRetained) {
@@ -1619,7 +1856,18 @@ inline EditResult EditService::commitPrepared(SceneId sceneId,
       return ctx.restorationRetained(r.launchId, r.batchId);
     });
   }
+  // Full receipt is optional after commit; the already-owned fallback and
+  // exact recovery record remain usable even if allocation fails here.
+  try {
+    if (fault(FaultStage::RECEIPT))
+      throw std::bad_alloc();
+    detail::writeCommitReceipt(res);
+  } catch (const std::bad_alloc &) {
+    res.outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
+  }
   m_sync.beginHook(sceneId);
+  if (res.outcome != Outcome::OK)
+    m_sync.markNeedsSync(sceneId);
   return res;
 }
 
@@ -1637,12 +1885,13 @@ inline Outcome EditService::synchronize(SceneId sceneId)
 {
   // Ordinary synchronization: the host hook runs exactly once per commit.
   bool confirmed = false;
-  if (auto hook = m_integration.normalSyncHook(sceneId)) {
-    try {
+  try {
+    if (fault(FaultStage::SYNC))
+      throw std::bad_alloc();
+    if (auto hook = m_integration.normalSyncHook(sceneId))
       confirmed = hook(sceneId);
-    } catch (...) {
-      confirmed = false;
-    }
+  } catch (...) {
+    confirmed = false;
   }
   // An earlier failure is only cleared by explicit Resynchronize.
   const bool ready = m_sync.finishHook(sceneId, confirmed);

@@ -156,6 +156,10 @@ struct StepContext
   // before mutation. Rechecks live authority, cancellation and deadline;
   // it does not reserve resources or consume a write sequence.
   std::function<Outcome()> beforeWrite;
+  // Generic edits prepare a truthful fallback before writes, then mark the
+  // irreversible boundary without allocating or notifying observers.
+  std::function<void(const std::string &, std::size_t)> prepareCommit;
+  std::function<void()> markCommitted;
   // Prepare bounded retained Activity result storage before any write.
   std::function<bool(std::size_t, ResultOwnership::Reserve)>
       prepareActivityResult;
@@ -174,6 +178,7 @@ struct StepContext
   std::function<void()> cancelRestoration;
   // On commit: the record becomes an eligible restorable batch.
   std::function<void()> publishRestoration;
+  bool sharedRetention{false}; // an authoritative Activity sink owns policy
   // False once the sink no longer retains the batch as eligible.
   std::function<bool(const std::string &launchId, const std::string &batchId)>
       restorationRetained;
@@ -238,6 +243,9 @@ struct Request
   // Logical deadline from admission; <= 0 means none.
   double deadlineSeconds{0.0};
   Executor executor;
+  // Prepared notification for a committed operation whose synchronization
+  // step cannot be queued. Invoked outside the engine lock.
+  std::function<void()> onSynchronizationFailure;
   // Optional ownership prepared by a bounded service before admission.
   std::shared_ptr<const void> resourceLease;
   ResultOwnership::Reserve reserveStatus;
@@ -507,6 +515,7 @@ class OperationEngine
     double deadlineSeconds{0.0};
     double deadline{0.0};
     Executor executor;
+    std::function<void()> onSynchronizationFailure;
 
     Phase phase{Phase::QUEUED};
     bool executing{false};
@@ -519,6 +528,7 @@ class OperationEngine
     bool committed{false};
     bool backendFault{false};
     std::string result;
+    std::string commitFallback; // unpublished until the first Scene write
     std::optional<ActivitySink::Id> activityId;
     std::function<std::shared_ptr<const void>()> reserveStatus;
   };
@@ -877,8 +887,17 @@ inline std::optional<ActivitySink::Id> OperationEngine::reserveActivity(
 
 inline void OperationEngine::notify(const Record &r, double now)
 {
-  if (m_sink && r.activityId)
-    m_sink->updated(*r.activityId, eventOf({r.sessionId, r.requestId}, r, now));
+  if (m_sink && r.activityId) {
+    try {
+      m_sink->updated(
+          *r.activityId, eventOf({r.sessionId, r.requestId}, r, now));
+    } catch (const std::bad_alloc &) {
+      // Recovery eligibility was already published independently. A failed
+      // diagnostic/status copy must not strand committed work or erase it.
+      if (!r.committed)
+        throw;
+    }
+  }
 }
 
 inline ControlGate &OperationEngine::controlGate()
@@ -940,6 +959,7 @@ inline OperationEngine::Key OperationEngine::admit(
   r.deadline =
       request.deadlineSeconds > 0.0 ? m_clock() + request.deadlineSeconds : 0.0;
   r.executor = std::move(request.executor);
+  r.onSynchronizationFailure = std::move(request.onSynchronizationFailure);
   r.resourceLease = std::move(request.resourceLease);
   r.reserveStatus = std::move(request.reserveStatus);
   r.holdsSlot = true;
@@ -1204,17 +1224,22 @@ inline bool OperationEngine::dispatch(
   }
   std::weak_ptr<bool> alive = m_alive;
   bool ok = false;
-  if (scene && *scene == INVALID_SCENE_ID) {
-    ok = m_integration.submitSessionWork([this, alive, key] {
-      if (alive.lock())
-        runStep(key, placeholderScene());
-    });
-  } else if (scene) {
-    ok = m_integration.submit(*scene, [this, alive, key](scene::Scene &s) {
-      if (alive.lock())
-        runStep(key, s);
-    });
+  try {
+    if (scene && *scene == INVALID_SCENE_ID) {
+      ok = m_integration.submitSessionWork([this, alive, key] {
+        if (alive.lock())
+          runStep(key, placeholderScene());
+      });
+    } else if (scene) {
+      ok = m_integration.submit(*scene, [this, alive, key](scene::Scene &s) {
+        if (alive.lock())
+          runStep(key, s);
+      });
+    }
+  } catch (const std::bad_alloc &) {
+    ok = false;
   }
+  std::function<void()> synchronizationFailure;
   if (!ok) {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (auto *r = find(key)) {
@@ -1222,15 +1247,21 @@ inline bool OperationEngine::dispatch(
       // Nothing will run this step: finish it so it releases its slot and
       // its activity entry turns terminal (never-started work reports busy,
       // started work cancelled). Work still holding backend resources keeps
-      // them until a later wake() re-dispatches it; committed work keeps
-      // its commit and is left to its synchronization owner.
-      if (!r->terminal && !r->executing && !r->committed
-          && r->phase != Phase::BACKEND)
+      // them until a later wake() re-dispatches it. Committed work keeps its
+      // prepared fallback receipt and notifies its synchronization owner.
+      if (!r->terminal && !r->executing && r->phase != Phase::BACKEND) {
+        if (r->committed)
+          synchronizationFailure = std::move(r->onSynchronizationFailure);
         finish(*r,
-            r->phase == Phase::QUEUED ? Outcome::BUSY : Outcome::CANCELLED,
+            r->committed                    ? Outcome::APPLIED_WITH_SYNC_FAILURE
+                : r->phase == Phase::QUEUED ? Outcome::BUSY
+                                            : Outcome::CANCELLED,
             m_clock());
+      }
     }
   }
+  if (synchronizationFailure)
+    synchronizationFailure();
   return ok;
 }
 
@@ -1282,6 +1313,7 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
 
   Executor executor;
   bool abandoned = false;
+  bool sharedRetention = false;
   {
     std::lock_guard<std::mutex> lock(m_mutex);
     auto *r = find(key);
@@ -1299,6 +1331,7 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
     }
     abandoned = r->terminal.has_value();
     executor = r->executor;
+    sharedRetention = m_sink != nullptr;
     r->executing = true;
     // Committed work re-dispatched to run its normal-synchronization hook
     // keeps reporting `synchronizing` while the hook executes (addendum 03
@@ -1325,6 +1358,7 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
                     if (resume)
                       dispatch(key, cleanupScene);
                   }};
+  ctx.sharedRetention = sharedRetention;
   ctx.isAbandoned = [this, alive, key] {
     if (!alive.lock())
       return true;
@@ -1359,6 +1393,21 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
         return r->deadline > 0. && m_clock() >= r->deadline ? Outcome::TIMEOUT
                                                             : Outcome::OK;
       };
+  ctx.prepareCommit = [this, key](
+                          const std::string &receipt, std::size_t capacity) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (auto *r = find(key)) {
+      r->commitFallback = receipt;
+      r->commitFallback.reserve(capacity);
+    }
+  };
+  ctx.markCommitted = [this, key] {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (auto *r = find(key)) {
+      r->result = std::move(r->commitFallback);
+      r->committed = true;
+    }
+  };
   // Serialized with notify() under the engine lock.
   auto withSink = [this, alive, key](auto &&fn) {
     if (!alive.lock())

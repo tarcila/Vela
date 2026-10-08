@@ -31,6 +31,29 @@ Token defaultToken = "default";
 
 // Helper functions ///////////////////////////////////////////////////////////
 
+namespace {
+
+struct ParameterBatchCleanup
+{
+  explicit ParameterBatchCleanup(std::vector<const Parameter *> *parameters)
+      : m_parameters(parameters)
+  {}
+  ~ParameterBatchCleanup();
+
+  VSR_NOT_COPYABLE(ParameterBatchCleanup)
+  VSR_NOT_MOVEABLE(ParameterBatchCleanup)
+
+ private:
+  std::vector<const Parameter *> *m_parameters{nullptr};
+};
+
+ParameterBatchCleanup::~ParameterBatchCleanup()
+{
+  m_parameters->clear();
+}
+
+} // namespace
+
 static Any parseValue(anari::DataType type, const void *mem)
 {
   if (type == ANARI_STRING)
@@ -505,12 +528,12 @@ void Object::endParameterBatch()
   std::sort(bp.begin(), bp.end());
   bp.erase(std::unique(bp.begin(), bp.end()), bp.end());
 
+  // A failed callback must not leave completed writes queued for another batch.
+  const ParameterBatchCleanup cleanup(&bp);
   // Record the write before downstream callbacks, which may throw.
   m_versions.parameter++;
   if (m_updateDelegate)
     m_updateDelegate->signalParameterBatchUpdated(this, bp);
-
-  bp.clear();
 }
 
 ObjectVersion Object::lastParameterChange() const

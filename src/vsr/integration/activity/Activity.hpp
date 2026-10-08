@@ -7,8 +7,9 @@
 //
 // Headless and ImGui-free. Records survive client disconnect (the log is
 // owned by the application, not a session) but not restart (nothing is
-// persisted). Retention is bounded by bytes, entry count, restorable-batch
-// count and a separate retained-image byte budget.
+// persisted). Metadata/results, eligible recovery, and retained render images
+// have separate budgets. Recovery FIFO is decided only at publication; pending
+// work and physical owners surviving eligibility are not historical entries.
 
 // vsr_integration
 #include "vsr/integration/edit/AgentEdit.hpp"
@@ -36,7 +37,8 @@ using session::Target;
 
 struct Limits
 {
-  std::size_t bytes{16u << 20}; // activity + restoration payloads
+  std::size_t bytes{16u << 20}; // activity metadata/results
+  std::uint64_t retentionBytes{UINT64_C(4294967296)};
   std::size_t entries{1024};
   std::size_t restorableBatches{32};
   std::size_t imageBytes{32u << 20}; // retained images, counted only here
@@ -168,6 +170,8 @@ struct Lookup
 
 struct Usage
 {
+  std::uint64_t retentionBytes{0}; // published eligible recovery
+  std::uint64_t reservedRetentionBytes{0}; // active preparation, not history
   std::size_t bytes{0};
   std::size_t entries{0};
   std::size_t restorableBatches{0};
@@ -235,17 +239,15 @@ class ActivityLog
   // retained; nullopt once the record is gone (outcome_unavailable).
   std::optional<Eligibility> eligibility(const BatchRef &ref) const;
 
-  // Restoration storage for an admitted edit (spec §5): charges `bytes` of
-  // payload to the shared byte budget and holds one restorable-batch slot,
-  // visibly expiring the oldest eligible batches and evicting older safe
-  // records as needed. False (reject busy before commit) when it cannot fit
-  // without evicting active work; nothing is evicted then.
+  // Non-destructive preparation. Normal entries fit individually under the
+  // soft budget; pending work is separate from eligible history. Publication
+  // serializes the final FIFO decision, without allocations or rejection.
   bool reserveRestoration(Id id, std::size_t bytes, BatchRef ref);
 
   // Releases an unpublished reservation and its payload bytes.
   void cancelRestoration(Id id);
 
-  // Commit: the reserved batch becomes an eligible restorable batch.
+  // Commit: allocation-free FIFO eviction and new eligibility under one lock.
   void publishRestoration(Id id);
 
   // Consumes eligibility at restoration commit and releases its payload.
@@ -272,6 +274,7 @@ class ActivityLog
     Id id{0};
     bool pinned{false};
     bool restorationReserved{false}; // reserved, not yet published
+    Id retentionOrder{0}; // successful publication, not admission/access
     Entry entry;
   };
   using Slots = std::list<Slot>;
@@ -286,10 +289,7 @@ class ActivityLog
 
   void loseEligibility(Slot &s, Eligibility to);
 
-  // Oldest safe restorable batch visibly expires; its metadata stays.
-  // Unpublished reservations count against the limit and are never expired.
-  // Makes room for one more.
-  bool makeRestorableRoom();
+  void makeRetentionRoom(std::uint64_t bytes);
 
   bool fits(std::size_t bytes, std::size_t entries) const;
 
@@ -307,6 +307,7 @@ class ActivityLog
   Usage m_usage;
   std::size_t m_reservedRestorable{0};
   Id m_serial{0};
+  Id m_retentionSerial{0};
 };
 
 // Maps an operations::Request kind string onto an OperationKind; unknown
@@ -376,7 +377,8 @@ class EngineActivitySink : public operations::ActivitySink
 
 inline bool Limits::valid() const
 {
-  return bytes > 0 && entries > 0 && restorableBatches > 0;
+  return bytes > 0 && retentionBytes > 0 && entries > 0
+      && restorableBatches > 0;
 }
 
 inline const Limits &ActivityLog::limits() const
@@ -387,7 +389,11 @@ inline const Limits &ActivityLog::limits() const
 inline std::optional<ActivityLog::Id> ActivityLog::append(Entry entry)
 {
   std::lock_guard<std::mutex> lock(m_mutex);
-  if (entry.eligibility == Eligibility::ELIGIBLE && !makeRestorableRoom())
+  if (!m_limits.valid() || m_serial == UINT64_MAX)
+    return std::nullopt;
+  if (entry.eligibility == Eligibility::ELIGIBLE
+      && (entry.restorationBytes > m_limits.retentionBytes
+          || m_reservedRestorable >= UINT64_MAX - m_retentionSerial))
     return std::nullopt;
   const std::size_t need = cost(entry);
   if (!makeRoom(need, 1))
@@ -398,12 +404,20 @@ inline std::optional<ActivityLog::Id> ActivityLog::append(Entry entry)
   Slot s;
   s.id = ++m_serial;
   s.entry = std::move(entry);
+  m_slots.push_back(std::move(s));
+  auto &published = m_slots.back();
   m_usage.bytes += need;
   m_usage.entries++;
-  m_usage.imageBytes += s.entry.image.size();
-  if (s.entry.eligibility == Eligibility::ELIGIBLE)
+  m_usage.imageBytes += published.entry.image.size();
+  if (published.entry.eligibility == Eligibility::ELIGIBLE) {
+    // The list node is allocated before any old recovery becomes unavailable.
+    published.entry.eligibility = Eligibility::NONE;
+    makeRetentionRoom(published.entry.restorationBytes);
+    published.retentionOrder = ++m_retentionSerial;
+    published.entry.eligibility = Eligibility::ELIGIBLE;
+    m_usage.retentionBytes += published.entry.restorationBytes;
     m_usage.restorableBatches++;
-  m_slots.push_back(std::move(s));
+  }
   return m_serial;
 }
 
@@ -413,12 +427,11 @@ inline bool ActivityLog::update(Id id, Entry entry)
   auto it = findId(id);
   if (it == m_slots.end())
     return false;
-  if (it->restorationReserved) {
-    // The reservation is owned by reserve/cancel/publishRestoration.
-    entry.batchRef = it->entry.batchRef;
-    entry.restorationBytes = it->entry.restorationBytes;
-    entry.eligibility = Eligibility::NONE;
-  }
+  // Recovery is owned exclusively by reserve/cancel/publish/consume, not a
+  // stale status copy captured before a concurrent retention decision.
+  entry.batchRef = it->entry.batchRef;
+  entry.restorationBytes = it->entry.restorationBytes;
+  entry.eligibility = it->entry.eligibility;
   const std::size_t oldCost = cost(it->entry);
   const std::size_t newCost = cost(entry);
   it->pinned = true; // don't evict the record being updated
@@ -530,24 +543,25 @@ inline bool ActivityLog::reserveRestoration(
   if (it == m_slots.end() || it->restorationReserved
       || it->entry.eligibility != Eligibility::NONE)
     return false;
+  if (bytes > m_limits.retentionBytes
+      || m_reservedRestorable >= UINT64_MAX - m_retentionSerial
+      || m_reservedRestorable >= m_limits.restorableBatches
+      || bytes > UINT64_MAX - m_usage.reservedRetentionBytes)
+    return false;
   Entry grown = it->entry;
   grown.batchRef = std::move(ref);
   grown.restorationBytes = bytes;
-  const std::size_t oldCost = cost(it->entry);
-  const std::size_t newCost = cost(grown);
+  const auto oldCost = cost(it->entry);
+  const auto newCost = cost(grown);
   it->pinned = true;
-  // Check the byte budget before expiring anything.
-  bool ok = newCost <= oldCost || feasible(newCost - oldCost, 0);
-  if (ok)
-    ok = makeRestorableRoom();
-  if (ok)
-    ok = newCost <= oldCost || makeRoom(newCost - oldCost, 0);
+  const bool ok = newCost <= oldCost || makeRoom(newCost - oldCost, 0);
   it->pinned = false;
   if (!ok)
     return false;
   m_usage.bytes = m_usage.bytes - oldCost + newCost;
   it->entry = std::move(grown);
   it->restorationReserved = true;
+  m_usage.reservedRetentionBytes += bytes;
   m_reservedRestorable++;
   return true;
 }
@@ -560,6 +574,7 @@ inline void ActivityLog::cancelRestoration(Id id)
     return;
   const std::size_t oldCost = cost(it->entry);
   it->entry.batchRef.reset();
+  m_usage.reservedRetentionBytes -= it->entry.restorationBytes;
   it->entry.restorationBytes = 0;
   m_usage.bytes = m_usage.bytes - oldCost + cost(it->entry);
   it->restorationReserved = false;
@@ -574,7 +589,11 @@ inline void ActivityLog::publishRestoration(Id id)
     return;
   it->restorationReserved = false;
   m_reservedRestorable--;
+  m_usage.reservedRetentionBytes -= it->entry.restorationBytes;
+  makeRetentionRoom(it->entry.restorationBytes);
+  it->retentionOrder = ++m_retentionSerial;
   it->entry.eligibility = Eligibility::ELIGIBLE;
+  m_usage.retentionBytes += it->entry.restorationBytes;
   m_usage.restorableBatches++;
 }
 
@@ -648,7 +667,7 @@ inline Usage ActivityLog::usage() const
 inline std::size_t ActivityLog::cost(const Entry &e)
 {
   std::size_t c = ENTRY_OVERHEAD
-      + std::max(e.result.size(), e.reservedResultBytes) + e.restorationBytes
+      + std::max(e.result.size(), e.reservedResultBytes)
       + e.targets.size() * sizeof(Target);
   if (e.ref)
     c += e.ref->sessionId.size();
@@ -693,7 +712,8 @@ inline ActivityLog::Slots::const_iterator ActivityLog::findId(Id id) const
 
 inline bool ActivityLog::safe(const Slot &s) const
 {
-  return !s.entry.active && !s.pinned;
+  return !s.entry.active && !s.pinned && !s.restorationReserved
+      && s.entry.eligibility != Eligibility::ELIGIBLE;
 }
 
 inline bool ActivityLog::setEligibility(
@@ -716,33 +736,30 @@ inline void ActivityLog::loseEligibility(Slot &s, Eligibility to)
 {
   s.entry.eligibility = to;
   m_usage.restorableBatches--;
-  m_usage.bytes -= s.entry.restorationBytes;
+  m_usage.retentionBytes -= s.entry.restorationBytes;
   s.entry.restorationBytes = 0; // payload released
 }
 
-inline bool ActivityLog::makeRestorableRoom()
+inline void ActivityLog::makeRetentionRoom(std::uint64_t bytes)
 {
-  if (m_reservedRestorable >= m_limits.restorableBatches)
-    return false;
-  while (m_usage.restorableBatches + m_reservedRestorable
-      >= m_limits.restorableBatches) {
+  // Reservation established bytes <= limit. Pending work is not evictable
+  // history and does not consume this target; physical leases cover overlap.
+  while (m_usage.restorableBatches >= m_limits.restorableBatches
+      || m_usage.retentionBytes > m_limits.retentionBytes - bytes) {
     Slot *victim = nullptr;
     for (auto &s : m_slots)
-      if (safe(s) && s.entry.eligibility == Eligibility::ELIGIBLE) {
+      if (s.entry.eligibility == Eligibility::ELIGIBLE
+          && (!victim || s.retentionOrder < victim->retentionOrder))
         victim = &s;
-        break;
-      }
-    if (!victim)
-      return false;
     loseEligibility(*victim, Eligibility::EXPIRED);
   }
-  return true;
 }
 
 inline bool ActivityLog::fits(std::size_t bytes, std::size_t entries) const
 {
-  return m_usage.bytes + bytes <= m_limits.bytes
-      && m_usage.entries + entries <= m_limits.entries;
+  return bytes <= m_limits.bytes && m_usage.bytes <= m_limits.bytes - bytes
+      && entries <= m_limits.entries
+      && m_usage.entries <= m_limits.entries - entries;
 }
 
 inline bool ActivityLog::feasible(std::size_t bytes, std::size_t entries) const
@@ -753,8 +770,9 @@ inline bool ActivityLog::feasible(std::size_t bytes, std::size_t entries) const
   for (auto &s : m_slots)
     if (safe(s))
       freeBytes += cost(s.entry), freeEntries++;
-  return m_usage.bytes - freeBytes + bytes <= m_limits.bytes
-      && m_usage.entries - freeEntries + entries <= m_limits.entries;
+  return m_usage.bytes - freeBytes <= m_limits.bytes - bytes
+      && entries <= m_limits.entries
+      && m_usage.entries - freeEntries <= m_limits.entries - entries;
 }
 
 inline bool ActivityLog::makeRoom(std::size_t bytes, std::size_t entries)

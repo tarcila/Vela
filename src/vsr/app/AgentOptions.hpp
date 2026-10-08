@@ -5,6 +5,7 @@
 
 // std
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <string_view>
 #include <utility>
@@ -16,9 +17,21 @@ namespace vsr::app {
 // leave unrelated arguments untouched for the application's existing parser.
 struct AgentOptions
 {
-  std::size_t restorationBytes{16u << 20};
+  std::uint64_t restorationBytes{UINT64_C(4294967296)};
   std::vector<const char *> arguments;
 };
+
+// Independent physical ownership headroom for retained + prepared recovery
+// and the unchanged 256 MiB transient work allowance. Saturate to addressable
+// size on narrow hosts; policy/configuration itself remains 64-bit.
+inline std::size_t agentPhysicalByteCap(std::uint64_t softBytes)
+{
+  constexpr std::size_t HEADROOM = 256u << 20;
+  constexpr auto MAX = std::numeric_limits<std::size_t>::max();
+  return softBytes > (MAX - HEADROOM) / 2
+      ? MAX
+      : std::size_t(softBytes) * 2 + HEADROOM;
+}
 
 inline bool parseAgentOptions(
     int argc, const char *const argv[], AgentOptions &options)
@@ -38,14 +51,14 @@ inline bool parseAgentOptions(
       return false;
     seen = true;
     const std::string_view value(argv[i]);
-    std::size_t bytes = 0;
+    std::uint64_t bytes = 0;
     if (value.empty())
       return false;
     for (const char digit : value) {
       if (digit < '0' || digit > '9')
         return false;
-      const auto n = std::size_t(digit - '0');
-      if (bytes > (std::numeric_limits<std::size_t>::max() - n) / 10)
+      const auto n = std::uint64_t(digit - '0');
+      if (bytes > (std::numeric_limits<std::uint64_t>::max() - n) / 10)
         return false;
       bytes = bytes * 10 + n;
     }

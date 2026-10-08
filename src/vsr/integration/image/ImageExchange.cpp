@@ -3,6 +3,7 @@
 
 // vsr_integration
 #include "vsr/integration/image/ImageExchange.hpp"
+#include "vsr/integration/activity/Activity.hpp"
 #include "vsr/integration/edit/AgentEdit.hpp"
 #include "vsr/integration/image/PngImport.hpp"
 #include "vsr/integration/mcp/Json.hpp"
@@ -342,12 +343,12 @@ std::string bindings(
 struct SessionLedger
 {
   std::mutex mutex;
-  std::size_t bytes{0};
+  std::uint64_t bytes{0};
 };
 struct SessionCharge
 {
   std::shared_ptr<SessionLedger> ledger;
-  std::size_t bytes{0};
+  std::uint64_t bytes{0};
   ~SessionCharge();
 };
 SessionCharge::~SessionCharge()
@@ -447,7 +448,6 @@ struct ImageExchange::State
   std::mutex fileMutex;
   Usage usage;
   std::size_t reserved{0};
-  std::size_t availableRetention{0};
   std::atomic<bool> stopping{false};
 #if defined(__linux__)
   std::vector<std::unique_ptr<Directory>> ancestry;
@@ -652,36 +652,44 @@ std::string ImageExchange::State::limitsJson(
     const Bounds *b, const std::string &sessionId) const
 {
   std::lock_guard<std::mutex> lock(mutex);
-  std::size_t physicalAvailable = 0;
+  auto policy = activity::Limits{};
+  policy.retentionBytes = limits.globalRetentionBytes;
+  std::uint64_t available = policy.retentionBytes;
+  if (limits.retention) {
+    policy = limits.retention->limits();
+    const auto used = limits.retention->usage().retentionBytes;
+    available = policy.retentionBytes - used;
+  }
+  std::uint64_t physical = 0;
   {
     std::lock_guard<std::mutex> retentionLock(retentionLedger->mutex);
-    physicalAvailable = limits.globalRetentionBytes
-        - std::min(limits.globalRetentionBytes, retentionLedger->bytes);
+    physical = retentionLedger->bytes;
   }
-  // Eligibility can be consumed/evicted while copied recovery owners or
-  // not-yet-drained Scene pins still retain the actual storage.
-  const auto available = std::min(availableRetention, physicalAvailable);
   std::string result = "{\"file_cap\":1024,\"byte_cap\":268435456,\"files_used\":"
       + std::to_string(usage.files) + ",\"bytes_used\":" + std::to_string(usage.bytes)
       + ",\"usage_complete\":" + (usage.complete ? "true" : "false")
       + ",\"quota_scan_entry_cap\":4096,\"max_ancillary_bytes\":65536,"
         "\"transient_image_byte_cap\":" + std::to_string(limits.transientBytes)
-      + ",\"session_snapshot_byte_cap\":67108864,\"effective_global_retention_byte_cap\":"
-      + std::to_string(limits.globalRetentionBytes)
-      + ",\"available_global_retention_bytes\":"
-      + std::to_string(available);
+      + ",\"effective_global_retention_byte_cap\":"
+      + std::to_string(policy.retentionBytes)
+      + ",\"available_global_retention_bytes\":" + std::to_string(available)
+      + ",\"retained_physical_bytes\":" + std::to_string(physical)
+      + ",\"physical_byte_cap\":" + std::to_string(limits.physicalByteCap)
+      + ",\"retention_order\":\"publication_fifo\",\"retention_entry_cap\":"
+      + std::to_string(policy.restorableBatches)
+      + ",\"activity_metadata_byte_cap\":" + std::to_string(policy.bytes)
+      + ",\"activity_entry_cap\":" + std::to_string(policy.entries);
   if (b)
     result += ",\"max_encoded_file_bytes\":" + std::to_string(b->encoded)
         + ",\"max_codec_work_bytes\":" + std::to_string(b->work);
   if (!sessionId.empty()) {
-    std::size_t used = 0;
+    std::uint64_t used = 0;
     const auto it = ledgers.find(sessionId);
     if (it != ledgers.end()) {
       std::lock_guard<std::mutex> ledgerLock(it->second->mutex);
       used = it->second->bytes;
     }
-    result += ",\"available_session_snapshot_bytes\":"
-        + std::to_string(67108864 - std::min<std::size_t>(67108864, used));
+    result += ",\"session_retained_physical_bytes\":" + std::to_string(used);
   }
   return result + "}";
 }
@@ -939,7 +947,6 @@ ImageExchange::ImageExchange(Integration &integration,
   m_state->limits.transientBytes = std::min({m_state->limits.transientBytes,
       m_state->limits.physicalByteCap,
       BYTE_CAP});
-  m_state->availableRetention = m_state->limits.globalRetentionBytes;
   if (!m_state->limits.allocator)
     m_state->limits.allocator = std::pmr::new_delete_resource();
 #if defined(__linux__)
@@ -1109,8 +1116,7 @@ bool ImageExchange::importAvailable() const
   return m_state->edits && !m_state->editsLifetime.expired()
       && m_state->restores && !m_state->restoresLifetime.expired()
       && m_state->restores->resultOwnershipAvailable()
-      && m_state->limits.reservePhysicalMemory
-      && m_state->limits.availableGlobalRetention
+      && m_state->limits.reservePhysicalMemory && m_state->limits.retention
       && m_state->limits.restorationRetained;
 }
 
@@ -1132,11 +1138,6 @@ std::string ImageExchange::metadata(
     SceneId scene, const std::string &sessionId) const
 {
   m_state->pruneRestorations();
-  if (m_state->limits.availableGlobalRetention) {
-    const auto available = m_state->limits.availableGlobalRetention();
-    std::lock_guard<std::mutex> lock(m_state->mutex);
-    m_state->availableRetention = available;
-  }
   const bool tracking = m_integration->imageTrackingAvailable(scene);
   const bool enabled = tracking && m_state->current();
   return std::string("{\"supported\":") + (enabled ? "true" : "false")
@@ -1388,12 +1389,6 @@ operations::Admission ImageExchange::submitCapture(
       job->width = array->dim(0);
       job->height = array->dim(1);
       job->channels = array->elementSize();
-      {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        state->availableRetention = state->limits.availableGlobalRetention
-            ? state->limits.availableGlobalRetention()
-            : state->limits.globalRetentionBytes;
-      }
       try {
         job->pixels.resize(b->texels);
       } catch (const std::bad_alloc &) {
@@ -1627,8 +1622,8 @@ operations::Admission ImageExchange::submitMeshImport(
           + replacement.newBytes
           + (replacement.dependencies.arrayCount + replacement.newCount)
               * (sizeof(vsr::scene::Array) + 4096)
-          + sizeof(edit::MeshSnapshot) + 4 * mesh::HEADER_CAP;
-      state->pruneRestorations();
+          + sizeof(edit::MeshSnapshot) + 4 * mesh::HEADER_CAP
+          + IMPORT_OWNER_BYTES;
       vsr::scene::detail::PreparedPositionBinding::drain(ctx.scene);
       std::shared_ptr<SessionLedger> ledger;
       {
@@ -1640,7 +1635,7 @@ operations::Admission ImageExchange::submitMeshImport(
       }
       const auto charge =
           [&](const std::shared_ptr<SessionLedger> &account,
-              std::size_t limit) -> std::shared_ptr<SessionCharge> {
+              std::uint64_t limit) -> std::shared_ptr<SessionCharge> {
         auto result = std::make_shared<SessionCharge>();
         result->ledger = account;
         std::lock_guard<std::mutex> lock(account->mutex);
@@ -1650,28 +1645,14 @@ operations::Admission ImageExchange::submitMeshImport(
         result->bytes = retainedBytes;
         return result;
       };
-      auto sessionCharge = charge(ledger, 67108864);
-      auto retentionCharge =
-          charge(state->retentionLedger, state->limits.globalRetentionBytes);
+      auto sessionCharge = charge(ledger, UINT64_MAX);
+      auto retentionCharge = charge(state->retentionLedger, UINT64_MAX);
       if (!sessionCharge || !retentionCharge) {
         // No retained storage has been allocated. Remove partial reservations
         // before reporting the originating session's actual available ceiling.
         sessionCharge.reset();
         retentionCharge.reset();
-        std::size_t availableSession = 0;
-        {
-          std::lock_guard<std::mutex> lock(ledger->mutex);
-          availableSession =
-              67108864 - std::min<std::size_t>(67108864, ledger->bytes);
-        }
-        auto rejected = fail(Outcome::BUSY, "restore_budget_exhausted");
-        rejected.result =
-            "{\"reason\":\"restore_budget_exhausted\",\"required_capacity_bytes\":"
-            + std::to_string(retainedBytes) + ",\"configured_capacity_bytes\":"
-            + std::to_string(state->limits.globalRetentionBytes)
-            + ",\"configured_session_capacity_bytes\":67108864,\"available_session_snapshot_bytes\":"
-            + std::to_string(availableSession) + "}";
-        return rejected;
+        return fail(Outcome::BUSY, "resource_limit");
       }
       auto snapshot = std::make_shared<edit::MeshSnapshot>();
       job->snapshot = snapshot;
@@ -1737,7 +1718,8 @@ operations::Admission ImageExchange::submitMeshImport(
         rejected.result =
             "{\"reason\":\"restore_budget_exhausted\",\"required_capacity_bytes\":"
             + std::to_string(retainedBytes) + ",\"configured_capacity_bytes\":"
-            + std::to_string(state->limits.globalRetentionBytes) + "}";
+            + std::to_string(state->limits.retention->limits().retentionBytes)
+            + "}";
         return rejected;
       }
       edit::RestorationRecord record;
@@ -1942,6 +1924,7 @@ operations::Admission ImageExchange::submitMeshImport(
       job->storePrepared = false;
       if (ctx.publishRestoration)
         ctx.publishRestoration();
+      state->pruneRestorations();
       job->notificationFailed = mesh::notify(ctx.scene,
           *geometry,
           transaction,
@@ -2119,14 +2102,29 @@ operations::Admission ImageExchange::submitImport(
             || array->elementSize() != job->channels
             || array->elementType() != job->elementType)
           return fail(Outcome::CONFLICT, "stale_data_version");
+        if (array->data()
+            && std::memcmp(array->data(), job->pixels.data(), job->bound.texels)
+                == 0) {
+          if (ctx.cancelRestoration)
+            ctx.cancelRestoration();
+          state->edits->restorations().cancelImage(job->batch);
+          job->storePrepared = false;
+          job->snapshot.reset();
+          job->releaseTransient();
+          Step unchanged;
+          unchanged.result =
+              "{\"committed\":false,\"unchanged\":true,\"handle\":"
+              + quote(handleName(handle))
+              + ",\"data_version\":" + quote(job->expectedVersion) + "}";
+          return unchanged;
+        }
         // All fallible control/store/receipt preparation precedes map(), the
         // sole ordinary write-sequence reservation boundary for this write.
         job->receipt = "{\"handle\":" + quote(handleName(handle))
             + ",\"batch_ref\":" + edit::detail::batchRefJson(job->batch) + ","
             + bindings(*ids, *array) + ",\"restoration_policy\":{"
-              "\"mode\":\"capacity_based\",\"session_snapshot_ceiling_bytes\":67108864,"
-              "\"effective_global_limit_bytes\":"
-            + std::to_string(state->limits.globalRetentionBytes)
+              "\"mode\":\"publication_fifo\",\"effective_global_limit_bytes\":"
+            + std::to_string(state->limits.retention->limits().retentionBytes)
             + ",\"eviction_possible\":true}";
         job->receipt.reserve(job->receipt.size() + 512);
         if (!ctx.prepareActivityResult
@@ -2171,6 +2169,7 @@ operations::Admission ImageExchange::submitImport(
         job->storePrepared = false;
         if (ctx.publishRestoration)
           ctx.publishRestoration();
+        state->pruneRestorations();
         job->snapshot.reset();
         job->releaseTransient();
         const auto revision = ids->sceneRevision();
@@ -2204,7 +2203,6 @@ operations::Admission ImageExchange::submitImport(
       if (!b || b->texels > std::numeric_limits<std::size_t>::max() - b->peak)
         return fail(Outcome::BUSY, "resource_limit");
       b->peak += b->texels; // E + D + W + S, not two physical snapshots.
-      state->pruneRestorations();
       std::shared_ptr<SessionLedger> ledger;
       {
         std::lock_guard<std::mutex> lock(state->mutex);
@@ -2218,14 +2216,14 @@ operations::Admission ImageExchange::submitImport(
       bool sessionReserved = false;
       {
         std::lock_guard<std::mutex> lock(ledger->mutex);
-        if (b->texels <= 67108864 && ledger->bytes <= 67108864 - b->texels) {
+        if (ledger->bytes <= UINT64_MAX - b->texels) {
           ledger->bytes += b->texels;
           charge->bytes = b->texels;
           sessionReserved = true;
         }
       }
       if (!sessionReserved)
-        return fail(Outcome::BUSY, "restore_budget_exhausted");
+        return fail(Outcome::BUSY, "resource_limit");
       job->snapshot =
           std::make_shared<edit::ImageSnapshot>(state->limits.allocator);
       job->snapshot->controlOwnership = operations::ResultOwnership(
@@ -2249,26 +2247,25 @@ operations::Admission ImageExchange::submitImport(
       if (!batchId)
         return fail(Outcome::BUSY, "resource_limit");
       job->batch = {state->launchId, *batchId};
-      if (b->texels > state->limits.globalRetentionBytes
-          || (ctx.reserveRestoration
-              && !ctx.reserveRestoration(
-                  b->texels + sizeof(edit::ImageSnapshot),
-                  state->launchId,
-                  *batchId)))
-        return fail(Outcome::BUSY, "resource_limit");
-      if (ctx.restorationRetained)
-        state->edits->restorations().expireUnless(
-            [&](const edit::BatchRef &ref) {
-              return ctx.restorationRetained(ref.launchId, ref.batchId);
-            });
+      const auto retainedBytes =
+          b->texels + sizeof(edit::ImageSnapshot) + IMPORT_OWNER_BYTES;
+      if (!ctx.reserveRestoration
+          || !ctx.reserveRestoration(
+              retainedBytes, state->launchId, *batchId)) {
+        auto rejected = fail(Outcome::BUSY, "restore_budget_exhausted");
+        rejected.result =
+            "{\"reason\":\"restore_budget_exhausted\",\"required_capacity_bytes\":"
+            + std::to_string(retainedBytes) + ",\"configured_capacity_bytes\":"
+            + std::to_string(state->limits.retention->limits().retentionBytes)
+            + "}";
+        return rejected;
+      }
       auto globalCharge = std::make_shared<SessionCharge>();
       globalCharge->ledger = state->retentionLedger;
       {
         std::lock_guard<std::mutex> lock(state->retentionLedger->mutex);
-        if (b->texels > state->limits.globalRetentionBytes
-            || state->retentionLedger->bytes
-                > state->limits.globalRetentionBytes - b->texels)
-          return fail(Outcome::BUSY, "restore_budget_exhausted");
+        if (state->retentionLedger->bytes > UINT64_MAX - b->texels)
+          return fail(Outcome::BUSY, "resource_limit");
         state->retentionLedger->bytes += b->texels;
         globalCharge->bytes = b->texels;
       }

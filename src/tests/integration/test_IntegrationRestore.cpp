@@ -7,13 +7,19 @@
 #include "vsr/integration/Integration.hpp"
 #include "vsr/integration/activity/Activity.hpp"
 #include "vsr/integration/edit/AgentEdit.hpp"
+#include "vsr/integration/mcp/Json.hpp"
 #include "vsr/integration/restore/BatchRestore.hpp"
 #include "vsr/scene/Scene.hpp"
 // std
+#include <array>
+#include <atomic>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -24,6 +30,81 @@ using vsr::core::math::float3;
 namespace tokens = vsr::scene::tokens;
 
 namespace {
+
+enum class NotificationHook
+{
+  PARAMETER_BATCH,
+  LAYER_STRUCTURE,
+  BATCH_END,
+  NONE
+};
+
+struct NotificationProbe
+{
+  NotificationHook failAt{NotificationHook::NONE};
+  std::exception_ptr failure;
+  std::array<int, 3> calls{};
+  std::size_t parameterCount{0};
+
+  void notify(NotificationHook hook);
+};
+
+void NotificationProbe::notify(NotificationHook hook)
+{
+  ++calls[static_cast<std::size_t>(hook)];
+  if (failAt == hook)
+    std::rethrow_exception(failure);
+}
+
+struct ThrowingWriteObserver : vsr::scene::EmptyUpdateDelegate
+{
+  explicit ThrowingWriteObserver(NotificationProbe *probe) : m_probe(probe) {}
+  void signalParameterBatchUpdated(const vsr::scene::Object *,
+      const std::vector<const vsr::scene::Parameter *> &) override;
+  void signalLayerStructureUpdated(const vsr::scene::Layer *) override;
+  void signalUpdateBatchEnd() override;
+
+ private:
+  NotificationProbe *m_probe{nullptr};
+};
+
+void ThrowingWriteObserver::signalParameterBatchUpdated(
+    const vsr::scene::Object *,
+    const std::vector<const vsr::scene::Parameter *> &parameters)
+{
+  m_probe->parameterCount = parameters.size();
+  m_probe->notify(NotificationHook::PARAMETER_BATCH);
+}
+
+void ThrowingWriteObserver::signalLayerStructureUpdated(
+    const vsr::scene::Layer *)
+{
+  m_probe->notify(NotificationHook::LAYER_STRUCTURE);
+}
+
+void ThrowingWriteObserver::signalUpdateBatchEnd()
+{
+  m_probe->notify(NotificationHook::BATCH_END);
+}
+
+struct WriteOrderObserver : vsr::scene::EmptyUpdateDelegate
+{
+  explicit WriteOrderObserver(std::vector<const vsr::scene::Object *> *order)
+      : m_order(order)
+  {}
+  void signalParameterBatchUpdated(const vsr::scene::Object *object,
+      const std::vector<const vsr::scene::Parameter *> &) override;
+
+ private:
+  std::vector<const vsr::scene::Object *> *m_order{nullptr};
+};
+
+void WriteOrderObserver::signalParameterBatchUpdated(
+    const vsr::scene::Object *object,
+    const std::vector<const vsr::scene::Parameter *> &)
+{
+  m_order->push_back(object);
+}
 
 struct Fixture
 {
@@ -47,7 +128,8 @@ struct Fixture
   vsr::scene::LightRef light;
   vsr::scene::MaterialRef other;
 
-  Fixture()
+  explicit Fixture(
+      bool nodeEdits = false, NotificationProbe *notificationFailure = nullptr)
   {
     matte = scene.createObject<vsr::scene::Material>(tokens::material::matte);
     light = scene.createObject<vsr::scene::Light>(tokens::light::directional);
@@ -62,6 +144,7 @@ struct Fixture
     s.scene = &scene;
     s.grants.read = true;
     s.grants.edit = true;
+    s.nodeEdits = nodeEdits;
     s.normalSyncHook = [this](SceneId) {
       ++hookCalls;
       return hook();
@@ -81,6 +164,9 @@ struct Fixture
         integration, *authority, {}, [this] { return now; });
     REQUIRE(engine);
     ids = std::make_unique<identity::IdentityAuthority>();
+    if (notificationFailure)
+      scene.updateDelegate().emplace<ThrowingWriteObserver>(
+          notificationFailure);
     identity = std::make_unique<identity::SceneIdentity>(*ids, scene);
     edits = std::make_unique<EditService>(
         integration, *engine, authority->launchId());
@@ -594,8 +680,12 @@ struct LoggedFixture
   activity::ActivityLog log;
   activity::EngineActivitySink sink;
 
-  explicit LoggedFixture(activity::Limits limits = {})
-      : log(limits), sink(log, fx.integration)
+  explicit LoggedFixture(activity::Limits limits = {},
+      bool nodeEdits = false,
+      NotificationProbe *notificationFailure = nullptr)
+      : fx(nodeEdits, notificationFailure),
+        log(limits),
+        sink(log, fx.integration)
   {
     fx.engine->setActivitySink(&sink);
   }
@@ -615,6 +705,7 @@ SCENARIO("Restoration updates the activity log's eligibility", "[integration]")
   auto b = fx.edit(2, {fx.entry(fx.light.data(), "irradiance", 3)});
   REQUIRE(lf.log.usage().restorableBatches == 2);
   const auto usageBefore = lf.log.usage().bytes;
+  const auto recoveryBefore = lf.log.usage().retentionBytes;
   const std::size_t bytesA = lf.log.get(1)->restorationBytes;
   const std::size_t bytesB = lf.log.get(2)->restorationBytes;
   REQUIRE(bytesA > 0);
@@ -635,7 +726,8 @@ SCENARIO("Restoration updates the activity log's eligibility", "[integration]")
       auto restoreEntry = lf.log.get(3);
       REQUIRE(restoreEntry);
       REQUIRE(lf.log.usage().bytes
-          == usageBefore - bytesA + activity::ActivityLog::cost(*restoreEntry));
+          == usageBefore + activity::ActivityLog::cost(*restoreEntry));
+      REQUIRE(lf.log.usage().retentionBytes == recoveryBefore - bytesA);
       REQUIRE(lf.log.eligibility(b) == activity::Eligibility::ELIGIBLE);
     }
   }
@@ -664,6 +756,518 @@ SCENARIO("Restoration updates the activity log's eligibility", "[integration]")
       REQUIRE(lf.log.eligibility(b) == activity::Eligibility::CONFLICTING);
     }
   }
+}
+
+TEST_CASE("Normal parameter edits use inclusive soft-budget FIFO",
+    "[integration][retention-fifo]")
+{
+  LoggedFixture measured;
+  measured.fx.edit(
+      1, {measured.fx.entry(measured.fx.matte.data(), "opacity", 0.5)});
+  activity::Limits limits;
+  limits.retentionBytes = measured.log.usage().retentionBytes;
+  LoggedFixture lf(limits);
+  auto &f = lf.fx;
+  const auto first = f.edit(1, {f.entry(f.matte.data(), "opacity", 0.5)});
+  CHECK(lf.log.usage().retentionBytes == limits.retentionBytes);
+  const auto second = f.edit(2, {f.entry(f.other.data(), "opacity", 0.25)});
+  CHECK(lf.log.eligibility(first) == activity::Eligibility::EXPIRED);
+  CHECK(lf.log.eligibility(second) == activity::Eligibility::ELIGIBLE);
+  CHECK(lf.log.usage().retentionBytes == limits.retentionBytes);
+  // No-op/replay leave both age and eligibility unchanged.
+  REQUIRE(f.edits
+              ->submit(f.creds,
+                  f.ref(3),
+                  {f.sceneId, {f.entry(f.other.data(), "opacity", 0.25)}})
+              .code
+      == Outcome::OK);
+  f.drain();
+  REQUIRE(f.edits->result(f.ref(3)));
+  CHECK_FALSE(f.edits->result(f.ref(3))->committed);
+  CHECK(lf.log.usage().restorableBatches == 1);
+  CHECK(f.restore(4, first).outcome == Outcome::OUTCOME_UNAVAILABLE);
+  f.matte->setParameter("color", float3(0.2f, 0.3f, 0.4f));
+  REQUIRE(f.restore(5, second).committed);
+  CHECK(f.opacity(f.other) == 1.f);
+  CHECK(f.opacity(f.matte) == 0.5f);
+  CHECK(
+      *f.matte->parameterValueAs<float3>("color") == float3(0.2f, 0.3f, 0.4f));
+}
+
+TEST_CASE(
+    "Concurrent public admissions serialize complete recovery publication",
+    "[integration][retention-fifo][retention-concurrent]")
+{
+  const bool reverseAdmission = GENERATE(false, true);
+  activity::Limits limits;
+  limits.restorableBatches = 1;
+  LoggedFixture lf(limits);
+  auto &f = lf.fx;
+  const auto old = f.edit(1, {f.entry(f.light.data(), "irradiance", 3)});
+  const auto revision = f.identity->sceneRevision();
+  const auto retainedBytes = lf.log.usage().retentionBytes;
+  const EditBatch left{f.sceneId, {f.entry(f.matte.data(), "opacity", 0.5)}};
+  const EditBatch right{f.sceneId, {f.entry(f.other.data(), "opacity", 0.25)}};
+  std::vector<const vsr::scene::Object *> writeOrder;
+  writeOrder.reserve(2);
+  f.scene.updateDelegate().emplace<WriteOrderObserver>(&writeOrder);
+  operations::Admission a, b;
+  std::atomic<bool> rightSubmitted{false};
+  std::thread one([&] {
+    if (reverseAdmission)
+      while (!rightSubmitted)
+        std::this_thread::yield();
+    a = f.edits->submit(f.creds, f.ref(2), left);
+  });
+  std::thread two([&] {
+    b = f.edits->submit(f.creds, f.ref(3), right);
+    rightSubmitted = true;
+  });
+  one.join();
+  two.join();
+  INFO("left admission: " << operations::outcomeName(a.code));
+  REQUIRE(b.code == Outcome::OK);
+  REQUIRE_FALSE(b.replayed);
+  REQUIRE(f.engine->highWater(f.sessionId) == 3);
+  REQUIRE((a.code == Outcome::OK || a.code == Outcome::OUTCOME_UNAVAILABLE));
+  if (reverseAdmission)
+    REQUIRE(a.code == Outcome::OUTCOME_UNAVAILABLE);
+
+  // Admission cannot evict the full history or mutate either target.
+  CHECK(f.identity->sceneRevision() == revision);
+  CHECK(f.identity->isCurrent(left.edits.front().expected));
+  CHECK(f.identity->isCurrent(right.edits.front().expected));
+  CHECK(f.opacity(f.matte) == 1.f);
+  CHECK(f.opacity(f.other) == 1.f);
+  CHECK(f.irradiance() == 3.f);
+  CHECK(writeOrder.empty());
+  CHECK(lf.log.eligibility(old) == activity::Eligibility::ELIGIBLE);
+  CHECK(lf.log.usage().restorableBatches == 1);
+  CHECK(lf.log.usage().retentionBytes == retainedBytes);
+  CHECK(lf.log.usage().reservedRetentionBytes == 0);
+
+  std::uint64_t leftId = 2;
+  if (a.code == Outcome::OUTCOME_UNAVAILABLE) {
+    REQUIRE_FALSE(f.edits->result(f.ref(2)));
+    REQUIRE(f.engine->status(f.creds, f.ref(2)).code
+        == Outcome::OUTCOME_UNAVAILABLE);
+    REQUIRE(f.engine->slotsInUse() == 1);
+    // A higher same-session ID may win concurrent admission. The lower ID
+    // is then permanently unavailable, not BUSY: retry the unchanged evidence
+    // once under a new monotonic ID, without servicing or refreshing versions.
+    leftId = 4;
+    a = f.edits->submit(f.creds, f.ref(leftId), left);
+  }
+  REQUIRE(a.code == Outcome::OK);
+  REQUIRE_FALSE(a.replayed);
+  REQUIRE(f.engine->slotsInUse() == 2);
+  f.drain();
+  const auto leftResult = f.edits->result(f.ref(leftId));
+  const auto rightResult = f.edits->result(f.ref(3));
+  REQUIRE(leftResult);
+  REQUIRE(rightResult);
+  REQUIRE(leftResult->outcome == Outcome::OK);
+  REQUIRE(rightResult->outcome == Outcome::OK);
+  REQUIRE(leftResult->committed);
+  REQUIRE(rightResult->committed);
+  REQUIRE(leftResult->batchRef);
+  REQUIRE(rightResult->batchRef);
+  REQUIRE(writeOrder.size() == 2);
+  CHECK(writeOrder.front() != writeOrder.back());
+  const auto first = *leftResult->batchRef;
+  const auto second = *rightResult->batchRef;
+  const bool leftRetained = writeOrder.back() == f.matte.data();
+  CHECK(f.restores->eligible(first) == leftRetained);
+  CHECK(f.restores->eligible(second) == !leftRetained);
+  CHECK(lf.log.eligibility(first)
+      == (leftRetained ? activity::Eligibility::ELIGIBLE
+                       : activity::Eligibility::EXPIRED));
+  CHECK(lf.log.eligibility(second)
+      == (leftRetained ? activity::Eligibility::EXPIRED
+                       : activity::Eligibility::ELIGIBLE));
+  CHECK(lf.log.eligibility(old) == activity::Eligibility::EXPIRED);
+  CHECK(lf.log.usage().restorableBatches == 1);
+  CHECK(lf.log.usage().reservedRetentionBytes == 0);
+  CHECK(f.opacity(f.matte) == 0.5f);
+  CHECK(f.opacity(f.other) == 0.25f);
+  CHECK(f.restore(5, leftRetained ? second : first).outcome
+      == Outcome::OUTCOME_UNAVAILABLE);
+  CHECK(f.restore(6, old).outcome == Outcome::OUTCOME_UNAVAILABLE);
+  REQUIRE(f.restore(7, leftRetained ? first : second).committed);
+  CHECK(f.opacity(f.matte) == (leftRetained ? 1.f : 0.5f));
+  CHECK(f.opacity(f.other) == (leftRetained ? 0.25f : 1.f));
+  CHECK(f.irradiance() == 3.f);
+  CHECK(lf.log.usage().restorableBatches == 0);
+}
+
+TEST_CASE("Failed prepared edits preserve complete recovery history",
+    "[integration][retention-fifo]")
+{
+  activity::Limits limits;
+  limits.restorableBatches = 1;
+  LoggedFixture lf(limits);
+  auto &f = lf.fx;
+  const auto old = f.edit(1, {f.entry(f.matte.data(), "opacity", 0.5)});
+  operations::Request request;
+  request.kind = "edit";
+  request.target = session::Target::scene(f.sceneId);
+  request.capability = session::Capability::EDIT;
+  request.canonicalArguments = "prepared-rejection";
+  request.executor = [&](operations::StepContext &ctx) {
+    PreparedBatch prepared;
+    std::size_t remaining = 4096;
+    const EditBatch batch{
+        f.sceneId, {f.entry(f.light.data(), "irradiance", 3)}};
+    const auto valid = f.edits->prepare(batch, f.scene, prepared, remaining);
+    REQUIRE(valid.outcome == Outcome::OK);
+    const auto rejected = f.edits->commitPrepared(
+        f.sceneId, prepared, ctx, [] { return Outcome::FORBIDDEN; });
+    CHECK_FALSE(rejected.committed);
+    operations::Step step;
+    step.outcome = rejected.outcome;
+    return step;
+  };
+  REQUIRE(f.engine->submit(f.creds, f.ref(2), std::move(request)).code
+      == Outcome::OK);
+  f.drain();
+  CHECK(f.engine->status(f.creds, f.ref(2)).terminal == Outcome::FORBIDDEN);
+  CHECK(f.irradiance() == 1.f);
+  CHECK(lf.log.eligibility(old) == activity::Eligibility::ELIGIBLE);
+  REQUIRE(f.restore(3, old).committed);
+  CHECK(f.opacity(f.matte) == 1.f);
+}
+
+TEST_CASE(
+    "Public generic commits retain recovery through late allocation faults",
+    "[integration][retention-fifo][retention-allocation]")
+{
+  const auto stage = GENERATE(
+      FaultStage::LAST_PREWRITE, FaultStage::RECEIPT, FaultStage::SYNC);
+  const bool nodeEdit = GENERATE(false, true);
+  activity::Limits limits;
+  limits.restorableBatches = 1;
+  LoggedFixture lf(limits, nodeEdit);
+  auto &f = lf.fx;
+  const auto old = f.edit(1, {f.entry(f.matte.data(), "opacity", 0.5)});
+  auto *layer = f.scene.defaultLayer();
+  const auto node = f.scene.insertChildTransformNode(layer->root());
+  EditEntry entry = f.entry(f.other.data(), "opacity", 0.25);
+  if (nodeEdit) {
+    entry.targetKind = TargetKind::NODE;
+    entry.parameter = "enabled";
+    entry.value = JsonValue::ofKind(JsonKind::BOOLEAN);
+    entry.value.boolean = false;
+    entry.nodeExpected =
+        *f.identity->nodeEditVersion(f.identity->handleOf(node));
+    entry.nodeDependencies =
+        *f.identity->beginNodeDependencies(entry.nodeExpected.node);
+    while (entry.nodeDependencies.ancestorSlot)
+      REQUIRE(f.identity->advanceNodeDependencies(entry.nodeDependencies));
+  }
+  const auto priorRevision = f.identity->sceneRevision();
+  const auto priorVersion = f.version(f.other.data());
+  const auto priorNode =
+      *f.identity->nodeEditVersion(f.identity->handleOf(node));
+  const auto priorBytes = lf.log.usage().retentionBytes;
+  bool hit = false;
+  f.edits->setFaultInjector([&](FaultStage current) {
+    if (current != stage)
+      return false;
+    hit = true;
+    return true;
+  });
+  const EditBatch batch{f.sceneId, {entry}};
+  REQUIRE(f.edits->submit(f.creds, f.ref(2), batch).code == Outcome::OK);
+  REQUIRE_NOTHROW(f.drain());
+  REQUIRE(hit);
+  const auto status = f.engine->status(f.creds, f.ref(2));
+  const auto result = f.edits->result(f.ref(2));
+  REQUIRE(result);
+  f.edits->setFaultInjector({});
+  if (stage == FaultStage::LAST_PREWRITE) {
+    CHECK_FALSE(status.committed);
+    CHECK_FALSE(result->committed);
+    CHECK(status.terminal == Outcome::BUSY);
+    CHECK(f.opacity(f.other) == 1.f);
+    CHECK(node->value().isEnabled());
+    CHECK(f.identity->sceneRevision() == priorRevision);
+    CHECK(f.version(f.other.data()) == priorVersion);
+    CHECK(
+        *f.identity->nodeEditVersion(f.identity->handleOf(node)) == priorNode);
+    CHECK(lf.log.usage().retentionBytes == priorBytes);
+    CHECK(lf.log.usage().reservedRetentionBytes == 0);
+    CHECK_FALSE(result->batchRef);
+    CHECK(lf.log.eligibility(old) == activity::Eligibility::ELIGIBLE);
+    REQUIRE(f.restore(3, old).committed);
+    CHECK(f.opacity(f.matte) == 1.f);
+  } else {
+    CHECK(status.committed);
+    CHECK(result->committed);
+    CHECK(f.opacity(f.other) == (nodeEdit ? 1.f : 0.25f));
+    CHECK(node->value().isEnabled() == !nodeEdit);
+    CHECK(f.edits->syncState(f.sceneId) != SyncState::READY);
+    CHECK(status.terminal == Outcome::APPLIED_WITH_SYNC_FAILURE);
+    CHECK(status.result.find("\"committed\":true") != std::string::npos);
+    REQUIRE(result->batchRef);
+    CHECK(lf.log.eligibility(old) == activity::Eligibility::EXPIRED);
+    CHECK(lf.log.eligibility(*result->batchRef)
+        == activity::Eligibility::ELIGIBLE);
+    CHECK(lf.log.usage().reservedRetentionBytes == 0);
+    REQUIRE(f.edits->submit(f.creds, f.ref(2), batch).replayed);
+    CHECK(lf.log.usage().restorableBatches == 1);
+    CHECK(f.restore(3, old).outcome == Outcome::OUTCOME_UNAVAILABLE);
+    REQUIRE(f.restore(4, *result->batchRef).committed);
+    CHECK(f.opacity(f.other) == 1.f);
+    CHECK(node->value().isEnabled());
+    CHECK(f.opacity(f.matte) == 0.5f);
+  }
+}
+
+TEST_CASE(
+    "Committed generic recovery survives synchronization queue exhaustion",
+    "[integration][retention-allocation]")
+{
+  activity::Limits limits;
+  limits.restorableBatches = 1;
+  LoggedFixture lf(limits);
+  auto &f = lf.fx;
+  const auto old = f.edit(1, {f.entry(f.matte.data(), "opacity", 0.5)});
+  f.edits->setFaultInjector([&](FaultStage stage) {
+    if (stage == FaultStage::RECEIPT)
+      for (std::size_t i = 0; i < f.integration.queueCapacity(); ++i)
+        REQUIRE(f.integration.submit(f.sceneId, [](vsr::scene::Scene &) {}));
+    return false;
+  });
+  const auto newest = f.edit(2, {f.entry(f.other.data(), "opacity", 0.25)});
+  const auto status = f.engine->status(f.creds, f.ref(2));
+  CHECK(status.committed);
+  CHECK(status.terminal == Outcome::APPLIED_WITH_SYNC_FAILURE);
+  CHECK(status.result.find("\"committed\":true") != std::string::npos);
+  CHECK(status.result.find(newest.batchId) != std::string::npos);
+  CHECK(
+      f.edits->result(f.ref(2))->outcome == Outcome::APPLIED_WITH_SYNC_FAILURE);
+  CHECK(f.edits->syncState(f.sceneId) == SyncState::FAILED);
+  CHECK(lf.log.eligibility(old) == activity::Eligibility::EXPIRED);
+  CHECK(lf.log.eligibility(newest) == activity::Eligibility::ELIGIBLE);
+  CHECK(f.hookCalls == 1);
+  f.edits->setFaultInjector({});
+  REQUIRE(f.restore(3, newest).committed);
+  CHECK(f.opacity(f.other) == 1.f);
+  CHECK(f.opacity(f.matte) == 0.5f);
+}
+
+TEST_CASE("Scene notification fanout rethrows the original first failure",
+    "[integration][retention-notification]")
+{
+  const auto hook = GENERATE(NotificationHook::PARAMETER_BATCH,
+      NotificationHook::LAYER_STRUCTURE,
+      NotificationHook::BATCH_END);
+  NotificationProbe first, second, later;
+  first.failure = std::make_exception_ptr(std::runtime_error("first"));
+  second.failure = std::make_exception_ptr(std::bad_alloc());
+  Fixture f(true, &first);
+  f.scene.updateDelegate().emplace<ThrowingWriteObserver>(&second);
+  f.scene.updateDelegate().emplace<ThrowingWriteObserver>(&later);
+  first.failAt = second.failAt = hook;
+  std::exception_ptr received;
+  try {
+    if (hook == NotificationHook::PARAMETER_BATCH) {
+      f.other->beginParameterBatch();
+      f.other->setParameter("opacity", 0.25f);
+      f.other->endParameterBatch();
+    } else if (hook == NotificationHook::LAYER_STRUCTURE) {
+      f.scene.signalLayerStructureChanged(f.scene.defaultLayer());
+    } else {
+      f.scene.beginUpdateBatch();
+      f.scene.endUpdateBatch();
+    }
+  } catch (...) {
+    received = std::current_exception();
+  }
+  CHECK(received == first.failure);
+  const auto index = static_cast<std::size_t>(hook);
+  CHECK(first.calls[index] == 1);
+  CHECK(second.calls[index] == 1);
+  CHECK(later.calls[index] == 1);
+  first.failAt = second.failAt = NotificationHook::NONE;
+  if (hook == NotificationHook::PARAMETER_BATCH) {
+    CHECK(f.opacity(f.other) == 0.25f);
+    // A failed notification must not leave parameters queued for the next
+    // batch.
+    f.other->beginParameterBatch();
+    REQUIRE_NOTHROW(f.other->endParameterBatch());
+    CHECK(later.parameterCount == 0);
+    CHECK(later.calls[index] == 2);
+  }
+}
+
+TEST_CASE("Generic publication survives failing downstream notification owners",
+    "[integration][retention-allocation][retention-notification]")
+{
+  const auto hook = GENERATE(NotificationHook::PARAMETER_BATCH,
+      NotificationHook::LAYER_STRUCTURE,
+      NotificationHook::BATCH_END);
+  NotificationProbe first, second, later;
+  first.failure = std::make_exception_ptr(std::bad_alloc());
+  second.failure = std::make_exception_ptr(std::runtime_error("second"));
+  activity::Limits limits;
+  limits.restorableBatches = 1;
+  LoggedFixture lf(limits, true, &first);
+  auto &f = lf.fx;
+  f.scene.updateDelegate().emplace<ThrowingWriteObserver>(&second);
+  f.scene.updateDelegate().emplace<ThrowingWriteObserver>(&later);
+  const auto old = f.edit(1, {f.entry(f.matte.data(), "opacity", 0.5)});
+  const auto node =
+      f.scene.insertChildTransformNode(f.scene.defaultLayer()->root());
+  EditEntry n;
+  n.targetKind = TargetKind::NODE;
+  n.nodeExpected = *f.identity->nodeEditVersion(f.identity->handleOf(node));
+  n.nodeDependencies = *f.identity->beginNodeDependencies(n.nodeExpected.node);
+  while (n.nodeDependencies.ancestorSlot)
+    REQUIRE(f.identity->advanceNodeDependencies(n.nodeDependencies));
+  n.parameter = "enabled";
+  n.value = JsonValue::ofKind(JsonKind::BOOLEAN);
+  const EditBatch batch{
+      f.sceneId, {f.entry(f.other.data(), "opacity", 0.25), n}};
+  first.calls = second.calls = later.calls = {};
+  first.failAt = second.failAt = hook;
+  REQUIRE(f.edits->submit(f.creds, f.ref(2), batch).code == Outcome::OK);
+  REQUIRE_NOTHROW(f.drain());
+  const auto status = f.engine->status(f.creds, f.ref(2));
+  REQUIRE(status.committed);
+  CHECK(status.terminal == Outcome::APPLIED_WITH_SYNC_FAILURE);
+  CHECK(status.result.find("\"committed\":true") != std::string::npos);
+  const auto result = f.edits->result(f.ref(2));
+  REQUIRE(result);
+  REQUIRE(result->committed);
+  REQUIRE(result->batchRef);
+  const auto newest = *result->batchRef;
+  CHECK(f.opacity(f.other) == 0.25f);
+  CHECK_FALSE(node->value().isEnabled());
+  CHECK(f.edits->syncState(f.sceneId) != SyncState::READY);
+  for (std::size_t i = 0; i < 3; ++i) {
+    CHECK(first.calls[i] == 1);
+    CHECK(second.calls[i] == 1);
+    CHECK(later.calls[i] == 1);
+  }
+  CHECK(lf.log.eligibility(old) == activity::Eligibility::EXPIRED);
+  CHECK(lf.log.eligibility(newest) == activity::Eligibility::ELIGIBLE);
+  REQUIRE(result->versions.size() == 1);
+  REQUIRE(result->nodeVersions.size() == 1);
+  CHECK(result->versions.front() == f.version(f.other.data()));
+  CHECK(result->nodeVersions.front().expected
+      == *f.identity->nodeEditVersion(f.identity->handleOf(node)));
+  CHECK(lf.log.usage().reservedRetentionBytes == 0);
+  const auto retainedBytes = lf.log.usage().retentionBytes;
+  REQUIRE(f.edits->submit(f.creds, f.ref(2), batch).replayed);
+  f.drain();
+  CHECK(lf.log.usage().retentionBytes == retainedBytes);
+  CHECK(lf.log.usage().restorableBatches == 1);
+  for (std::size_t i = 0; i < 3; ++i)
+    CHECK(later.calls[i] == 1);
+  first.failAt = second.failAt = NotificationHook::NONE;
+  CHECK(f.restore(3, old).outcome == Outcome::OUTCOME_UNAVAILABLE);
+  REQUIRE(f.restore(4, newest).committed);
+  CHECK(f.opacity(f.other) == 1.f);
+  CHECK(node->value().isEnabled());
+  CHECK(f.opacity(f.matte) == 0.5f);
+}
+
+TEST_CASE("Generic commits survive allocation failure in sync-state listeners",
+    "[integration][retention-allocation]")
+{
+  const auto failedTransition =
+      GENERATE(SyncState::SYNCHRONIZING, SyncState::READY);
+  LoggedFixture lf;
+  auto &f = lf.fx;
+  bool hit = false;
+  f.edits->syncStates().setTransitionListener(
+      [&, large = std::string(4096, 'x')](SceneId, SyncState, SyncState to) {
+        if (to == failedTransition) {
+          hit = true;
+          throw std::bad_alloc();
+        }
+      });
+  const auto batch = f.edit(1, {f.entry(f.matte.data(), "opacity", 0.5)});
+  CHECK(hit);
+  CHECK(f.edits->syncState(f.sceneId) == SyncState::FAILED);
+  CHECK(f.engine->status(f.creds, f.ref(1)).committed);
+  CHECK(f.engine->status(f.creds, f.ref(1)).terminal
+      == Outcome::APPLIED_WITH_SYNC_FAILURE);
+  CHECK(lf.log.eligibility(batch) == activity::Eligibility::ELIGIBLE);
+  f.edits->syncStates().setTransitionListener({});
+  REQUIRE(f.restore(2, batch).committed);
+  CHECK(f.opacity(f.matte) == 1.f);
+}
+
+TEST_CASE("Last generic prewrite guard rejects changed dependency pointers",
+    "[integration][retention-allocation]")
+{
+  LoggedFixture lf;
+  auto &f = lf.fx;
+  const auto old = f.edit(1, {f.entry(f.matte.data(), "opacity", 0.5)});
+  const EditBatch batch{f.sceneId, {f.entry(f.other.data(), "opacity", 0.25)}};
+  f.edits->setFaultInjector([&](FaultStage stage) {
+    if (stage == FaultStage::LAST_PREWRITE)
+      f.other->removeParameter("opacity");
+    return false;
+  });
+  REQUIRE(f.edits->submit(f.creds, f.ref(2), batch).code == Outcome::OK);
+  f.drain();
+  const auto status = f.engine->status(f.creds, f.ref(2));
+  CHECK_FALSE(status.committed);
+  CHECK(status.terminal == Outcome::CONFLICT);
+  CHECK(lf.log.eligibility(old) == activity::Eligibility::ELIGIBLE);
+  CHECK(lf.log.usage().reservedRetentionBytes == 0);
+  f.edits->setFaultInjector({});
+  REQUIRE(f.restore(3, old).committed);
+  CHECK(f.opacity(f.matte) == 1.f);
+  CHECK_FALSE(f.other->parameter("opacity"));
+}
+
+TEST_CASE("Maximum public Node batch has complete bounded receipt and recovery",
+    "[integration][retention-allocation]")
+{
+  LoggedFixture lf({}, true);
+  auto &f = lf.fx;
+  EditBatch batch;
+  batch.scene = f.sceneId;
+  std::vector<vsr::scene::LayerNodeRef> nodes;
+  for (int i = 0; i < 64; ++i) {
+    const auto node =
+        f.scene.insertChildTransformNode(f.scene.defaultLayer()->root());
+    nodes.push_back(node);
+    EditEntry n;
+    n.targetKind = TargetKind::NODE;
+    n.nodeExpected = *f.identity->nodeEditVersion(f.identity->handleOf(node));
+    n.nodeDependencies =
+        *f.identity->beginNodeDependencies(n.nodeExpected.node);
+    while (n.nodeDependencies.ancestorSlot)
+      REQUIRE(f.identity->advanceNodeDependencies(n.nodeDependencies));
+    n.parameter = "enabled";
+    n.value = JsonValue::ofKind(JsonKind::BOOLEAN);
+    batch.edits.push_back(n);
+  }
+  REQUIRE(f.edits->submit(f.creds, f.ref(1), batch).code == Outcome::OK);
+  f.drain();
+  const auto status = f.engine->status(f.creds, f.ref(1));
+  CHECK(status.terminal == Outcome::OK);
+  mcp::json::Value receipt;
+  REQUIRE(mcp::json::parse(status.result, receipt));
+  REQUIRE(receipt.get("node_versions"));
+  CHECK(receipt.get("node_versions")->a.size() == 64);
+  const auto result = f.edits->result(f.ref(1));
+  REQUIRE(result);
+  REQUIRE(result->batchRef);
+  REQUIRE(result->nodeVersions.size() == 64);
+  for (std::size_t i = 0; i < nodes.size(); ++i) {
+    CHECK_FALSE(nodes[i]->value().isEnabled());
+    CHECK(result->nodeVersions[i].expected
+        == *f.identity->nodeEditVersion(f.identity->handleOf(nodes[i])));
+  }
+  REQUIRE(f.restore(2, *result->batchRef).committed);
+  for (const auto &node : nodes)
+    CHECK(node->value().isEnabled());
 }
 
 SCENARIO("A batch the log expired reports outcome_unavailable", "[integration]")

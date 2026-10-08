@@ -2563,7 +2563,7 @@ struct LoggedFixture
 // cost of an active placeholder, measured under an unconstrained log.
 struct Costs
 {
-  std::size_t edit{0}, result{0}, active{0};
+  std::size_t edit{0}, result{0}, active{0}, retention{0};
 };
 
 Costs measureCosts()
@@ -2576,6 +2576,7 @@ Costs measureCosts()
   REQUIRE(e);
   REQUIRE(e->restorationBytes > 0);
   c.edit = activity::ActivityLog::cost(*e);
+  c.retention = e->restorationBytes;
   c.result = e->result.size();
   m.holdActive();
   c.active = m.log->usage().bytes - c.edit;
@@ -2704,7 +2705,7 @@ SCENARIO("Restoration payloads share the activity byte budget", "[integration]")
   GIVEN("a budget holding about two committed edits")
   {
     activity::Limits l;
-    l.bytes = 2 * c.edit + c.edit / 2;
+    l.retentionBytes = 2 * c.retention;
     LoggedFixture lf(l);
     std::vector<BatchRef> refs;
     for (std::uint64_t id = 1; id <= 4; id++) {
@@ -2715,8 +2716,9 @@ SCENARIO("Restoration payloads share the activity byte budget", "[integration]")
     THEN("older terminal records are evicted and their batches expire")
     {
       REQUIRE(lf.log->usage().bytes <= l.bytes);
-      REQUIRE_FALSE(lf.log->get(1));
-      REQUIRE_FALSE(lf.log->eligibility(refs[0]));
+      REQUIRE(lf.log->get(1));
+      REQUIRE(lf.log->eligibility(refs[0]) == activity::Eligibility::EXPIRED);
+      REQUIRE(lf.log->usage().retentionBytes <= l.retentionBytes);
       REQUIRE(lf.fx.edits->restorations().expired(refs[0]));
       REQUIRE_FALSE(lf.fx.edits->restorations().find(refs[0]));
       REQUIRE(lf.log->eligibility(refs[3]) == activity::Eligibility::ELIGIBLE);
@@ -4431,9 +4433,9 @@ TEST_CASE("World ancestry change-back conflicts but local restore stays narrow",
     parent->value().setAsTransform(vsr::math::IDENTITY_MAT4);
     child->value().setAsTransform(vsr::math::IDENTITY_MAT4);
     f.scene.signalLayerStructureChanged(l);
-    auto entry = [&] {
+    auto entry = [&](double x = 1) {
       auto e = f.positionEntry(child,
-          JsonValue::array({JsonValue::fromNumber(1),
+          JsonValue::array({JsonValue::fromNumber(x),
               JsonValue::fromNumber(2),
               JsonValue::fromNumber(3)}));
       e.space = world ? "world" : "local";
@@ -4451,7 +4453,7 @@ TEST_CASE("World ancestry change-back conflicts but local restore stays narrow",
     changeBack();
     auto result = f.run(1, f.batch({stale}));
     CHECK(result.outcome == (world ? Outcome::CONFLICT : Outcome::OK));
-    result = f.run(2, f.batch({entry()}));
+    result = f.run(2, f.batch({entry(4)}));
     REQUIRE(result.committed);
     changeBack();
     restore::RestoreService restores(*f.engine, *f.edits);

@@ -250,8 +250,28 @@ with `mesh_parameter_limit`. Restore also bounds its current target before
 preparation. This is a bounded transaction-copy policy,
 not a new limit on ordinary Scene editing.
 
-Mesh and Image share the configurable restoration pool (unchanged 16 MiB
-default), Activity eligibility and originating-session ceiling (64 MiB).
+Mesh, Image and existing parameter/Node batches share one Activity-owned
+recovery policy. Newly launched qualified hosts default to exactly
+4,294,967,296 bytes (4 GiB), configured with `--agentRestorationBytes` in binary
+bytes; explicit launch settings are preserved. This target is not preallocated.
+For a normal entry whose complete conservative recovery charge fits that soft
+budget, successful publication evicts the oldest complete eligible batches until
+the newest suffix fits. Order is successful publication, not preparation,
+request arrival, status access or restore attempts. The separate 32-entry
+recovery bound uses the same FIFO decision. Pending preparation is not history:
+validation, allocations, authority and freshness checks precede eviction.
+Failed/cancelled precommit attempts preserve existing recovery. No-op operations
+and historical replay create no entry and evict nothing.
+
+Activity metadata/results remain separately bounded by 16 MiB and 1024 records;
+eligible recovery and active/reserved work cannot be discarded by ordinary
+metadata churn. Genuine metadata/publication, transport, transient-work and
+physical-ownership allocation limits remain distinct safeguards, not a second
+session undo ceiling. Qualified Import reads policy directly from the Activity
+log; the Image session/global ledgers measure ownership rather than admission.
+There is no 64 MiB per-session snapshot ceiling. This slice does not implement
+the oversized-entry exception, an 8 GiB hard cap or above-cap approval; entries
+above the effective soft budget still refuse before Scene mutation/eviction.
 A mesh batch conservatively charges all unique required prior Array data plus
 replacement data, `sizeof(Array) + 4096` bytes per retained Array for lifetime/
 control ownership, the snapshot record, and a conservative 256 KiB allowance
@@ -262,9 +282,16 @@ metadata is not a new copied mesh payload, and these limits are not a cap on all
 viewer RAM/GPU memory. Image snapshots and mesh lifetime entries additionally
 share a physical-retention ledger: Activity eviction or consumed history cannot
 make copied snapshots or not-yet-drained pins uncharged. Reservations survive
-until the corresponding buffers/pins are physically releasable. Insufficient
-mesh capacity reports `required_capacity_bytes` and `configured_capacity_bytes`
-before binding publication, with no irreversible fallback or automatic increase.
+until the corresponding buffers/pins are physically releasable. Charges also include a 106,496-byte conservative allowance for request/store/
+receipt ownership. A charge above the currently supported soft limit reports
+`required_capacity_bytes` and `configured_capacity_bytes` before publication,
+with no irreversible fallback or automatic increase. The viewer/headless host
+physical-owner pool is separately configured to twice the soft target plus
+256 MiB (8,858,370,048 bytes at the default), saturating at addressable `size_t`
+on narrow hosts. Its checked leases cover preparation overlap and copied/pinned
+owners until release, not all process/Scene/GPU memory. No amount is preallocated.
+The rendering library's default FrameBudget remains 256 MiB; explicit host
+budgets now accept larger finite limits. Transient/codec/file limits are unchanged.
 
 File creation is descriptor-relative,
 exclusive and identity checked; partial files are removed by held identity,
@@ -293,14 +320,22 @@ Poll ordinary operation status and inspect `committed` before deciding recovery:
   refusals. Fix the working file/profile, not the surrounding asset graph.
 - Stale evidence/conflict requires fresh export evidence and a deliberate retry;
   no force/merge path exists. An ordinary open map is busy, not silently closed.
-- `busy` / `resource_limit` can mean transient, physical, file, slot or retention
-  pressure. Retention refusals report `required_capacity_bytes` and
-  `configured_capacity_bytes`, plus originating-session capacity/availability.
-  Exchange metadata reports `effective_global_retention_byte_cap`,
-  `available_global_retention_bytes`, `session_snapshot_byte_cap` and authenticated
-  `available_session_snapshot_bytes`. Global availability is the smaller of
-  logical eligibility and physical retention availability. Raising only the
-  global host budget cannot bypass the 64 MiB originating-session ceiling.
+- `busy` / `resource_limit` identifies actual transient, physical, file, slot or
+  publication-resource safeguards. An individually unsupported recovery charge
+  reports `restore_budget_exhausted`, `required_capacity_bytes` and
+  `configured_capacity_bytes`. Old eligible history alone is not an admission
+  barrier for a normal entry. Exchange metadata reports
+  `effective_global_retention_byte_cap`, `available_global_retention_bytes`
+  (soft target minus eligible charges), `retention_order:publication_fifo`,
+  `retention_entry_cap`, `activity_metadata_byte_cap`, `activity_entry_cap`,
+  `physical_byte_cap` and `retained_physical_bytes` (snapshot/pin ledger charges,
+  including conservative Mesh ownership allowances, not process RSS or the
+  entire shared physical pool). Authenticated observations add
+  `session_retained_physical_bytes`; this is ownership, not a session cap.
+  Evicted/consumed eligibility does not imply physical reclamation: copied
+  recovery and Scene pins remain charged until actual release. Eligible free
+  space and physical ownership are deliberately distinct; neither is a promise
+  of future allocation success.
 - Authority withdrawal, cancellation or timeout before publication leaves the
   Scene unchanged. Cleanup can finish after the terminal receipt. After
   publication, `applied_with_sync_failure` remains **committed=true**; do not

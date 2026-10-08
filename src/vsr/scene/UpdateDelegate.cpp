@@ -4,8 +4,33 @@
 #include "vsr/scene/UpdateDelegate.hpp"
 // std
 #include <algorithm>
+#include <exception>
 
 namespace vsr::scene {
+
+namespace {
+
+// Committed writes must reach identity tracking even if an earlier consumer
+// fails. Keep the original exception without allocating a callback wrapper.
+template <typename Notify>
+void notifyAllThenRethrow(
+    const std::vector<std::unique_ptr<BaseUpdateDelegate>> &delegates,
+    const Notify &notify)
+{
+  std::exception_ptr failure;
+  for (const auto &d : delegates) {
+    try {
+      notify(*d);
+    } catch (...) {
+      if (!failure)
+        failure = std::current_exception();
+    }
+  }
+  if (failure)
+    std::rethrow_exception(failure);
+}
+
+} // namespace
 
 size_t MultiUpdateDelegate::size() const
 {
@@ -68,8 +93,8 @@ void MultiUpdateDelegate::signalParameterRemoved(
 void MultiUpdateDelegate::signalParameterBatchUpdated(
     const Object *o, const std::vector<const Parameter *> &ps)
 {
-  for (auto &d : m_delegates)
-    d->signalParameterBatchUpdated(o, ps);
+  notifyAllThenRethrow(m_delegates,
+      [&](BaseUpdateDelegate &d) { d.signalParameterBatchUpdated(o, ps); });
 }
 
 void MultiUpdateDelegate::signalArrayMapped(const Array *a)
@@ -116,8 +141,8 @@ void MultiUpdateDelegate::signalLayerAdded(const Layer *l)
 
 void MultiUpdateDelegate::signalLayerStructureUpdated(const Layer *l)
 {
-  for (auto &d : m_delegates)
-    d->signalLayerStructureUpdated(l);
+  notifyAllThenRethrow(m_delegates,
+      [&](BaseUpdateDelegate &d) { d.signalLayerStructureUpdated(l); });
 }
 
 void MultiUpdateDelegate::signalLayerTransformUpdated(const Layer *l)
@@ -158,8 +183,8 @@ void MultiUpdateDelegate::signalUpdateBatchBegin()
 
 void MultiUpdateDelegate::signalUpdateBatchEnd()
 {
-  for (auto &d : m_delegates)
-    d->signalUpdateBatchEnd();
+  notifyAllThenRethrow(
+      m_delegates, [](BaseUpdateDelegate &d) { d.signalUpdateBatchEnd(); });
 }
 
 void MultiUpdateDelegate::signalMetadataUpdated(

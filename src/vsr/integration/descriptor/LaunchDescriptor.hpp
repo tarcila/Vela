@@ -309,7 +309,8 @@ inline bool validImageExchange(std::string_view text, std::string_view launchId)
       return false;
   }
   const auto *limits = value.get("exchange_limits");
-  if (!limits || !limits->isObject() || limits->o.size() != 11)
+  if (!limits || !limits->isObject()
+      || (limits->o.size() != 11 && limits->o.size() != 16))
     return false;
   const auto integer = [&](const char *name, double cap, bool exact = false) {
     const auto *v = limits->get(name);
@@ -323,8 +324,21 @@ inline bool validImageExchange(std::string_view text, std::string_view launchId)
   constexpr double BYTE_CAP = 268435456;
   constexpr double QUOTA_SCAN_ENTRY_CAP = 4096;
   constexpr double ANCILLARY_BYTE_CAP = 65536;
-  constexpr double SESSION_SNAPSHOT_BYTE_CAP = 67108864;
   constexpr double MAX_EXACT_JSON_INTEGER = 9007199254740991.;
+  if (limits->o.size() == 11) {
+    // Read legacy launch metadata without claiming its old admission policy.
+    if (!integer("session_snapshot_byte_cap", 67108864, true))
+      return false;
+  } else {
+    const auto *order = limits->get("retention_order");
+    if (!order || !order->isString() || order->s != "publication_fifo"
+        || !integer("retained_physical_bytes", MAX_EXACT_JSON_INTEGER)
+        || !integer("physical_byte_cap", MAX_EXACT_JSON_INTEGER)
+        || !integer("retention_entry_cap", MAX_EXACT_JSON_INTEGER)
+        || !integer("activity_metadata_byte_cap", MAX_EXACT_JSON_INTEGER)
+        || !integer("activity_entry_cap", MAX_EXACT_JSON_INTEGER))
+      return false;
+  }
   return integer("file_cap", FILE_CAP, true)
       && integer("byte_cap", BYTE_CAP, true)
       && integer("files_used", MAX_EXACT_JSON_INTEGER)
@@ -332,7 +346,6 @@ inline bool validImageExchange(std::string_view text, std::string_view launchId)
       && integer("quota_scan_entry_cap", QUOTA_SCAN_ENTRY_CAP, true)
       && integer("max_ancillary_bytes", ANCILLARY_BYTE_CAP, true)
       && integer("transient_image_byte_cap", BYTE_CAP)
-      && integer("session_snapshot_byte_cap", SESSION_SNAPSHOT_BYTE_CAP, true)
       && integer("effective_global_retention_byte_cap", MAX_EXACT_JSON_INTEGER)
       && integer("available_global_retention_bytes",
           limits->get("effective_global_retention_byte_cap")
