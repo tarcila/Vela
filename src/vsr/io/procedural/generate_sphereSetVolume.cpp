@@ -18,7 +18,7 @@ void generate_sphereSetVolume(Scene &scene, LayerNodeRef location)
   location = scene.insertChildTransformNode(location);
 
   auto root = scene.insertChildNode(location);
-  (*root)->name() = "Sphere Set Volume";
+  (*root)->setName("Sphere Set Volume");
 
   constexpr int volumeSize = 512;
   constexpr float voxelSpacing = 1.0f / volumeSize;

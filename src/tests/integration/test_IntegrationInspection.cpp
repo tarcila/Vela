@@ -1403,7 +1403,7 @@ SCENARIO("node dependencies distinguish structural and ancestor write history",
       != ancestorMoved.get("ancestry_version")->s);
   otherParent->value().setAsTransform(moved);
   otherParent->value().setEnabled(false);
-  parent->value().name() = "renamed";
+  parent->value().setName("renamed");
   auto *otherLayer = f.scene.addLayer("unrelated");
   otherLayer->root()->value().setAsTransform(moved);
   auto material = f.scene.createObject<vsr::scene::Material>("matte");
@@ -1578,7 +1578,7 @@ SCENARIO("node edit versions exclude unrelated writes and storage relocation",
     auto first = page(f.inspect(all, f.nextId++));
     REQUIRE(first.get("cursor"));
     all.cursor = first.get("cursor")->s;
-    node->value().name() = "renamed";
+    node->value().setName("renamed");
     f.scene.signalLayerStructureChanged(layer);
     CHECK(f.inspect(all, f.nextId++).terminal == Outcome::CURSOR_STALE);
   }
@@ -1982,7 +1982,7 @@ SCENARIO("node handles follow real copy move and destruction lifetimes",
   args.filters.handle = handle;
   auto moved = page(f.inspect(args, 3));
   CHECK(moved.get("items")->a[0].get("handle")->s == handle);
-  node->value().name() = "renamed";
+  node->value().setName("renamed");
   node->value().setEnabled(false);
   f.scene.signalLayerTransformChanged(layer);
   CHECK(page(f.inspect(args, 4)).get("items")->a[0].get("handle")->s == handle);
@@ -2159,7 +2159,7 @@ SCENARIO("deep node ancestry and preorder continuations are bounded",
   for (int i = 0; i < 24; ++i)
     node =
         node->insert_last_child(vsr::scene::LayerNodeData(layer, step, "deep"));
-  node->value().name() = "target";
+  node->value().setName("target");
   PageArgs args;
   args.kind = "nodes";
   args.filters.name = "target";
@@ -2224,8 +2224,8 @@ SCENARIO("layers expose live roots and stored names in scene order",
   f.scene.removeAllLayers();
   auto *first = f.scene.addLayer("first-key");
   auto *second = f.scene.addLayer("second-key");
-  first->editableName() = "duplicate";
-  second->editableName() = "duplicate";
+  first->setName("duplicate");
+  second->setName("duplicate");
   f.scene.signalLayerStructureChanged(first);
   f.scene.signalLayerStructureChanged(second);
   f.scene.setLayerActive("second-key", false);
@@ -2255,8 +2255,7 @@ SCENARIO("layer name filters intersect on stored literal names",
   f.scene.removeAllLayers();
   for (const auto &key : {"first-key", "second-key", "Queen.*"}) {
     auto *layer = f.scene.addLayer(key);
-    layer->editableName() =
-        std::string(key) == "Queen.*" ? "queen.*" : "Queen.*";
+    layer->setName(std::string(key) == "Queen.*" ? "queen.*" : "Queen.*");
     f.scene.signalLayerStructureChanged(layer);
   }
   PageArgs args;
@@ -2293,7 +2292,7 @@ SCENARIO("filtered layer cursors bind every filter and replay historical pages",
   f.scene.removeAllLayers();
   for (const auto &key : {"one", "two", "three"}) {
     auto *layer = f.scene.addLayer(key);
-    layer->editableName() = "duplicate";
+    layer->setName("duplicate");
     f.scene.signalLayerStructureChanged(layer);
   }
   PageArgs args;
@@ -2319,7 +2318,7 @@ SCENARIO("filtered layer cursors bind every filter and replay historical pages",
   }
   REQUIRE(page(f.inspect(args, 2)).get("items")->a.size() == 1);
   auto *layer = f.scene.layers().at_index(0).second.ptr.get();
-  layer->editableName() = "changed";
+  layer->setName("changed");
   f.scene.signalLayerStructureChanged(layer);
   CHECK(f.inspect(args, 3).terminal == Outcome::CURSOR_STALE);
   args.cursor.clear();
@@ -2517,7 +2516,7 @@ SCENARIO("layer and root lifetimes survive notifications but never removal",
   f.scene.signalLayerStructureChanged(layer);
   f.scene.signalLayerTransformChanged(layer);
   f.scene.setLayerActive("live", false);
-  layer->editableName() = "renamed";
+  layer->setName("renamed");
   f.scene.signalLayerStructureChanged(layer);
   auto changed = page(f.inspect(args, 4));
   CHECK(changed.get("items")->a[0].get("handle")->s == handle);
@@ -2584,7 +2583,7 @@ SCENARIO("layer cursors bind identity and every supported policy",
   }
   SECTION("notifying mutations")
   {
-    layer->editableName() = "renamed";
+    layer->setName("renamed");
     f.scene.signalLayerStructureChanged(layer);
     CHECK(f.inspect(args, 3).terminal == Outcome::CURSOR_STALE);
   }

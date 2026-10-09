@@ -33,6 +33,7 @@ class PreparedMeshBinding
   void commit(Geometry &geometry) noexcept;
 
  private:
+  ObjectVersion m_metadata{0};
   Object::ParameterMap m_before;
   Object::ParameterMap m_parameters;
   std::vector<const Parameter *> m_notifications;
@@ -41,7 +42,9 @@ class PreparedMeshBinding
 // Inlined definitions ////////////////////////////////////////////////////////
 
 inline PreparedMeshBinding::PreparedMeshBinding(const Geometry &geometry)
-    : m_before(geometry.m_parameters), m_parameters(geometry.m_parameters)
+    : m_metadata(geometry.lastMetadataChange()),
+      m_before(geometry.m_parameters),
+      m_parameters(geometry.m_parameters)
 {}
 
 inline bool PreparedMeshBinding::available(const Geometry &geometry)
@@ -51,7 +54,8 @@ inline bool PreparedMeshBinding::available(const Geometry &geometry)
 
 inline bool PreparedMeshBinding::isCurrent(const Geometry &geometry) const
 {
-  if (!available(geometry) || geometry.m_parameters.size() != m_before.size())
+  if (!available(geometry) || geometry.lastMetadataChange() != m_metadata
+      || geometry.m_parameters.size() != m_before.size())
     return false;
   const auto same = [](const Any &a, const Any &b) {
     // Any deliberately treats invalid values as unequal, whereas two absent
@@ -61,8 +65,8 @@ inline bool PreparedMeshBinding::isCurrent(const Geometry &geometry) const
   for (const auto &entry : m_before) {
     const auto *now = geometry.parameter(entry.first);
     const auto &before = entry.second;
-    // Some UI metadata setters deliberately do not advance parameter clocks.
-    // A whole-map swap must not overwrite such an intervening edit either.
+    // A whole-map swap must preserve all metadata, including detached
+    // snapshots.
     if (!now || !same(now->value(), before.value())
         || !same(now->min(), before.min()) || !same(now->max(), before.max())
         || now->description() != before.description()

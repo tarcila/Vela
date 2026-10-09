@@ -104,7 +104,8 @@ struct Array : public Object
   bool supportsHostWriteTracking() const;
   std::weak_ptr<ArrayLifetime> lifetime() const;
   std::optional<std::uint64_t> dataWriteSequence() const;
-  // Historical API name; enrolls both supported Images and host mesh Arrays.
+  // Historical API name; enrolls supported Images, HDRI radiance and host
+  // mesh Arrays. This is write evidence, not an exchange capability.
   bool trackImageWrites(const std::shared_ptr<ArrayWriteSequence> &sequence);
 
   void convertProxyToHost();

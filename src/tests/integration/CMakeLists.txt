@@ -20,6 +20,10 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
   VSR_MESH_TEST_PYTHON="${Python3_EXECUTABLE}"
   VSR_MESH_TEST_SOURCE="${CMAKE_SOURCE_DIR}"
 )
+add_executable(vsrPreparedHdriAllocation PreparedHdriAllocation.cpp)
+target_link_libraries(vsrPreparedHdriAllocation PRIVATE vsr_scene)
+add_test(NAME vsr::prepared-hdri-allocation COMMAND vsrPreparedHdriAllocation)
+
 add_test(NAME vsr::integration COMMAND ${PROJECT_NAME} "[integration]")
 add_test(NAME vsr::mesh-helper
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/test-mesh-bundle.py)

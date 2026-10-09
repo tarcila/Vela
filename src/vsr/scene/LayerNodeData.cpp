@@ -42,7 +42,9 @@ LayerNodeData::LayerNodeData(Layer *layer, Object *o, const char *n)
 }
 
 LayerNodeData::LayerNodeData(const LayerNodeData &o)
-    : m_editVersion(o.m_editVersion), m_transformVersion(o.m_transformVersion)
+    : m_editVersion(o.m_editVersion),
+      m_transformVersion(o.m_transformVersion),
+      m_metadataSequence(o.m_metadataSequence)
 {
   m_name = o.m_name;
   m_enabled = o.m_enabled;
@@ -56,7 +58,9 @@ LayerNodeData::LayerNodeData(const LayerNodeData &o)
 }
 
 LayerNodeData::LayerNodeData(LayerNodeData &&o)
-    : m_editVersion(o.m_editVersion), m_transformVersion(o.m_transformVersion)
+    : m_editVersion(o.m_editVersion),
+      m_transformVersion(o.m_transformVersion),
+      m_metadataSequence(o.m_metadataSequence)
 {
   m_name = std::move(o.m_name);
   m_enabled = std::move(o.m_enabled);
@@ -68,6 +72,7 @@ LayerNodeData::LayerNodeData(LayerNodeData &&o)
   m_sceneOwner = o.m_sceneOwner;
   o.m_value.reset();
   o.noteEdit();
+  o.noteMetadataChange();
 }
 
 LayerNodeData::LayerNodeData(LayerNodeData &&o, StorageRelocationTag) noexcept
@@ -75,6 +80,7 @@ LayerNodeData::LayerNodeData(LayerNodeData &&o, StorageRelocationTag) noexcept
       m_enabled(o.m_enabled),
       m_editVersion(o.m_editVersion),
       m_transformVersion(o.m_transformVersion),
+      m_metadataSequence(o.m_metadataSequence),
       m_value(std::move(o.m_value)),
       m_defaultValue(std::move(o.m_defaultValue)),
       m_srt(o.m_srt),
@@ -96,6 +102,7 @@ void LayerNodeData::relocateAssign(LayerNodeData &&o) noexcept
   m_enabled = o.m_enabled;
   m_editVersion = o.m_editVersion;
   m_transformVersion = o.m_transformVersion;
+  m_metadataSequence = o.m_metadataSequence;
   m_value = std::move(o.m_value);
   m_defaultValue = std::move(o.m_defaultValue);
   m_srt = o.m_srt;
@@ -137,6 +144,7 @@ LayerNodeData &LayerNodeData::operator=(const LayerNodeData &o)
 {
   checkAssignmentOwner(o);
   noteEdit();
+  noteMetadataChange();
   if (this == &o)
     return *this;
   decObjectUseCount();
@@ -158,6 +166,7 @@ LayerNodeData &LayerNodeData::operator=(LayerNodeData &&o)
 {
   checkAssignmentOwner(o);
   noteEdit();
+  noteMetadataChange();
   if (this == &o)
     return *this;
   decObjectUseCount();
@@ -174,6 +183,7 @@ LayerNodeData &LayerNodeData::operator=(LayerNodeData &&o)
   // The source reference is transferred, not released and reacquired.
   o.m_value.reset();
   o.noteEdit();
+  o.noteMetadataChange();
   return *this;
 }
 
@@ -218,8 +228,10 @@ void LayerNodeData::setToDefaultValue()
 
 void LayerNodeData::setCurrentValueAsDefault()
 {
-  if (isTransform())
+  if (isTransform()) {
+    noteMetadataChange();
     m_defaultValue = m_value;
+  }
 }
 
 anari::DataType LayerNodeData::type() const
@@ -272,8 +284,10 @@ void LayerNodeData::setAsTransform(const math::mat4 &m)
   noteEdit();
   decObjectUseCount();
   m_value = m;
-  if (!hasDefault())
+  if (!hasDefault()) {
+    noteMetadataChange();
     m_defaultValue = m_value;
+  }
 
   auto &sc = m_srt[0];
   auto &azelrot = m_srt[1];
@@ -286,6 +300,7 @@ void LayerNodeData::setAsTransform(const math::mat4 &m)
 void LayerNodeData::setAsTransform(
     const math::mat4 &m, const math::mat4 &defaultM)
 {
+  noteMetadataChange();
   m_defaultValue = defaultM;
   setAsTransform(m);
 }
@@ -312,8 +327,10 @@ void LayerNodeData::setAsTransform(const math::mat3 &srt)
 
   m_value = math::mul(
       math::translation_matrix(tl), math::mul(rot, math::scaling_matrix(sc)));
-  if (!hasDefault())
+  if (!hasDefault()) {
+    noteMetadataChange();
     m_defaultValue = m_value;
+  }
 }
 
 void LayerNodeData::setTransformState(
@@ -339,7 +356,7 @@ void LayerNodeData::setEmpty()
   m_srt[1] = math::float3(0.f, 0.f, 0.f);
   m_srt[2] = math::float3(0.f, 0.f, 0.f);
   clearInstanceParameters();
-  m_name.clear();
+  setName({});
 }
 
 void LayerNodeData::setEnabled(bool e)
@@ -356,6 +373,19 @@ std::uint64_t LayerNodeData::editVersion() const
 std::uint64_t LayerNodeData::transformVersion() const
 {
   return m_transformVersion;
+}
+
+std::uint64_t LayerNodeData::metadataSequence() const
+{
+  return m_metadataSequence;
+}
+
+void LayerNodeData::noteMetadataChange()
+{
+  // Local history still advances for detached payloads and expired owners.
+  if (++m_metadataSequence == 0)
+    std::terminate();
+  noteDependencyChange();
 }
 
 void LayerNodeData::noteDependencyChange()
@@ -420,9 +450,10 @@ Array *LayerNodeData::getTransformArray() const
   return nullptr;
 }
 
-std::string &LayerNodeData::name()
+void LayerNodeData::setName(std::string name)
 {
-  return m_name;
+  noteMetadataChange();
+  m_name = std::move(name);
 }
 
 const std::string &LayerNodeData::name() const
@@ -433,6 +464,16 @@ const std::string &LayerNodeData::name() const
 Any LayerNodeData::getValueRaw() const
 {
   return m_value;
+}
+
+const Any &LayerNodeData::valueRaw() const
+{
+  return m_value;
+}
+
+const Any &LayerNodeData::defaultValueRaw() const
+{
+  return m_defaultValue;
 }
 
 void LayerNodeData::setValueRaw(const Any &v, bool ignoreObjectUsageCounts)
@@ -453,13 +494,13 @@ const InstanceParameterMap &LayerNodeData::getInstanceParameters() const
 
 void LayerNodeData::setInstanceParameter(const std::string &name, Any v)
 {
-  noteDependencyChange();
+  noteMetadataChange();
   m_instanceParameters.set(name, v);
 }
 
 void LayerNodeData::clearInstanceParameters()
 {
-  noteDependencyChange();
+  noteMetadataChange();
   m_instanceParameters.clear();
 }
 
@@ -467,6 +508,13 @@ void LayerNodeData::incObjectUseCount()
 {
   if (auto *o = getObject(); o)
     o->incUseCount(Object::UseKind::LAYER);
+}
+
+void LayerNodeData::remapObjectIndex(size_t index)
+{
+  // Storage relocation is not an ordinary editable write. Scene defrag alone
+  // can use this path; the public raw setter still spends edit history.
+  m_value = Any(m_value.type(), index);
 }
 
 void LayerNodeData::decObjectUseCount()

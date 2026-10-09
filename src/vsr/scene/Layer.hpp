@@ -42,12 +42,14 @@ struct Layer final
   }
 
   const std::string &name() const;
-  std::string &editableName();
+  std::uint64_t metadataSequence() const;
+  void setName(std::string name);
 
   // Nodes within the layer //
 
   size_t size() const;
   size_t capacity() const;
+  bool profileStorage(StorageProfile &profile, size_t reserveSize) const;
   bool empty() const;
 
   LayerNodeRef root() const;
@@ -71,16 +73,26 @@ struct Layer final
 
  private:
   void noteMembershipChange();
+  void noteMetadataChange();
   void revokeMembership();
   void validateCopy(const LayerNodeData &value) const;
 
   friend struct Scene; // Scene removal revokes tracking, not object resolution.
+  friend class detail::PreparedHdriContent;
+  friend class detail::PreparedHdriRemoval;
   friend struct LayerNodeData;
   const std::uint64_t m_lifetime;
   std::shared_ptr<detail::LayerOwnerState> m_owner;
   std::string m_name;
+  std::uint64_t m_metadataSequence{1};
   Forest<LayerNodeData> m_tree;
 };
+
+inline bool Layer::profileStorage(
+    StorageProfile &profile, size_t reserveSize) const
+{
+  return m_tree.profileStorage(profile, reserveSize);
+}
 
 using LayerVisitor = Layer::Visitor;
 

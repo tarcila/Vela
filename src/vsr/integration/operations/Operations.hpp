@@ -268,7 +268,7 @@ struct Step
   // Optional bounded-result copy reservation (no global result-store change).
   // Called before copying visible payloads to a public Status, including
   // replay.
-  std::function<std::shared_ptr<const void>()> reserveStatus;
+  ResultOwnership::Reserve reserveStatus;
   // No-fail ownership handoff only after COMPLETE is accepted, never after
   // cancellation/deadline. Runs under the record lock: no engine reentrancy,
   // I/O or allocation. The executor must not publish ownership speculatively.
@@ -599,7 +599,7 @@ class OperationEngine
     std::string result;
     std::string commitFallback; // unpublished until the first Scene write
     std::optional<ActivitySink::Id> activityId;
-    std::function<std::shared_ptr<const void>()> reserveStatus;
+    ResultOwnership::Reserve reserveStatus;
   };
 
   using Key = std::pair<std::string, std::uint64_t>;
@@ -943,7 +943,7 @@ inline ActivityEvent OperationEngine::eventOf(
   e.covered = r.covered;
   const bool borrowed = r.resourceLease
       && (r.kind == "image_import" || r.kind == "mesh_import"
-          || r.kind == "restore");
+          || r.kind == "create_hdri" || r.kind == "restore");
   e.status = describe(r, !borrowed, now);
   if (borrowed)
     e.resultPayload = &r.result;
@@ -1289,12 +1289,15 @@ inline bool OperationEngine::dispatch(
     const Key &key, std::optional<SceneId> cleanupScene)
 {
   std::optional<SceneId> scene;
+  std::shared_ptr<const void> captureLease;
   {
     std::lock_guard<std::mutex> lock(m_mutex);
     auto *r = find(key);
     if (!r)
       return false;
     scene = sceneFor(r->sessionWide, r->target);
+    if (r->kind == "create_hdri")
+      captureLease = r->resourceLease;
     // A view may close while its backend owns preparation/encoding. A wake
     // retains the original Scene safe-point route for cleanup only, never a
     // replacement view. Normal queued work still requires a live target.
@@ -1306,15 +1309,16 @@ inline bool OperationEngine::dispatch(
   bool ok = false;
   try {
     if (scene && *scene == INVALID_SCENE_ID) {
-      ok = m_integration.submitSessionWork([this, alive, key] {
+      ok = m_integration.submitSessionWork([this, alive, key, captureLease] {
         if (alive.lock())
           runStep(key, placeholderScene());
       });
     } else if (scene) {
-      ok = m_integration.submit(*scene, [this, alive, key](scene::Scene &s) {
-        if (alive.lock())
-          runStep(key, s);
-      });
+      ok = m_integration.submit(
+          *scene, [this, alive, key, captureLease](scene::Scene &s) {
+            if (alive.lock())
+              runStep(key, s);
+          });
     }
   } catch (const std::bad_alloc &) {
     ok = false;
@@ -1392,6 +1396,7 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
   }
 
   Executor executor;
+  std::shared_ptr<const void> callbackLease;
   bool abandoned = false;
   bool sharedRetention = false;
   {
@@ -1411,6 +1416,8 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
     }
     abandoned = r->terminal.has_value();
     executor = r->executor;
+    if (r->kind == "create_hdri")
+      callbackLease = r->resourceLease;
     sharedRetention = m_sink != nullptr;
     r->executing = true;
     // Committed work re-dispatched to run its normal-synchronization hook
@@ -1447,6 +1454,17 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
     return !r || r->terminal.has_value() || r->pendingCancel.has_value()
         || (r->deadline > 0. && m_clock() >= r->deadline);
   };
+  if (callbackLease) {
+    // Worker/pump copies share each engine-produced guard, not its captured
+    // key strings. Keep preparation coverage through the LAST guard owner,
+    // independently of Job completion or record expiry.
+    auto wake =
+        std::make_shared<const std::function<void()>>(std::move(ctx.wake));
+    auto abandoned = std::make_shared<const std::function<bool()>>(
+        std::move(ctx.isAbandoned));
+    ctx.wake = [wake, callbackLease] { (*wake)(); };
+    ctx.isAbandoned = [abandoned, callbackLease] { return (*abandoned)(); };
+  }
   ctx.beforeWrite = [this,
                         alive,
                         key,
@@ -1521,7 +1539,10 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
     std::lock_guard<std::mutex> lock(m_mutex);
     const auto *r = find(key);
     ctx.recoveryApprovalRequested = r && r->approvalRequestId.has_value();
-    ctx.reserveRecoveryMemory = m_recoveryReserve;
+    // HDRI passes its own shared dispatch authority. Do not copy a host's
+    // otherwise opaque legacy recovery callback into unused worker context.
+    if (!callbackLease)
+      ctx.reserveRecoveryMemory = m_recoveryReserve;
   }
   ctx.authorizeRecovery = [this, alive, key, &ctx](std::size_t bytes,
                               std::string_view canonical,

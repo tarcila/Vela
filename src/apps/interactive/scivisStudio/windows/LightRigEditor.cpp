@@ -263,7 +263,7 @@ void LightRigEditor::buildUI_lightList(LightRig &rig)
 
     ImGui::BeginDisabled(m_renameLightName.empty() || !selectedNode);
     if (ImGui::Button("Rename") && selectedNode) {
-      (*selectedNode)->name() = m_renameLightName;
+      (*selectedNode)->setName(m_renameLightName);
       if (auto *object = (*selectedNode)->getObject())
         object->setName(m_renameLightName);
       m_projectContext->project().markDirty();

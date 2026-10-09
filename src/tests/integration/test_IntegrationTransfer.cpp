@@ -224,7 +224,7 @@ SCENARIO("public clones bind to their destination and preserve exact payloads",
       vsr::math::float3(0.f, 8.f, 0.f)};
   source->value().setTransformState(matrix, srt);
   source->value().setEnabled(false);
-  source->value().name() = "branch";
+  source->value().setName("branch");
   source->value().setInstanceParameter("id", vsr::core::Any(9));
   if (nonleaf) {
     scene.insertChildObjectNode(source, object, "light");

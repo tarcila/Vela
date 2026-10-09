@@ -170,7 +170,7 @@ bool deserialize_Layer(
       else
         (*currentNode)->setValueRaw(node["value"].getValue());
       (*currentNode)->setEnabled(node["enabled"].getValueOr(true));
-      (*currentNode)->name() = node["name"].getValueAs<std::string>();
+      (*currentNode)->setName(node["name"].getValueAs<std::string>());
       deserializeLayerNodeInstanceParameters(node, (*currentNode).value());
     }
 

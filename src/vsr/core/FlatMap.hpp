@@ -56,6 +56,7 @@ struct FlatMap
   // Property queries //
 
   size_t size() const;
+  size_t backingCapacity() const;
   bool empty() const;
 
   bool contains(const KEY &key) const;
@@ -161,6 +162,12 @@ template <typename KEY, typename VALUE>
 inline size_t FlatMap<KEY, VALUE>::size() const
 {
   return values.size();
+}
+
+template <typename KEY, typename VALUE>
+inline size_t FlatMap<KEY, VALUE>::backingCapacity() const
+{
+  return values.capacity();
 }
 
 template <typename KEY, typename VALUE>

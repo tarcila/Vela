@@ -4,9 +4,11 @@
 #pragma once
 
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <utility>
 #include <vector>
+#include "vsr/core/StorageProfile.hpp"
 
 namespace vsr::core {
 
@@ -47,12 +49,18 @@ struct ObjectPool
   // Logical slot extent, including empty slots; not backing vector capacity.
   size_t capacity() const;
   bool empty() const;
+  // Actual backing and simultaneous old/new reserve peak, not slot extent.
+  bool profileStorage(StorageProfile &profile, size_t reserveSize) const;
 
   bool slot_empty(size_t i) const;
   float density() const;
   bool is_dense() const;
 
   ObjectPoolRef<T> insert(T &&v);
+  // Append a prepared value at the logical tail without default-constructing
+  // a slot or recycling a free index. reserve(capacity()+1) must precede it.
+  bool can_append_reserved() const;
+  ObjectPoolRef<T> append_reserved(T &&v);
   template <typename... Args>
   ObjectPoolRef<T> emplace(Args &&...args);
   // Place a value in slot i, growing the pool with empty slots as needed;
@@ -61,6 +69,10 @@ struct ObjectPool
   template <typename... Args>
   ObjectPoolRef<T> emplace_at(size_t i, Args &&...args);
   bool erase(size_t i);
+  // Prepared transactions provide a detached empty payload when its default
+  // constructor can allocate. reserve() also secures free-index storage.
+  bool can_erase_reserved(size_t count) const;
+  bool erase_prepared(size_t i, T &&emptyValue);
 
   void clear();
   // Reserve backing values/markers/free indices without changing the logical
@@ -198,6 +210,30 @@ inline size_t ObjectPool<T>::capacity() const
 }
 
 template <typename T>
+inline bool ObjectPool<T>::profileStorage(
+    StorageProfile &profile, size_t reserveSize) const
+{
+#ifdef __GLIBCXX__
+  // libstdc++ vector::reserve allocates exactly n elements. vector<bool>
+  // rounds to machine-word bits; cover one complete extra word. No payload
+  // copy occurs: Scene Objects are move-only and ForestNode relocation is
+  // noexcept. Payload metadata is profiled separately by the Scene seam.
+  const auto values = m_values.capacity();
+  const auto markers = m_slots.capacity();
+  const auto indices = m_freeIndices.capacity();
+  return profile.add(values, sizeof(T))
+      && profile.add(markers / 8 + sizeof(unsigned long))
+      && profile.add(indices, sizeof(size_t))
+      && (reserveSize <= values || profile.add(reserveSize, sizeof(T)))
+      && (reserveSize <= markers
+          || profile.add(reserveSize / 8 + sizeof(unsigned long)))
+      && (reserveSize <= indices || profile.add(reserveSize, sizeof(size_t)));
+#else
+  return false;
+#endif
+}
+
+template <typename T>
 inline bool ObjectPool<T>::empty() const
 {
   return size() == 0;
@@ -235,6 +271,22 @@ inline ObjectPoolRef<T> ObjectPool<T>::insert(T &&v)
     m_slots[i] = true;
     return at(i);
   }
+}
+
+template <typename T>
+inline bool ObjectPool<T>::can_append_reserved() const
+{
+  return m_values.capacity() > m_values.size()
+      && m_slots.capacity() > m_slots.size();
+}
+
+template <typename T>
+inline ObjectPoolRef<T> ObjectPool<T>::append_reserved(T &&v)
+{
+  assert(can_append_reserved());
+  m_values.emplace_back(std::move(v));
+  m_slots.push_back(true);
+  return at(m_values.size() - 1);
 }
 
 template <typename T>
@@ -287,6 +339,24 @@ inline bool ObjectPool<T>::erase(size_t i)
   m_slots[i] = false;
   m_freeIndices.push_back(i);
 
+  return true;
+}
+
+template <typename T>
+inline bool ObjectPool<T>::can_erase_reserved(size_t count) const
+{
+  return count <= m_freeIndices.capacity() - m_freeIndices.size();
+}
+
+template <typename T>
+inline bool ObjectPool<T>::erase_prepared(size_t i, T &&emptyValue)
+{
+  if (slot_empty(i))
+    return false;
+  assert(can_erase_reserved(1));
+  m_values[i] = std::move(emptyValue);
+  m_slots[i] = false;
+  m_freeIndices.push_back(i);
   return true;
 }
 

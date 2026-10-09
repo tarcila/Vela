@@ -22,6 +22,8 @@ namespace vsr::scene {
 namespace detail {
 class PreparedPositionBinding;
 class PreparedMeshBinding;
+class PreparedHdriContent;
+class PreparedHdriRemoval;
 } // namespace detail
 struct Object;
 } // namespace vsr::scene
@@ -181,7 +183,13 @@ struct Object : public ParameterObserver
  private:
   friend class detail::PreparedPositionBinding;
   friend class detail::PreparedMeshBinding;
+  friend class detail::PreparedHdriContent;
+  friend class detail::PreparedHdriRemoval;
   friend struct Scene;
+  friend struct Parameter;
+  void requireMetadataHistory() const;
+  void advanceParameterMetadata();
+  void bindParameterObservers();
   void incObjectUseCountParameter(const Parameter *p);
   void decObjectUseCountParameter(const Parameter *p);
 
@@ -193,6 +201,7 @@ struct Object : public ParameterObserver
   void objectMetadataChanged();
 
   Scene *m_scene{nullptr};
+  std::shared_ptr<ParameterOwnerLifetime> m_parameterOwner;
 
   ParameterMap m_parameters;
   bool m_inParameterBatch{false};

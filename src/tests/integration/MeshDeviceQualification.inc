@@ -9,6 +9,7 @@ struct MeshQualificationDevice
 {
   explicit MeshQualificationDevice(const char *name);
   ~MeshQualificationDevice();
+  const char *lightingRenderer(const std::string &name) const;
   VSR_NOT_COPYABLE(MeshQualificationDevice)
   VSR_NOT_MOVEABLE(MeshQualificationDevice)
   anari::Library library{nullptr};
@@ -33,6 +34,21 @@ MeshQualificationDevice::MeshQualificationDevice(const char *name)
     if (device)
       anari::commitParameters(device, device);
   }
+}
+
+const char *MeshQualificationDevice::lightingRenderer(
+    const std::string &name) const
+{
+  // Require an explicit known lighting profile, rather than assuming a
+  // backend's default implements HDRI. No fallback to a diagnostic subtype.
+  const char *wanted = name == "visrtx" ? "quality" : "default";
+  const auto *types = anariGetObjectSubtypes(device, ANARI_RENDERER);
+  for (auto p = types; p && *p; ++p) {
+    std::fprintf(stderr, "HDRI renderer subtype: %s\n", *p);
+    if (std::strcmp(*p, wanted) == 0)
+      return wanted;
+  }
+  return nullptr;
 }
 
 MeshQualificationDevice::~MeshQualificationDevice()

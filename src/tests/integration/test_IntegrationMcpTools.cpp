@@ -18,6 +18,7 @@
 #include "vsr/integration/Integration.hpp"
 #include "vsr/integration/activity/Activity.hpp"
 #include "vsr/integration/mcp/McpServer.hpp"
+#include "vsr/integration/mcp/tools/ContentTools.hpp"
 #include "vsr/integration/mcp/tools/EditTools.hpp"
 #include "vsr/integration/mcp/tools/FrameTools.hpp"
 #include "vsr/integration/mcp/tools/ImageTools.hpp"
@@ -368,6 +369,20 @@ std::string token(const R &r)
       + std::to_string(r.value);
 }
 
+// Fault injection is an externally owned test service. The production creator
+// receives only the shared service/dispatch pair, never copies this opaque
+// target. Existing Image/Mesh fixture authority remains unchanged.
+struct HdriTestReservation
+{
+  std::function<std::shared_ptr<const void>(size_t)> callback;
+  std::shared_ptr<const void> reserve(size_t bytes) const;
+};
+
+std::shared_ptr<const void> HdriTestReservation::reserve(size_t bytes) const
+{
+  return callback(bytes);
+}
+
 struct Fixture
 {
   vsr::scene::Scene scene;
@@ -387,6 +402,7 @@ struct Fixture
   std::unique_ptr<edit::TranslationService> translations;
   std::unique_ptr<restore::RestoreService> restores;
   std::unique_ptr<image::ImageExchange> images;
+  std::unique_ptr<content::ContentCreation> creator;
   bool hookOk{true};
   TempDir tmp;
   descriptor::RuntimeDirectory dir;
@@ -401,7 +417,8 @@ struct Fixture
       std::uint64_t writeLimit = UINT64_MAX,
       image::ExchangeLimits exchangeLimits = {},
       bool imageImports = false,
-      operations::Limits engineLimits = {})
+      operations::Limits engineLimits = {},
+      bool contentCreation = false)
       : integration(DEFAULT_QUEUE_CAPACITY, writeLimit)
   {
     for (int i = 0; i < 5; i++)
@@ -499,6 +516,19 @@ struct Fixture
     mcp::Config cfg;
     cfg.imageExchange = images->metadata(sceneId);
     mcp::tools::addImageTools(cfg.tools, {ids, *images});
+    if (contentCreation) {
+      REQUIRE(imageImports);
+      auto hdriAuthority = std::make_shared<HdriTestReservation>();
+      hdriAuthority->callback = std::move(exchangeLimits.reservePhysicalMemory);
+      creator = std::make_unique<content::ContentCreation>(integration,
+          *engine,
+          *edits,
+          *imageActivity,
+          operations::Reservation::from(std::move(hdriAuthority)));
+      creator->attachScene(sceneId, *sceneIds);
+      REQUIRE(creator->assetRoots().approve(tmp.path));
+      mcp::tools::addContentTools(cfg.tools, ids, *creator, *engine);
+    }
     mcp::tools::addQueryTools(cfg.tools, {*engine, *inspector});
     mcp::tools::addLookupTools(cfg.tools, *engine);
     mcp::tools::addEditTools(
@@ -605,6 +635,8 @@ struct Fixture
   {
     for (;;) {
       images->pump();
+      if (creator)
+        creator->pump();
       if (integration.service() == 0)
         break;
     }
@@ -1662,8 +1694,8 @@ SCENARIO("MCP minimal filters preserve meaningful empty names",
     f.scene.getObject<vsr::scene::Material>(i)->setName("named");
   f.scene.defaultCamera()->setName("named-camera");
   auto *layer = f.scene.defaultLayer();
-  layer->editableName() = "";
-  layer->root()->value().name() = "named-root";
+  layer->setName("");
+  layer->root()->value().setName("named-root");
   layer->root()->insert_last_child(vsr::scene::LayerNodeData(layer, ""));
   layer->root()->insert_last_child(vsr::scene::LayerNodeData(layer, "named"));
   f.scene.signalLayerStructureChanged(layer);
@@ -1792,7 +1824,7 @@ SCENARIO("MCP layer queries expose live layer and root handles",
   Fixture f;
   f.scene.removeAllLayers();
   auto *layer = f.scene.addLayer("wire-key");
-  layer->editableName() = "wire-name";
+  layer->setName("wire-name");
   f.scene.signalLayerStructureChanged(layer);
   f.scene.setLayerActive("wire-key", false);
   auto list = f.rpc("tools/list", "{}");
@@ -12070,6 +12102,13 @@ SCENARIO(
 #include "RetentionPressure.inc"
 
 // Approval cancellation reuses the bounded read gate declared above.
+#include "HdriCreationMcp.inc"
+#include "HdriOutsideUseMcp.inc"
+#include "HdriRestoreMcp.inc"
+#include "HdriSafetyMcp.inc"
+// Pressure/final-guard/teardown tests reuse the real HDRI fixture above.
+#include "HdriLifecycleMcp.inc"
+#include "HdriPressureMcp.inc"
 #include "RecoveryApprovalBoundaries.inc"
 #include "RecoveryApprovalFailure.inc"
 #include "RecoveryApprovalGeneric.inc"

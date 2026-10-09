@@ -55,9 +55,22 @@ const std::string &Layer::name() const
   return m_name;
 }
 
-std::string &Layer::editableName()
+std::uint64_t Layer::metadataSequence() const
 {
-  return m_name;
+  return m_metadataSequence;
+}
+
+void Layer::setName(std::string name)
+{
+  noteMetadataChange();
+  m_name = std::move(name);
+}
+
+void Layer::noteMetadataChange()
+{
+  if (++m_metadataSequence == 0)
+    std::terminate();
+  noteMembershipChange();
 }
 
 size_t Layer::size() const

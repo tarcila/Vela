@@ -388,7 +388,7 @@ SCENARIO("storage relocation preserves exact payload and ancestor history",
       vsr::math::float3(12.f, 34.f, 56.f),
       vsr::math::float3(0.f, 8.f, 0.f)};
   node->value().setTransformState(matrix, srt);
-  node->value().name() = "exact payload";
+  node->value().setName("exact payload");
   node->value().setEnabled(false);
   node->value().setInstanceParameter("id", vsr::core::Any(9));
   const auto handle = ids.handleOf(node);
@@ -1308,8 +1308,10 @@ SCENARIO("Inspection revisions change independently of edit and render",
   SECTION("metadata change")
   {
     m->setMetadataValue("tag", 3);
-    REQUIRE(ids.refreshAllMetadata());
-    REQUIRE(ids.inspectionRevision() != inspectBefore);
+    const auto notified = ids.inspectionRevision();
+    REQUIRE(notified != inspectBefore);
+    REQUIRE_FALSE(ids.refreshAllMetadata());
+    REQUIRE(ids.inspectionRevision() == notified);
     REQUIRE(ids.sceneRevision() == sceneBefore);
     REQUIRE(ids.isCurrent(token));
   }

@@ -8,6 +8,7 @@
 
 // vsr_integration
 #include "vsr/integration/Integration.hpp"
+#include "vsr/integration/content/HdriRemoval.hpp"
 #include "vsr/integration/identity/Identity.hpp"
 #include "vsr/integration/operations/Operations.hpp"
 #include "vsr/integration/session/SessionAuthority.hpp"
@@ -548,8 +549,29 @@ struct MeshSnapshot : ImageSnapshot
   std::size_t retainedBytes{0};
 };
 
+// HDRI exact removal shares the prepared scope/control machinery, but retains
+// only weak owned-content evidence: ImageSnapshot::bytes stays empty.
+struct HdriSnapshot : ImageSnapshot
+{
+  content::HdriRemovalEvidence evidence;
+  // Temporary deletion tombstones can outlive pool erasure, but never enter
+  // retained undo evidence. Acquire their physical ownership before deletion.
+  operations::Reservation reserveRemoval;
+  std::size_t retainedBytes{0};
+};
+
 struct RestorationRecord
 {
+  // Independent coverage precedes every value copy of the record's strings.
+  // Shared snapshots still have one physical allocation, not another texel pin.
+  operations::ResultOwnership ownership;
+  RestorationRecord() = default;
+  RestorationRecord(const RestorationRecord &) = default;
+  RestorationRecord(RestorationRecord &&) noexcept = default;
+  RestorationRecord &operator=(const RestorationRecord &other);
+  RestorationRecord &operator=(RestorationRecord &&other) noexcept;
+  void swap(RestorationRecord &other) noexcept;
+
   BatchRef ref;
   SceneId scene{INVALID_SCENE_ID};
   std::optional<OperationRef> provenance; // external work
@@ -561,6 +583,7 @@ struct RestorationRecord
   std::shared_ptr<ImageSnapshot> image;
   // Mesh reuses Image's prepared bounded store/scope/receipt ownership.
   std::shared_ptr<MeshSnapshot> mesh;
+  std::shared_ptr<HdriSnapshot> hdri;
 };
 
 // Active reservations are bounded (32 by default). Qualified hosts use the
@@ -581,6 +604,7 @@ class RestorationStore
   void publish(RestorationRecord record, bool sharedRetention = false);
   // Allocate all store/control state before an Image's write boundary.
   bool prepareImage(RestorationRecord record);
+  static std::size_t hdriScopeBytes(const BatchRef &ref);
   void publishImage(const BatchRef &ref);
   void cancelImage(const BatchRef &ref);
   std::optional<SceneId> imageScope(const BatchRef &ref) const;
@@ -613,6 +637,9 @@ class RestorationStore
   std::size_t m_reserved{0};
   std::map<std::string, RestorationRecord> m_records;
   std::map<std::string, RestorationRecord> m_pendingImages;
+  // Coverage for persistent order-vector growth attributable to HDRI creation.
+  // Declared before the vectors: their backing dies before these leases.
+  operations::ResultOwnership m_hdriOrderOwnership;
   struct ImageScope
   {
     std::shared_ptr<const void> lease;
@@ -732,6 +759,43 @@ inline bool operator==(const BatchRef &a, const BatchRef &b)
   return a.launchId == b.launchId && a.batchId == b.batchId;
 }
 
+inline void RestorationRecord::swap(RestorationRecord &other) noexcept
+{
+  using std::swap;
+  swap(ref, other.ref);
+  swap(scene, other.scene);
+  swap(provenance, other.provenance);
+  swap(localProvenance, other.localProvenance);
+  swap(changes, other.changes);
+  swap(resultingVersions, other.resultingVersions);
+  swap(nodeChanges, other.nodeChanges);
+  swap(publicationBytes, other.publicationBytes);
+  swap(image, other.image);
+  swap(mesh, other.mesh);
+  swap(hdri, other.hdri);
+  swap(ownership, other.ownership);
+}
+
+inline RestorationRecord &RestorationRecord::operator=(
+    const RestorationRecord &other)
+{
+  if (this != &other) {
+    RestorationRecord copy(other);
+    swap(copy);
+  }
+  return *this;
+}
+
+inline RestorationRecord &RestorationRecord::operator=(
+    RestorationRecord &&other) noexcept
+{
+  if (this != &other) {
+    RestorationRecord moved(std::move(other));
+    swap(moved);
+  }
+  return *this;
+}
+
 // RestorationStore //
 
 inline RestorationStore::RestorationStore(std::size_t capacity)
@@ -759,6 +823,8 @@ inline void RestorationStore::cancelReservation()
 inline bool RestorationStore::prepareRecord(const BatchRef &ref)
 {
   std::lock_guard<std::mutex> lock(m_mutex);
+  if (m_hdriOrderOwnership.lease && m_order.size() > 4096)
+    return false;
   m_order.reserve(m_order.size() + m_reserved + 1);
   RestorationRecord pending;
   pending.ref = ref;
@@ -796,6 +862,24 @@ inline void RestorationStore::publish(
   m_records[id] = std::move(record);
 }
 
+inline std::size_t RestorationStore::hdriScopeBytes(const BatchRef &ref)
+{
+#if defined(__GLIBCXX__)
+  core::StorageProfile scope(64u << 10);
+  using RecordNode =
+      std::_Rb_tree_node<std::pair<const std::string, RestorationRecord>>;
+  using ScopeNode =
+      std::_Rb_tree_node<std::pair<const std::string, ImageScope>>;
+  if (!scope.add(sizeof(RecordNode) + sizeof(ScopeNode))
+      || !scope.add(4, ref.batchId.size() + 1)
+      || !scope.add(4, ref.launchId.size() + ref.batchId.size() + 2))
+    return 0;
+  return scope.bytes();
+#else
+  return 0;
+#endif
+}
+
 inline bool RestorationStore::prepareImage(RestorationRecord record)
 {
   std::lock_guard<std::mutex> lock(m_mutex);
@@ -803,6 +887,35 @@ inline bool RestorationStore::prepareImage(RestorationRecord record)
     return false;
   const auto id = record.ref.batchId;
   const auto scopeKey = record.ref.launchId + "/" + id;
+  if (record.hdri) {
+    // Existing Store/Activity history has bounded counts, not an unlimited
+    // allocation license. Qualify the actual vector growth before allocation;
+    // a replacement charge overlaps the old charge until reserve completes.
+    if (m_capacity > 4096 || m_order.size() > 4096
+        || m_imageScopeOrder.size() > 1024)
+      return false;
+    // Reserve the declared bounded history capacities, not just this append.
+    // Later ordinary edits can reuse these vectors without growing an HDRI-
+    // attributable allocation beyond its surviving Store-owned coverage.
+    const size_t orderCapacity = 4096 + m_capacity + 1;
+    const size_t scopeCapacity = 1024 + m_capacity + 1;
+    if (m_order.capacity() > orderCapacity
+        || m_imageScopeOrder.capacity() > scopeCapacity)
+      return false;
+    core::StorageProfile profile(4u << 20);
+    if (!profile.add(m_order.capacity() + orderCapacity, sizeof(std::string))
+        || !profile.add(
+            m_imageScopeOrder.capacity() + scopeCapacity, sizeof(std::string)))
+      return false;
+    operations::ResultOwnership growth(operations::ResultOwnership::Reserve(
+        record.hdri->reserveRemoval, profile.bytes()));
+    auto prior = std::move(m_hdriOrderOwnership);
+    m_hdriOrderOwnership = std::move(growth);
+    // Keep new coverage even if the second reserve throws after the first
+    // leaves persistent capacity. The old owner covers the overlap here.
+    m_order.reserve(orderCapacity);
+    m_imageScopeOrder.reserve(scopeCapacity);
+  }
   // Allocations here may fail; no write has occurred. Rollback the partial
   // control state before propagating an allocation failure to admission.
   try {
@@ -893,11 +1006,20 @@ inline bool RestorationStore::setImageState(
     const BatchRef &ref, ImageState state)
 {
   std::lock_guard<std::mutex> lock(m_mutex);
-  const auto it = m_imageScopes.find(ref.launchId + "/" + ref.batchId);
-  if (it == m_imageScopes.end())
-    return false;
-  it->second.state = state;
-  return true;
+  // Used after irreversible writes. Match the prepared scope key without
+  // constructing a temporary launch-qualified string.
+  for (auto &entry : m_imageScopes) {
+    const auto &key = entry.first;
+    if (key.size() == ref.launchId.size() + 1 + ref.batchId.size()
+        && key.compare(0, ref.launchId.size(), ref.launchId) == 0
+        && key[ref.launchId.size()] == '/'
+        && key.compare(ref.launchId.size() + 1, ref.batchId.size(), ref.batchId)
+            == 0) {
+      entry.second.state = state;
+      return true;
+    }
+  }
+  return false;
 }
 
 inline void RestorationStore::expireLocked(const std::string &id)
@@ -962,9 +1084,13 @@ inline std::size_t restorationBytes(const RestorationRecord &record)
       + record.resultingVersions.capacity() * sizeof(ParameterVersionToken);
   n += record.nodeChanges.capacity() * sizeof(NodeChange);
   // Map node, order key and allocation/control bookkeeping.
-  n += 4096 + record.publicationBytes;
+  if (!record.hdri)
+    n += 4096; // Legacy services' bounded publication allowance.
+  n += record.publicationBytes;
   if (record.image)
     n += record.image->bytes.size();
+  if (record.hdri)
+    n += record.hdri->retainedBytes;
   for (auto &c : record.changes)
     n += sizeof(Change) + c.parameter.size() + anyBytes(c.before)
         + anyBytes(c.after);

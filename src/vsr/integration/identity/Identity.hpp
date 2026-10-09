@@ -17,6 +17,10 @@
 namespace vsr::integration::mesh {
 class MeshCommitAccess;
 }
+namespace vsr::integration::content {
+class PreparedHdriPublication;
+class PreparedHdriRemoval;
+} // namespace vsr::integration::content
 
 namespace vsr::integration::identity {
 
@@ -155,6 +159,33 @@ struct NodeEditVersionToken
   }
 };
 
+// Metadata evidence names identities, never retained payload pointers. Layer
+// handles include their registered lifetime; node tokens also bind that Layer.
+struct NodeMetadataVersionToken
+{
+  NodeHandle node;
+  LayerHandle layer;
+  std::uint64_t sequence{0};
+
+  friend bool operator==(
+      const NodeMetadataVersionToken &a, const NodeMetadataVersionToken &b)
+  {
+    return a.node == b.node && a.layer == b.layer && a.sequence == b.sequence;
+  }
+};
+
+struct LayerMetadataVersionToken
+{
+  LayerHandle layer;
+  std::uint64_t sequence{0};
+
+  friend bool operator==(
+      const LayerMetadataVersionToken &a, const LayerMetadataVersionToken &b)
+  {
+    return a.layer == b.layer && a.sequence == b.sequence;
+  }
+};
+
 struct ParameterVersionToken
 {
   ObjectHandle object;
@@ -254,6 +285,15 @@ class SceneIdentity
       const NodeHandle &h) const;
   bool isCurrent(const NodeEditVersionToken &t) const;
 
+  // Owned-content metadata guards, deliberately not folded into transform-only
+  // recovery or borrowed destination/ancestry evidence.
+  std::optional<NodeMetadataVersionToken> nodeMetadataVersion(
+      const NodeHandle &h) const;
+  std::optional<LayerMetadataVersionToken> layerMetadataVersion(
+      const LayerHandle &h) const;
+  bool isCurrent(const NodeMetadataVersionToken &t) const;
+  bool isCurrent(const LayerMetadataVersionToken &t) const;
+
   // Parameter versions //
 
   std::optional<ParameterVersionToken> parameterVersion(
@@ -307,6 +347,8 @@ class SceneIdentity
     std::size_t metadataFingerprint{0};
     std::weak_ptr<scene::ArrayLifetime> arrayLifetime;
     bool array{false};
+    // Prepared additive publication enrolled this object before callbacks.
+    bool publishedBeforeNotification{false};
   };
 
   struct LayerEntry
@@ -322,6 +364,8 @@ class SceneIdentity
   class Observer;
   friend class Observer;
   friend class ::vsr::integration::mesh::MeshCommitAccess;
+  friend class ::vsr::integration::content::PreparedHdriPublication;
+  friend class ::vsr::integration::content::PreparedHdriRemoval;
 
   static anari::DataType normalize(anari::DataType t);
   static bool isViewObject(anari::DataType t);
@@ -497,7 +541,10 @@ class SceneIdentity::Observer : public scene::BaseUpdateDelegate
   void signalObjectLayerUseCountZero(const scene::Object *) override {}
   void signalObjectRemoved(const scene::Object *o) override
   {
-    m_owner->untrack(o);
+    // Prepared deletion unregisters before callbacks and delivers detached
+    // tombstones. A consumer may already have reused the released pool slot.
+    if (o && o->scene() == m_owner->m_scene)
+      m_owner->untrack(o);
   }
   void signalRemoveAllObjects() override
   {
@@ -728,6 +775,37 @@ inline bool SceneIdentity::isCurrent(const NodeEditVersionToken &t) const
   return current && *current == t;
 }
 
+inline std::optional<NodeMetadataVersionToken>
+SceneIdentity::nodeMetadataVersion(const NodeHandle &h) const
+{
+  auto node = resolve(h);
+  if (!node)
+    return {};
+  return NodeMetadataVersionToken{
+      h, handleOf(node->value().layer()), node->value().metadataSequence()};
+}
+
+inline std::optional<LayerMetadataVersionToken>
+SceneIdentity::layerMetadataVersion(const LayerHandle &h) const
+{
+  auto *layer = resolve(h);
+  if (!layer)
+    return {};
+  return LayerMetadataVersionToken{h, layer->metadataSequence()};
+}
+
+inline bool SceneIdentity::isCurrent(const NodeMetadataVersionToken &t) const
+{
+  auto current = nodeMetadataVersion(t.node);
+  return current && *current == t;
+}
+
+inline bool SceneIdentity::isCurrent(const LayerMetadataVersionToken &t) const
+{
+  auto current = layerMetadataVersion(t.layer);
+  return current && *current == t;
+}
+
 inline ObjectHandle SceneIdentity::handleOf(const scene::Object *o) const
 {
   if (!o || o->scene() != m_scene)
@@ -876,8 +954,8 @@ inline void SceneIdentity::advanceRevision(std::uint64_t &revision)
 
 inline std::size_t SceneIdentity::fingerprint(const scene::Object &o)
 {
-  // The metadata version is not preserved across object moves, so it is
-  // combined with content that is; a spurious difference only over-reports.
+  // Write history survives pool relocation. Include label and metadata
+  // cardinality for hosts using explicit refresh without notification.
   std::size_t h = std::hash<std::string>{}(o.name());
   h = h * 1099511628211ull ^ std::hash<std::uint64_t>{}(o.lastMetadataChange());
   h = h * 1099511628211ull ^ std::hash<std::size_t>{}(o.numMetadata());
@@ -897,6 +975,10 @@ inline void SceneIdentity::track(const scene::Object *o)
   if (!o)
     return;
   const Key key{normalize(o->type()), o->index()};
+  if (auto *entry = entryOf(o); entry && entry->publishedBeforeNotification) {
+    entry->publishedBeforeNotification = false;
+    return;
+  }
   // Prepared unpublished Arrays may already have reserved their identity.
   if (const auto *array = dynamic_cast<const scene::Array *>(o))
     if (auto *entry = entryOf(o))

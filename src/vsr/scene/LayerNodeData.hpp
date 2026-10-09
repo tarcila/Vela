@@ -68,6 +68,9 @@ struct LayerNodeData
   std::uint64_t editVersion() const;
   // Globally ordered payload/transform history, excluding enabled-only writes.
   std::uint64_t transformVersion() const;
+  // Local label, instance-parameter and default-baseline write history.
+  // Independent of edit/transform tokens and of the owner's lifetime.
+  std::uint64_t metadataSequence() const;
 
   void setAsObject(Object *o);
   void setAsObject(anari::DataType type, size_t index);
@@ -88,12 +91,14 @@ struct LayerNodeData
   math::mat3 getTransformSRT() const;
   Array *getTransformArray() const;
 
-  std::string &name();
   const std::string &name() const;
+  void setName(std::string name);
 
   //////////////////////////////////////////////////////////////////
   // Warning: these operate on the raw Any value, no type checking!
   Any getValueRaw() const;
+  const Any &valueRaw() const;
+  const Any &defaultValueRaw() const;
   void setValueRaw(const Any &v, bool ignoreObjectUsageCounts = false);
   //////////////////////////////////////////////////////////////////
 
@@ -103,6 +108,9 @@ struct LayerNodeData
 
  private:
   friend struct Layer;
+  friend struct Scene;
+  friend class detail::PreparedHdriRemoval;
+  friend class detail::PreparedHdriContent;
   friend struct vsr::core::ForestStorageTraits<LayerNodeData>;
   struct StorageRelocationTag
   {
@@ -110,9 +118,11 @@ struct LayerNodeData
   LayerNodeData(LayerNodeData &&o, StorageRelocationTag) noexcept;
   void relocateAssign(LayerNodeData &&o) noexcept;
   void bind(Layer *layer);
+  void remapObjectIndex(size_t index);
   void noteDependencyChange();
   void checkAssignmentOwner(const LayerNodeData &o) const;
   void noteEdit(bool transformWrite = true);
+  void noteMetadataChange();
   void incObjectUseCount();
   void decObjectUseCount();
 
@@ -122,6 +132,7 @@ struct LayerNodeData
   bool m_enabled{true};
   std::uint64_t m_editVersion{1};
   std::uint64_t m_transformVersion{0};
+  std::uint64_t m_metadataSequence{1};
   Any m_value;
   Any m_defaultValue;
   math::mat3 m_srt; // scale, azelrot, translation

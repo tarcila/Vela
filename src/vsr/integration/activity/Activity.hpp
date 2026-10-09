@@ -60,6 +60,8 @@ enum class OperationKind
   MESH_EXPORT,
   MESH_IMPORT,
   IMAGE_IMPORT,
+  CREATE_HDRI,
+  CONTENT_OPTIONS,
   EDIT,
   RESTORE,
   RESYNCHRONIZE,
@@ -85,6 +87,10 @@ inline const char *operationKindName(OperationKind k)
     return "mesh_import";
   case OperationKind::IMAGE_IMPORT:
     return "image_import";
+  case OperationKind::CREATE_HDRI:
+    return "create_hdri";
+  case OperationKind::CONTENT_OPTIONS:
+    return "content_options";
   case OperationKind::EDIT:
     return "edit";
   case OperationKind::RESTORE:
@@ -335,6 +341,8 @@ inline OperationKind operationKindOf(const std::string &kind)
            OperationKind::MESH_EXPORT,
            OperationKind::MESH_IMPORT,
            OperationKind::IMAGE_IMPORT,
+           OperationKind::CREATE_HDRI,
+           OperationKind::CONTENT_OPTIONS,
            OperationKind::EDIT,
            OperationKind::RESTORE,
            OperationKind::RESYNCHRONIZE,

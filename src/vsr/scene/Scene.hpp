@@ -247,6 +247,8 @@ struct Scene
 
  private:
   friend class detail::PreparedPositionBinding;
+  friend class detail::PreparedHdriContent;
+  friend class detail::PreparedHdriRemoval;
   friend struct Layer;
   friend struct LayerNodeData;
   friend bool ::vsr::io::deserialize_CameraArchive(

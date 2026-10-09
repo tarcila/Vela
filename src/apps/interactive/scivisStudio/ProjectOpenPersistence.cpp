@@ -169,7 +169,7 @@ void migrateLegacyShotLights(Project &project, vsr::scene::Scene &scene)
     if (auto existing = findDirectChild(lightRigsRoot, rig.id))
       scene.removeNode(existing, true);
     legacyLights->container()->move_subtree(legacyLights, lightRigsRoot);
-    (*legacyLights)->name() = rig.id;
+    (*legacyLights)->setName(rig.id);
     rig.rootNode = nodeRef("studio", legacyLights);
     shot.lightRigId = rig.id;
     project.lightRigs.push_back(std::move(rig));
@@ -295,7 +295,7 @@ void hydrateLightRigs(const detail::ProjectOpenState &state,
       clearLightRigBindings(project, rig.id);
       continue;
     }
-    (*root)->name() = rig.id;
+    (*root)->setName(rig.id);
     rig.rootNode = nodeRef("studio", root);
     rig.persistedName = rig.name;
     kept.push_back(std::move(rig));
@@ -381,7 +381,7 @@ void hydrateDatasets(const detail::ProjectOpenState &state,
     loaded.persistedName = inventoryEntry.name;
     // loaded.dirty stays as deserialized: clean for an ordinary asset, dirty
     // when a Declared Dataset just materialized (ADR 0014).
-    (*loadedRoot)->name() = loaded.id;
+    (*loadedRoot)->setName(loaded.id);
     loaded.rootNode = nodeRef("studio", loadedRoot);
     inventoryEntry = std::move(loaded);
   }

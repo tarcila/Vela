@@ -66,6 +66,7 @@ struct Any
 
   std::string getString() const;
   std::string_view getStringView() const;
+  size_t stringBackingCapacity() const;
   const char *getCStr() const;
   void reserveString(size_t size);
   void resizeString(size_t size);
@@ -350,6 +351,11 @@ inline T Any::storageAs() const
 inline std::string Any::getString() const
 {
   return type() == ANARI_STRING ? m_string : "";
+}
+
+inline size_t Any::stringBackingCapacity() const
+{
+  return m_string.capacity();
 }
 
 inline std::string_view Any::getStringView() const

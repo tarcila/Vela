@@ -8,14 +8,21 @@
 #include "vsr/core/Token.hpp"
 #include "vsr/core/TypeMacros.hpp"
 // std
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace vsr::scene {
+struct Object;
+struct ParameterOwnerLifetime
+{
+  Object *object{nullptr};
+};
 namespace detail {
 class PreparedPositionBinding;
 class PreparedMeshBinding;
+class PreparedHdriContent;
 } // namespace detail
 
 using namespace vsr::core;
@@ -113,19 +120,31 @@ struct Parameter
   Parameter() = default;
   ~Parameter() = default;
 
-  VSR_DEFAULT_MOVEABLE(Parameter)
-  VSR_DEFAULT_COPYABLE(Parameter)
+  // Copies and moves are detached snapshots. Moving out of a live slot must
+  // not silently empty its value or metadata; assignment keeps the target
+  // owner.
+  Parameter(const Parameter &);
+  Parameter(Parameter &&);
+  Parameter &operator=(const Parameter &);
+  Parameter &operator=(Parameter &&);
 
  private:
   friend class detail::PreparedPositionBinding;
   friend class detail::PreparedMeshBinding;
+  friend class detail::PreparedHdriContent;
   friend struct Object;
   friend struct Scene;
 
+  void relocateFrom(Parameter &&p) noexcept;
   void setObserver(ParameterObserver *o);
+  ParameterObserver *observer() const;
+  std::shared_ptr<ParameterOwnerLifetime> metadataChanging();
+  static void metadataChanged(
+      const std::shared_ptr<ParameterOwnerLifetime> &owner);
   bool selectStringValue();
 
   ParameterObserver *m_observer{nullptr};
+  std::weak_ptr<ParameterOwnerLifetime> m_owner;
   Token m_name;
   std::string m_description;
   ParameterUsageHint m_usageHint{ParameterUsageHint::NONE};

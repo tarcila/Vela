@@ -90,6 +90,91 @@ SCENARIO("A throwing notification cannot revive parameter evidence",
   geometry->setUpdateDelegate(nullptr);
 }
 
+SCENARIO("Parameter snapshots and assignment retain narrow owner histories",
+    "[Object][meta-param]")
+{
+  vsr::scene::Object source;
+  source.setParameter("value", 1.f)->setDescription("original");
+  const auto metadata = source.lastMetadataChange();
+  const auto parameters = source.lastParameterChange();
+  auto copy = *source.parameter("value");
+  auto moved = std::move(*source.parameter("value"));
+  copy.setDescription("detached").setMin(0.f).setMax(9.f);
+  moved.setValue(3.f);
+  CHECK(source.parameter("value")->description() == "original");
+  CHECK(source.parameterValueAs<float>("value").value() == 1.f);
+  CHECK(source.lastMetadataChange() == metadata);
+  CHECK(source.lastParameterChange() == parameters);
+
+  vsr::scene::Object target;
+  target.setParameter("target", 2.f);
+  const auto targetMetadata = target.lastMetadataChange();
+  *target.parameter("target") = copy;
+  CHECK(target.parameter("target")->name() == "target");
+  CHECK(target.parameter("target")->description() == "detached");
+  CHECK(target.lastMetadataChange() > targetMetadata);
+  const auto assigned = target.lastMetadataChange();
+  target.parameterAt(0).setUsage(vsr::scene::ParameterUsageHint::COLOR);
+  CHECK(target.lastMetadataChange() > assigned);
+  CHECK(source.lastMetadataChange() == metadata);
+
+  // Pool/map relocation preserves clocks and rebinds all ordinary setter paths.
+  vsr::scene::Object relocated(std::move(source));
+  CHECK(relocated.lastMetadataChange() == metadata);
+  relocated.parameterAt(0).setDescription("after relocation");
+  CHECK(relocated.lastMetadataChange() > metadata);
+  for (int i = 0; i < 64; ++i)
+    relocated.setParameter(("extra" + std::to_string(i)).c_str(), i);
+  const auto grown = relocated.lastMetadataChange();
+  relocated.parameter("value")->setMax(8.f);
+  CHECK(relocated.lastMetadataChange() > grown);
+  relocated.removeParameter("extra1");
+  const auto compacted = relocated.lastMetadataChange();
+  relocated.parameter("value")->setMin(-8.f);
+  CHECK(relocated.lastMetadataChange() > compacted);
+
+  // Snapshots retain no raw Object/Scene observer after owner teardown.
+  auto survivor = std::make_unique<vsr::scene::Parameter>();
+  {
+    auto owner = std::make_unique<vsr::scene::Object>();
+    owner->setParameter("temporary", 5.f);
+    *survivor = *owner->parameter("temporary");
+  }
+  survivor->setDescription("after death").setValue(6.f);
+  survivor->remove();
+  CHECK(survivor->value().get<float>() == 6.f);
+}
+
+SCENARIO("Parameter metadata history survives absent or throwing notifications",
+    "[Object][meta-param]")
+{
+  vsr::scene::Object object;
+  object.setParameter("value", 1.f);
+  const auto metadata = object.lastMetadataChange();
+  const auto parameters = object.lastParameterChange();
+  object.parameter("value")->setDescription("equal write");
+  const auto first = object.lastMetadataChange();
+  object.parameter("value")->setDescription("equal write");
+  CHECK(object.lastMetadataChange() > first);
+  CHECK(first > metadata);
+  CHECK(object.lastParameterChange() == parameters);
+  struct ThrowingMetadata : vsr::scene::EmptyUpdateDelegate
+  {
+    void signalObjectMetadataChanged(const vsr::scene::Object *) override
+    {
+      throw std::runtime_error("metadata consumer failed");
+    }
+  } delegate;
+  object.setUpdateDelegate(&delegate);
+  const auto prior = object.lastMetadataChange();
+  CHECK_THROWS_AS(object.parameter("value")->setDescription("committed edit"),
+      std::runtime_error);
+  CHECK(object.lastMetadataChange() > prior);
+  CHECK(object.parameter("value")->description() == "committed edit");
+  CHECK(object.lastParameterChange() == parameters);
+  object.setUpdateDelegate(nullptr);
+}
+
 SCENARIO("vsr::Object interface", "[Object]")
 {
   GIVEN("A default constructed Object")

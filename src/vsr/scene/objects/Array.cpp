@@ -194,6 +194,8 @@ bool Array::supportsHostWriteTracking() const
   // FLOAT16. Tracking is write evidence, not an exchange eligibility test:
   // MeshCapture validates its narrower profile; Image callers require isImage.
   return isImage()
+      || (isHost() && type() == ANARI_ARRAY2D && data()
+          && elementType() == ANARI_FLOAT32_VEC3)
       || (isHost() && type() == ANARI_ARRAY1D && data()
           && elementType() >= ANARI_INT8
           && elementType() <= ANARI_FLOAT64_VEC4);
@@ -213,8 +215,8 @@ std::optional<std::uint64_t> Array::dataWriteSequence() const
 bool Array::trackImageWrites(
     const std::shared_ptr<ArrayWriteSequence> &sequence)
 {
-  // Enroll host numeric mesh storage as well as the historical Image
-  // whitelist. Unsupported exchange types may still be honestly tracked.
+  // Enroll HDRI radiance and host numeric mesh storage as well as the
+  // historical Image whitelist. Tracking is not exchange eligibility.
   if (!supportsHostWriteTracking())
     return true;
   if (m_writeSequence == sequence)

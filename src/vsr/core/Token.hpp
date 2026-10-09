@@ -5,6 +5,8 @@
 
 #include "vsr/core/TypeMacros.hpp"
 // std
+#include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -25,6 +27,13 @@ struct Token
   Token() = default;
   Token(const char *s);
   Token(const std::string &s);
+
+  // Narrow bounded interning: reserve node/string/rehash overlap while holding
+  // the registry lock, before allocation. Successful storage is adopted by the
+  // permanent intern registry, not physically reclaimed with the caller lease.
+  static std::optional<Token> internBounded(const std::string &value,
+      const std::function<bool(size_t)> &reserve,
+      size_t bucketLimit = 65536);
 
   const char *c_str() const;
   const char *value() const;

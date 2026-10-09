@@ -505,7 +505,7 @@ LightRig *ProjectContext::cloneLightRig(const LightRigID &id)
   scene.beginLayerEditBatch();
   auto cloneRoot = scene.cloneLayerSubtree(sourceRoot, lightRigsRoot, true);
   if (cloneRoot)
-    (*cloneRoot)->name() = clone.id;
+    (*cloneRoot)->setName(clone.id);
   scene.endLayerEditBatch();
   if (!cloneRoot)
     return nullptr;
@@ -710,7 +710,7 @@ LightRig *ProjectContext::loadLightRigArchive(
   auto splicedRoot = loadLightRigArchiveFile(scene, file, lightRigsRoot, &name);
   if (splicedRoot) {
     rig.id = light_rig::nextLightRigId(m_project);
-    (*splicedRoot)->name() = rig.id; // resolveLightRigRoot keys on node==rig.id
+    (*splicedRoot)->setName(rig.id); // resolveLightRigRoot keys on node==rig.id
   }
   scene.endLayerEditBatch();
 
@@ -818,7 +818,7 @@ LightRig *ProjectContext::ensureDefaultLightRig()
       if (node->isObject() && node->type() == ANARI_LIGHT) {
         if (auto *light = node->getObject())
           light->setName("mainLight");
-        node->name() = "mainLight";
+        node->setName("mainLight");
         return false;
       }
       return true;
@@ -1368,7 +1368,7 @@ bool ProjectContext::loadDataset(const DatasetID &id, std::string *error)
   // loaded.dirty stays as deserialized: clean for an ordinary asset, dirty
   // when a Declared Dataset just materialized (ADR 0014).
   loaded.residency = DatasetResidency::Loaded;
-  (*loadedRoot)->name() = loaded.id;
+  (*loadedRoot)->setName(loaded.id);
   loaded.rootNode = refFor("studio", loadedRoot);
   *dataset = std::move(loaded);
   markProjectDirty();
@@ -1610,7 +1610,7 @@ Dataset *ProjectContext::loadDatasetArchiveImpl(
 
   loaded.id = project::nextDatasetId(m_project);
   loaded.name = finalName;
-  (*root)->name() = loaded.id;
+  (*root)->setName(loaded.id);
   loaded.rootNode = refFor("studio", root);
   loaded.dirty = !alreadyManaged || finalName != validation.dataset.name;
   loaded.persistedName = loaded.dirty ? std::string{} : finalName;
@@ -1769,7 +1769,7 @@ bool ProjectContext::reimportStaticDataset(
   replacement.source = dataset->source;
   replacement.persistedName = persistedName;
   replacement.dirty = true;
-  (*replacementRoot)->name() = id;
+  (*replacementRoot)->setName(id);
   replacement.rootNode = refFor("studio", replacementRoot);
   *dataset = std::move(replacement);
   markProjectDirty();

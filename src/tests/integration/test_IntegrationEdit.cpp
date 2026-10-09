@@ -1844,7 +1844,7 @@ TEST_CASE("Mixed batches commit and restore one complete scene adjustment",
   f.recorder->onParameters();
 
   // Metadata, unedited parameters and defaults are not restored.
-  a->value().name() = "keep name";
+  a->value().setName("keep name");
   f.light->setParameter("irradiance", 4.f);
   auto parentMatrix = vsr::core::math::IDENTITY_MAT4;
   parentMatrix[3].x = 100.f;
@@ -3032,7 +3032,7 @@ TEST_CASE(
   bool conflict = false;
   SECTION("unrelated metadata and ancestor transforms survive restoration")
   {
-    n->value().name() = "renamed";
+    n->value().setName("renamed");
     translated[3].x = 200.f;
     parent->value().setAsTransform(translated);
     f.scene.signalLayerTransformChanged(l);
@@ -3596,7 +3596,7 @@ TEST_CASE("Local position groups publish final versions and restore atomically",
   CHECK(movedSrt[0] == srt[0]);
   CHECK(movedSrt[1] == srt[1]);
   CHECK(movedSrt[2] == float3(7, 8, 9));
-  parent->value().name() = "renamed";
+  parent->value().setName("renamed");
   restore::RestoreService restores(*f.engine, *f.edits);
   restores.attachScene(f.sceneId, *f.identity);
   f.recorder->onParameters = [&] {
@@ -3793,7 +3793,11 @@ TEST_CASE("Local position restore preparation replay and field isolation",
   CHECK(f.identity->isCurrent(version));
   CHECK(n->value().getTransform()[3].xyz() == float3(4, 5, 6));
   CHECK(f.recorder->layerSignals == 0);
-  n->value().name() = "keep name";
+  n->value().setName("keep name");
+  l->setName("keep Layer label");
+  n->value().setInstanceParameter("keep instance value", vsr::core::Any(7.f));
+  auto camera = f.scene.createObject<vsr::scene::Camera>("perspective");
+  camera->setParameter("position", float3(8, 9, 10));
   auto baseline = n->value().getTransform();
   n->value().setCurrentValueAsDefault();
   f.authority->setAgentEditsDisabled(true);
@@ -3805,6 +3809,14 @@ TEST_CASE("Local position restore preparation replay and field isolation",
   REQUIRE(restores.resultLocal(a.ref)->committed);
   CHECK(n->value().getTransform() == vsr::core::math::IDENTITY_MAT4);
   CHECK(n->value().name() == "keep name");
+  CHECK(l->name() == "keep Layer label");
+  REQUIRE(n->value().getInstanceParameters().at("keep instance value"));
+  CHECK(n->value()
+            .getInstanceParameters()
+            .at("keep instance value")
+            ->getAs<float>()
+      == 7.f);
+  CHECK(*camera->parameterValueAs<float3>("position") == float3(8, 9, 10));
   CHECK_FALSE(restores.eligible(*r.batchRef));
   CHECK_FALSE(n->value().isDefaultValue());
   n->value().setToDefaultValue();
@@ -3842,7 +3854,7 @@ TEST_CASE("Node edits use precise target and structural history",
     REQUIRE(r.committed);
     restore::RestoreService restores(*f.engine, *f.edits);
     restores.attachScene(f.sceneId, *f.identity);
-    sibling->value().name() = "preserved";
+    sibling->value().setName("preserved");
     auto adm = restores.submitLocal({f.sceneId, *r.batchRef});
     REQUIRE(adm.code == Outcome::OK);
     while (f.integration.service()) {
@@ -4832,7 +4844,7 @@ TEST_CASE(
     auto unrelated = vsr::math::IDENTITY_MAT4;
     unrelated[3] = {17, 19, 23, 1};
     sibling->value().setAsTransform(unrelated);
-    child->value().name() = "keep rename";
+    child->value().setName("keep rename");
     f.scene.signalLayerStructureChanged(layer);
     restore::RestoreService restores(*f.engine, *f.edits);
     restores.attachScene(f.sceneId, *f.identity);

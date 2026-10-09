@@ -226,7 +226,7 @@ Scene::Scene()
         if (!node->isObject())
           return true;
         size_t newIdx = remap(node->type(), node->getObjectIndex());
-        node->setValueRaw({node->type(), newIdx}, true);
+        node->remapObjectIndex(newIdx);
         return true;
       });
     }
@@ -778,6 +778,7 @@ void Scene::setLayerActive(Token name, bool active)
   if (auto *ls = m_layers.at(name); ls && ls->active != active) {
     m_numActiveLayers += active ? 1 : -1;
     ls->active = active;
+    ls->ptr->noteMetadataChange();
     signalActiveLayersChanged();
   }
 }
@@ -785,19 +786,27 @@ void Scene::setLayerActive(Token name, bool active)
 void Scene::setOnlyLayerActive(Token name)
 {
   if (auto *ls = m_layers.at(name); ls) {
-    for (auto &ls : m_layers)
-      ls.second.active = false;
+    for (auto &entry : m_layers) {
+      const bool active = entry.second.ptr == ls->ptr;
+      if (entry.second.active != active) {
+        entry.second.active = active;
+        entry.second.ptr->noteMetadataChange();
+      }
+    }
 
     m_numActiveLayers = 1;
-    ls->active = true;
     signalActiveLayersChanged();
   }
 }
 
 void Scene::setAllLayersActive()
 {
-  for (auto &ls : m_layers)
-    ls.second.active = true;
+  for (auto &ls : m_layers) {
+    if (!ls.second.active) {
+      ls.second.active = true;
+      ls.second.ptr->noteMetadataChange();
+    }
+  }
   m_numActiveLayers = m_layers.size();
   signalActiveLayersChanged();
 }

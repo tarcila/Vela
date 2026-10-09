@@ -200,6 +200,7 @@ struct Forest
   VSR_NOT_MOVEABLE(Forest)
 
   void reserve(size_t size);
+  bool profileStorage(StorageProfile &profile, size_t reserveSize) const;
 
   // ForestNode access //
 
@@ -212,6 +213,11 @@ struct Forest
   const T &operator[](size_t i) const;
 
   NodeRef root() const;
+
+  // A short-lived append plan may predict creation stamps without issuing
+  // live nodes. Recheck the cursor at commit; intervening insertions stale it.
+  std::uint64_t next_lifetime() const;
+  bool can_issue_nodes(size_t count) const;
 
   // Mutation //
 
@@ -537,6 +543,13 @@ inline Forest<T>::Forest(T &&v,
 }
 
 template <typename T>
+inline bool Forest<T>::profileStorage(
+    StorageProfile &profile, size_t reserveSize) const
+{
+  return m_nodes.profileStorage(profile, reserveSize);
+}
+
+template <typename T>
 inline void Forest<T>::reserve(size_t size)
 {
   m_nodes.reserve(size);
@@ -582,6 +595,20 @@ template <typename T>
 inline typename Forest<T>::NodeRef Forest<T>::root() const
 {
   return m_root;
+}
+
+template <typename T>
+inline std::uint64_t Forest<T>::next_lifetime() const
+{
+  return m_nextLifetime;
+}
+
+template <typename T>
+inline bool Forest<T>::can_issue_nodes(size_t count) const
+{
+  return !count
+      || (m_nextLifetime && count - 1 <= UINT64_MAX - m_nextLifetime
+          && count <= UINT64_MAX - m_topologyClock);
 }
 
 template <typename T>

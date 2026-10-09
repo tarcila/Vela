@@ -31,6 +31,19 @@ namespace tokens = vsr::scene::tokens;
 
 namespace {
 
+struct RemovalReservation
+{
+  std::size_t *charge;
+  std::shared_ptr<const void> reserve(std::size_t bytes);
+};
+
+std::shared_ptr<const void> RemovalReservation::reserve(std::size_t bytes)
+{
+  if (charge)
+    *charge = bytes;
+  return std::make_shared<int>(0);
+}
+
 enum class NotificationHook
 {
   PARAMETER_BATCH,
@@ -122,6 +135,8 @@ struct Fixture
   std::unique_ptr<identity::SceneIdentity> identity;
   std::unique_ptr<EditService> edits;
   std::unique_ptr<RestoreService> restores;
+  std::unique_ptr<activity::ActivityLog> hdriLog;
+  std::unique_ptr<activity::EngineActivitySink> hdriSink;
   operations::Credentials creds;
   std::string sessionId;
   vsr::scene::MaterialRef matte;
@@ -178,6 +193,7 @@ struct Fixture
 
   ~Fixture()
   {
+    engine->setActivitySink(nullptr);
     restores.reset();
     edits.reset();
     identity.reset();
@@ -253,6 +269,74 @@ struct Fixture
     return *r;
   }
 
+  void enableHdriLog()
+  {
+    hdriLog = std::make_unique<activity::ActivityLog>();
+    hdriSink =
+        std::make_unique<activity::EngineActivitySink>(*hdriLog, integration);
+    engine->setActivitySink(hdriSink.get());
+  }
+
+  BatchRef stagedHdri(bool ownsLayer,
+      content::HdriHandles &handles,
+      std::size_t *tombstoneCharge = nullptr)
+  {
+    REQUIRE(scene.trackImageWrites(
+        std::make_shared<vsr::scene::ArrayWriteSequence>()));
+    scene.defaultLayer();
+    const float3 radiance[] = {{8.f, 4.f, 2.f}};
+    content::PreparedHdriPublication prepared(*identity,
+        {},
+        "HDRI root",
+        1,
+        1,
+        radiance,
+        {},
+        ownsLayer ? "owned HDRI" : vsr::scene::Token{});
+    handles = prepared.handles();
+    auto snapshot = std::make_shared<HdriSnapshot>();
+    snapshot->reserveResult = [] { return std::make_shared<int>(0); };
+    snapshot->controlOwnership =
+        operations::ResultOwnership(snapshot->reserveResult);
+    snapshot->scopeLease = snapshot->reserveResult();
+    snapshot->reserveRemoval =
+        operations::Reservation::from(std::make_shared<RemovalReservation>(
+            RemovalReservation{tombstoneCharge}));
+    snapshot->retainedBytes = sizeof(HdriSnapshot);
+    RestorationRecord record;
+    record.ref = {edits->launchId(), *edits->newBatchId()};
+    record.scene = sceneId;
+    record.image = snapshot;
+    record.hdri = snapshot;
+    const auto batch = record.ref;
+    operations::Request request;
+    request.kind = "test_staged_hdri"; // not public Content Creation admission
+    request.target = session::Target::scene(sceneId);
+    request.capability = session::Capability::EDIT;
+    request.canonicalArguments = "staged HDRI test fixture";
+    request.executor = [&](operations::StepContext &ctx) {
+      REQUIRE(ctx.reserveRestoration(
+          restorationBytes(record), batch.launchId, batch.batchId));
+      REQUIRE(edits->restorations().prepareImage(std::move(record)));
+      ctx.prepareCommit("{\"committed\":true}", 128);
+      REQUIRE(ctx.beforeWrite() == Outcome::OK);
+      REQUIRE(prepared.commit());
+      REQUIRE(snapshot->evidence.seal(*identity, handles, ownsLayer));
+      ctx.markCommitted();
+      edits->restorations().publishImage(batch);
+      ctx.publishRestoration();
+      prepared.notify();
+      operations::Step step;
+      step.committed = true;
+      return step;
+    };
+    const auto admission = engine->submitLocal(std::move(request));
+    REQUIRE(admission.code == Outcome::OK);
+    drain();
+    REQUIRE(engine->statusLocal(admission.ref).committed);
+    return batch;
+  }
+
   float opacity(const vsr::scene::MaterialRef &m)
   {
     return *m->parameterValueAs<float>("opacity");
@@ -264,6 +348,78 @@ struct Fixture
 };
 
 } // namespace
+
+TEST_CASE("Normal shared Restore consumes exact staged HDRI removal",
+    "[integration][content][restore][hdri-restore]")
+{
+  const bool ownsLayer = GENERATE(false, true);
+  Fixture fx;
+  fx.enableHdriLog();
+  const auto old = fx.edit(1, {fx.entry(fx.matte.data(), "opacity", .25)});
+  content::HdriHandles handles;
+  std::size_t transient = 0;
+  const auto batch = fx.stagedHdri(ownsLayer, handles, &transient);
+  const auto record = fx.edits->restorations().find(batch);
+  REQUIRE(record);
+  REQUIRE(record->hdri);
+  CHECK(record->hdri->bytes.empty());
+  CHECK(record->hdri->evidence.check(*fx.identity) == nullptr);
+  CHECK_FALSE(record->hdri->physicalLease); // no retained radiance undo owner
+  const auto bytes = restorationBytes(*record);
+  CHECK(bytes >= sizeof(HdriSnapshot));
+  CHECK(bytes < 16384);
+  fx.scene.defaultLayer()->setName("borrowed label");
+  auto restored = fx.restore(2, batch);
+  CHECK(restored.committed);
+  CHECK(restored.outcome == Outcome::OK);
+  // The temporary reservation covers radiance AND backing/growth/tombstones,
+  // not the former unexplained 8-KiB control estimate or retained undo texels.
+  CHECK(transient > 8192);
+  CHECK(transient < (1u << 20));
+  CHECK_FALSE(fx.identity->resolve(handles.radiance));
+  CHECK_FALSE(fx.identity->resolve(handles.light));
+  CHECK_FALSE(fx.identity->resolve(handles.contentRoot));
+  CHECK(fx.scene.numberOfLayers() == 1);
+  CHECK(fx.restores->restored(batch));
+  CHECK(fx.restores->eligible(old));
+  CHECK(fx.restore(3, batch).outcome == Outcome::ALREADY_RESTORED);
+  CHECK(fx.restore(4, old).committed);
+  CHECK(fx.opacity(fx.matte) == 1.f);
+}
+
+TEST_CASE("Normal HDRI Restore rejects writes and preparation faults safely",
+    "[integration][content][restore][hdri-restore]")
+{
+  const int mutation = GENERATE(0, 1, 2);
+  Fixture fx;
+  fx.enableHdriLog();
+  content::HdriHandles handles;
+  const auto batch = fx.stagedHdri(false, handles);
+  if (mutation == 0) {
+    auto *array = dynamic_cast<vsr::scene::Array *>(
+        fx.identity->resolve(handles.radiance));
+    array->mapAs<float3>()[0] = {8.f, 4.f, 2.f};
+    array->unmap();
+    CHECK(fx.restore(1, batch).outcome == Outcome::CONFLICT);
+    CHECK(fx.restores->conflicting(batch));
+    CHECK(fx.restore(2, batch).outcome == Outcome::CONFLICT);
+  } else if (mutation == 1) {
+    fx.restores->setFaultInjector([] { return true; });
+    CHECK(fx.restore(1, batch).outcome == Outcome::BUSY);
+    CHECK(fx.restores->eligible(batch));
+    CHECK(fx.identity->resolve(handles.light));
+    fx.restores->setFaultInjector({});
+    CHECK(fx.restore(2, batch).committed);
+  } else {
+    fx.scene.defaultLayer()->root()->insert_last_child(
+        vsr::scene::LayerNodeData(fx.scene.defaultLayer(),
+            fx.identity->resolve(handles.light),
+            "outside user"));
+    CHECK(fx.restore(1, batch).outcome == Outcome::CONFLICT);
+    CHECK(fx.identity->resolve(handles.light));
+    CHECK(fx.identity->resolve(handles.radiance));
+  }
+}
 
 TEST_CASE("Generic typed edits restore exact values or conflict as one batch",
     "[integration][generic-edit][restore]")

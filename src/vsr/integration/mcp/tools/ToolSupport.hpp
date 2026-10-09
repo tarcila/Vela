@@ -119,9 +119,32 @@ inline ToolResult statusResult(const operations::OperationRef &ref,
     return rejected(s.code);
   ToolResult r;
   if (s.ownership.reserve
-      && (s.kind == "image_import" || s.kind == "restore")) {
+      && (s.kind == "image_import" || s.kind == "restore"
+          || s.kind == "create_hdri")) {
     try {
-      r.ownership = operations::ResultOwnership(s.ownership.reserve);
+      auto reserve = s.ownership.reserve;
+      if (s.kind == "create_hdri") {
+        // Count both quote levels without allocating. ToolSupport builds
+        // two string carriers; McpServer embeds them directly (no result
+        // parser tree), then builds res/RPC/HTTP strings. Four simultaneous
+        // encoding owners include their doubling/reallocation overlap.
+        if (s.result.size() > 16384 || ref.sessionId.size() > 256)
+          return rejected(Outcome::BUSY);
+        size_t quoted = 2, twiceQuoted = 6;
+        for (const unsigned char c : s.result) {
+          const size_t first = c < 32 ? 6 : (c == '"' || c == '\\' ? 2 : 1);
+          quoted += first;
+          twiceQuoted += c < 32 ? 7 : (first == 2 ? 4 : 1);
+        }
+        // Server additionally permits at most 1024 serialized RPC-ID bytes.
+        const size_t header = 6 * ref.sessionId.size() + 1024 + 1024;
+        const size_t bytes =
+            4 * (s.result.size() + quoted + twiceQuoted + header)
+            + sizeof(ToolResult) + 2 * sizeof(std::string)
+            + 2 * sizeof(std::shared_ptr<const void>) + sizeof(int);
+        reserve = reserve.forBytes(bytes);
+      }
+      r.ownership = operations::ResultOwnership(std::move(reserve));
     } catch (const std::bad_alloc &) {
       return rejected(Outcome::BUSY);
     }
@@ -144,7 +167,9 @@ inline ToolResult statusResult(const operations::OperationRef &ref,
 
   r.resourceLease = r.ownership.lease ? r.ownership.lease : s.resourceLease;
   if (s.resourceLease)
-    r.maxResponseBytes = r.ownership.lease ? 65536 : 12582912;
+    r.maxResponseBytes = s.kind == "create_hdri" ? 4 * (16384 + 6 * 16384)
+        : r.ownership.lease                      ? 65536
+                                                 : 12582912;
   r.structuredJson = j;
   r.contentJson = "[{\"type\":\"text\",\"text\":" + json::quote(j) + "}]";
   r.isError = s.terminal && *s.terminal != Outcome::OK;

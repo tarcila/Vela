@@ -231,7 +231,7 @@ old walks as evidence of current state.
 
 Hosts must mutate and query on the safe-point thread. Normal Scene notifications
 advance revisions incrementally; no query-time hierarchy snapshot or fingerprint
-scan is used. After changing `Layer::editableName()` or using raw Forest/node
+scan is used. After changing `Layer::setName()` or using ordinary Forest/node
 mutations, call `Scene::signalLayerStructureChanged(layer)` (or
 `signalLayerTransformChanged` for transforms). Scene layer membership/activation
 and `Layer::clear()` notify automatically. Unsupported raw mutation without the
@@ -251,6 +251,19 @@ Hosts must still publish the appropriate Scene layer signal after writes (one
 coalesced signal is sufficient), including renames, to keep cursors, render
 indices and UI current. Bypassing setters through raw-memory writes is unsupported
 and cannot maintain edit history, even if a later layer notification is sent.
+
+Node and Layer names expose only const readers. Editors copy the label to a
+separate buffer and commit through `setName()`. `metadataSequence()` advances
+locally for label writes, Node instance-parameter set/clear, default-baseline
+writes, payload assignment and genuine move-out, even after owner destruction.
+Forest storage relocation preserves all histories. `SceneIdentity` exposes
+`nodeMetadataVersion()` and `layerMetadataVersion()` guards tied to lifetime-safe
+Node/Layer handles; these do not require a Scene notification to reject a
+change-back. They are separate from Node edit/ancestry evidence, so renaming a
+borrowed destination or changing an unrelated camera does not invalidate a
+transform-only Restore. Owned-content removal must explicitly guard only its
+owned Node/Layer metadata. This prerequisite does not admit HDRI creation or
+implement creation Restore.
 
 Structural mutation audit: Forest child insertion (including explicit-slot
 insertion) issues a fresh lifetime and creation event; `copy_subtree` uses that

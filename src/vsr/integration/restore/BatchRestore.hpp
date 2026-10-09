@@ -154,7 +154,7 @@ class RestoreService
   OperationEngine &m_engine;
   EditService &m_edits;
   operations::ResultOwnership::Reserve m_reserveResult;
-  RestoreFaultInjector m_fault;
+  std::shared_ptr<const RestoreFaultInjector> m_fault;
   std::shared_ptr<bool> m_alive;
 
   mutable std::mutex m_mutex;
@@ -218,7 +218,9 @@ inline void RestoreService::attachScene(SceneId scene, SceneIdentity &identity)
 inline void RestoreService::setFaultInjector(RestoreFaultInjector injector)
 {
   std::lock_guard<std::mutex> lock(m_mutex);
-  m_fault = std::move(injector);
+  m_fault = injector
+      ? std::make_shared<const RestoreFaultInjector>(std::move(injector))
+      : nullptr;
 }
 
 inline bool RestoreService::restored(const BatchRef &ref) const
@@ -459,7 +461,7 @@ inline RestoreResult RestoreService::commit(
   }
   res.targetBatchRef = request.targetBatchRef;
   SceneIdentity *ident = nullptr;
-  RestoreFaultInjector fault;
+  std::shared_ptr<const RestoreFaultInjector> fault;
   bool consumed = false;
   bool conflicted = false;
   {
@@ -538,6 +540,126 @@ inline RestoreResult RestoreService::commit(
     return res;
   }
 
+  if (record->hdri) {
+    const auto &snapshot = record->hdri;
+    const auto check = [&]() {
+      return ident ? snapshot->evidence.check(*ident) : "owner_retired";
+    };
+    const auto reject = [&](const char *reason) {
+      if (std::strcmp(reason, "array_mapped") == 0
+          || std::strcmp(reason, "write_contract_unavailable") == 0) {
+        res.outcome = Outcome::BUSY;
+        res.reason = reason;
+      } else {
+        markConflicting(request.targetBatchRef, ctx);
+        res.outcome = Outcome::CONFLICT;
+      }
+    };
+    if (const auto *reason = check()) {
+      reject(reason);
+      return res;
+    }
+    std::shared_ptr<const void> tombstoneLease;
+    std::unique_ptr<content::PreparedHdriRemoval> transaction;
+    try {
+      if (fault && (*fault)())
+        throw std::bad_alloc();
+      auto *array = dynamic_cast<scene::Array *>(
+          ident->resolve(snapshot->evidence.handles.radiance));
+      core::StorageProfile removal(64u << 20);
+      if (!snapshot->reserveRemoval || !array
+          || !scene::detail::PreparedHdriContent::profileStorage(scene,
+              ident->resolve(snapshot->evidence.handles.contentRoot),
+              array->size(),
+              false,
+              removal)
+          || !removal.add(sizeof(content::PreparedHdriRemoval)
+              + sizeof(scene::detail::PreparedHdriRemoval)))
+        throw std::bad_alloc();
+      // Declared before transaction: coverage survives notifications, their
+      // exception paths, and destruction of the removed radiance tombstone.
+      // The live Scene reserve backing in this conservative profile is not
+      // reclaimed by dropping this temporary ownership reservation.
+      tombstoneLease = snapshot->reserveRemoval(removal.bytes());
+      if (!tombstoneLease)
+        throw std::bad_alloc();
+      res.ownership = operations::ResultOwnership(snapshot->reserveResult);
+      res.wireLease = snapshot->reserveResult();
+      if (!res.wireLease)
+        throw std::bad_alloc();
+      res.imageReceipt = "{\"target_batch_ref\":"
+          + edit::detail::batchRefJson(request.targetBatchRef)
+          + ",\"committed\":true,\"restored\":true,\"removed_content\":true,"
+            "\"versions\":[],\"node_versions\":[],\"image_versions\":[]}";
+      res.imageReceipt.reserve(res.imageReceipt.size() + 256);
+      if (!ctx.prepareActivityResult
+          || !ctx.prepareActivityResult(
+              res.imageReceipt.capacity(), snapshot->reserveResult))
+        throw std::bad_alloc();
+      m_edits.syncStates().prepareScene(request.scene);
+      transaction = std::make_unique<content::PreparedHdriRemoval>(
+          *ident, snapshot->evidence);
+      if (!ctx.prepareCommit || !ctx.markCommitted)
+        throw std::bad_alloc();
+      ctx.prepareCommit(res.imageReceipt, res.imageReceipt.capacity());
+    } catch (const std::bad_alloc &) {
+      res.outcome = Outcome::BUSY;
+      res.reason = "resource_limit";
+      return res;
+    }
+    if (!ctx.beforeWrite) {
+      res.outcome = Outcome::FORBIDDEN;
+      return res;
+    }
+    res.outcome = ctx.beforeWrite();
+    if (res.outcome != Outcome::OK)
+      return res;
+    if (const auto *reason = check()) {
+      reject(reason);
+      return res;
+    }
+    if (!transaction->isCurrent() || !transaction->commit()) {
+      res.outcome = Outcome::BUSY;
+      res.reason = "prepared_state_changed";
+      return res;
+    }
+    res.committed = true;
+    ctx.markCommitted();
+    m_edits.restorations().setImageState(
+        request.targetBatchRef, edit::RestorationStore::ImageState::RESTORED);
+    m_edits.restorations().release(request.targetBatchRef);
+    try {
+      if (ctx.markRestored)
+        ctx.markRestored(
+            request.targetBatchRef.launchId, request.targetBatchRef.batchId);
+    } catch (...) {
+      res.outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
+    }
+    res.sceneRevision = ident->sceneRevision();
+    char revision[256];
+    const auto &value = *res.sceneRevision;
+    std::snprintf(revision,
+        sizeof(revision),
+        ",\"scene_revision\":\"%llu.%llu.%llu.%llu\"}",
+        (unsigned long long)value.launch.activation,
+        (unsigned long long)value.launch.nonce,
+        (unsigned long long)value.domain,
+        (unsigned long long)value.value);
+    res.imageReceipt.pop_back();
+    res.imageReceipt.append(revision);
+    try {
+      transaction->notify();
+    } catch (...) {
+      res.outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
+    }
+    try {
+      m_edits.syncStates().beginHook(request.scene);
+    } catch (...) {
+      res.outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
+    }
+    return res;
+  }
+
   if (record->mesh) {
     const auto &snapshot = record->mesh;
     auto *geometry = ident && ident->scene() == &scene
@@ -566,7 +688,7 @@ inline RestoreResult RestoreService::commit(
     std::vector<std::pair<std::weak_ptr<scene::ArrayLifetime>, std::size_t>>
         preparedIndices;
     try {
-      if (fault && fault())
+      if (fault && (*fault)())
         throw std::bad_alloc();
       res.ownership = operations::ResultOwnership(snapshot->reserveResult);
       res.wireLease = snapshot->reserveResult();
@@ -718,7 +840,7 @@ inline RestoreResult RestoreService::commit(
       return res;
     }
     try {
-      if (fault && fault())
+      if (fault && (*fault)())
         throw std::bad_alloc();
       res.ownership = operations::ResultOwnership(snapshot->reserveResult);
       res.wireLease = snapshot->reserveResult();
@@ -875,7 +997,7 @@ inline RestoreResult RestoreService::commit(
   std::vector<const scene::Layer *> layers;
   std::vector<scene::LayerNodeRef> nodes;
   try {
-    if (fault && fault())
+    if (fault && (*fault)())
       throw std::bad_alloc();
     nodes.reserve(record->nodeChanges.size());
     layers.reserve(record->nodeChanges.size());

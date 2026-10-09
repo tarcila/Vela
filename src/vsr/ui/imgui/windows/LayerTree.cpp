@@ -732,7 +732,11 @@ bool LayerTree::buildUI_mutatingMenuItems(
     ImGui::Separator();
 
   if (nodeSelected && ImGui::BeginMenu("rename")) {
-    ImGui::InputText("##edit_node_name", &(*menuNode)->name());
+    std::string name = (*menuNode)->name();
+    if (ImGui::InputText("##edit_node_name", &name)) {
+      (*menuNode)->setName(std::move(name));
+      scene.signalLayerStructureChanged(&layer);
+    }
     ImGui::EndMenu();
   }
 

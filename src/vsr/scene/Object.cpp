@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #if VSR_USE_CUDA
 #include <cuda_runtime.h>
 #endif
@@ -150,12 +151,17 @@ Object::Object(anari::DataType type, Token stype)
 
 Object::~Object()
 {
+  if (m_parameterOwner)
+    m_parameterOwner->object = nullptr;
   for (auto &p : m_parameters)
     decObjectUseCountParameter(&p.second);
 }
 
 Object::Object(Object &&o)
 {
+  m_parameterOwner = std::move(o.m_parameterOwner);
+  if (m_parameterOwner)
+    m_parameterOwner->object = this;
   for (auto &p : m_parameters)
     decObjectUseCountParameter(&p.second);
   m_parameters = std::move(o.m_parameters);
@@ -168,13 +174,28 @@ Object::Object(Object &&o)
   m_metadata = std::move(o.m_metadata);
   m_useCounts = std::move(o.m_useCounts);
   m_rendererDeviceName = std::move(o.m_rendererDeviceName);
-  m_versions.parameter = o.m_versions.parameter;
-  for (auto &p : m_parameters)
-    p.second.setObserver(this);
+  m_versions = o.m_versions;
+  bindParameterObservers();
 }
 
 Object &Object::operator=(Object &&o)
 {
+  if (this == &o)
+    return *this;
+  // Assignment over a live Scene slot is an edit, unlike relocation into an
+  // empty pool slot. Never install a source's older metadata history there.
+  const bool replacing =
+      m_scene && m_type != ANARI_UNKNOWN && o.m_type != ANARI_UNKNOWN;
+  const auto metadata = replacing
+      ? std::max(m_versions.metadata, o.m_versions.metadata)
+      : o.m_versions.metadata;
+  if (replacing && metadata == std::numeric_limits<ObjectVersion>::max())
+    throw std::runtime_error("Object metadata history exhausted");
+  if (m_parameterOwner)
+    m_parameterOwner->object = nullptr;
+  m_parameterOwner = std::move(o.m_parameterOwner);
+  if (m_parameterOwner)
+    m_parameterOwner->object = this;
   for (auto &p : m_parameters)
     decObjectUseCountParameter(&p.second);
   m_parameters = std::move(o.m_parameters);
@@ -187,9 +208,9 @@ Object &Object::operator=(Object &&o)
   m_metadata = std::move(o.m_metadata);
   m_useCounts = std::move(o.m_useCounts);
   m_rendererDeviceName = std::move(o.m_rendererDeviceName);
-  m_versions.parameter = o.m_versions.parameter;
-  for (auto &p : m_parameters)
-    p.second.setObserver(this);
+  m_versions = o.m_versions;
+  m_versions.metadata = metadata + (replacing ? 1 : 0);
+  bindParameterObservers();
   return *this;
 }
 
@@ -329,7 +350,9 @@ void Object::setName(const std::string &n)
 {
   if (m_name == n)
     return;
-  m_name = n;
+  std::string prepared(n);
+  requireMetadataHistory();
+  m_name = std::move(prepared);
   objectMetadataChanged();
 }
 
@@ -359,9 +382,10 @@ void Object::getMetadataArray(std::string_view name,
 
 void Object::setMetadataValue(std::string_view name, Any v)
 {
+  requireMetadataHistory();
   initMetadata();
   m_metadata->root().append(name) = v;
-  m_versions.metadata++;
+  advanceParameterMetadata();
   metadataChanged(name);
 }
 
@@ -370,9 +394,10 @@ void Object::setMetadataArray(std::string_view name,
     const void *v,
     size_t numElements)
 {
+  requireMetadataHistory();
   initMetadata();
   m_metadata->root().append(name).setValueAsArray(type, v, numElements);
-  m_versions.metadata++;
+  advanceParameterMetadata();
   metadataChanged(name);
 }
 
@@ -380,8 +405,9 @@ void Object::removeMetadata(std::string_view name)
 {
   if (!m_metadata || m_metadata->root().child(name) == nullptr)
     return;
+  requireMetadataHistory();
   m_metadata->root().remove(name);
-  m_versions.metadata++;
+  advanceParameterMetadata();
   metadataChanged(name);
 }
 
@@ -412,7 +438,12 @@ const char *Object::getMetadataName(size_t i) const
 
 Parameter &Object::addParameter(Token name)
 {
-  m_parameters.set(name, Parameter(this, name.c_str()));
+  if (!m_parameterOwner) {
+    m_parameterOwner = std::make_shared<ParameterOwnerLifetime>();
+    m_parameterOwner->object = this;
+  }
+  m_parameters.set(name, Parameter(nullptr, name.c_str()));
+  bindParameterObservers();
   m_versions.parameter++;
   return *parameter(name);
 }
@@ -458,15 +489,30 @@ Parameter *Object::parameter(Token name)
 void Object::removeParameter(Token name)
 {
   if (auto *p = parameter(name); p) {
+    ++m_versions.parameter;
     decObjectUseCountParameter(p);
     if (m_updateDelegate)
       m_updateDelegate->signalParameterRemoved(this, p);
   }
-  m_parameters.erase(name);
+  if (const auto index = m_parameters.indexOfKey(name)) {
+    // Compaction must not call public snapshot assignment, allocate, or spend
+    // another slot's histories. Its logical owner/key travels with the value.
+    for (size_t i = *index; i + 1 < m_parameters.size(); ++i) {
+      auto &to = m_parameters.at_index(i);
+      auto &from = m_parameters.at_index(i + 1);
+      to.first = from.first;
+      to.second.relocateFrom(std::move(from.second));
+    }
+    m_parameters.shrink(m_parameters.size() - 1);
+    bindParameterObservers();
+  }
 }
 
 void Object::removeAllParameters()
 {
+  if (m_parameters.empty())
+    return;
+  ++m_versions.parameter;
   for (size_t i = 0; i < numParameters(); i++) {
     auto *p = &parameterAt(i);
     decObjectUseCountParameter(p);
@@ -639,12 +685,29 @@ void Object::removeParameter(const Parameter *p)
   }
 
   removeParameter(p->name());
-  m_versions.parameter++;
+}
+
+void Object::bindParameterObservers()
+{
+  for (auto &p : m_parameters)
+    p.second.setObserver(this);
+}
+
+void Object::requireMetadataHistory() const
+{
+  if (m_versions.metadata == std::numeric_limits<ObjectVersion>::max())
+    throw std::runtime_error("Object metadata history exhausted");
+}
+
+void Object::advanceParameterMetadata()
+{
+  requireMetadataHistory();
+  ++m_versions.metadata;
 }
 
 void Object::objectMetadataChanged()
 {
-  m_versions.metadata++;
+  advanceParameterMetadata();
   if (m_updateDelegate)
     m_updateDelegate->signalObjectMetadataChanged(this);
 }

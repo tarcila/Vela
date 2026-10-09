@@ -179,6 +179,8 @@ struct MultiUpdateDelegate : public BaseUpdateDelegate
 
  private:
   friend class detail::PreparedImageWrite;
+  friend class detail::PreparedHdriContent;
+  friend class detail::PreparedHdriRemoval;
   std::vector<std::shared_ptr<BaseUpdateDelegate>> m_delegates;
 };
 
