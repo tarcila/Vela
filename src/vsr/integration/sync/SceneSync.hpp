@@ -79,6 +79,8 @@ class SyncStates
   void confirmView(ViewId view);
   void forgetView(ViewId view);
   void markNeedsSync(SceneId scene);
+  // A committed failure after its normal hook completed owns no pending hook.
+  void markFailed(SceneId scene);
 
  private:
   struct Scene
@@ -319,6 +321,11 @@ inline void SyncStates::forgetView(ViewId view)
 inline void SyncStates::markNeedsSync(SceneId scene)
 {
   mutate(scene, [](Scene &s) { s.needsSync = true; });
+}
+
+inline void SyncStates::markFailed(SceneId scene)
+{
+  mutate(scene, [](Scene &s) { s.failed = true; });
 }
 
 // SyncService //

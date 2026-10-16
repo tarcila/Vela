@@ -696,11 +696,27 @@ inline operations::Request TranslationService::makeCommitRequest(
   work.canonicalArguments = "translation-commit;" + preview.launchId + ";"
       + preview.previewId + ";" + std::to_string(preview.scene);
   std::weak_ptr<int> alive = m_alive;
-  auto committed = std::make_shared<std::optional<EditResult>>();
-  work.onSynchronizationFailure = [this, alive, scene = preview.scene] {
-    if (alive.lock() && !m_editLifetime.expired())
-      m_edits->syncStates().finishHook(scene, false);
+  struct PendingSynchronization
+  {
+    std::optional<EditResult> result;
+    bool hookPending{true};
   };
+  auto pending = std::make_shared<PendingSynchronization>();
+  auto committed =
+      std::shared_ptr<std::optional<EditResult>>(pending, &pending->result);
+  work.onSynchronizationFailure =
+      [this, alive, pending, reservation, scene = preview.scene] {
+        if (alive.lock() && !m_editLifetime.expired()) {
+          if (pending->hookPending) {
+            pending->hookPending = false;
+            m_edits->syncStates().finishHook(scene, false);
+          } else {
+            m_edits->syncStates().markFailed(scene);
+          }
+          if (pending->result)
+            pending->result->outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
+        }
+      };
   const auto budget = m_budget;
   const auto deadlineAt = m_clock() + m_limits.deadlineSeconds;
   work.executor = [this,
@@ -710,6 +726,7 @@ inline operations::Request TranslationService::makeCommitRequest(
                       preview = std::move(preview),
                       owner = std::move(owner),
                       committed,
+                      pending,
                       reservation = std::move(reservation),
                       reserveStatus =
                           operations::ResultOwnership::Reserve{[budget] {
@@ -746,6 +763,7 @@ inline operations::Request TranslationService::makeCommitRequest(
     }
     auto &result = **committed;
     step.committed = true;
+    pending->hookPending = false;
     const auto synchronized = usable
         ? m_edits->synchronizeCommitted(preview.scene)
         : Outcome::APPLIED_WITH_SYNC_FAILURE;

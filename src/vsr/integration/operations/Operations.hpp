@@ -295,8 +295,9 @@ struct Request
   // Logical deadline from admission; <= 0 means none.
   double deadlineSeconds{0.0};
   Executor executor;
-  // Prepared notification for a committed operation whose synchronization
-  // step cannot be queued. Invoked outside the engine lock.
+  // Prepared notification when committed synchronization cannot be queued or
+  // completed. Invoked once outside the engine lock; the owner must distinguish
+  // its outstanding hook from one already completed before a later failure.
   std::function<void()> onSynchronizationFailure;
   // Optional ownership prepared by a bounded service before admission.
   std::shared_ptr<const void> resourceLease;
@@ -1199,6 +1200,7 @@ inline void OperationEngine::releaseSlot(Record &r)
   if (!r.committed && m_sink && r.activityId)
     m_sink->cancelRestoration(*r.activityId);
   r.executor = {};
+  r.onSynchronizationFailure = {};
   r.recoveryApproval.reset();
 }
 
@@ -1335,7 +1337,7 @@ inline bool OperationEngine::dispatch(
       // prepared fallback receipt and notifies its synchronization owner.
       if (!r->terminal && !r->executing && r->phase != Phase::BACKEND) {
         if (r->committed)
-          synchronizationFailure = std::move(r->onSynchronizationFailure);
+          synchronizationFailure.swap(r->onSynchronizationFailure);
         finish(*r,
             r->committed                    ? Outcome::APPLIED_WITH_SYNC_FAILURE
                 : r->phase == Phase::QUEUED ? Outcome::BUSY
@@ -1344,8 +1346,14 @@ inline bool OperationEngine::dispatch(
       }
     }
   }
-  if (synchronizationFailure)
-    synchronizationFailure();
+  if (synchronizationFailure) {
+    try {
+      synchronizationFailure();
+    } catch (...) {
+      // The operation is already terminal and committed. A consumer failure
+      // cannot undo its receipt or strand its execution/admission slot.
+    }
+  }
   return ok;
 }
 
@@ -1726,21 +1734,36 @@ inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
     // infallible. Preserve the prepared committed receipt; never overwrite it
     // with a nonmutating rejection. A worker already owning preparation must
     // still drain through its existing wake/pump before its slot is released.
-    std::lock_guard<std::mutex> lock(m_mutex);
-    auto *r = find(key);
-    if (!r)
-      return;
-    r->executing = false;
-    if (r->terminal && !r->awaitingCleanup)
-      return;
-    cleanupPending =
-        cleanupPending || r->phase == Phase::BACKEND || r->awaitingCleanup;
-    r->phase =
-        cleanupPending && !r->committed ? Phase::BACKEND : Phase::RUNNING;
-    finish(*r,
-        r->committed ? Outcome::APPLIED_WITH_SYNC_FAILURE
-                     : r->terminal.value_or(Outcome::BUSY),
-        m_clock());
+    std::function<void()> synchronizationFailure;
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      auto *r = find(key);
+      if (!r)
+        return;
+      r->executing = false;
+      if (r->terminal && !r->awaitingCleanup)
+        return;
+      cleanupPending =
+          cleanupPending || r->phase == Phase::BACKEND || r->awaitingCleanup;
+      r->phase =
+          cleanupPending && !r->committed ? Phase::BACKEND : Phase::RUNNING;
+      // std::function::swap is noexcept: no target copy or allocation is
+      // permitted on this failure boundary. Keep its owner until delivery.
+      if (r->committed)
+        synchronizationFailure.swap(r->onSynchronizationFailure);
+      finish(*r,
+          r->committed ? Outcome::APPLIED_WITH_SYNC_FAILURE
+                       : r->terminal.value_or(Outcome::BUSY),
+          m_clock());
+    }
+    if (synchronizationFailure) {
+      try {
+        synchronizationFailure();
+      } catch (...) {
+        // Completion is best-effort for arbitrary host consumers, not a new
+        // exception escape from the transaction barrier.
+      }
+    }
   }
 }
 

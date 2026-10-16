@@ -123,6 +123,7 @@ class ContentCreation
     bool preparedStore{false};
     bool committed{false};
     bool notificationFailed{false};
+    bool hookPending{false};
   };
   std::shared_ptr<State> m_state;
   Integration *m_integration{nullptr};
@@ -274,7 +275,10 @@ inline operations::Admission ContentCreation::submit(
   // quote() grows at most sixfold; libstdc++ concatenation doubles capacity.
   // Eight simultaneous canonical/receipt construction owners include overlap.
   core::StorageProfile controls(1u << 20);
-  if (!controls.add(sizeof(Job) + sizeof(operations::Request))
+  // The failure target owns exactly one shared Job pointer, not an opaque
+  // host callback. Its backing and overlap stay under the Job control lease.
+  if (!controls.add(sizeof(Job) + sizeof(operations::Request)
+          + sizeof(std::shared_ptr<Job>) + 2 * sizeof(std::max_align_t))
       || !controls.string(request.fileName)
       || !controls.string(request.rootName)
       || !controls.string(request.newLayer) || !controls.string(ref.sessionId)
@@ -358,6 +362,17 @@ inline operations::Admission ContentCreation::submit(
         + std::to_string(request.parent->serial);
   job->request = std::move(request);
   job->settingsJson = settingsJson;
+  operation.onSynchronizationFailure = [job] {
+    if (job->state->editsLife.expired())
+      return;
+    auto &sync = job->state->edits->syncStates();
+    if (job->hookPending) {
+      job->hookPending = false;
+      sync.finishHook(job->request.scene, false);
+    } else {
+      sync.markFailed(job->request.scene);
+    }
+  };
   operation.executor = [state, job, integration = m_integration](
                            operations::StepContext &ctx) {
     const auto &request = job->request;
@@ -384,6 +399,9 @@ inline operations::Admission ContentCreation::submit(
       result.reserveStatus =
           operations::ResultOwnership::Reserve(state->reserve, RESULT_BACKING);
       result.result = std::move(job->receipt);
+      // Transfer this hook to synchronizeCommitted before invoking consumers;
+      // a later engine failure must not consume a different outstanding hook.
+      job->hookPending = false;
       try {
         result.outcome = state->editsLife.expired()
             ? Outcome::APPLIED_WITH_SYNC_FAILURE
@@ -710,11 +728,8 @@ inline operations::Admission ContentCreation::submit(
       job->source.reset();
       job->decoded.image.radiance.clear();
       DecodedHdri::Radiance().swap(job->decoded.image.radiance);
-      try {
-        state->edits->syncStates().beginHook(request.scene);
-      } catch (...) {
-        job->notificationFailed = true;
-      }
+      job->hookPending = true;
+      state->edits->syncStates().beginHook(request.scene);
       Step result;
       result.committed = true;
       result.status = Step::Status::SYNCHRONIZING;

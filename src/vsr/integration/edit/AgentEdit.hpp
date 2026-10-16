@@ -1375,19 +1375,31 @@ inline operations::Request EditService::makeRequest(EditBatch batch, Slot slot)
   r.approvalRequestId = batch.approvalRequestId;
   r.boundSceneRead = true;
   std::weak_ptr<bool> alive = m_alive;
-  auto shared = std::make_shared<EditBatch>(std::move(batch));
+  struct PendingSynchronization
+  {
+    EditBatch batch;
+    bool hookPending{true};
+  };
+  auto pending = std::make_shared<PendingSynchronization>();
+  pending->batch = std::move(batch);
+  auto shared = std::shared_ptr<EditBatch>(pending, &pending->batch);
   // One prepared owner serves both the pending committed state and public
   // result lookup; a failed synchronization dispatch cannot lose its receipt.
   auto committed = slot;
-  r.onSynchronizationFailure = [this, alive, slot, scene = shared->scene] {
+  r.onSynchronizationFailure = [this, alive, slot, pending] {
     if (alive.lock()) {
-      m_sync.finishHook(scene, false);
+      if (pending->hookPending) {
+        pending->hookPending = false;
+        m_sync.finishHook(pending->batch.scene, false);
+      } else {
+        m_sync.markFailed(pending->batch.scene);
+      }
       std::lock_guard<std::mutex> lock(m_mutex);
       if (*slot)
         (*slot)->outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
     }
   };
-  r.executor = [this, alive, shared, slot, committed](
+  r.executor = [this, alive, shared, slot, committed, pending](
                    operations::StepContext &ctx) {
     operations::Step step;
     if (!alive.lock())
@@ -1413,6 +1425,7 @@ inline operations::Request EditService::makeRequest(EditBatch batch, Slot slot)
       return step;
     }
     EditResult res = std::move(**committed);
+    pending->hookPending = false;
     const auto synchronized = synchronize(shared->scene);
     if (res.outcome == Outcome::OK)
       res.outcome = synchronized;
