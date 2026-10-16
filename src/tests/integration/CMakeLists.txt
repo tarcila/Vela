@@ -23,6 +23,14 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
 add_executable(vsrPreparedHdriAllocation PreparedHdriAllocation.cpp)
 target_link_libraries(vsrPreparedHdriAllocation PRIVATE vsr_scene)
 add_test(NAME vsr::prepared-hdri-allocation COMMAND vsrPreparedHdriAllocation)
+add_executable(vsrHdriOperationAllocation HdriOperationAllocation.cpp)
+target_link_libraries(vsrHdriOperationAllocation PRIVATE vsr_integration)
+add_test(NAME vsr::hdri-operation-allocation COMMAND vsrHdriOperationAllocation)
+add_executable(vsrHdriProfileUnavailable HdriProfileUnavailable.cpp)
+target_link_libraries(vsrHdriProfileUnavailable PRIVATE vsr_integration)
+target_compile_definitions(vsrHdriProfileUnavailable PRIVATE
+  VSR_DISABLE_HDRI_ALLOCATION_PROFILE)
+add_test(NAME vsr::hdri-profile-unavailable COMMAND vsrHdriProfileUnavailable)
 
 add_test(NAME vsr::integration COMMAND ${PROJECT_NAME} "[integration]")
 add_test(NAME vsr::mesh-helper
@@ -43,8 +51,8 @@ if (VSR_USE_INTEGRATION_MCP AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 if (VSR_USE_INTEGRATION_MCP AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  # Installed headless CLI qualification of the trusted startup asset roots and
-  # the launch-private working input. Runs against the installed library, in a
+  # Build-tree headless CLI qualification of trusted startup asset roots and
+  # the launch-private working input. Runs against installed libraries in a
   # private XDG runtime; never touches a live viewer, Scene or user config.
   add_test(NAME vsr::content-host-roots COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_SOURCE_DIR}/scripts/test-content-host-roots.py

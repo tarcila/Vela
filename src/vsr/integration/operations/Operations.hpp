@@ -1351,370 +1351,397 @@ inline bool OperationEngine::dispatch(
 
 inline void OperationEngine::runStep(const Key &key, scene::Scene &scene)
 {
-  std::string sessionId;
-  Target target;
-  Capability capability;
-  bool boundSceneRead = false;
-  bool sessionWide = false;
-  {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    auto *r = find(key);
-    if (!r)
-      return;
-    r->dispatched = false;
-    const double now = m_clock();
-    if (!r->terminal && r->deadline > 0.0 && now >= r->deadline)
-      cancelRecord(*r, Outcome::TIMEOUT, now);
-    if (r->terminal && !r->awaitingCleanup)
-      return; // expired or cancelled queued work never starts
-    sessionId = r->sessionId;
-    target = r->target;
-    capability = r->capability;
-    boundSceneRead = r->boundSceneRead;
-    sessionWide = r->sessionWide;
-  }
-
-  // Current policy applies at the safe point; checked without m_mutex since
-  // the authority may call back into onSessionEnded.
-  Outcome auth = Outcome::OK;
-  if (sessionId.empty()) {
-    if (!sessionWide && !m_authority.authorizeLocal(target, capability))
-      auth = Outcome::FORBIDDEN;
-  } else {
-    const auto code =
-        m_authority.authorizeExecution(sessionId, target, capability);
-    // Session-wide work needs only a live session: FORBIDDEN proves it is.
-    auth = sessionWide && code == session::Code::FORBIDDEN
-        ? Outcome::OK
-        : fromSessionCode(code);
-    if (auth == Outcome::OK && boundSceneRead) {
-      const auto scene = sceneFor(target);
-      auth = scene ? fromSessionCode(m_authority.authorizeExecution(
-                         sessionId, Target::scene(*scene), Capability::READ))
-                   : Outcome::FORBIDDEN;
-    }
-  }
-
-  Executor executor;
-  std::shared_ptr<const void> callbackLease;
-  bool abandoned = false;
-  bool sharedRetention = false;
-  {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    auto *r = find(key);
-    if (!r || (r->terminal && !r->awaitingCleanup))
-      return;
-    if (!r->terminal && !r->committed && auth != Outcome::OK) {
-      // Authority gates mutation, not the already committed sync/cleanup step.
-      // Current read still gates every protected result at status retrieval.
-      // Session ended or permission withdrawn before execution.
-      cancelRecord(*r,
-          auth == Outcome::FORBIDDEN ? Outcome::FORBIDDEN : Outcome::CANCELLED,
-          m_clock());
-      if (!r->awaitingCleanup)
+  bool cleanupPending = false;
+  try {
+    std::string sessionId;
+    Target target;
+    Capability capability;
+    bool boundSceneRead = false;
+    bool sessionWide = false;
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      auto *r = find(key);
+      if (!r)
         return;
+      r->dispatched = false;
+      const double now = m_clock();
+      if (!r->terminal && r->deadline > 0.0 && now >= r->deadline)
+        cancelRecord(*r, Outcome::TIMEOUT, now);
+      if (r->terminal && !r->awaitingCleanup)
+        return; // expired or cancelled queued work never starts
+      cleanupPending = r->phase == Phase::BACKEND || r->awaitingCleanup;
+      sessionId = r->sessionId;
+      target = r->target;
+      capability = r->capability;
+      boundSceneRead = r->boundSceneRead;
+      sessionWide = r->sessionWide;
     }
-    abandoned = r->terminal.has_value();
-    executor = r->executor;
-    if (r->kind == "create_hdri")
-      callbackLease = r->resourceLease;
-    sharedRetention = m_sink != nullptr;
-    r->executing = true;
-    // Committed work re-dispatched to run its normal-synchronization hook
-    // keeps reporting `synchronizing` while the hook executes (addendum 03
-    // §5).
-    const bool hookStep = r->committed && r->phase == Phase::SYNCHRONIZING;
-    if (!abandoned && !hookStep && r->phase != Phase::RUNNING) {
-      r->phase = Phase::RUNNING;
-      notify(*r, m_clock());
-    }
-  }
 
-  std::weak_ptr<bool> alive = m_alive;
-  const auto cleanupScene = sceneFor(sessionWide, target);
-  StepContext ctx{scene, abandoned, [this, alive, key, cleanupScene] {
-                    if (!alive.lock())
-                      return;
-                    bool resume = false;
-                    {
-                      std::lock_guard<std::mutex> lock(m_mutex);
-                      auto *r = find(key);
-                      resume = r && !r->executing && !r->dispatched
-                          && (r->phase == Phase::BACKEND || r->awaitingCleanup);
-                    }
-                    if (resume)
-                      dispatch(key, cleanupScene);
-                  }};
-  ctx.sharedRetention = sharedRetention;
-  ctx.isAbandoned = [this, alive, key] {
-    if (!alive.lock())
-      return true;
-    std::lock_guard<std::mutex> lock(m_mutex);
-    const auto *r = find(key);
-    return !r || r->terminal.has_value() || r->pendingCancel.has_value()
-        || (r->deadline > 0. && m_clock() >= r->deadline);
-  };
-  if (callbackLease) {
-    // Worker/pump copies share each engine-produced guard, not its captured
-    // key strings. Keep preparation coverage through the LAST guard owner,
-    // independently of Job completion or record expiry.
-    auto wake =
-        std::make_shared<const std::function<void()>>(std::move(ctx.wake));
-    auto abandoned = std::make_shared<const std::function<bool()>>(
-        std::move(ctx.isAbandoned));
-    ctx.wake = [wake, callbackLease] { (*wake)(); };
-    ctx.isAbandoned = [abandoned, callbackLease] { return (*abandoned)(); };
-  }
-  ctx.beforeWrite = [this,
-                        alive,
-                        key,
-                        sessionId,
-                        target,
-                        capability,
-                        boundSceneRead] {
-    if (!alive.lock())
-      return Outcome::CANCELLED;
-    Outcome current = sessionId.empty()
-        ? (m_authority.authorizeLocal(target, capability) ? Outcome::OK
-                                                          : Outcome::FORBIDDEN)
-        : fromSessionCode(
-              m_authority.authorizeExecution(sessionId, target, capability));
-    if (current == Outcome::OK && boundSceneRead) {
-      const auto bound = sceneFor(target);
-      current = !bound ? Outcome::FORBIDDEN
-          : sessionId.empty()
-          ? (m_authority.authorizeLocal(Target::scene(*bound), Capability::READ)
-                    ? Outcome::OK
-                    : Outcome::FORBIDDEN)
-          : fromSessionCode(m_authority.authorizeExecution(
-                sessionId, Target::scene(*bound), Capability::READ));
+    // Current policy applies at the safe point; checked without m_mutex since
+    // the authority may call back into onSessionEnded.
+    Outcome auth = Outcome::OK;
+    if (sessionId.empty()) {
+      if (!sessionWide && !m_authority.authorizeLocal(target, capability))
+        auth = Outcome::FORBIDDEN;
+    } else {
+      const auto code =
+          m_authority.authorizeExecution(sessionId, target, capability);
+      // Session-wide work needs only a live session: FORBIDDEN proves it is.
+      auth = sessionWide && code == session::Code::FORBIDDEN
+          ? Outcome::OK
+          : fromSessionCode(code);
+      if (auth == Outcome::OK && boundSceneRead) {
+        const auto scene = sceneFor(target);
+        auth = scene ? fromSessionCode(m_authority.authorizeExecution(
+                           sessionId, Target::scene(*scene), Capability::READ))
+                     : Outcome::FORBIDDEN;
+      }
     }
-    if (current != Outcome::OK)
-      return current;
-    std::lock_guard<std::mutex> lock(m_mutex);
-    const auto *r = find(key);
-    if (!r || r->terminal || r->pendingCancel)
-      return Outcome::CANCELLED;
-    if (r->recoveryApproval && !r->recoveryApproval->valid(r->recoveryCharge))
-      return Outcome::FORBIDDEN;
-    return r->deadline > 0. && m_clock() >= r->deadline ? Outcome::TIMEOUT
-                                                        : Outcome::OK;
-  };
-  ctx.prepareCommit = [this, key](
-                          const std::string &receipt, std::size_t capacity) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (auto *r = find(key)) {
-      r->commitFallback = receipt;
-      r->commitFallback.reserve(capacity);
+
+    Executor executor;
+    std::shared_ptr<const void> callbackLease;
+    bool abandoned = false;
+    bool sharedRetention = false;
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      auto *r = find(key);
+      if (!r || (r->terminal && !r->awaitingCleanup))
+        return;
+      if (!r->terminal && !r->committed && auth != Outcome::OK) {
+        // Authority gates mutation, not the already committed sync/cleanup
+        // step. Current read still gates every protected result at status
+        // retrieval. Session ended or permission withdrawn before execution.
+        cancelRecord(*r,
+            auth == Outcome::FORBIDDEN ? Outcome::FORBIDDEN
+                                       : Outcome::CANCELLED,
+            m_clock());
+        if (!r->awaitingCleanup)
+          return;
+      }
+      abandoned = r->terminal.has_value();
+      executor = r->executor;
+      if (r->kind == "create_hdri")
+        callbackLease = r->resourceLease;
+      sharedRetention = m_sink != nullptr;
+      r->executing = true;
+      // Committed work re-dispatched to run its normal-synchronization hook
+      // keeps reporting `synchronizing` while the hook executes (addendum 03
+      // §5).
+      const bool hookStep = r->committed && r->phase == Phase::SYNCHRONIZING;
+      if (!abandoned && !hookStep && r->phase != Phase::RUNNING) {
+        r->phase = Phase::RUNNING;
+        notify(*r, m_clock());
+      }
     }
-  };
-  ctx.markCommitted = [this, key] {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (auto *r = find(key)) {
-      r->result = std::move(r->commitFallback);
-      r->committed = true;
-    }
-  };
-  // Serialized with notify() under the engine lock.
-  auto withSink = [this, alive, key](auto &&fn) {
-    if (!alive.lock())
-      return;
-    std::lock_guard<std::mutex> lock(m_mutex);
-    auto *r = find(key);
-    if (m_sink && r && r->activityId)
-      fn(*m_sink, *r->activityId);
-  };
-  ctx.prepareActivityResult = [withSink](std::size_t bytes,
-                                  ResultOwnership::Reserve reserve) {
-    bool ok = false;
-    withSink([&](ActivitySink &s, ActivitySink::Id id) {
-      ok = s.prepareResult(id, bytes, std::move(reserve));
-    });
-    return ok;
-  };
-  withSink([&](ActivitySink &s, ActivitySink::Id) {
-    ctx.restorationPolicy = s.restorationPolicy();
-  });
-  {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    const auto *r = find(key);
-    ctx.recoveryApprovalRequested = r && r->approvalRequestId.has_value();
-    // HDRI passes its own shared dispatch authority. Do not copy a host's
-    // otherwise opaque legacy recovery callback into unused worker context.
-    if (!callbackLease)
-      ctx.reserveRecoveryMemory = m_recoveryReserve;
-  }
-  ctx.authorizeRecovery = [this, alive, key, &ctx](std::size_t bytes,
-                              std::string_view canonical,
-                              std::weak_ptr<const void> registration,
-                              approval::ProposalStore::Reserve reserve,
-                              std::string_view layout) {
-    if (!alive.lock())
-      return false;
-    std::lock_guard<std::mutex> lock(m_mutex);
-    auto *r = find(key);
-    if (!r || !m_sink || !ctx.restorationPolicy)
-      return false;
-    if (bytes <= ctx.restorationPolicy->hardBytes)
-      return !r->approvalRequestId;
-    auto *store = m_sink->recoveryApprovals();
-    if (!store || r->sessionId.empty())
-      return false;
-    const approval::Identity identity{m_authority.launchId(),
-        r->sessionId,
-        r->target.id,
-        r->kind,
-        r->approvalRequestId.value_or(r->requestId)};
-    if (!r->approvalRequestId) {
-      ctx.approvalOffered = store->offer(identity,
-          canonical,
-          bytes,
-          ctx.restorationPolicy->softBytes,
-          ctx.restorationPolicy->hardBytes,
-          std::move(registration),
-          reserve ? reserve : m_recoveryReserve,
-          r->canonicalArguments,
-          layout);
-      return false;
-    }
-    if (*r->approvalRequestId >= r->requestId)
-      return false;
-    auto claim =
-        store->claim(identity, canonical, bytes, r->canonicalArguments, layout);
-    if (!claim)
-      return false;
-    r->recoveryApproval = std::move(claim);
-    r->recoveryCharge = bytes;
-    return true;
-  };
-  ctx.consumeRecoveryApproval = [this, alive, key] {
-    if (!alive.lock())
-      return false;
-    std::lock_guard<std::mutex> lock(m_mutex);
-    auto *r = find(key);
-    return r
-        && (!r->recoveryApproval
-            || r->recoveryApproval->consume(r->recoveryCharge));
-  };
-  ctx.reserveRestoration = [withSink, this, key](std::size_t bytes,
-                               const std::string &launchId,
-                               const std::string &batchId) {
-    bool ok = true;
-    withSink([&](ActivitySink &s, ActivitySink::Id id) {
+
+    std::weak_ptr<bool> alive = m_alive;
+    const auto cleanupScene = sceneFor(sessionWide, target);
+    StepContext ctx{
+        scene, abandoned, [this, alive, key, cleanupScene] {
+          if (!alive.lock())
+            return;
+          bool resume = false;
+          {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto *r = find(key);
+            resume = r && !r->executing && !r->dispatched
+                && (r->phase == Phase::BACKEND || r->awaitingCleanup);
+          }
+          if (resume)
+            dispatch(key, cleanupScene);
+        }};
+    ctx.sharedRetention = sharedRetention;
+    ctx.isAbandoned = [this, alive, key] {
+      if (!alive.lock())
+        return true;
+      std::lock_guard<std::mutex> lock(m_mutex);
       const auto *r = find(key);
-      ok = s.reserveRestoration(
-          id, bytes, launchId, batchId, r ? r->recoveryApproval : nullptr);
+      return !r || r->terminal.has_value() || r->pendingCancel.has_value()
+          || (r->deadline > 0. && m_clock() >= r->deadline);
+    };
+    if (callbackLease) {
+      // Worker/pump copies share each engine-produced guard, not its captured
+      // key strings. Keep preparation coverage through the LAST guard owner,
+      // independently of Job completion or record expiry.
+      auto wake =
+          std::make_shared<const std::function<void()>>(std::move(ctx.wake));
+      auto abandoned = std::make_shared<const std::function<bool()>>(
+          std::move(ctx.isAbandoned));
+      ctx.wake = [wake, callbackLease] { (*wake)(); };
+      ctx.isAbandoned = [abandoned, callbackLease] { return (*abandoned)(); };
+    }
+    ctx.beforeWrite =
+        [this, alive, key, sessionId, target, capability, boundSceneRead] {
+          if (!alive.lock())
+            return Outcome::CANCELLED;
+          Outcome current = sessionId.empty()
+              ? (m_authority.authorizeLocal(target, capability)
+                        ? Outcome::OK
+                        : Outcome::FORBIDDEN)
+              : fromSessionCode(m_authority.authorizeExecution(
+                    sessionId, target, capability));
+          if (current == Outcome::OK && boundSceneRead) {
+            const auto bound = sceneFor(target);
+            current = !bound ? Outcome::FORBIDDEN
+                : sessionId.empty()
+                ? (m_authority.authorizeLocal(
+                       Target::scene(*bound), Capability::READ)
+                          ? Outcome::OK
+                          : Outcome::FORBIDDEN)
+                : fromSessionCode(m_authority.authorizeExecution(
+                      sessionId, Target::scene(*bound), Capability::READ));
+          }
+          if (current != Outcome::OK)
+            return current;
+          std::lock_guard<std::mutex> lock(m_mutex);
+          const auto *r = find(key);
+          if (!r || r->terminal || r->pendingCancel)
+            return Outcome::CANCELLED;
+          if (r->recoveryApproval
+              && !r->recoveryApproval->valid(r->recoveryCharge))
+            return Outcome::FORBIDDEN;
+          return r->deadline > 0. && m_clock() >= r->deadline ? Outcome::TIMEOUT
+                                                              : Outcome::OK;
+        };
+    ctx.prepareCommit = [this, key](
+                            const std::string &receipt, std::size_t capacity) {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      if (auto *r = find(key)) {
+        r->commitFallback = receipt;
+        r->commitFallback.reserve(capacity);
+      }
+    };
+    ctx.markCommitted = [this, key] {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      if (auto *r = find(key)) {
+        r->result = std::move(r->commitFallback);
+        r->committed = true;
+      }
+    };
+    // Serialized with notify() under the engine lock.
+    auto withSink = [this, alive, key](auto &&fn) {
+      if (!alive.lock())
+        return;
+      std::lock_guard<std::mutex> lock(m_mutex);
+      auto *r = find(key);
+      if (m_sink && r && r->activityId)
+        fn(*m_sink, *r->activityId);
+    };
+    ctx.prepareActivityResult = [withSink](std::size_t bytes,
+                                    ResultOwnership::Reserve reserve) {
+      bool ok = false;
+      withSink([&](ActivitySink &s, ActivitySink::Id id) {
+        ok = s.prepareResult(id, bytes, std::move(reserve));
+      });
+      return ok;
+    };
+    withSink([&](ActivitySink &s, ActivitySink::Id) {
+      ctx.restorationPolicy = s.restorationPolicy();
     });
-    return ok;
-  };
-  ctx.cancelRestoration = [withSink, this, key] {
-    withSink([&](ActivitySink &s, ActivitySink::Id id) {
-      s.cancelRestoration(id);
-      if (auto *r = find(key))
-        r->recoveryApproval.reset();
-    });
-  };
-  ctx.publishRestoration = [withSink] {
-    withSink(
-        [](ActivitySink &s, ActivitySink::Id id) { s.publishRestoration(id); });
-  };
-  ctx.restorationRetained = [this, alive](const std::string &launchId,
-                                const std::string &batchId) {
-    if (!alive.lock())
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      const auto *r = find(key);
+      ctx.recoveryApprovalRequested = r && r->approvalRequestId.has_value();
+      // HDRI passes its own shared dispatch authority. Do not copy a host's
+      // otherwise opaque legacy recovery callback into unused worker context.
+      if (!callbackLease)
+        ctx.reserveRecoveryMemory = m_recoveryReserve;
+    }
+    ctx.authorizeRecovery = [this, alive, key, &ctx](std::size_t bytes,
+                                std::string_view canonical,
+                                std::weak_ptr<const void> registration,
+                                approval::ProposalStore::Reserve reserve,
+                                std::string_view layout) {
+      if (!alive.lock())
+        return false;
+      std::lock_guard<std::mutex> lock(m_mutex);
+      auto *r = find(key);
+      if (!r || !m_sink || !ctx.restorationPolicy)
+        return false;
+      if (bytes <= ctx.restorationPolicy->hardBytes)
+        return !r->approvalRequestId;
+      auto *store = m_sink->recoveryApprovals();
+      if (!store || r->sessionId.empty())
+        return false;
+      const approval::Identity identity{m_authority.launchId(),
+          r->sessionId,
+          r->target.id,
+          r->kind,
+          r->approvalRequestId.value_or(r->requestId)};
+      if (!r->approvalRequestId) {
+        ctx.approvalOffered = store->offer(identity,
+            canonical,
+            bytes,
+            ctx.restorationPolicy->softBytes,
+            ctx.restorationPolicy->hardBytes,
+            std::move(registration),
+            reserve ? reserve : m_recoveryReserve,
+            r->canonicalArguments,
+            layout);
+        return false;
+      }
+      if (*r->approvalRequestId >= r->requestId)
+        return false;
+      auto claim = store->claim(
+          identity, canonical, bytes, r->canonicalArguments, layout);
+      if (!claim)
+        return false;
+      r->recoveryApproval = std::move(claim);
+      r->recoveryCharge = bytes;
       return true;
-    std::lock_guard<std::mutex> lock(m_mutex);
-    return !m_sink || m_sink->restorationRetained(launchId, batchId);
-  };
-  ctx.restorationKnown = [this, alive](const std::string &launchId,
-                             const std::string &batchId) {
-    if (!alive.lock())
-      return false;
-    std::lock_guard<std::mutex> lock(m_mutex);
-    return !m_sink || m_sink->restorationKnown(launchId, batchId);
-  };
-  ctx.markRestored = [this, alive](const std::string &launchId,
-                         const std::string &batchId) {
-    if (!alive.lock())
-      return;
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_sink)
-      m_sink->restorationRestored(launchId, batchId);
-  };
-  ctx.markConflicting = [this, alive](const std::string &launchId,
-                            const std::string &batchId) {
-    if (!alive.lock())
-      return;
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_sink)
-      m_sink->restorationConflicting(launchId, batchId);
-  };
-  Step step = executor ? executor(ctx) : Step{};
+    };
+    ctx.consumeRecoveryApproval = [this, alive, key] {
+      if (!alive.lock())
+        return false;
+      std::lock_guard<std::mutex> lock(m_mutex);
+      auto *r = find(key);
+      return r
+          && (!r->recoveryApproval
+              || r->recoveryApproval->consume(r->recoveryCharge));
+    };
+    ctx.reserveRestoration = [withSink, this, key](std::size_t bytes,
+                                 const std::string &launchId,
+                                 const std::string &batchId) {
+      bool ok = true;
+      withSink([&](ActivitySink &s, ActivitySink::Id id) {
+        const auto *r = find(key);
+        ok = s.reserveRestoration(
+            id, bytes, launchId, batchId, r ? r->recoveryApproval : nullptr);
+      });
+      return ok;
+    };
+    ctx.cancelRestoration = [withSink, this, key] {
+      withSink([&](ActivitySink &s, ActivitySink::Id id) {
+        s.cancelRestoration(id);
+        if (auto *r = find(key))
+          r->recoveryApproval.reset();
+      });
+    };
+    ctx.publishRestoration = [withSink] {
+      withSink([](ActivitySink &s, ActivitySink::Id id) {
+        s.publishRestoration(id);
+      });
+    };
+    ctx.restorationRetained = [this, alive](const std::string &launchId,
+                                  const std::string &batchId) {
+      if (!alive.lock())
+        return true;
+      std::lock_guard<std::mutex> lock(m_mutex);
+      return !m_sink || m_sink->restorationRetained(launchId, batchId);
+    };
+    ctx.restorationKnown = [this, alive](const std::string &launchId,
+                               const std::string &batchId) {
+      if (!alive.lock())
+        return false;
+      std::lock_guard<std::mutex> lock(m_mutex);
+      return !m_sink || m_sink->restorationKnown(launchId, batchId);
+    };
+    ctx.markRestored = [this, alive](const std::string &launchId,
+                           const std::string &batchId) {
+      if (!alive.lock())
+        return;
+      std::lock_guard<std::mutex> lock(m_mutex);
+      if (m_sink)
+        m_sink->restorationRestored(launchId, batchId);
+    };
+    ctx.markConflicting = [this, alive](const std::string &launchId,
+                              const std::string &batchId) {
+      if (!alive.lock())
+        return;
+      std::lock_guard<std::mutex> lock(m_mutex);
+      if (m_sink)
+        m_sink->restorationConflicting(launchId, batchId);
+    };
+    Step step = executor ? executor(ctx) : Step{};
 
-  bool redispatch = false;
-  {
+    bool redispatch = false;
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      auto *r = find(key);
+      if (!r)
+        return;
+      r->executing = false;
+      const double now = m_clock();
+      r->backendFault = r->backendFault || step.backendFault;
+      if (step.committed)
+        r->committed = true;
+
+      if (r->terminal) {
+        // Abandoned: late results never make the operation succeed.
+        if (step.status == Step::Status::BACKEND_PENDING)
+          r->awaitingCleanup = true;
+        else
+          releaseSlot(*r);
+        notify(*r, now);
+        return;
+      }
+
+      if (!r->committed && r->deadline > 0. && now >= r->deadline)
+        r->pendingCancel = Outcome::TIMEOUT;
+      if (r->pendingCancel && !r->committed) {
+        const Outcome o = *r->pendingCancel;
+        r->phase = step.status == Step::Status::BACKEND_PENDING
+            ? Phase::BACKEND
+            : Phase::RUNNING;
+        finish(*r, o, now);
+        return;
+      }
+      r->pendingCancel.reset();
+
+      switch (step.status) {
+      case Step::Status::YIELD:
+        r->phase = Phase::YIELDED;
+        redispatch = true;
+        notify(*r, now);
+        break;
+      case Step::Status::SYNCHRONIZING:
+        r->phase = Phase::SYNCHRONIZING;
+        redispatch = true;
+        notify(*r, now);
+        break;
+      case Step::Status::BACKEND_PENDING:
+        r->phase = Phase::BACKEND;
+        notify(*r, now);
+        break;
+      case Step::Status::COMPLETE:
+        r->result = std::move(step.result);
+        if (step.resourceLease)
+          r->resourceLease = std::move(step.resourceLease);
+        if (step.reserveStatus)
+          r->reserveStatus = std::move(step.reserveStatus);
+        if (r->sessionWide)
+          r->covered = std::move(step.covered);
+        r->phase = Phase::RUNNING;
+        if (step.onAccepted)
+          step.onAccepted();
+        finish(*r, step.outcome, now);
+        break;
+      }
+    }
+    if (redispatch)
+      dispatch(key);
+  } catch (...) {
+    // Context construction is part of the host transaction barrier too.
+    // In particular, a physical lease does not make shared/function allocation
+    // infallible. Preserve the prepared committed receipt; never overwrite it
+    // with a nonmutating rejection. A worker already owning preparation must
+    // still drain through its existing wake/pump before its slot is released.
     std::lock_guard<std::mutex> lock(m_mutex);
     auto *r = find(key);
     if (!r)
       return;
     r->executing = false;
-    const double now = m_clock();
-    r->backendFault = r->backendFault || step.backendFault;
-    if (step.committed)
-      r->committed = true;
-
-    if (r->terminal) {
-      // Abandoned: late results never make the operation succeed.
-      if (step.status == Step::Status::BACKEND_PENDING)
-        r->awaitingCleanup = true;
-      else
-        releaseSlot(*r);
-      notify(*r, now);
+    if (r->terminal && !r->awaitingCleanup)
       return;
-    }
-
-    if (!r->committed && r->deadline > 0. && now >= r->deadline)
-      r->pendingCancel = Outcome::TIMEOUT;
-    if (r->pendingCancel && !r->committed) {
-      const Outcome o = *r->pendingCancel;
-      r->phase = step.status == Step::Status::BACKEND_PENDING ? Phase::BACKEND
-                                                              : Phase::RUNNING;
-      finish(*r, o, now);
-      return;
-    }
-    r->pendingCancel.reset();
-
-    switch (step.status) {
-    case Step::Status::YIELD:
-      r->phase = Phase::YIELDED;
-      redispatch = true;
-      notify(*r, now);
-      break;
-    case Step::Status::SYNCHRONIZING:
-      r->phase = Phase::SYNCHRONIZING;
-      redispatch = true;
-      notify(*r, now);
-      break;
-    case Step::Status::BACKEND_PENDING:
-      r->phase = Phase::BACKEND;
-      notify(*r, now);
-      break;
-    case Step::Status::COMPLETE:
-      r->result = std::move(step.result);
-      if (step.resourceLease)
-        r->resourceLease = std::move(step.resourceLease);
-      if (step.reserveStatus)
-        r->reserveStatus = std::move(step.reserveStatus);
-      if (r->sessionWide)
-        r->covered = std::move(step.covered);
-      r->phase = Phase::RUNNING;
-      if (step.onAccepted)
-        step.onAccepted();
-      finish(*r, step.outcome, now);
-      break;
-    }
+    cleanupPending =
+        cleanupPending || r->phase == Phase::BACKEND || r->awaitingCleanup;
+    r->phase =
+        cleanupPending && !r->committed ? Phase::BACKEND : Phase::RUNNING;
+    finish(*r,
+        r->committed ? Outcome::APPLIED_WITH_SYNC_FAILURE
+                     : r->terminal.value_or(Outcome::BUSY),
+        m_clock());
   }
-  if (redispatch)
-    dispatch(key);
 }
 
 inline void OperationEngine::onSessionEnded(const std::string &sessionId)

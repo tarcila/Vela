@@ -26,6 +26,7 @@
 #include "vsr/integration/mcp/tools/QueryTools.hpp"
 #include "vsr/integration/mcp/tools/RenderTools.hpp"
 #include "vsr/integration/render/ControllerCamera.hpp"
+#include "vsr/io/archives/SceneArchive.hpp"
 #include "vsr/io/images/ImageCache.hpp"
 #include "vsr/rendering/index/RenderIndexAllLayers.hpp"
 #include "vsr/rendering/pipeline/ImagePipeline.h"
@@ -12104,6 +12105,7 @@ SCENARIO(
 // Approval cancellation reuses the bounded read gate declared above.
 #include "HdriCreationMcp.inc"
 #include "HdriOutsideUseMcp.inc"
+#include "HdriPersistenceMcp.inc"
 #include "HdriRestoreMcp.inc"
 #include "HdriSafetyMcp.inc"
 // Pressure/final-guard/teardown tests reuse the real HDRI fixture above.

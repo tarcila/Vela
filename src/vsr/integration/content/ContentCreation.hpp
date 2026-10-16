@@ -5,6 +5,7 @@
 
 // vsr_integration
 #include "vsr/integration/activity/Activity.hpp"
+#include "vsr/integration/content/AllocationProfile.hpp"
 #include "vsr/integration/content/AssetRoots.hpp"
 #include "vsr/integration/content/HdriDecode.hpp"
 #include "vsr/integration/content/PreparationOwnership.hpp"
@@ -235,6 +236,8 @@ inline std::string ContentCreation::rootProfiles() const
 
 inline std::string ContentCreation::metadata() const
 {
+  if (!allocation_profile::AVAILABLE)
+    return "{\"kinds\":[],\"reason\":\"hdri_allocation_profile_unavailable\"}";
   return "{\"kinds\":[\"hdri\"],\"source_profile\":\"radiance_rgbe_minus_y_plus_x\","
       "\"color\":\"linear_float32_rgb\",\"rows\":\"bottom_up_light_radiance\","
       "\"defaults\":{\"scale\":1,\"up\":[0,1,0],\"direction\":[1,0,0],\"root_name\":\"HDRI Content\"},"
@@ -257,6 +260,8 @@ inline operations::Admission ContentCreation::submit(
   using operations::Step;
   operations::Admission rejected;
   rejected.code = Outcome::INVALID_REQUEST;
+  if (!allocation_profile::AVAILABLE)
+    return rejected;
   if (request.fileName.empty() || request.fileName.size() > 4096
       || request.rootName.empty() || request.rootName.size() > 256
       || request.rootName.find('\0') != std::string::npos
@@ -400,6 +405,9 @@ inline operations::Admission ContentCreation::submit(
       }
       if (state->stopping.load() || ctx.abandoned || ctx.isAbandoned())
         return fail(Outcome::CANCELLED, "cancelled");
+      if (const auto *reason =
+              scene::detail::validateHdriSettings(request.settings))
+        return fail(Outcome::INVALID_REQUEST, reason);
       Source source;
       {
         std::lock_guard<std::mutex> lock(state->mutex);
@@ -512,15 +520,8 @@ inline operations::Admission ContentCreation::submit(
         // libstdc++ async's actual state and result allocation types. The
         // thread trampoline owns one member-function pointer plus a state
         // pointer and a virtual base; max_align_t rounding is conservative.
-        using Async = std::__future_base::_Async_state_impl<
-            std::thread::_Call_wrapper<decltype(task)>>;
         constexpr size_t ASYNC_BYTES =
-            sizeof(std::_Sp_counted_ptr_inplace<Async,
-                std::allocator<void>,
-                __gnu_cxx::_S_atomic>)
-            + sizeof(std::__future_base::_Result<void>)
-            + sizeof(void (Async::*)()) + sizeof(Async *)
-            + 2 * sizeof(std::max_align_t);
+            allocation_profile::asyncBytes<decltype(task)>();
         job->asyncControl = state->reserve(ASYNC_BYTES);
         if (!job->asyncControl)
           return fail(Outcome::BUSY, "async_control_limit");
@@ -588,10 +589,9 @@ inline operations::Admission ContentCreation::submit(
       snapshot->scopeLease = state->reserve(scopeBytes);
       if (!snapshot->scopeLease)
         return fail(Outcome::BUSY, "scope_ownership_limit");
-      using SnapshotControl = std::_Sp_counted_ptr_inplace<edit::HdriSnapshot,
-          CapacityAllocator<edit::HdriSnapshot>,
-          __gnu_cxx::_S_atomic>;
-      snapshot->retainedBytes = sizeof(SnapshotControl)
+      snapshot->retainedBytes =
+          allocation_profile::sharedControlBytes<edit::HdriSnapshot,
+              CapacityAllocator<edit::HdriSnapshot>>()
           + sizeof(CapacityArena::Charge) + 2 * sizeof(std::max_align_t)
           + scopeBytes;
       core::StorageProfile recordProfile(64u << 10);

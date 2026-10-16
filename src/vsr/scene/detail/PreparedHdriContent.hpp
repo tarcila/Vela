@@ -25,6 +25,33 @@ struct HdriSettings
   math::mat4 transform{math::IDENTITY_MAT4};
 };
 
+// Allocation-free validation shared by admission and detached preparation.
+inline const char *validateHdriSettings(const HdriSettings &settings)
+{
+  if (!std::isfinite(settings.scale) || settings.scale < 0.f)
+    return "hdri_scale_must_be_finite_and_nonnegative";
+  for (size_t column = 0; column < 4; ++column)
+    for (size_t row = 0; row < 4; ++row)
+      if (!std::isfinite(settings.transform[column][row]))
+        return "hdri_transform_must_be_finite";
+  if (settings.transform[0][3] != 0.f || settings.transform[1][3] != 0.f
+      || settings.transform[2][3] != 0.f || settings.transform[3][3] != 1.f)
+    return "hdri_transform_must_be_affine";
+  const auto finite = [](const math::float3 &v) {
+    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+  };
+  const auto upLength = math::length(settings.up);
+  const auto directionLength = math::length(settings.direction);
+  const auto crossLength =
+      math::length(math::cross(settings.up, settings.direction));
+  if (!finite(settings.up) || !finite(settings.direction)
+      || !std::isfinite(upLength) || !std::isfinite(directionLength)
+      || !std::isfinite(crossLength) || upLength == 0.f
+      || directionLength == 0.f || crossLength == 0.f)
+    return "hdri_up_and_direction_must_be_finite_nonzero_and_nonparallel";
+  return nullptr;
+}
+
 /* Internal, owning-thread append seam, not an admitted agent operation.
  * All values, data, pool/forest capacity and optional Layer ownership are
  * prepared while detached. commit() never calls ordinary Scene constructors
@@ -234,27 +261,10 @@ inline PreparedHdriContent::PreparedHdriContent(Scene &scene,
   m_delegates.reserve(scene.m_updateDelegate.m_delegates.size());
   for (const auto &delegate : scene.m_updateDelegate.m_delegates)
     m_delegates.emplace_back(delegate);
-  if (!radiance || !std::isfinite(settings.scale) || settings.scale < 0.f)
-    throw std::runtime_error("Invalid prepared HDRI content");
-  const auto finite = [](const math::float3 &v) {
-    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
-  };
-  for (size_t column = 0; column < 4; ++column)
-    for (size_t row = 0; row < 4; ++row)
-      if (!std::isfinite(settings.transform[column][row]))
-        throw std::runtime_error("Invalid HDRI initial transform");
-  if (settings.transform[0][3] != 0.f || settings.transform[1][3] != 0.f
-      || settings.transform[2][3] != 0.f || settings.transform[3][3] != 1.f)
-    throw std::runtime_error("HDRI initial transform must be affine");
-  const auto upLength = math::length(settings.up);
-  const auto directionLength = math::length(settings.direction);
-  const auto crossLength =
-      math::length(math::cross(settings.up, settings.direction));
-  if (!finite(settings.up) || !finite(settings.direction)
-      || !std::isfinite(upLength) || !std::isfinite(directionLength)
-      || !std::isfinite(crossLength) || upLength == 0.f
-      || directionLength == 0.f || crossLength == 0.f)
-    throw std::runtime_error("Invalid HDRI orientation");
+  if (!radiance)
+    throw std::runtime_error("Invalid prepared HDRI radiance");
+  if (const auto *reason = validateHdriSettings(settings))
+    throw std::runtime_error(reason);
   if (!parent && !newLayerName) {
     if (scene.m_layers.empty())
       newLayerName = m_newLayerName = Token("default");

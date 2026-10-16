@@ -207,9 +207,11 @@ and partial reserve failure. This deliberately overcharges existing order
 capacity rather than pretending to instrument baseline Store/Activity allocation;
 there is no per-record duplicate full-vector reserve. Later ordinary history
 cannot grow beyond the qualified backing without a prewrite refusal. Metadata
-Snapshots remain weak and contain no radiance bytes. Startup/private-root wiring,
-production registration and central review remain required; the bounded internal
-control profile is not a global malloc/Scene/GPU accounting promise.
+Snapshots remain weak and contain no radiance bytes. Startup/private-root wiring
+and production registration have landed; central review remains required. The
+bounded internal control profile is not a global malloc/Scene/GPU accounting
+promise. Unsupported standard-library allocation profiles advertise no HDRI kind
+and refuse before preparation rather than using an unproven allowance.
 
 ## Confinement, worker currency and lifecycle
 
@@ -293,8 +295,10 @@ presented viewport captures or inherited native Mesh evidence.
 
 The original installed Helide Light-factory failure and red evidence remain in
 the ticket's diagnostic artifacts. Helide is still a supported geometry/data
-fast control, **not** an HDRI illumination pass. BOTH VisRTX and Barney remain
-mandatory in tickets 08/09 for the complete later content milestone.
+fast control, **not** an HDRI illumination pass. VisRTX is the mandatory GPU
+reference for acceptance, including tickets 08/09. Barney continues as diagnostic
+coverage: failures are recorded, not delivery blockers or authorization to repair
+the backend. Passing HDRI creation/removal does not qualify edited-Image refresh.
 
 Ticket 01's accounting, startup/private-root controls and installed operator
 discovery have landed. Independent central Standards/Spec review, default-`g`

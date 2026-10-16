@@ -147,6 +147,44 @@ SCENARIO("Public HDRI typed defaults preserve resident HDR rows and placement",
   CHECK(f.scene.numberOfObjects(ANARI_LIGHT) == 0);
 }
 
+SCENARIO("Public HDRI rejects invalid settings before reading input",
+    "[integration][content][mcp][hdri-invalid-settings]")
+{
+  const auto settings = GENERATE(",\"up\":[0,0,0]",
+      ",\"direction\":[0,0,0]",
+      ",\"up\":[1,0,0],\"direction\":[2,0,0]",
+      ",\"transform\":[1,0,0,1,0,1,0,0,0,0,1,0,0,0,0,1]");
+  HdriFixture f;
+  const auto s = f.attach();
+  writePublicHdri(f.tmp.path + "/safety.hdr");
+  f.tool(s, "vsr_create_hdri", publicHdriArgs(f, 1));
+  const auto prior = f.await(s, 1);
+  REQUIRE(prior.flag("committed"));
+  const auto revision = f.sceneIds->sceneRevision();
+  const auto lights = f.scene.numberOfObjects(ANARI_LIGHT);
+  const auto arrays = f.scene.numberOfObjects(ANARI_ARRAY);
+  f.tool(s, "vsr_create_hdri", publicHdriArgs(f, 2, settings));
+  const auto rejected = f.await(s, 2);
+  CHECK(rejected.str("outcome") == "invalid_request");
+  CHECK_FALSE(rejected.flag("committed"));
+  REQUIRE(rejected.result());
+  REQUIRE(rejected.result()->get("reason"));
+  CHECK(rejected.result()->get("reason")->s.find("hdri_") == 0);
+  CHECK(f.sceneIds->sceneRevision() == revision);
+  CHECK(f.scene.numberOfObjects(ANARI_LIGHT) == lights);
+  CHECK(f.scene.numberOfObjects(ANARI_ARRAY) == arrays);
+  REQUIRE(std::remove((f.tmp.path + "/safety.hdr").c_str()) == 0);
+  f.tool(s, "vsr_create_hdri", publicHdriArgs(f, 3, settings));
+  const auto missingInput = f.await(s, 3);
+  CHECK(missingInput.str("outcome") == "invalid_request");
+  REQUIRE(missingInput.result());
+  CHECK(missingInput.result()->get("reason")->s
+      == rejected.result()->get("reason")->s);
+  CHECK(f.sceneIds->sceneRevision() == revision);
+  f.restoreBatch(s, 4, *prior.result()->get("batch_ref"));
+  CHECK(f.await(s, 4).str("outcome") == "ok");
+}
+
 SCENARIO("Public HDRI owned Parameter metadata change-back conflicts",
     "[integration][content][mcp][meta-param-public]")
 {
