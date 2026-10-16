@@ -11,6 +11,12 @@ Parameter::Parameter(ParameterObserver *object, Token name)
     : m_observer(object), m_name(name)
 {}
 
+Parameter::Parameter(ParameterObserver *object, const Parameter &saved)
+    : Parameter(saved)
+{
+  m_observer = object;
+}
+
 void Parameter::remove()
 {
   if (m_observer)

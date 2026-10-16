@@ -57,6 +57,8 @@ struct ParameterObserver
 struct Parameter
 {
   Parameter(ParameterObserver *object, Token name);
+  // Copy saved state while binding notifications to the current owner address.
+  Parameter(ParameterObserver *object, const Parameter &saved);
 
   void remove(); // remove (and delete) parameter from parent object
 
