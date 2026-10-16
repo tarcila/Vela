@@ -156,6 +156,10 @@ if (TARGET vsrViewer)
   add_test(NAME vsr::viewer-cli COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_LIST_DIR}/viewer_cli.py
     ${CMAKE_INSTALL_PREFIX}/bin/vsrViewer)
+  add_test(NAME vsr::agent-cli COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/scripts/test-agent-cli.py
+    ${CMAKE_INSTALL_PREFIX}/bin
+    $<BOOL:${VSR_USE_INTEGRATION}> $<BOOL:${VSR_USE_INTEGRATION_MCP}>)
 endif()
 add_test(NAME vsr::AnimationArchive COMMAND ${PROJECT_NAME} "[AnimationArchive]")
 add_test(NAME vsr::AnimationManagerArchive

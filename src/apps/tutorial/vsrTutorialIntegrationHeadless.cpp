@@ -20,7 +20,7 @@
 //        [--agentAssetRoot <absolute-directory>]... (trusted host read roots)
 
 // vsr
-#include "vsr/app/AgentOptions.hpp"
+#include "vsr/app/AgentCommandLine.hpp"
 #include "vsr/app/Context.h"
 #include "vsr/integration/Integration.hpp"
 #include "vsr/integration/activity/Activity.hpp"
@@ -323,12 +323,17 @@ int fail(const char *what)
 
 int main(int argc, const char *argv[])
 {
+  if (vsr::app::viewerHelpRequested(argc, argv)) {
+    std::fputs(vsr::app::agentHeadlessCommandLineHelp().c_str(), stdout);
+    return 0;
+  }
+  if (const auto error = vsr::app::agentOptionAvailabilityError(
+          argc, argv, true, vsr::app::AGENT_CLI_MCP);
+      !error.empty())
+    return fail(error.c_str());
   vsr::app::AgentOptions agentOptions;
   if (!vsr::app::parseAgentOptions(argc, argv, agentOptions)) {
-    std::fprintf(stderr,
-        "--agentRestorationBytes requires one positive decimal byte count; "
-        "--agentRestorationHardBytes likewise, with hard >= soft; "
-        "--agentAssetRoot one absolute directory, at most 8, no duplicates\n");
+    std::fprintf(stderr, "%s\n", vsr::app::agentOptionsValueError().c_str());
     return 1;
   }
   bool exitAfterActivation = false;

@@ -67,9 +67,15 @@ inline bool parseAgentOptions(
     int argc, const char *const argv[], AgentOptions &options)
 {
   AgentOptions parsed;
-  bool seenSoft = false, seenHard = false;
+  bool seenSoft = false, seenHard = false, literal = false;
   for (int i = 0; i < argc; ++i) {
     const std::string_view arg(argv[i]);
+    if (i > 0 && arg == "--")
+      literal = true;
+    if (literal) {
+      parsed.arguments.push_back(argv[i]);
+      continue;
+    }
     const bool hard = arg == "--agentRestorationHardBytes";
     if (i > 0 && arg == "--agentAssetRoot") {
       if (++i == argc

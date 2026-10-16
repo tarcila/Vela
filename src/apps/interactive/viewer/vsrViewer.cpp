@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // vsr_app
-#include <vsr/app/AgentOptions.hpp>
-#include <vsr/app/ViewerCommandLine.hpp>
+#include <vsr/app/AgentCommandLine.hpp>
 // vsr_io
 #include <vsr/io/procedural.hpp>
 // vsr_ui_imgui
@@ -1420,39 +1419,26 @@ void Application::teardownIntegration()
 int main(int argc, const char *argv[])
 {
   if (vsr::app::viewerHelpRequested(argc, argv)) {
-    std::fputs(vsr::app::viewerCommandLineHelp().c_str(), stdout);
+    const auto help =
+        vsr::app::viewerCommandLineHelp(vsr::app::agentCommandLineOptions())
+        + (vsr::app::AGENT_CLI_INTEGRATION
+                ? vsr::app::agentCommandLineHelpNotes()
+                : std::string{});
+    std::fputs(help.c_str(), stdout);
     return 0;
   }
-  // Reject malformed host options before Context can treat them as scene files.
   vsr::app::AgentOptions options;
-  if (!vsr::app::parseAgentOptions(argc, argv, options)) {
-    std::fprintf(stderr,
-        "--agentRestorationBytes requires one positive decimal byte count; "
-        "--agentRestorationHardBytes likewise, with hard >= soft; "
-        "--agentAssetRoot one absolute directory, at most 8, no duplicates\n");
-    return 1;
-  }
-  // vsrViewer owns `--agentIntegration`; remove it before the base parser.
   bool agentIntegrationRequested = false;
-  std::vector<const char *> args;
-  args.reserve(options.arguments.size());
-  for (std::size_t i = 0; i < options.arguments.size(); i++) {
-    if (i > 0 && std::strcmp(options.arguments[i], "--agentIntegration") == 0)
-      agentIntegrationRequested = true;
-    else
-      args.push_back(options.arguments[i]);
-  }
-
-  if (const auto error =
-          vsr::app::validateViewerCommandLine(int(args.size()), args.data());
+  if (const auto error = vsr::app::parseAgentViewerCommandLine(
+          argc, argv, options, agentIntegrationRequested);
       !error.empty()) {
     std::fprintf(stderr, "%s\nUse --help for usage.\n", error.c_str());
     return 1;
   }
 
   {
-    vsr_viewer::Application app(int(args.size()),
-        args.data(),
+    vsr_viewer::Application app(int(options.arguments.size()),
+        options.arguments.data(),
         agentIntegrationRequested,
         options.restorationBytes,
         options.restorationHardBytes,
