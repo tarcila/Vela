@@ -8,6 +8,7 @@
 // vsr_app
 #include "vsr/app/ApplicationDump.h"
 #include "vsr/app/UIStateTree.h"
+#include "vsr/app/ViewerCommandLine.hpp"
 // vsr_io
 #include "vsr/io/exporters.hpp"
 // vsr_rendering
@@ -224,17 +225,28 @@ ExtensionManager *Application::extensionManager() const
 void Application::parseCommandLine(std::vector<std::string> &args)
 {
   for (int i = 1; i < args.size(); i++) {
-    std::string arg = std::move(args[i]); // consume arguments
+    if (args[i] == "--")
+      break;
+    // Values belong to their options, not to this UI pass.
+    if (vsr::app::sceneOptionTakesValue(args[i])) {
+      vsr::app::commandLineValue(args, i);
+      continue;
+    }
+    const int optionIndex = i;
+    const std::string arg = args[i];
     if (arg.empty())
       continue;
     if (arg == "--noDefaultLayout")
       m_commandLine.useDefaultLayout = false;
-    else if (arg == "--secondaryView" || arg == "-sv")
-      m_commandLine.secondaryViewportLibrary = std::move(args[++i]);
-    else if (arg == "--noDefaultRenderer")
+    else if (arg == "--secondaryView" || arg == "-sv") {
+      m_commandLine.secondaryViewportLibrary =
+          vsr::app::commandLineValue(args, i);
+      args[i].clear();
+    } else if (arg == "--noDefaultRenderer")
       m_commandLine.useDefaultRenderer = false;
     else
-      args[i] = std::move(arg); // move back unconsumed arguments
+      continue;
+    args[optionIndex].clear();
   }
 }
 

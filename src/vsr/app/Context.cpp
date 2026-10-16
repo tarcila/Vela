@@ -4,6 +4,7 @@
 #define ANARI_EXTENSION_UTILITY_IMPL
 
 #include "Context.h"
+#include "ViewerCommandLine.hpp"
 // vsr_animation
 #include "vsr/animation/Animation.hpp"
 // vsr_core
@@ -50,11 +51,20 @@ void Context::parseCommandLine(int argc, const char **argv)
 void Context::parseCommandLine(std::vector<std::string> &args)
 {
   auto &importerType = this->commandLine.importerType;
+  bool literal = false;
 
   for (int i = 1; i < args.size(); i++) {
-    std::string &arg = args[i];
+    std::string arg = args[i];
     if (arg.empty())
       continue;
+
+    if (!literal && arg == "--") {
+      literal = true;
+      continue;
+    }
+    // Keep shared callers permissive; strict option recognition is viewer-only.
+    if (literal)
+      arg.clear();
 
     if (arg == "-v" || arg == "--verbose")
       setLogVerbose(true);
@@ -63,7 +73,7 @@ void Context::parseCommandLine(std::vector<std::string> &args)
     else if (arg == "--openUnloaded")
       this->commandLine.openUnloaded = true;
     else if (arg == "-l" || arg == "--layer")
-      this->commandLine.currentLayerName = args[++i];
+      this->commandLine.currentLayerName = commandLineValue(args, i);
     else if (arg == "-vsr") {
       importerType = vsr::io::ImporterType::NONE;
       if (this->commandLine.loadedFromStateFile) {
@@ -72,9 +82,8 @@ void Context::parseCommandLine(std::vector<std::string> &args)
       }
       if (hasSceneArchiveLoad(this->commandLine))
         throw std::runtime_error("Only one Scene Archive may be specified");
-      if (++i >= args.size())
-        throw std::runtime_error("A Scene Archive filename must follow -vsr");
-      this->commandLine.sceneInputs.push_back(SceneArchiveLoad{args[i]});
+      this->commandLine.sceneInputs.push_back(
+          SceneArchiveLoad{commandLineValue(args, i)});
     } else if (arg == "-agx")
       importerType = vsr::io::ImporterType::AGX;
     else if (arg == "-assimp")
@@ -91,7 +100,7 @@ void Context::parseCommandLine(std::vector<std::string> &args)
       importerType = vsr::io::ImporterType::ENSIGHT;
     else if (arg == "-ensight_fields") {
       this->commandLine.ensightFields.clear();
-      auto tokens = vsr::io::splitString(args[++i], ',');
+      auto tokens = vsr::io::splitString(commandLineValue(args, i), ',');
       for (auto &t : tokens)
         if (!t.empty())
           this->commandLine.ensightFields.push_back(t);
@@ -139,7 +148,7 @@ void Context::parseCommandLine(std::vector<std::string> &args)
     else if (arg == "-vtu")
       importerType = vsr::io::ImporterType::VTU;
     else if (arg == "-vtu_property")
-      this->commandLine.vtuProperty = args[++i];
+      this->commandLine.vtuProperty = commandLineValue(args, i);
     else if (arg == "-xyzdp")
       importerType = vsr::io::ImporterType::XYZDP;
     else if (arg == "-volume")
@@ -152,8 +161,9 @@ void Context::parseCommandLine(std::vector<std::string> &args)
     else if (arg == "-xf" || arg == "--transferFunction")
       importerType = vsr::io::ImporterType::XF;
     else if (arg == "-camera" || arg == "--camera")
-      this->commandLine.cameraFile = args[++i];
+      this->commandLine.cameraFile = commandLineValue(args, i);
     else {
+      arg = args[i];
       if (importerType != vsr::io::ImporterType::NONE) {
         if (importerType == vsr::io::ImporterType::POINTSBIN_MULTIFILE
             || importerType == vsr::io::ImporterType::VOLUME_ANIMATION) {

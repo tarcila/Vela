@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+// vsr_app
+#include <vsr/app/ViewerCommandLine.hpp>
 // vsr_io
 #include <vsr/io/procedural.hpp>
 // vsr_ui_imgui
@@ -19,6 +21,7 @@
 
 // std
 #include <chrono>
+#include <cstdio>
 
 namespace vsr_viewer {
 
@@ -375,6 +378,15 @@ DockSpace         ID=0x80F5B4C5 Window=0x079D3A04 Pos=0,56 Size=3840,2206 Split=
 
 int main(int argc, const char *argv[])
 {
+  if (vsr::app::viewerHelpRequested(argc, argv)) {
+    std::fputs(vsr::app::viewerCommandLineHelp().c_str(), stdout);
+    return 0;
+  }
+  if (const auto error = vsr::app::validateViewerCommandLine(argc, argv);
+      !error.empty()) {
+    std::fprintf(stderr, "%s\nUse --help for usage.\n", error.c_str());
+    return 1;
+  }
   {
     vsr_viewer::Application app(argc, argv);
     app.run(1920, 1080, "VSR Viewer");
