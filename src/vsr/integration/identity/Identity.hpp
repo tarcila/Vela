@@ -19,6 +19,8 @@ class MeshCommitAccess;
 }
 namespace vsr::integration::content {
 class PreparedHdriPublication;
+class PreparedSurfacePublication;
+class PreparedSurfaceRemoval;
 class PreparedHdriRemoval;
 } // namespace vsr::integration::content
 
@@ -365,6 +367,8 @@ class SceneIdentity
   friend class Observer;
   friend class ::vsr::integration::mesh::MeshCommitAccess;
   friend class ::vsr::integration::content::PreparedHdriPublication;
+  friend class ::vsr::integration::content::PreparedSurfacePublication;
+  friend class ::vsr::integration::content::PreparedSurfaceRemoval;
   friend class ::vsr::integration::content::PreparedHdriRemoval;
 
   static anari::DataType normalize(anari::DataType t);

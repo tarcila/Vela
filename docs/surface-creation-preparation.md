@@ -4,6 +4,9 @@ There is **no public Surface creation operation or capability yet**. This note
 records the internal `content::detail::prepareSurfaceGraph()` boundary for the
 ongoing compound-creation implementation, not an alternative privileged API.
 Do not copy its private Scene into a live Scene using ordinary constructors.
+The unregistered `PreparedSurfacePublication` / `PreparedSurfaceRemoval` seams
+now provide owning-thread structural adoption and removal; they are not a public
+request, async worker, or ordinary shared Restore adapter.
 
 ## Prepared output
 
@@ -47,16 +50,41 @@ property. Cooperative abandonment is checked during decoding, before private
 construction, between Array copies and after complete validation. It is not a
 promise of interrupting a single allocation, copy or structural scan immediately.
 
-## Remaining publication boundary
+## Unregistered structural publication/removal
 
-Preparation is not admission, a reservation grant, identity registration,
-conditional recovery or a synchronization event. This function must remain
-unregistered until the compound transaction has actual storage profiles and
-reservations, full worker/file/current-authority guards, detached remapping and
-allocation-safe pool/identity/result/recovery publication, alias-aware whole-owned-
-graph removal, borrowed lifetime checks, authoritative Array histories, honest
-last-owner/tombstone charges and exactly-once creation/Restore synchronization.
-Its live data size must not automatically become a copied-payload undo charge.
+`PreparedSurfacePublication` profiles guarded libstdc++ pool/Forest/registry
+backing and metadata, reserves processing ownership before detached construction,
+remaps each distinct Array once, prepares stable typed identities and a bounded
+inventory, and enrolls the complete graph before post-write callbacks. Indexed
+and nonindexed fields retain complete bytes, types, enabled flags and aliases.
+It can target an existing parent or explicitly own a new Layer. Commit, evidence
+sealing, notifications and first identity lookups require no further allocation.
+Abandoned preparation can leave pool/registry backing capacity, not logical
+content or exposed new identities. The processing reservation is a conservative
+peak bound, not a claim of physical reclamation or a permanent live-memory grant.
+
+`SurfaceRemovalEvidence` is fixed metadata only: it owns no Scene, Layer or Array
+payload. It checks owned parameter/metadata/data-write histories, exact bindings,
+node membership and local child-list history, as well as alias-aware use counts
+and a bounded scan of ordinary/raw/default/min/max/instance/object-Array uses.
+`ForestNode::childrenVersion()` supplies scoped add/remove change-back history
+without invalidating the closure for unrelated sibling or Layer edits. Relocation
+preserves this token. The owning-thread removal plan reserves replacements,
+free-list and tombstone backing before writes, unregisters objects and both node
+lifetime entries before callbacks, then notifies once despite consumer failure.
+Its processing reservation covers the temporarily transferred tombstone payload;
+this is not a full-payload undo copy. Destroy publication/removal plans promptly
+after notification; retaining plans also retains their charged processing owners
+(and, for an owned Layer or removal tombstones, actual resources).
+
+These structural seams do **not** supply shared-history enrollment, copied-result
+or weak-control accounting, public synchronization-hook ownership, async/source/
+authority checks, or borrowed Material handling. They must remain unregistered
+until all of those gates are connected and verified. Source preparation remains
+separately owned/charged by its eventual worker. A callback exception is committed
+structural state, not rollback; no public recovery receipt is promised by these
+internal primitives. The public adapter must prepare normal recovery and exactly-
+once creation/Restore failure-hook owners before allowing writes.
 
 Public MCP/status/inspection/render/Restore, STL into that public path, meaningful
 VisRTX placement/removal, resident IncludeData persistence and independent delivery

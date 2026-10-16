@@ -16,7 +16,9 @@ struct Layer;
 namespace detail {
 
 class PreparedHdriContent;
+class PreparedSurfaceContent;
 class PreparedHdriRemoval;
+class PreparedSurfaceRemoval;
 
 // Resolution and dependency state do not keep either owner alive. Revocation
 // precedes pool destruction; weak references cannot revive on address reuse.

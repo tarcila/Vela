@@ -111,6 +111,8 @@ struct LayerNodeData
   friend struct Scene;
   friend class detail::PreparedHdriRemoval;
   friend class detail::PreparedHdriContent;
+  friend class detail::PreparedSurfaceContent;
+  friend class detail::PreparedSurfaceRemoval;
   friend struct vsr::core::ForestStorageTraits<LayerNodeData>;
   struct StorageRelocationTag
   {

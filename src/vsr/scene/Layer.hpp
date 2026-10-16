@@ -84,6 +84,8 @@ struct Layer final
   friend struct Scene; // Scene removal revokes tracking, not object resolution.
   friend class detail::PreparedSurfaceStorage;
   friend class detail::PreparedHdriContent;
+  friend class detail::PreparedSurfaceContent;
+  friend class detail::PreparedSurfaceRemoval;
   friend class detail::PreparedHdriRemoval;
   friend struct LayerNodeData;
   const std::uint64_t m_lifetime;

@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // vsr_integration
+#include "vsr/integration/content/SurfaceRemoval.hpp"
 #include "vsr/integration/content/detail/PreparedSurfaceGraph.hpp"
+#include "vsr/rendering/view/FrameObservation.h"
+#include "vsr/scene/detail/PreparedSurfaceContent.hpp"
 // catch
 #include "catch.hpp"
 // std
@@ -12,6 +15,11 @@
 using namespace vsr;
 
 namespace {
+integration::operations::Reservation surfaceReservation()
+{
+  static auto budget = std::make_shared<rendering::FrameBudget>(64u << 20);
+  return integration::operations::Reservation::from(budget);
+}
 std::pmr::vector<std::uint8_t> carrier(const std::string &header)
 {
   std::pmr::vector<std::uint8_t> bytes;
@@ -39,7 +47,360 @@ std::pmr::vector<std::uint8_t> triangleBundle()
   append(bytes, points);
   return bytes;
 }
+struct SurfaceObserver : scene::EmptyUpdateDelegate
+{
+  void signalObjectAdded(const scene::Object *) override;
+  void signalObjectRemoved(const scene::Object *) override;
+  integration::identity::SceneIdentity *ids{nullptr};
+  integration::content::SurfaceHandles handles;
+  size_t added{0}, removed{0};
+  bool coherent{true}, fail{false};
+};
+void SurfaceObserver::signalObjectAdded(const scene::Object *)
+{
+  ++added;
+  coherent = coherent && ids->resolve(handles.surface)
+      && ids->resolve(handles.geometry) && ids->resolve(handles.material)
+      && ids->resolve(handles.contentRoot);
+  for (size_t i = 0; i < handles.arrayCount; ++i)
+    coherent = coherent && ids->resolve(handles.arrays[i]);
+  if (fail)
+    throw std::runtime_error("Surface observer failed");
+}
+void SurfaceObserver::signalObjectRemoved(const scene::Object *)
+{
+  ++removed;
+  coherent = coherent && !ids->resolve(handles.surface)
+      && !ids->resolve(handles.geometry) && !ids->resolve(handles.material)
+      && !ids->resolve(handles.contentRoot);
+  for (size_t i = 0; i < handles.arrayCount; ++i)
+    coherent = coherent && !ids->resolve(handles.arrays[i]);
+  if (fail)
+    throw std::runtime_error("Surface observer failed");
+}
 } // namespace
+
+TEST_CASE(
+    "Prepared Surface adoption publishes a complete alias-preserving closure",
+    "[integration][content][prepared-surface]")
+{
+  std::unique_ptr<integration::content::detail::PreparedSurfaceGraph> graph;
+  REQUIRE(integration::content::detail::prepareSurfaceGraph(
+              triangleBundle(), "Adopted", {}, graph)
+      == nullptr);
+  scene::Scene live;
+  live.defaultLayer();
+  const auto arrays = live.numberOfObjects(ANARI_ARRAY);
+  const auto materials = live.numberOfObjects(ANARI_MATERIAL);
+  scene::detail::PreparedSurfaceContent prepared(
+      live, {}, graph->geometry(), graph->material(), graph->root()->value());
+  CHECK(live.numberOfObjects(ANARI_ARRAY) == arrays);
+  CHECK(live.numberOfObjects(ANARI_SURFACE) == 0);
+  REQUIRE(prepared.isCurrent());
+  REQUIRE(prepared.commit());
+  CHECK_FALSE(prepared.commit());
+  CHECK(live.numberOfObjects(ANARI_ARRAY) == arrays + 1);
+  CHECK(live.numberOfObjects(ANARI_MATERIAL) == materials + 1);
+  auto *surface =
+      live.getObject<scene::Surface>(prepared.surfaceIndex()).data();
+  REQUIRE(surface);
+  REQUIRE(surface->geometry());
+  auto *position = surface->geometry()->parameterValueAsObject<scene::Array>(
+      "vertex.position");
+  REQUIRE(position);
+  CHECK(position
+      == surface->geometry()->parameterValueAsObject<scene::Array>(
+          "vertex.attribute0"));
+  CHECK(position->useCount(scene::Object::UseKind::PARAMETER) == 2);
+  const float expected[] = {10, 20, 30, 12, 20, 30, 10, 23, 30};
+  CHECK(std::memcmp(position->data(), expected, sizeof(expected)) == 0);
+  CHECK(prepared.root()->value().name() == "Adopted");
+  CHECK(prepared.node()->value().getObject() == surface);
+  CHECK(surface->material() != &graph->material());
+  CHECK(surface->geometry() != &graph->geometry());
+  prepared.notify();
+}
+
+TEST_CASE("Prepared Surface identities support exact alias-aware removal",
+    "[integration][content][prepared-surface]")
+{
+  std::unique_ptr<integration::content::detail::PreparedSurfaceGraph> graph;
+  REQUIRE(integration::content::detail::prepareSurfaceGraph(
+              triangleBundle(), "Published", {}, graph)
+      == nullptr);
+  scene::Scene live;
+  live.defaultLayer();
+  REQUIRE(live.trackImageWrites(std::make_shared<scene::ArrayWriteSequence>()));
+  integration::identity::IdentityAuthority authority;
+  integration::identity::SceneIdentity ids(authority, live);
+  const auto materialCount = live.numberOfObjects(ANARI_MATERIAL);
+  core::StorageProfile profile(64u << 20);
+  REQUIRE(integration::content::PreparedSurfacePublication::profileStorage(
+      ids, {}, *graph, false, profile));
+  integration::content::PreparedSurfacePublication prepared(
+      ids, {}, *graph, surfaceReservation());
+  const auto handles = prepared.handles();
+  CHECK(handles.arrayCount == 1);
+  CHECK_FALSE(ids.resolve(handles.surface));
+  REQUIRE(prepared.commit());
+  integration::content::SurfaceRemovalEvidence evidence;
+  REQUIRE(evidence.seal(ids, handles, false));
+  prepared.notify();
+  CHECK(ids.handleOf(ids.resolve(handles.surface)) == handles.surface);
+  CHECK(ids.resolve(handles.geometry)->type() == ANARI_GEOMETRY);
+  live.defragmentObjectStorage();
+  REQUIRE(evidence.check(ids) == nullptr);
+  integration::content::PreparedSurfaceRemoval removal(
+      ids, evidence, surfaceReservation());
+  REQUIRE(removal.commit());
+  CHECK_FALSE(ids.resolve(handles.surface));
+  CHECK_FALSE(ids.resolve(handles.geometry));
+  CHECK_FALSE(ids.resolve(handles.material));
+  CHECK_FALSE(ids.resolve(handles.arrays[0]));
+  CHECK_FALSE(ids.resolve(handles.contentRoot));
+  CHECK(live.numberOfObjects(ANARI_ARRAY) == 0);
+  CHECK(live.numberOfObjects(ANARI_MATERIAL) == materialCount);
+  removal.notify();
+  CHECK_FALSE(removal.commit());
+}
+
+TEST_CASE(
+    "Surface removal refuses owned histories and hidden outside aliases atomically",
+    "[integration][content][prepared-surface]")
+{
+  std::unique_ptr<integration::content::detail::PreparedSurfaceGraph> graph;
+  REQUIRE(integration::content::detail::prepareSurfaceGraph(
+              triangleBundle(), "Owned", {}, graph)
+      == nullptr);
+  scene::Scene live;
+  live.defaultLayer();
+  REQUIRE(live.trackImageWrites(std::make_shared<scene::ArrayWriteSequence>()));
+  integration::identity::IdentityAuthority authority;
+  integration::identity::SceneIdentity ids(authority, live);
+  integration::content::PreparedSurfacePublication publication(
+      ids, {}, *graph, surfaceReservation());
+  const auto h = publication.handles();
+  REQUIRE(publication.commit());
+  integration::content::SurfaceRemovalEvidence evidence;
+  REQUIRE(evidence.seal(ids, h, false));
+  publication.notify();
+  auto *g = ids.resolve(h.geometry);
+  auto *material = ids.resolve(h.material);
+  auto *a = dynamic_cast<scene::Array *>(ids.resolve(h.arrays[0]));
+  auto root = ids.resolve(h.contentRoot);
+  SECTION("owned parameter change-back")
+  {
+    material->setParameter("opacity", 0.5f);
+    material->setParameter("opacity", 1.f);
+  }
+  SECTION("owned parameter metadata change-back")
+  {
+    g->parameter("vertex.attribute0")->setDescription("changed");
+    g->parameter("vertex.attribute0")->setDescription("");
+  }
+  SECTION("ordinary Array same-byte write")
+  {
+    a->setData(a->data());
+  }
+  SECTION("Array metadata change-back")
+  {
+    a->setName("changed");
+    a->setName("");
+  }
+  SECTION("root label change-back")
+  {
+    root->value().setName("changed");
+    root->value().setName("Owned");
+  }
+  SECTION("child added then removed")
+  {
+    auto child =
+        live.insertChildTransformNode(root, core::math::IDENTITY_MAT4, "new");
+    live.removeNode(child);
+  }
+  SECTION("outside ordinary use")
+  {
+    auto other =
+        live.createObject<scene::Geometry>(scene::tokens::geometry::triangle);
+    other->setParameterObject("vertex.position", *a);
+  }
+  SECTION("outside uncounted disabled raw binding")
+  {
+    auto other =
+        live.createObject<scene::Geometry>(scene::tokens::geometry::triangle);
+    other->setParameter(
+        "vertex.position", core::Any(ANARI_ARRAY1D, a->index()));
+    other->parameter("vertex.position")->setEnabled(false);
+  }
+  SECTION("outside min metadata reference")
+  {
+    auto other =
+        live.createObject<scene::Geometry>(scene::tokens::geometry::triangle);
+    other->addParameter("x").setValue(1.f).setMin(
+        core::Any(ANARI_MATERIAL, material->index()));
+  }
+  REQUIRE(evidence.check(ids) != nullptr);
+  const auto revision = live.dependencyRevision();
+  const auto arrays = live.numberOfObjects(ANARI_ARRAY);
+  CHECK_THROWS(integration::content::PreparedSurfaceRemoval(
+      ids, evidence, surfaceReservation()));
+  CHECK(live.dependencyRevision() == revision);
+  CHECK(live.numberOfObjects(ANARI_ARRAY) == arrays);
+  CHECK(ids.resolve(h.geometry));
+  CHECK(ids.handleOf(ids.resolve(h.geometry)) == h.geometry);
+  CHECK(ids.resolve(h.material) == material);
+}
+
+TEST_CASE(
+    "Surface safe-point plans reject destination changes before publication",
+    "[integration][content][prepared-surface]")
+{
+  std::unique_ptr<integration::content::detail::PreparedSurfaceGraph> graph;
+  REQUIRE(integration::content::detail::prepareSurfaceGraph(
+              triangleBundle(), "Candidate", {}, graph)
+      == nullptr);
+  scene::Scene live;
+  auto parent = live.defaultLayer()->root();
+  integration::identity::IdentityAuthority authority;
+  integration::identity::SceneIdentity ids(authority, live);
+  integration::content::PreparedSurfacePublication publication(
+      ids, parent, *graph, surfaceReservation());
+  parent->value().setAsTransform(core::math::IDENTITY_MAT4);
+  const auto revision = live.dependencyRevision();
+  CHECK_FALSE(publication.commit());
+  CHECK(live.dependencyRevision() == revision);
+  CHECK_FALSE(ids.resolve(publication.handles().surface));
+  CHECK(live.numberOfObjects(ANARI_ARRAY) == 0);
+}
+
+TEST_CASE("Surface owned Layer removal preserves unrelated camera and lighting",
+    "[integration][content][prepared-surface]")
+{
+  std::unique_ptr<integration::content::detail::PreparedSurfaceGraph> graph;
+  REQUIRE(integration::content::detail::prepareSurfaceGraph(
+              triangleBundle(), "Owned", {}, graph)
+      == nullptr);
+  scene::Scene live;
+  auto light =
+      live.createObject<scene::Light>(scene::tokens::light::directional);
+  live.defaultLayer();
+  REQUIRE(live.trackImageWrites(std::make_shared<scene::ArrayWriteSequence>()));
+  integration::identity::IdentityAuthority authority;
+  integration::identity::SceneIdentity ids(authority, live);
+  const auto lh = ids.handleOf(light.data());
+  integration::content::PreparedSurfacePublication publication(
+      ids, {}, *graph, surfaceReservation(), "new-layer");
+  const auto h = publication.handles();
+  REQUIRE(publication.commit());
+  integration::content::SurfaceRemovalEvidence evidence;
+  REQUIRE(evidence.seal(ids, h, true));
+  publication.notify();
+  light->setParameter("irradiance", 7.f);
+  auto camera = live.getObject<scene::Camera>(0);
+  camera->setParameter("position", core::math::float3(9, 8, 7));
+  REQUIRE(evidence.check(ids) == nullptr);
+  integration::content::PreparedSurfaceRemoval removal(
+      ids, evidence, surfaceReservation());
+  REQUIRE(removal.commit());
+  removal.notify();
+  CHECK_FALSE(ids.resolve(h.layer));
+  CHECK(live.numberOfLayers() == 1);
+  CHECK(ids.resolve(lh) == light.data());
+  CHECK(light->parameter("irradiance")->value().get<float>() == 7.f);
+  CHECK(camera->parameter("position")->value().get<core::math::float3>()
+      == core::math::float3(9, 8, 7));
+}
+
+TEST_CASE(
+    "Surface callbacks observe complete enrolled or retired identities despite failure",
+    "[integration][content][prepared-surface]")
+{
+  std::unique_ptr<integration::content::detail::PreparedSurfaceGraph> graph;
+  REQUIRE(integration::content::detail::prepareSurfaceGraph(
+              triangleBundle(), "Callback", {}, graph)
+      == nullptr);
+  scene::Scene live;
+  live.defaultLayer();
+  REQUIRE(live.trackImageWrites(std::make_shared<scene::ArrayWriteSequence>()));
+  integration::identity::IdentityAuthority authority;
+  integration::identity::SceneIdentity ids(authority, live);
+  auto *observer = live.updateDelegate().emplace<SurfaceObserver>();
+  observer->ids = &ids;
+  observer->fail = true;
+  integration::content::PreparedSurfacePublication publication(
+      ids, {}, *graph, surfaceReservation());
+  observer->handles = publication.handles();
+  REQUIRE(publication.commit());
+  integration::content::SurfaceRemovalEvidence evidence;
+  REQUIRE(evidence.seal(ids, publication.handles(), false));
+  CHECK_THROWS_WITH(publication.notify(), "Surface observer failed");
+  CHECK(publication.committed());
+  CHECK(observer->added == 4);
+  CHECK(observer->coherent);
+  publication.notify();
+  CHECK(observer->added == 4);
+  REQUIRE(evidence.check(ids) == nullptr);
+  integration::content::PreparedSurfaceRemoval removal(
+      ids, evidence, surfaceReservation());
+  REQUIRE(removal.commit());
+  CHECK_THROWS_WITH(removal.notify(), "Surface observer failed");
+  CHECK(removal.committed());
+  CHECK(observer->removed == 4);
+  CHECK(observer->coherent);
+  removal.notify();
+  CHECK(observer->removed == 4);
+}
+
+TEST_CASE(
+    "Surface processing reservations precede pool writes and cover private owner lifetime",
+    "[integration][content][prepared-surface]")
+{
+  std::unique_ptr<integration::content::detail::PreparedSurfaceGraph> graph;
+  REQUIRE(integration::content::detail::prepareSurfaceGraph(
+              triangleBundle(), "Reserved", {}, graph)
+      == nullptr);
+  scene::Scene live;
+  live.defaultLayer();
+  REQUIRE(live.trackImageWrites(std::make_shared<scene::ArrayWriteSequence>()));
+  integration::identity::IdentityAuthority authority;
+  integration::identity::SceneIdentity ids(authority, live);
+  auto budget = std::make_shared<rendering::FrameBudget>(64u << 20);
+  const auto reserve = integration::operations::Reservation::from(budget);
+  const auto baseline = budget->used();
+  integration::content::SurfaceRemovalEvidence evidence;
+  {
+    integration::content::PreparedSurfacePublication publication(
+        ids, {}, *graph, reserve);
+    CHECK(budget->used() > baseline);
+    REQUIRE(publication.commit());
+    REQUIRE(evidence.seal(ids, publication.handles(), false));
+    publication.notify();
+    CHECK(budget->used() > baseline);
+  }
+  CHECK(budget->used() == baseline);
+  REQUIRE(evidence.check(ids) == nullptr);
+  auto tiny = std::make_shared<rendering::FrameBudget>(
+      sizeof(rendering::FrameBudget) + 256);
+  const auto refused = integration::operations::Reservation::from(tiny);
+  const auto revision = live.dependencyRevision();
+  CHECK_THROWS_AS(integration::content::PreparedSurfacePublication(
+                      ids, {}, *graph, refused),
+      std::bad_alloc);
+  CHECK_THROWS_AS(
+      integration::content::PreparedSurfaceRemoval(ids, evidence, refused),
+      std::bad_alloc);
+  CHECK(live.dependencyRevision() == revision);
+  CHECK(ids.resolve(evidence.handles.surface));
+  {
+    integration::content::PreparedSurfaceRemoval removal(
+        ids, evidence, reserve);
+    CHECK(budget->used() > baseline);
+    REQUIRE(removal.commit());
+    removal.notify();
+    CHECK(budget->used() > baseline); // Tombstone payload is still owned.
+  }
+  CHECK(budget->used() == baseline);
+}
 
 TEST_CASE("Private Surface preparation builds a complete independent closure",
     "[integration][content][prepared-surface]")
@@ -160,6 +521,50 @@ TEST_CASE(
       == core::math::float4(11, 12, 13, 1));
   CHECK(graph->material().parameter("color")->value().get<core::math::float3>()
       == core::math::float3(0.2f, 0.3f, 0.4f));
+  scene::Scene live;
+  live.defaultLayer();
+  REQUIRE(live.trackImageWrites(std::make_shared<scene::ArrayWriteSequence>()));
+  integration::identity::IdentityAuthority authority;
+  integration::identity::SceneIdentity ids(authority, live);
+  integration::content::PreparedSurfacePublication publication(
+      ids, {}, *graph, surfaceReservation());
+  REQUIRE(publication.commit());
+  integration::content::SurfaceRemovalEvidence evidence;
+  REQUIRE(evidence.seal(ids, publication.handles(), false));
+  publication.notify();
+  auto *adopted = ids.resolve(publication.handles().geometry);
+  const auto checkLive = [&](const char *name,
+                             anari::DataType type,
+                             const void *expected,
+                             size_t size) {
+    const auto *a = adopted->parameterValueAsObject<scene::Array>(name);
+    REQUIRE(a);
+    CHECK(a->elementType() == type);
+    CHECK(a->size() * a->elementSize() == size);
+    CHECK(std::memcmp(a->data(), expected, size) == 0);
+    return a;
+  };
+  const auto *livePosition =
+      checkLive("vertex.position", ANARI_FLOAT64_VEC3, points, sizeof(points));
+  checkLive("primitive.index", ANARI_UINT64_VEC3, indices, sizeof(indices));
+  checkLive("vertex.normal", ANARI_INT8_VEC3, normals, sizeof(normals));
+  checkLive("vertex.tangent", ANARI_FLOAT32_VEC4, tangents, sizeof(tangents));
+  checkLive("primitive.color", ANARI_UFIXED8_VEC4, color, sizeof(color));
+  checkLive("vertex.attribute0", ANARI_INT64, values, sizeof(values));
+  checkLive(
+      "faceVarying.attribute1", ANARI_FLOAT64_VEC2, corners, sizeof(corners));
+  CHECK(livePosition
+      != checkLive(
+          "vertex.attribute2", ANARI_FLOAT64_VEC3, points, sizeof(points)));
+  CHECK(livePosition
+      == adopted->parameterValueAsObject<scene::Array>("vertex.attribute3"));
+  CHECK_FALSE(adopted->parameter("vertex.attribute0")->isEnabled());
+  REQUIRE(evidence.check(ids) == nullptr);
+  integration::content::PreparedSurfaceRemoval removal(
+      ids, evidence, surfaceReservation());
+  REQUIRE(removal.commit());
+  removal.notify();
+  CHECK(live.numberOfObjects(ANARI_ARRAY) == 0);
 }
 
 TEST_CASE(

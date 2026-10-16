@@ -85,6 +85,8 @@ struct ForestNode
     return m_topologyVersion;
   }
 
+  // Persistent local child-list history, including add/remove change-back.
+  std::uint64_t childrenVersion() const;
   Ref insert_first_child(T &&v);
   Ref insert_last_child(T &&v);
   Ref insert_last_child_at(size_t index, T &&v);
@@ -101,6 +103,8 @@ struct ForestNode
   friend bool operator==(const ForestNode<U> &a, const ForestNode<U> &b);
 
   std::uint64_t m_lifetime{0};
+  void noteChildrenChange();
+  std::uint64_t m_childrenVersion{1};
   std::uint64_t m_topologyVersion{0};
   T m_value{};
   Ref m_prev;
@@ -314,6 +318,7 @@ template <typename T>
 inline ForestNode<T>::ForestNode(ForestNode &&o) noexcept(
     noexcept(ForestStorageTraits<T>::relocate(std::move(o.m_value))))
     : m_lifetime(o.m_lifetime),
+      m_childrenVersion(o.m_childrenVersion),
       m_topologyVersion(o.m_topologyVersion),
       m_value(ForestStorageTraits<T>::relocate(std::move(o.m_value))),
       m_prev(o.m_prev),
@@ -334,6 +339,7 @@ inline ForestNode<T> &ForestNode<T>::operator=(ForestNode &&o) noexcept(
     return *this;
   ForestStorageTraits<T>::relocateAssign(m_value, std::move(o.m_value));
   m_lifetime = o.m_lifetime;
+  m_childrenVersion = o.m_childrenVersion;
   m_topologyVersion = o.m_topologyVersion;
   m_prev = o.m_prev;
   m_children_begin = o.m_children_begin;
@@ -473,6 +479,19 @@ inline void ForestNode<T>::erase_subtree()
 {
   if (auto *f = forest(); f != nullptr)
     f->erase_subtree(self());
+}
+
+template <typename T>
+inline std::uint64_t ForestNode<T>::childrenVersion() const
+{
+  return m_childrenVersion;
+}
+
+template <typename T>
+inline void ForestNode<T>::noteChildrenChange()
+{
+  if (++m_childrenVersion == 0)
+    std::terminate();
 }
 
 template <typename T>
@@ -624,6 +643,7 @@ inline typename Forest<T>::NodeRef Forest<T>::insert_first_child(
   else
     n->m_children_begin->m_prev = newForestNode;
   n->m_children_begin = newForestNode;
+  n->noteChildrenChange();
   noteMembershipChange();
   return newForestNode;
 }
@@ -660,6 +680,7 @@ inline void Forest<T>::link_last_child(
   else
     n->m_children_end->m_next = newForestNode;
   n->m_children_end = newForestNode;
+  n->noteChildrenChange();
   noteMembershipChange();
 }
 
@@ -694,6 +715,7 @@ inline void Forest<T>::erase(Forest<T>::NodeRef n)
   else
     next->m_prev = prev;
 
+  n->parent()->noteChildrenChange();
   m_nodes.erase(n.index());
   noteMembershipChange();
 }
@@ -724,6 +746,7 @@ inline void Forest<T>::erase_subtree(Forest<T>::NodeRef n)
 
   n->m_children_begin = n;
   n->m_children_end = n;
+  n->noteChildrenChange();
   noteMembershipChange();
 }
 
@@ -826,6 +849,8 @@ inline void Forest<T>::move_subtree(
   else
     nextSibling->m_prev = prev;
 
+  source->parent()->noteChildrenChange();
+  newParent->noteChildrenChange();
   // Attach source to newParent as last child
   source->m_topologyVersion = nextTopologyVersion();
   source->m_parent = newParent;

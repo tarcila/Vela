@@ -9,6 +9,37 @@
 #include <stdexcept>
 #include <vector>
 
+TEST_CASE(
+    "Forest child-list history survives change-back and relocation", "[Forest]")
+{
+  vsr::core::Forest<int> tree(-1);
+  auto root = tree.root();
+  CHECK(root->childrenVersion() == 1);
+  auto left = tree.insert_last_child(root, 1);
+  auto right = tree.insert_first_child(root, 2);
+  CHECK(root->childrenVersion() == 3);
+  auto child = tree.insert_last_child(left, 3);
+  CHECK(left->childrenVersion() == 2);
+  CHECK(right->childrenVersion() == 1);
+  tree.move_subtree(child, right);
+  CHECK(left->childrenVersion() == 3);
+  CHECK(right->childrenVersion() == 2);
+  tree.move_subtree(child, left);
+  CHECK(left->childrenVersion() == 4);
+  CHECK(right->childrenVersion() == 3);
+  tree.erase(child);
+  CHECK(left->childrenVersion() == 5);
+  CHECK(left->isLeaf());
+  tree.reserve(4096);
+  CHECK(left->childrenVersion() == 5);
+  CHECK(right->childrenVersion() == 3);
+  CHECK(root->childrenVersion() == 3);
+  tree.erase_subtree(root);
+  CHECK(root->childrenVersion() == 4);
+  tree.clear();
+  CHECK(root->childrenVersion() == 4); // Empty clear is not a child-list edit.
+}
+
 SCENARIO("Forest value binding is optional and only binds stored members",
     "[Forest]")
 {

@@ -249,6 +249,8 @@ struct Scene
   friend class detail::PreparedSurfaceStorage;
   friend class detail::PreparedPositionBinding;
   friend class detail::PreparedHdriContent;
+  friend class detail::PreparedSurfaceContent;
+  friend class detail::PreparedSurfaceRemoval;
   friend class detail::PreparedHdriRemoval;
   friend struct Layer;
   friend struct LayerNodeData;

@@ -23,6 +23,8 @@ namespace detail {
 class PreparedPositionBinding;
 class PreparedMeshBinding;
 class PreparedHdriContent;
+class PreparedSurfaceContent;
+class PreparedSurfaceRemoval;
 class PreparedHdriRemoval;
 } // namespace detail
 struct Object;
@@ -184,6 +186,8 @@ struct Object : public ParameterObserver
   friend class detail::PreparedPositionBinding;
   friend class detail::PreparedMeshBinding;
   friend class detail::PreparedHdriContent;
+  friend class detail::PreparedSurfaceContent;
+  friend class detail::PreparedSurfaceRemoval;
   friend class detail::PreparedHdriRemoval;
   friend struct Scene;
   friend struct Parameter;

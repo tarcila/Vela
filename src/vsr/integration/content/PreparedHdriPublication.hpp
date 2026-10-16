@@ -14,6 +14,8 @@
 
 namespace vsr::integration::content {
 
+class PreparedSurfacePublication;
+
 struct HdriHandles
 {
   identity::ObjectHandle radiance;
@@ -66,6 +68,7 @@ class PreparedHdriPublication
   void notify();
 
  private:
+  friend class PreparedSurfacePublication;
   using SerialNode = decltype(identity::SceneIdentity::m_serialOf)::node_type;
   using ObjectNode = decltype(identity::SceneIdentity::m_entries)::node_type;
   using LayerSerialNode =
