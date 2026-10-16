@@ -651,8 +651,13 @@ class RestorationStore
   std::vector<std::string> m_order; // oldest first
   struct Expired
   {
-    std::string id;
+    Expired() = default;
+    VSR_NOT_COPYABLE(Expired)
+    Expired(Expired &&) noexcept = default;
+    Expired &operator=(Expired &&other) noexcept;
+    // The dynamic ID dies before its charge, including erase's move-overwrite.
     std::shared_ptr<const void> imageLease;
+    std::string id;
   };
   std::vector<Expired> m_expired; // 1024 allocation-free tombstones
 
@@ -797,6 +802,17 @@ inline RestorationRecord &RestorationRecord::operator=(
 }
 
 // RestorationStore //
+
+inline RestorationStore::Expired &RestorationStore::Expired::operator=(
+    Expired &&other) noexcept
+{
+  if (this != &other) {
+    Expired moved(std::move(other));
+    imageLease.swap(moved.imageLease);
+    id.swap(moved.id);
+  }
+  return *this;
+}
 
 inline RestorationStore::RestorationStore(std::size_t capacity)
     : m_capacity(capacity)
@@ -1029,6 +1045,9 @@ inline void RestorationStore::expireLocked(const std::string &id)
     return;
   Expired expired;
   if (record->second.image) {
+    // Scope history ages independently of eligibility. The retained Snapshot
+    // still owns this ID's prepared charge even after its map entry ages out.
+    expired.imageLease = record->second.image->scopeLease;
     // Match the already-owned scope key without constructing launch/id.
     const auto &launch = record->second.ref.launchId;
     for (auto scope = m_imageScopes.begin(); scope != m_imageScopes.end();
@@ -1038,7 +1057,8 @@ inline void RestorationStore::expireLocked(const std::string &id)
           && key.compare(0, launch.size(), launch) == 0
           && key[launch.size()] == '/'
           && key.compare(launch.size() + 1, id.size(), id) == 0) {
-        expired.imageLease = std::move(scope->second.lease);
+        if (!expired.imageLease)
+          expired.imageLease = std::move(scope->second.lease);
         m_imageScopeOrder.erase(
             std::remove(
                 m_imageScopeOrder.begin(), m_imageScopeOrder.end(), key),

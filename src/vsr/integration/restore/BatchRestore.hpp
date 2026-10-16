@@ -7,6 +7,8 @@
 // ticket 19).
 
 // vsr_integration
+#include "vsr/integration/content/AllocationProfile.hpp"
+#include "vsr/integration/content/CapacityAllocator.hpp"
 #include "vsr/integration/edit/AgentEdit.hpp"
 #include "vsr/integration/mesh/MeshCommit.hpp"
 // vsr_scene
@@ -136,7 +138,10 @@ class RestoreService
   struct ResultSlot
   {
     operations::ResultOwnership ownership;
+    RestoreRequest request;
     std::optional<RestoreResult> result;
+    bool hookPending{false};
+    bool completed{false};
   };
   using Slot = std::shared_ptr<ResultSlot>;
   struct SceneBinding
@@ -147,8 +152,9 @@ class RestoreService
 
   static bool validEnvelope(const RestoreRequest &request);
   operations::Request makeRequest(RestoreRequest request, Slot slot);
-  RestoreResult commit(
-      const RestoreRequest &request, operations::StepContext &ctx);
+  RestoreResult commit(const RestoreRequest &request,
+      operations::StepContext &ctx,
+      bool &hookPending);
   void markConflicting(const BatchRef &ref, operations::StepContext &ctx);
 
   OperationEngine &m_engine;
@@ -273,17 +279,29 @@ inline operations::Request RestoreService::makeRequest(
   r.capability = session::Capability::EDIT;
   r.canonicalArguments = canonicalArguments(request);
   std::weak_ptr<bool> alive = m_alive;
-  auto shared = std::make_shared<RestoreRequest>(std::move(request));
-  auto committed = std::make_shared<std::optional<RestoreResult>>();
-  r.executor = [this, alive, shared, slot, committed](
-                   operations::StepContext &ctx) {
+  slot->request = std::move(request);
+  const auto failure = [this, alive, slot] {
+    if (!alive.lock())
+      return;
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      if (slot->result)
+        slot->result->outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
+      slot->completed = true;
+    }
+    if (std::exchange(slot->hookPending, false))
+      m_edits.syncStates().finishHook(slot->request.scene, false);
+    else
+      m_edits.syncStates().markFailed(slot->request.scene);
+  };
+  const auto execute = [this, alive, slot](operations::StepContext &ctx) {
     operations::Step step;
     if (!alive.lock())
       return step;
-    if (!*committed) {
+    if (!slot->result) {
       if (ctx.abandoned)
         return step; // never mutate for abandoned work
-      RestoreResult res = commit(*shared, ctx);
+      RestoreResult res = commit(slot->request, ctx, slot->hookPending);
       if (!res.committed) {
         step.outcome = res.outcome;
         if (res.expired)
@@ -291,17 +309,21 @@ inline operations::Request RestoreService::makeRequest(
         else if (!res.reason.empty())
           step.result = "{\"reason\":\"" + res.reason + "\"}";
         slot->result = std::move(res);
+        slot->completed = true;
         return step;
       }
-      *committed = std::move(res);
+      slot->result = std::move(res);
       step.committed = true;
       step.status = operations::Step::Status::SYNCHRONIZING;
       return step;
     }
-    RestoreResult res = std::move(**committed);
+    auto &res = *slot->result;
     Outcome syncOutcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
+    // The normal hook owns completion even when it throws. A late engine
+    // failure must not consume somebody else's outstanding hook.
+    slot->hookPending = false;
     try {
-      syncOutcome = m_edits.synchronizeCommitted(shared->scene);
+      syncOutcome = m_edits.synchronizeCommitted(slot->request.scene);
     } catch (...) {
       // Commit/eligibility are already final; host notification failure is
       // not a noncommitting preparation rejection.
@@ -314,7 +336,7 @@ inline operations::Request RestoreService::makeRequest(
       step.resourceLease = std::move(res.wireLease);
       step.reserveStatus = res.ownership.reserve;
       step.result = std::move(res.imageReceipt);
-      slot->result = std::move(res);
+      slot->completed = true;
       return step;
     }
     step.result = "{\"target_batch_ref\":"
@@ -333,9 +355,27 @@ inline operations::Request RestoreService::makeRequest(
     if (res.nodeVersions.empty())
       step.result += ",\"node_versions\":[]";
     step.result += ",\"restored\":true}";
-    slot->result = std::move(res);
+    slot->completed = true;
     return step;
   };
+  // The existing 64 KiB slot profile covers this known control allocation,
+  // request and callback targets, separately from RestoreResult's reservation.
+  // Qualify actual backing before constructing std::functions; their captures
+  // share the original charge, never clone an opaque host closure.
+  core::StorageProfile callbacks(64u << 10);
+  if (!callbacks.add(sizeof(failure) + alignof(decltype(failure)))
+      || !callbacks.add(2, sizeof(execute) + alignof(decltype(execute)))
+      || !callbacks.add(r.canonicalArguments.capacity() + 1)
+      || !callbacks.add(2, slot->request.targetBatchRef.launchId.capacity() + 1)
+      || !callbacks.add(2, slot->request.targetBatchRef.batchId.capacity() + 1)
+      || !callbacks.add(
+          content::allocation_profile::sharedControlBytes<ResultSlot,
+              content::CapacityAllocator<ResultSlot>>()
+          + sizeof(content::CapacityArena::Charge)
+          + 2 * alignof(std::max_align_t)))
+    throw std::bad_alloc();
+  r.onSynchronizationFailure = failure;
+  r.executor = execute;
   return r;
 }
 
@@ -357,7 +397,8 @@ inline Admission RestoreService::submit(
     busy.code = Outcome::BUSY;
     return busy;
   }
-  auto slot = std::make_shared<ResultSlot>();
+  auto slot = std::allocate_shared<ResultSlot>(
+      content::CapacityAllocator<ResultSlot>(ownership.lease));
   slot->ownership = std::move(ownership);
   auto a =
       m_engine.submit(credentials, ref, makeRequest(std::move(request), slot));
@@ -368,8 +409,7 @@ inline Admission RestoreService::submit(
     while (m_results.size() >= 1024) {
       auto old = std::find_if(
           m_results.begin(), m_results.end(), [](const auto &entry) {
-            return entry.second->result.has_value()
-                || entry.second.use_count() == 1;
+            return entry.second->completed || entry.second.use_count() == 1;
           });
       if (old == m_results.end())
         break;
@@ -395,7 +435,8 @@ inline LocalAdmission RestoreService::submitLocal(RestoreRequest request)
     busy.code = Outcome::BUSY;
     return busy;
   }
-  auto slot = std::make_shared<ResultSlot>();
+  auto slot = std::allocate_shared<ResultSlot>(
+      content::CapacityAllocator<ResultSlot>(ownership.lease));
   slot->ownership = std::move(ownership);
   auto a = m_engine.submitLocal(makeRequest(std::move(request), slot));
   if (a.code == Outcome::OK) {
@@ -403,8 +444,7 @@ inline LocalAdmission RestoreService::submitLocal(RestoreRequest request)
     while (m_localResults.size() >= 1024) {
       auto old = std::find_if(
           m_localResults.begin(), m_localResults.end(), [](const auto &entry) {
-            return entry.second->result.has_value()
-                || entry.second.use_count() == 1;
+            return entry.second->completed || entry.second.use_count() == 1;
           });
       if (old == m_localResults.end())
         break;
@@ -422,7 +462,7 @@ inline std::optional<RestoreResult> RestoreService::result(
   auto it = m_results.find({ref.sessionId, ref.requestId});
   if (it == m_results.end())
     return std::nullopt;
-  return it->second->result;
+  return it->second->completed ? it->second->result : std::nullopt;
 }
 
 inline std::optional<RestoreResult> RestoreService::resultLocal(
@@ -432,7 +472,7 @@ inline std::optional<RestoreResult> RestoreService::resultLocal(
   auto it = m_localResults.find(ref.id);
   if (it == m_localResults.end())
     return std::nullopt;
-  return it->second->result;
+  return it->second->completed ? it->second->result : std::nullopt;
 }
 
 inline void RestoreService::markConflicting(
@@ -448,13 +488,17 @@ inline void RestoreService::markConflicting(
     ctx.markConflicting(ref.launchId, ref.batchId);
 }
 
-inline RestoreResult RestoreService::commit(
-    const RestoreRequest &request, operations::StepContext &ctx)
+inline RestoreResult RestoreService::commit(const RestoreRequest &request,
+    operations::StepContext &ctx,
+    bool &hookPending)
 {
   scene::Scene &scene = ctx.scene;
   RestoreResult res;
   try {
     res.ownership = operations::ResultOwnership(m_reserveResult);
+    // A later beginHook must increment the prepared entry without allocating,
+    // so setting hookPending immediately before it cannot claim a missing hook.
+    m_edits.syncStates().prepareScene(request.scene);
   } catch (const std::bad_alloc &) {
     res.outcome = Outcome::BUSY;
     return res;
@@ -653,6 +697,7 @@ inline RestoreResult RestoreService::commit(
       res.outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
     }
     try {
+      hookPending = true;
       m_edits.syncStates().beginHook(request.scene);
     } catch (...) {
       res.outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
@@ -810,6 +855,7 @@ inline RestoreResult RestoreService::commit(
         (unsigned long long)revision.value);
     res.imageReceipt.append(suffix);
     try {
+      hookPending = true;
       m_edits.syncStates().beginHook(request.scene);
     } catch (...) {
       res.outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
@@ -924,6 +970,7 @@ inline RestoreResult RestoreService::commit(
         (unsigned long long)revision.value);
     res.imageReceipt.append(suffix);
     try {
+      hookPending = true;
       m_edits.syncStates().beginHook(request.scene);
     } catch (...) {
       res.outcome = Outcome::APPLIED_WITH_SYNC_FAILURE;
@@ -1076,6 +1123,7 @@ inline RestoreResult RestoreService::commit(
   }
   res.committed = true;
   res.sceneRevision = ident->sceneRevision();
+  hookPending = true;
   m_edits.syncStates().beginHook(request.scene);
   return res;
 }

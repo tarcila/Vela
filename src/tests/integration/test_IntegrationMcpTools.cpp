@@ -435,6 +435,10 @@ struct Fixture
       s.grants.edit = true;
       s.normalSyncHook = [this](SceneId) { return hookOk; };
     }
+    if (contentCreation) {
+      s.grants.resynchronize = true;
+      s.recoveryCallback = [this](SceneId) { return hookOk; };
+    }
     sceneId = *integration.registerScene(s);
     SceneRegistration h; // no grants: not exposed to the agent
     h.name = "hidden";

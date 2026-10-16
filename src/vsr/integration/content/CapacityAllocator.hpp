@@ -82,12 +82,19 @@ class CapacityAllocator
   explicit CapacityAllocator(operations::Reservation authority)
       : m_authority(std::move(authority))
   {}
+  // Keep a known, precharged result profile through last-weak deallocation.
+  explicit CapacityAllocator(std::shared_ptr<const void> lease)
+      : m_profileLease(std::move(lease))
+  {}
   template <typename U>
   CapacityAllocator(const CapacityAllocator<U> &other)
-      : m_arena(other.arena()), m_authority(other.authority())
+      : m_arena(other.arena()),
+        m_authority(other.authority()),
+        m_profileLease(other.profileLease())
   {}
   std::shared_ptr<CapacityArena> arena() const;
   operations::Reservation authority() const;
+  std::shared_ptr<const void> profileLease() const;
   T *allocate(size_t count);
   void deallocate(T *pointer, size_t count) noexcept;
   template <typename U>
@@ -101,6 +108,7 @@ class CapacityAllocator
       (sizeof(CapacityArena::Charge) + UNIT - 1) / UNIT;
   std::shared_ptr<CapacityArena> m_arena;
   operations::Reservation m_authority;
+  std::shared_ptr<const void> m_profileLease;
 };
 
 // Inlined definitions ////////////////////////////////////////////////////////
@@ -202,6 +210,12 @@ inline operations::Reservation CapacityAllocator<T>::authority() const
 }
 
 template <typename T>
+inline std::shared_ptr<const void> CapacityAllocator<T>::profileLease() const
+{
+  return m_profileLease;
+}
+
+template <typename T>
 inline T *CapacityAllocator<T>::allocate(size_t count)
 {
   static_assert(alignof(T) <= alignof(std::max_align_t),
@@ -212,8 +226,8 @@ inline T *CapacityAllocator<T>::allocate(size_t count)
   const auto units = HEADER_UNITS + (count * sizeof(T) + UNIT - 1) / UNIT;
   auto charge =
       m_arena ? m_arena->reserve(units * UNIT) : CapacityArena::Charge{};
-  if (!m_arena && m_authority) {
-    charge.physical = m_authority(units * UNIT);
+  if (!m_arena && (m_authority || m_profileLease)) {
+    charge.physical = m_authority ? m_authority(units * UNIT) : m_profileLease;
     if (!charge.physical)
       throw std::bad_alloc();
   }
@@ -248,7 +262,8 @@ template <typename U>
 inline bool CapacityAllocator<T>::operator==(
     const CapacityAllocator<U> &other) const
 {
-  return m_arena == other.arena() && m_authority == other.authority();
+  return m_arena == other.arena() && m_authority == other.authority()
+      && m_profileLease == other.profileLease();
 }
 
 template <typename T>

@@ -24,6 +24,7 @@ SCENARIO("MCP creates real RGBE HDRI and ordinary Restore removes it",
     "[integration][content][mcp][public-hdri-create]")
 {
   const bool owned = GENERATE(false, true);
+  const bool restoreQueueFailure = GENERATE(false, true);
   HdriFixture f;
   auto parent = f.scene.insertChildTransformNode(f.scene.defaultLayer()->root(),
       vsr::math::IDENTITY_MAT4,
@@ -106,8 +107,8 @@ SCENARIO("MCP creates real RGBE HDRI and ordinary Restore removes it",
   REQUIRE(view);
   identity::ViewRevisionTracker tracker(f.ids, *f.sceneIds);
   tracker.setCamera(f.sceneIds->handleOf(camera.data()));
-  sync::SyncStates states;
-  sync::SyncService syncService(f.integration, *f.engine, states);
+  sync::SyncService syncService(
+      f.integration, *f.engine, f.edits->syncStates());
   render::RenderService renders(
       f.integration, *f.engine, syncService, *f.imageActivity);
   REQUIRE(renders.attachView(*view, *f.sceneIds, tracker, backend));
@@ -270,9 +271,32 @@ SCENARIO("MCP creates real RGBE HDRI and ordinary Restore removes it",
   f.tool(session, "vsr_create_hdri", args);
   CHECK(f.await(session, 7).flag("committed"));
   CHECK(f.scene.numberOfObjects(ANARI_LIGHT) == 2);
+  if (restoreQueueFailure)
+    f.edits->syncStates().setTransitionListener(
+        [&](SceneId, sync::SyncState, sync::SyncState to) {
+          if (to == sync::SyncState::SYNCHRONIZING)
+            while (f.integration.submit(f.sceneId, [](vsr::scene::Scene &) {}))
+              ;
+        });
   f.restoreBatch(session, 12, *result->get("batch_ref"));
-  CHECK(f.await(session, 12).str("outcome") == "ok");
+  const auto restored = f.await(session, 12);
+  CHECK(restored.str("outcome")
+      == (restoreQueueFailure ? "applied_with_sync_failure" : "ok"));
+  CHECK(restored.flag("committed"));
+  f.edits->syncStates().setTransitionListener({});
   renderRequest = 12;
+  if (restoreQueueFailure) {
+    REQUIRE(f.edits->syncState(f.sceneId) == sync::SyncState::FAILED);
+    REQUIRE_FALSE(syncService.viewReady(*view));
+    f.tool(session,
+        "vsr_resynchronize",
+        "{\"request_id\":13,\"scene_id\":" + std::to_string(f.sceneId) + "}");
+    const auto recovered = f.await(session, 13);
+    REQUIRE(recovered.str("outcome") == "ok");
+    REQUIRE(recovered.result()->get("ready")->b);
+    REQUIRE(syncService.viewReady(*view));
+    renderRequest = 13;
+  }
   CHECK(f.scene.numberOfObjects(ANARI_LIGHT) == 1);
   CHECK(existingLight->lastParameterChange() == existingLightVersion);
   CHECK(*existingLight->parameterValueAs<float>("irradiance") == .01f);
