@@ -3,6 +3,7 @@
 
 // vsr_app
 #include <vsr/app/AgentOptions.hpp>
+#include <vsr/app/ViewerCommandLine.hpp>
 // vsr_io
 #include <vsr/io/procedural.hpp>
 // vsr_ui_imgui
@@ -54,6 +55,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -1417,6 +1419,10 @@ void Application::teardownIntegration()
 
 int main(int argc, const char *argv[])
 {
+  if (vsr::app::viewerHelpRequested(argc, argv)) {
+    std::fputs(vsr::app::viewerCommandLineHelp().c_str(), stdout);
+    return 0;
+  }
   // Reject malformed host options before Context can treat them as scene files.
   vsr::app::AgentOptions options;
   if (!vsr::app::parseAgentOptions(argc, argv, options)) {
@@ -1435,6 +1441,13 @@ int main(int argc, const char *argv[])
       agentIntegrationRequested = true;
     else
       args.push_back(options.arguments[i]);
+  }
+
+  if (const auto error =
+          vsr::app::validateViewerCommandLine(int(args.size()), args.data());
+      !error.empty()) {
+    std::fprintf(stderr, "%s\nUse --help for usage.\n", error.c_str());
+    return 1;
   }
 
   {

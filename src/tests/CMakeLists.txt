@@ -8,6 +8,7 @@ endif()
 project(vsrTests LANGUAGES CXX)
 project_add_executable(
   test_App.cpp
+  test_ViewerCommandLine.cpp
   test_AnimationManager.cpp
   test_AnimationArchive.cpp
   test_AnimationManagerArchive.cpp
@@ -146,6 +147,16 @@ endif()
 add_test(NAME vsr::AnimationManager COMMAND ${PROJECT_NAME} "[AnimationManager]")
 add_test(NAME vsr::AutoExposure   COMMAND ${PROJECT_NAME} "[AutoExposure]" )
 add_test(NAME vsr::App COMMAND ${PROJECT_NAME} "[App]")
+if (TARGET vsr_ui_imgui)
+  target_link_libraries(${PROJECT_NAME} PRIVATE vsr_ui_imgui)
+  target_compile_definitions(${PROJECT_NAME} PRIVATE VSR_TEST_VIEWER_UI)
+endif()
+if (TARGET vsrViewer)
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  add_test(NAME vsr::viewer-cli COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_LIST_DIR}/viewer_cli.py
+    ${CMAKE_INSTALL_PREFIX}/bin/vsrViewer)
+endif()
 add_test(NAME vsr::AnimationArchive COMMAND ${PROJECT_NAME} "[AnimationArchive]")
 add_test(NAME vsr::AnimationManagerArchive
   COMMAND ${PROJECT_NAME} "[AnimationManagerArchive]")
