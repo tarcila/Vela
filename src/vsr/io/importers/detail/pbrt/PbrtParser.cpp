@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+// vsr_io
 #include "PbrtParser.hpp"
+// vsr_core
 #include "vsr/core/Logging.hpp"
+// std
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -55,8 +58,7 @@ static float expectFloat(Lexer &lex, const char *context)
 {
   Token tok = lex.next();
   if (tok.type != TokenType::Number) {
-    throw tokenError(
-        lex, tok, std::string("expected number for ") + context);
+    throw tokenError(lex, tok, std::string("expected number for ") + context);
   }
   return std::stof(tok.text);
 }
@@ -65,8 +67,7 @@ static int expectInt(Lexer &lex, const char *context)
 {
   Token tok = lex.next();
   if (tok.type != TokenType::Number) {
-    throw tokenError(
-        lex, tok, std::string("expected integer for ") + context);
+    throw tokenError(lex, tok, std::string("expected integer for ") + context);
   }
   return std::stoi(tok.text);
 }
@@ -76,8 +77,7 @@ static std::string expectStringOrNumber(Lexer &lex, const char *context)
   Token tok = lex.next();
   if (tok.type != TokenType::String && tok.type != TokenType::Number
       && tok.type != TokenType::Identifier) {
-    throw tokenError(
-        lex, tok, std::string("expected value for ") + context);
+    throw tokenError(lex, tok, std::string("expected value for ") + context);
   }
   return tok.text;
 }
@@ -86,8 +86,7 @@ static void expectRBracket(Lexer &lex, const char *context)
 {
   Token tok = lex.next();
   if (tok.type != TokenType::RBracket) {
-    throw tokenError(
-        lex, tok, std::string("expected ']' to close ") + context);
+    throw tokenError(lex, tok, std::string("expected ']' to close ") + context);
   }
 }
 
@@ -319,6 +318,7 @@ void Parser::parseFilm(Lexer &lex)
 
 void Parser::parseCamera(Lexer &lex)
 {
+  m_scene.camera.authored = true;
   m_scene.camera.type = parseQuotedString(lex);
   m_scene.camera.params = parseParamList(lex);
   m_scene.camera.cameraToWorld = currentState().ctm;
@@ -457,9 +457,9 @@ void Parser::parseInclude(Lexer &lex)
   }
   if (m_includeDepth >= kMaxIncludeDepth) {
     throw std::runtime_error(lex.currentFile() + ":"
-        + std::to_string(lex.currentLine())
-        + ": pbrt: include depth limit (" + std::to_string(kMaxIncludeDepth)
-        + ") exceeded at '" + fullPath + "'");
+        + std::to_string(lex.currentLine()) + ": pbrt: include depth limit ("
+        + std::to_string(kMaxIncludeDepth) + ") exceeded at '" + fullPath
+        + "'");
   }
 
   std::ifstream file(fullPath);
