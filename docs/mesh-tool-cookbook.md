@@ -178,6 +178,70 @@ omission otherwise preserves them and can make the import reject. Submit the
 bundle with **fresh evidence for that target**, obtained independently of how the
 replacement was authored.
 
+## Actual STL to a new working bundle (external process)
+
+The installed `mesh-stl-to-bundle.py` example uses the **existing Trimesh STL
+reader**, then the existing `Bundle.create()` / `replace_topology()` helpers.
+It is not a new native STL parser, a universal converter, or a privileged file
+reader. Run it only on the intended external input, producing a new working
+file in a host-approved input root when that file will be submitted to Content
+Creation:
+
+```sh
+python3 "$prefix/share/vela/examples/mesh-stl-to-bundle.py" \
+  /path/to/selected-part.stl /path/to/private-input/part.vmesh
+# If the printed/refused FLOAT64 -> FLOAT32 rounding is acceptable, retry:
+python3 "$prefix/share/vela/examples/mesh-stl-to-bundle.py" \
+  /path/to/selected-part.stl /path/to/private-input/part.vmesh \
+  --allow-precision-loss
+```
+
+The external reader accepts binary STL or a single nonempty ASCII-solid result.
+Multiple nonempty ASCII solids are deliberately refused, not concatenated or
+silently reduced to one; Trimesh may ignore empty solids.
+The output has enabled FLOAT32_VEC3 positions and UINT32_VEC3 explicit triangle
+indices, with no live Scene/source authority or Material description. Coordinates,
+facet order and units are retained; there is no welding, fitting, recentering,
+normalization, repair or generated-normal binding. Repeated corners remain separate
+vertices, including coincident/degenerate/duplicate facets. The existing Trimesh
+reader determines STL parsing semantics; this example does not certify strict
+STL grammar or preservation of nonstandard extensions.
+
+Read the JSON report: it records the actual Trimesh version, SHA-256 of the
+consumed source bytes, triangle count, exact output field actions, representation
+changes and all discarded tool attributes. **STL facet normals, header/solid labels
+and attribute-byte/color extensions are omitted**, not claimed as preserved.
+There is no source appearance/Material conversion. FLOAT64-to-FLOAT32 changes
+are refused unless explicitly acknowledged; overflow/nonfinite positions, empty
+geometry, invalid topology and unsupported multi-solid output always fail without
+publishing a bundle. Binary FLOAT32 coordinates widen exactly inside Trimesh and
+return exactly to FLOAT32 in the qualified profile.
+
+The input is opened read-only and bounded to 64 MiB. Helper output payload/header
+bounds still apply, but **Trimesh's external working allocations are not bounded
+by the privileged host's processing budget**. No Scene is accessed or changed.
+The completed bundle is published exclusively to a new `.vmesh` file (including
+against a competing output creator), never replacing an existing file or link.
+Original assets are not written. The report stays separate from the bundle;
+retain it to judge the deliberate topology-only conversion losses.
+
+**Ticket-02 WIP boundary:** the external conversion is available; public additive
+Surface creation is not yet implemented or advertised. This command does not
+create a Surface, and must not be described as the complete creation → render →
+Restore workflow. Existing `vsr_mesh_import` can use this bundle only to replace
+an existing Geometry with independently obtained current target/dependency
+evidence and deliberately resolved old bindings. Do not invent a creation tool
+or use export metadata as authority to mutate a former target.
+
+Reproduce this helper control (hand-authored binary STL, ASCII precision decision,
+invalid/multi-solid rejection and unchanged original files):
+
+```sh
+VSR_MESH_HELPER_PATH="$prefix/share/vela/python" \
+VSR_MESH_EXAMPLE_PATH="$prefix/share/vela/examples" \
+  python3 scripts/test-mesh-stl.py
+```
+
 ## Conversion contract and explicit errors
 
 - `to_trimesh` transfers only finite FLOAT32/FLOAT64 Nx3 positions and enabled

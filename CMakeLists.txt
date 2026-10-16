@@ -137,7 +137,8 @@ if (VSR_USE_INTEGRATION)
     docs/agent-undo-retention.md
     DESTINATION share/vela/docs)
   install(FILES scripts/mesh-numpy-edit.py scripts/mesh-tool-replacement.py
-    scripts/mesh-device-edit.py DESTINATION share/vela/examples)
+    scripts/mesh-stl-to-bundle.py scripts/mesh-device-edit.py
+    DESTINATION share/vela/examples)
 endif()
 
 ## Cleanup CMake variables ##
