@@ -1,14 +1,46 @@
-# HDRI Content Creation — candidate, not production delivery
+# HDRI Content Creation — registered, pending central review
 
-`ContentCreation` and its strict MCP adapter are currently registered only in
-isolated qualification hosts. **The viewer and headless application do not
-advertise these tools.** Full Scene pool/Forest/identity preparation accounting
-and usable application startup/private-root wiring remain ticket 01 hard gates.
-A passing render test is not permission to expose an unfinished mutation path.
-No Surface, Volume, Asset Import, generic constructor, root-grant tool or new
-Undo store is provided by this slice.
+`ContentCreation` and its strict MCP adapter are now registered by `vsrViewer`
+(with `--agentIntegration`) and by `vsrTutorialIntegrationHeadless`, together
+with the trusted host asset-root startup controls described below. Only the
+actually implemented safe Radiance RGBE HDRI profile is advertised. No Surface,
+Volume, Asset Import, generic constructor, root-grant tool or new Undo store is
+provided by this slice. Independent Standards/Spec review and integration
+landing remain outstanding; registration is not a review sign-off.
 
-## Candidate operator/tool contract
+## Trusted host asset roots (startup controls, never agent grants)
+
+Read authority is a **host** control with exactly two sources, both resolved at
+launch, both outside any agent's reach:
+
+- `--agentAssetRoot <absolute-directory>`, repeatable up to 8 times, no
+  duplicates, no `.`/`..`/empty components, no trailing slash, no `=` form.
+  These are ordinary operator folders: their mode and ownership are read and
+  **never changed**, and they are explicitly **not** required to be `0700`.
+  A refused directory is reported and fails the launch rather than silently
+  dropping authority.
+- One launch-private working input namespace, created mode `0700` beneath the
+  validated per-user runtime directory as `content-<launch id>` and pinned for
+  the launch. Only this namespace must be private; it is validated for `0700`
+  and effective-user ownership by both `openDirectory` and `approve()`. At
+  teardown the launch removes it only when empty — operator files left there
+  are never deleted.
+
+`vsr_content_options` publishes `asset_root_profiles`: the root ids, their kind
+(`host_startup` / `launch_private`), a bounded host label and approval state.
+**No path, credential or grant is ever published**, and no MCP tool, request
+field or environment variable can add, rename or widen a root. An agent may
+only select an existing root id plus a relative file name, which the kernel
+resolves beneath that pinned directory fd.
+
+`scripts/test-content-host-roots.py` (ctest `vsr::content-host-roots`)
+qualifies this against the **installed** headless CLI: refused malformed and
+unsafe options, discovery without paths, traversal/symlink/absolute refusal,
+unapproved root ids, creation and ordinary Restore from both an ordinary 0755
+operator folder and the private namespace, and an unchanged operator folder
+mode across the whole run.
+
+## Operator/tool contract
 
 A trusted custom host supplies the shared physical-memory reservation provider,
 EditService, OperationEngine and ActivityLog, then attaches its qualified Scene
@@ -17,11 +49,11 @@ absolute asset directories. At most 16 roots are allowed; duplicate directories,
 symlinks and unconfined paths are rejected. Shared asset directories need not be
 `0700`; approval does not chmod them. `revoke(id)` withdraws access, including
 from already prepared snapshots. These are direct trusted host controls, **not
-agent permissions**. Application startup flags/private working-root discovery
-are not implemented yet; do not invent a production launch command for them.
+agent permissions**. Hosts that embed the services directly use the same
+`configureHostAssetRoots()` wiring as the viewer and headless application.
 
-In a qualified isolated host, `vsr_content_options` requires Scene READ and
-reports the actual candidate profile/defaults/limits. `vsr_create_hdri` requires
+`vsr_content_options` requires Scene READ and
+reports the actual profile/defaults/limits. `vsr_create_hdri` requires
 Scene READ+EDIT and enabled agent edits. Required fields:
 
 - `request_id`, `scene_id`, host-issued `asset_root` (0–15), relative `file_name`.
@@ -50,7 +82,7 @@ sources are rejected, not normalized or replaced by an 8-bit image. Linear
 FLOAT32 RGB rows are bottom-up, as required by HDRI Light radiance and ADR 0014;
 Sampler Image orientation is a different contract.
 
-Candidate operation limits: 4 MiB input, 1 Mi pixels, 4096 per dimension,
+Operation limits: 4 MiB input, 1 Mi pixels, 4096 per dimension,
 a 32 MiB worker backing arena plus an allocation-free graph backing profile
 capped at 64 MiB per job, 16 KiB result, 1024 ancestors and a 30-second logical
 deadline. These are separate from the existing shared host limit (not an
@@ -100,7 +132,7 @@ size arithmetic. Arena admission precedes allocation. Growing a buffer holds
 both old and new backing charges until physical deallocation; `clear()` does not
 release capacity. Copies reserve their own physical backing, and moving/swapping
 or releasing a copy off-thread does not lose its charge. The finite 32 MiB arena
-bounds simultaneous worker backing, not Undo retention. Successful candidate
+bounds simultaneous worker backing, not Undo retention. Successful
 receipts report `worker_allocator_peak_bytes`, measured from actual live backing
 allocations and distinct from required recovery capacity. This is specifically a
 worker statistic, **not a claim to have measured total publication or GPU peak**.
@@ -264,9 +296,8 @@ the ticket's diagnostic artifacts. Helide is still a supported geometry/data
 fast control, **not** an HDRI illumination pass. BOTH VisRTX and Barney remain
 mandatory in tickets 08/09 for the complete later content milestone.
 
-Before production registration, finish ticket 01's complete global preparation
-and retained ownership accounting, trusted application startup/private-root
-controls and installed operator discovery. Existing public tests qualify many
-faults/conflicts, FIFO/approval boundaries and lifecycle releases; they do not
-close the remaining gates or independent central review. Never expose future
-formats or register this candidate merely because its GPU tracer passes.
+Ticket 01's accounting, startup/private-root controls and installed operator
+discovery have landed. Independent central Standards/Spec review, default-`g`
+integration verification and landing remain outstanding, as does the later
+tickets' all-kinds device qualification. Never expose future formats or widen
+this profile merely because its GPU tracer passes.

@@ -42,3 +42,13 @@ if (VSR_USE_INTEGRATION_MCP AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     "VSR_IMAGE_QUALIFICATION_LIBRARY=helide")
 endif()
 
+if (VSR_USE_INTEGRATION_MCP AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # Installed headless CLI qualification of the trusted startup asset roots and
+  # the launch-private working input. Runs against the installed library, in a
+  # private XDG runtime; never touches a live viewer, Scene or user config.
+  add_test(NAME vsr::content-host-roots COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/scripts/test-content-host-roots.py
+    $<TARGET_FILE_DIR:${PROJECT_NAME}>
+    ${CMAKE_BINARY_DIR}/content-host-roots-evidence
+    --install-prefix ${CMAKE_INSTALL_PREFIX})
+endif()

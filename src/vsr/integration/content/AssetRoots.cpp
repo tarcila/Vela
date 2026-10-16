@@ -27,6 +27,8 @@ struct AssetRoots::Root
   ~Root();
   std::atomic<bool> approved{true};
   int fd{-1};
+  Kind kind{Kind::HOST_STARTUP};
+  std::string label;
 };
 
 struct AssetRoots::Snapshot::Currency
@@ -223,12 +225,26 @@ void AssetRoots::setCapacityArena(std::shared_ptr<CapacityArena> arena)
   m_arena = std::move(arena);
 }
 
-std::optional<size_t> AssetRoots::approve(const std::string &directory)
+std::vector<AssetRoots::Profile> AssetRoots::profiles() const
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  std::vector<Profile> result;
+  result.reserve(m_roots.size());
+  for (size_t i = 0; i < m_roots.size(); i++)
+    result.push_back(
+        {i, m_roots[i]->kind, m_roots[i]->label, m_roots[i]->approved.load()});
+  return result;
+}
+
+std::optional<size_t> AssetRoots::approve(
+    const std::string &directory, Kind kind, const std::string &label)
 {
   std::lock_guard<std::mutex> lock(m_mutex);
 #ifndef _WIN32
   if (m_roots.size() >= MAX_ROOTS || directory.empty()
-      || directory.front() != '/' || directory.size() > MAX_PATH_BYTES)
+      || directory.front() != '/' || directory.size() > MAX_PATH_BYTES
+      || label.size() > MAX_LABEL_BYTES
+      || label.find('\0') != std::string::npos)
     return {};
   File slash(open("/", O_RDONLY | O_CLOEXEC | O_DIRECTORY));
   File root(directory == "/"
@@ -239,6 +255,12 @@ std::optional<size_t> AssetRoots::approve(const std::string &directory)
   struct stat stat{};
   if (fstat(root.fd(), &stat) != 0 || !S_ISDIR(stat.st_mode))
     return {};
+  // Only the launch's own working input namespace must be private. Ordinary
+  // operator asset folders stay as the operator left them: shared modes are
+  // accepted and never changed here.
+  if (kind == Kind::LAUNCH_PRIVATE
+      && (stat.st_uid != geteuid() || (stat.st_mode & 07777) != 0700))
+    return {};
   for (const auto &existing : m_roots) {
     struct stat other{};
     if (fstat(existing->fd, &other) == 0 && stat.st_dev == other.st_dev
@@ -247,6 +269,8 @@ std::optional<size_t> AssetRoots::approve(const std::string &directory)
   }
   auto approval = std::allocate_shared<Root>(CapacityAllocator<Root>(m_arena));
   approval->fd = root.release();
+  approval->kind = kind;
+  approval->label = label;
   m_roots.push_back(std::move(approval));
   return m_roots.size() - 1;
 #else

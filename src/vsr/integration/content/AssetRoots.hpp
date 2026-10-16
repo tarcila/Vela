@@ -29,7 +29,29 @@ class AssetRoots
   static constexpr size_t MAX_ROOTS = 16;
   static constexpr size_t MAX_PATH_BYTES = 4096;
   static constexpr size_t MAX_INPUT_BYTES = 64u << 20;
+  static constexpr size_t MAX_LABEL_BYTES = 64;
   struct Root;
+
+  /* How the host obtained this read authority. Both kinds are trusted host
+   * controls; neither is agent-grantable. HOST_STARTUP roots are ordinary
+   * shared operator directories and are never chmod'd. LAUNCH_PRIVATE is the
+   * launch's own working input namespace, created mode 0700 and owned by the
+   * effective user. */
+  enum class Kind
+  {
+    HOST_STARTUP,
+    LAUNCH_PRIVATE
+  };
+
+  // Operator discovery only: a stable id, its kind and a bounded host label.
+  // Never a filesystem path, credential or grantable capability.
+  struct Profile
+  {
+    size_t id{0};
+    Kind kind{Kind::HOST_STARTUP};
+    std::string label;
+    bool approved{false};
+  };
   using Bytes = std::vector<std::uint8_t, CapacityAllocator<std::uint8_t>>;
 
   class Snapshot
@@ -61,9 +83,13 @@ class AssetRoots
   VSR_NOT_COPYABLE(AssetRoots)
   VSR_NOT_MOVEABLE(AssetRoots)
   void setCapacityArena(std::shared_ptr<CapacityArena> arena);
-  std::optional<size_t> approve(const std::string &absoluteDirectory);
+  std::optional<size_t> approve(const std::string &absoluteDirectory,
+      Kind kind = Kind::HOST_STARTUP,
+      const std::string &label = {});
   bool revoke(size_t root);
   size_t size() const;
+  // Current profiles, including revoked ids, for host/agent discovery.
+  std::vector<Profile> profiles() const;
   // Cooperative native-I/O boundary: regular files only; snapshots are private
   // immutable bytes. Currency/revocation must be rechecked at final safe point.
   std::shared_ptr<Snapshot> read(size_t root,

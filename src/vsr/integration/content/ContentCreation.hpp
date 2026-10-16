@@ -64,6 +64,8 @@ class ContentCreation
       const operations::OperationRef &ref,
       HdriRequest request);
   std::string metadata() const;
+  // Bounded host-root discovery: ids/kinds/labels only, never paths.
+  std::string rootProfiles() const;
 
  private:
   struct Source
@@ -213,6 +215,24 @@ inline void ContentCreation::attachScene(
   m_state->sources[scene] = {&identity, identity.lifetime()};
 }
 
+inline std::string ContentCreation::rootProfiles() const
+{
+  // Bounded operator discovery: at most 16 ids, each with its trusted kind and
+  // a <=64-byte host label. No filesystem path, credential or grant appears,
+  // and selecting an id never widens access beyond its pinned directory fd.
+  std::string out = "[";
+  for (const auto &profile : m_state->roots.profiles()) {
+    if (out.size() > 1)
+      out += ',';
+    out += "{\"id\":" + std::to_string(profile.id) + ",\"kind\":\""
+        + (profile.kind == AssetRoots::Kind::LAUNCH_PRIVATE ? "launch_private"
+                                                            : "host_startup")
+        + "\",\"label\":" + mcp::json::quote(profile.label)
+        + ",\"approved\":" + (profile.approved ? "true" : "false") + "}";
+  }
+  return out + "]";
+}
+
 inline std::string ContentCreation::metadata() const
 {
   return "{\"kinds\":[\"hdri\"],\"source_profile\":\"radiance_rgbe_minus_y_plus_x\","
@@ -222,7 +242,9 @@ inline std::string ContentCreation::metadata() const
       "\"processing_bytes_per_job\":171966464,\"control_profile_bytes\":1048576,\"store_record_bound\":4096,\"store_scope_bound\":1024,\"worker_backing_bytes\":33554432,\"initial_profile_bytes\":67108864,\"token_profile_bytes\":4194304,\"preparation_profile_bytes\":67108864,\"metadata_bytes_per_owner\":65536,\"registry_buckets\":65536,\"concurrent_jobs\":32,\"registered_scenes\":32,\"result_bytes\":16384,\"reference_scan_slots\":32768,"
       "\"reference_scan_values\":131072,\"ancestry\":1024,\"deadline_seconds\":30},"
       "\"asset_roots\":" + std::to_string(m_state->roots.size())
-      + ",\"cancellation\":\"cooperative_io_chunks_and_decode_rows; slot_and_leases_held_until_worker_exit\","
+      + ",\"asset_root_profiles\":" + rootProfiles()
+      + ",\"root_authority\":\"trusted_host_startup_and_launch_private_only; no_agent_grant\""
+        ",\"cancellation\":\"cooperative_io_chunks_and_decode_rows; slot_and_leases_held_until_worker_exit\","
         "\"recovery\":\"normal_conditional_restore_metadata_only_shared_fifo\"}";
 }
 

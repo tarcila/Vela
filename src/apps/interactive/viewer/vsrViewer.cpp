@@ -33,8 +33,10 @@
 #include <vsr/integration/inspection/Inspection.hpp>
 #include <vsr/integration/render/RevisionRender.hpp>
 #ifdef VSR_USE_INTEGRATION_MCP
+#include <vsr/integration/content/HostAssetRoots.hpp>
 #include <vsr/integration/descriptor/LaunchDescriptor.hpp>
 #include <vsr/integration/mcp/McpServer.hpp>
+#include <vsr/integration/mcp/tools/ContentTools.hpp>
 #include <vsr/integration/mcp/tools/EditTools.hpp>
 #include <vsr/integration/mcp/tools/FrameTools.hpp>
 #include <vsr/integration/mcp/tools/ImageTools.hpp>
@@ -263,8 +265,8 @@ struct AgentView : vsr::integration::render::RenderBackend
 
     r.pipeline = std::make_unique<vsr::rendering::ImagePipeline>();
     r.pipeline->setDimensions(WIDTH, HEIGHT);
-    r.pass = r.pipeline->setSource<vsr::rendering::AnariSceneRenderPass>(
-        r.device);
+    r.pass =
+        r.pipeline->setSource<vsr::rendering::AnariSceneRenderPass>(r.device);
     r.pass->setRunAsync(false);
     r.pass->setCamera(r.camera);
     r.pass->setRenderer(r.renderer);
@@ -495,18 +497,25 @@ class Application : public VSRApplication
       const char *argv[],
       bool agentIntegrationRequested,
       std::uint64_t restorationBytes,
-      std::uint64_t restorationHardBytes)
+      std::uint64_t restorationHardBytes,
+      std::vector<const char *> assetRoots = {})
       : VSRApplication(argc, argv)
   {
 #ifdef VSR_USE_INTEGRATION
     // Opt-in: nothing is exposed to agents unless the operator asks.
     m_agentIntegrationRequested = agentIntegrationRequested;
+#ifdef VSR_USE_INTEGRATION_MCP
+    m_startupAssetRoots = std::move(assetRoots);
+#else
+    (void)assetRoots;
+#endif
     m_activityLimits.retentionBytes = restorationBytes;
     m_activityLimits.hardRetentionBytes = restorationHardBytes;
 #else
     (void)agentIntegrationRequested;
     (void)restorationBytes;
     (void)restorationHardBytes;
+    (void)assetRoots;
 #endif
   }
   ~Application() override = default;
@@ -713,6 +722,8 @@ class Application : public VSRApplication
 #ifdef VSR_USE_INTEGRATION_MCP
     if (m_images)
       m_images->pump();
+    if (m_creator)
+      m_creator->pump();
 #endif
     if (m_frames && m_integration) {
       // Bind only after initial background setup has completed. Natural render
@@ -971,6 +982,9 @@ DockSpace         ID=0x80F5B4C5 Window=0x079D3A04 Pos=0,56 Size=3840,2206 Split=
 #ifdef VSR_USE_INTEGRATION_MCP
   vsr::integration::descriptor::RuntimeDirectory m_runtimeDir;
   std::unique_ptr<vsr::integration::image::ImageExchange> m_images;
+  std::unique_ptr<vsr::integration::content::ContentCreation> m_creator;
+  vsr::integration::content::HostAssetRootReport m_assetRoots;
+  std::vector<const char *> m_startupAssetRoots;
   std::unique_ptr<vsr::integration::mcp::McpServer> m_mcp;
 #endif
 #endif
@@ -1182,9 +1196,47 @@ void Application::setupIntegration()
         return m_images->metadata(id, sessionId);
       },
       [this](vi::SceneId id) { return m_images->unavailableReason(id); });
+  struct HostReservation
+  {
+    std::shared_ptr<vsr::rendering::FrameBudget> budget;
+    std::shared_ptr<const void> reserve(std::size_t bytes) const
+    {
+      return budget->reserve(bytes);
+    }
+  };
+  auto contentReservation = std::make_shared<HostReservation>();
+  contentReservation->budget = hostImageMemory;
+  m_creator = std::make_unique<vi::content::ContentCreation>(*m_integration,
+      *m_engine,
+      *m_edits,
+      *m_activity,
+      vi::operations::Reservation::from(std::move(contentReservation)));
+  m_creator->attachScene(*sceneId, *m_identity);
+  // Trusted host controls only: directories named by the operator on this
+  // launch's command line, plus this launch's private 0700 working input.
+  // No agent request, MCP field or environment variable can add a root.
+  m_assetRoots = vi::content::configureHostAssetRoots(m_creator->assetRoots(),
+      m_startupAssetRoots,
+      m_runtimeDir,
+      m_authority->launchId());
+  for (const auto &failure : m_assetRoots.failures)
+    vsr::core::logError("[vsrViewer] asset root: %s", failure.c_str());
+  if (m_assetRoots.startupApproved != m_startupAssetRoots.size()
+      || !m_assetRoots.launchPrivateApproved) {
+    vsr::core::logError(
+        "[vsrViewer] content creation disabled: asset root setup failed");
+    m_creator.reset();
+    vi::content::releaseLaunchPrivateInput(m_assetRoots);
+  } else {
+    vsr::core::logStatus("[vsrViewer] content input (launch-private, 0700): %s",
+        m_assetRoots.launchPrivatePath.c_str());
+  }
+
   vi::mcp::Config cfg;
   cfg.imageExchange = m_images->metadata(*sceneId);
   vi::mcp::tools::addImageTools(cfg.tools, {*m_ids, *m_images});
+  if (m_creator)
+    vi::mcp::tools::addContentTools(cfg.tools, *m_ids, *m_creator, *m_engine);
   vi::mcp::tools::addQueryTools(cfg.tools, {*m_engine, *m_inspector});
   vi::mcp::tools::addLookupTools(cfg.tools, *m_engine);
   vi::mcp::tools::addEditTools(
@@ -1320,6 +1372,9 @@ void Application::teardownIntegration()
     m_activityWindow->model().setServices({});
 #ifdef VSR_USE_INTEGRATION_MCP
   m_mcp.reset();
+  // Cancels and joins creation workers before their leases are released.
+  m_creator.reset();
+  vsr::integration::content::releaseLaunchPrivateInput(m_assetRoots);
   m_images.reset();
 #endif
   if (m_cameraPoses)
@@ -1367,7 +1422,8 @@ int main(int argc, const char *argv[])
   if (!vsr::app::parseAgentOptions(argc, argv, options)) {
     std::fprintf(stderr,
         "--agentRestorationBytes requires one positive decimal byte count; "
-        "--agentRestorationHardBytes likewise, with hard >= soft\n");
+        "--agentRestorationHardBytes likewise, with hard >= soft; "
+        "--agentAssetRoot one absolute directory, at most 8, no duplicates\n");
     return 1;
   }
   // vsrViewer owns `--agentIntegration`; remove it before the base parser.
@@ -1386,7 +1442,8 @@ int main(int argc, const char *argv[])
         args.data(),
         agentIntegrationRequested,
         options.restorationBytes,
-        options.restorationHardBytes);
+        options.restorationHardBytes,
+        options.assetRoots);
     app.run(1920, 1080, "VSR Viewer");
   }
 

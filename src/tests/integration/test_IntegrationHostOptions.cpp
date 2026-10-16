@@ -129,3 +129,91 @@ TEST_CASE("Host restoration option is strict and launch-local",
   const char *equalsHard[] = {"host", "--agentRestorationHardBytes=8589934592"};
   CHECK_FALSE(parseAgentOptions(2, equalsHard, options));
 }
+
+TEST_CASE("Host asset roots are trusted launch options only",
+    "[integration][host-options][content-roots]")
+{
+  using vsr::app::AgentOptions;
+  using vsr::app::parseAgentOptions;
+  AgentOptions options;
+  const char *none[] = {"host", "--agentIntegration"};
+  REQUIRE(parseAgentOptions(2, none, options));
+  CHECK(options.assetRoots.empty());
+
+  const char *two[] = {"host",
+      "--agentIntegration",
+      "--agentAssetRoot",
+      "/srv/hdri",
+      "-gltf",
+      "board.gltf",
+      "--agentAssetRoot",
+      "/home/user/assets"};
+  REQUIRE(parseAgentOptions(8, two, options));
+  REQUIRE(options.assetRoots == std::vector<const char *>({two[3], two[7]}));
+  // Root options are consumed by the host, never handed to the scene parser.
+  CHECK(options.arguments
+      == std::vector<const char *>({two[0], two[1], two[4], two[5]}));
+
+  for (const auto *value : {"",
+           "relative/dir",
+           ".",
+           "/",
+           "/srv/../etc",
+           "/srv/./hdri",
+           "/srv//hdri",
+           "/srv/hdri/",
+           "--agentIntegration"}) {
+    const char *args[] = {"host", "--agentAssetRoot", value};
+    INFO(value);
+    CHECK_FALSE(parseAgentOptions(3, args, options));
+  }
+  const std::string deep = "/" + std::string(4096, 'a');
+  const char *tooLong[] = {"host", "--agentAssetRoot", deep.c_str()};
+  CHECK_FALSE(parseAgentOptions(3, tooLong, options));
+  const char *missing[] = {"host", "--agentAssetRoot"};
+  CHECK_FALSE(parseAgentOptions(2, missing, options));
+  const char *equals[] = {"host", "--agentAssetRoot=/srv/hdri"};
+  CHECK_FALSE(parseAgentOptions(2, equals, options));
+  const char *duplicate[] = {
+      "host", "--agentAssetRoot", "/srv/hdri", "--agentAssetRoot", "/srv/hdri"};
+  CHECK_FALSE(parseAgentOptions(5, duplicate, options));
+  const char *many[] = {"host",
+      "--agentAssetRoot",
+      "/a1",
+      "--agentAssetRoot",
+      "/a2",
+      "--agentAssetRoot",
+      "/a3",
+      "--agentAssetRoot",
+      "/a4",
+      "--agentAssetRoot",
+      "/a5",
+      "--agentAssetRoot",
+      "/a6",
+      "--agentAssetRoot",
+      "/a7",
+      "--agentAssetRoot",
+      "/a8"};
+  REQUIRE(parseAgentOptions(17, many, options));
+  CHECK(options.assetRoots.size() == AgentOptions::MAX_ASSET_ROOTS);
+  const char *tooMany[] = {"host",
+      "--agentAssetRoot",
+      "/a1",
+      "--agentAssetRoot",
+      "/a2",
+      "--agentAssetRoot",
+      "/a3",
+      "--agentAssetRoot",
+      "/a4",
+      "--agentAssetRoot",
+      "/a5",
+      "--agentAssetRoot",
+      "/a6",
+      "--agentAssetRoot",
+      "/a7",
+      "--agentAssetRoot",
+      "/a8",
+      "--agentAssetRoot",
+      "/a9"};
+  CHECK_FALSE(parseAgentOptions(19, tooMany, options));
+}

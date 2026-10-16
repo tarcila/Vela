@@ -17,6 +17,7 @@
 // the blocking service loop until interrupted (Ctrl-C / SIGTERM).
 //
 // Usage: vsrTutorialIntegrationHeadless [--exit-after-activation]
+//        [--agentAssetRoot <absolute-directory>]... (trusted host read roots)
 
 // vsr
 #include "vsr/app/AgentOptions.hpp"
@@ -30,8 +31,10 @@
 #include "vsr/integration/render/RevisionRender.hpp"
 #include "vsr/integration/restore/BatchRestore.hpp"
 #ifdef VSR_USE_INTEGRATION_MCP
+#include "vsr/integration/content/HostAssetRoots.hpp"
 #include "vsr/integration/descriptor/LaunchDescriptor.hpp"
 #include "vsr/integration/mcp/McpServer.hpp"
+#include "vsr/integration/mcp/tools/ContentTools.hpp"
 #include "vsr/integration/mcp/tools/EditTools.hpp"
 #include "vsr/integration/mcp/tools/ImageTools.hpp"
 #include "vsr/integration/mcp/tools/LookupTools.hpp"
@@ -275,6 +278,8 @@ struct Host
 #ifdef VSR_USE_INTEGRATION_MCP
   vi::descriptor::RuntimeDirectory runtimeDir;
   std::unique_ptr<vi::image::ImageExchange> images;
+  std::unique_ptr<vi::content::ContentCreation> creator;
+  vi::content::HostAssetRootReport assetRoots;
   std::unique_ptr<vi::mcp::McpServer> mcp;
 #endif
 
@@ -282,6 +287,9 @@ struct Host
   {
 #ifdef VSR_USE_INTEGRATION_MCP
     mcp.reset();
+    // Cancels and joins creation workers before their leases are released.
+    creator.reset();
+    vi::content::releaseLaunchPrivateInput(assetRoots);
     images.reset();
 #endif
     inspector.reset();
@@ -319,7 +327,8 @@ int main(int argc, const char *argv[])
   if (!vsr::app::parseAgentOptions(argc, argv, agentOptions)) {
     std::fprintf(stderr,
         "--agentRestorationBytes requires one positive decimal byte count; "
-        "--agentRestorationHardBytes likewise, with hard >= soft\n");
+        "--agentRestorationHardBytes likewise, with hard >= soft; "
+        "--agentAssetRoot one absolute directory, at most 8, no duplicates\n");
     return 1;
   }
   bool exitAfterActivation = false;
@@ -449,9 +458,44 @@ int main(int argc, const char *argv[])
         return host->images->metadata(id, sessionId);
       },
       [&host](vi::SceneId id) { return host->images->unavailableReason(id); });
+  struct HostReservation
+  {
+    std::shared_ptr<vsr::rendering::FrameBudget> budget;
+    std::shared_ptr<const void> reserve(std::size_t bytes) const
+    {
+      return budget->reserve(bytes);
+    }
+  };
+  auto reservation = std::make_shared<HostReservation>();
+  reservation->budget = hostImageMemory;
+  host->creator = std::make_unique<vi::content::ContentCreation>(integration,
+      *host->engine,
+      *host->edits,
+      *host->activity,
+      vi::operations::Reservation::from(std::move(reservation)));
+  host->creator->attachScene(*sceneId, *host->identity);
+  // Trusted host controls only: startup directories named on this launch's
+  // command line, plus this launch's own private 0700 working input folder.
+  host->assetRoots =
+      vi::content::configureHostAssetRoots(host->creator->assetRoots(),
+          agentOptions.assetRoots,
+          host->runtimeDir,
+          host->authority->launchId());
+  for (const auto &failure : host->assetRoots.failures)
+    std::fprintf(stderr, "asset root: %s\n", failure.c_str());
+  if (host->assetRoots.startupApproved != agentOptions.assetRoots.size())
+    return fail("refused --agentAssetRoot directory");
+  if (!host->assetRoots.launchPrivateApproved)
+    return fail("launch-private content input directory unavailable");
+  std::fprintf(stderr,
+      "content input (launch-private, 0700): %s\n",
+      host->assetRoots.launchPrivatePath.c_str());
+
   vi::mcp::Config cfg;
   cfg.imageExchange = host->images->metadata(*sceneId);
   vi::mcp::tools::addImageTools(cfg.tools, {*host->ids, *host->images});
+  vi::mcp::tools::addContentTools(
+      cfg.tools, *host->ids, *host->creator, *host->engine);
   vi::mcp::tools::addQueryTools(cfg.tools, {*host->engine, *host->inspector});
   vi::mcp::tools::addLookupTools(cfg.tools, *host->engine);
   vi::mcp::tools::addEditTools(cfg.tools,
@@ -491,6 +535,7 @@ int main(int argc, const char *argv[])
     integration.service();
 #ifdef VSR_USE_INTEGRATION_MCP
     host->images->pump();
+    host->creator->pump();
 #endif
     host->translations->pump();
     host->renders->pump();
