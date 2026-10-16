@@ -10,6 +10,10 @@ namespace vsr::scene {
 
 struct Scene;
 
+namespace detail {
+class PreparedSurfaceStorage;
+}
+
 /*
  * Named Forest-based hierarchy of LayerNodeData nodes owned by a Scene;
  * nodes carry transforms or Object references and can be traversed, queried
@@ -78,6 +82,7 @@ struct Layer final
   void validateCopy(const LayerNodeData &value) const;
 
   friend struct Scene; // Scene removal revokes tracking, not object resolution.
+  friend class detail::PreparedSurfaceStorage;
   friend class detail::PreparedHdriContent;
   friend class detail::PreparedHdriRemoval;
   friend struct LayerNodeData;

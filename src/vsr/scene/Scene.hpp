@@ -246,6 +246,7 @@ struct Scene
   void removeDefragCallback(size_t token);
 
  private:
+  friend class detail::PreparedSurfaceStorage;
   friend class detail::PreparedPositionBinding;
   friend class detail::PreparedHdriContent;
   friend class detail::PreparedHdriRemoval;

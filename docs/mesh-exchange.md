@@ -42,6 +42,11 @@ READ+EDIT, exposure or enabled agent edits. READ-only sessions may export.
 Discovery's usage/capacity observations can change before admission; they are
 not reservations. Export supplies the current complete mesh dependency tokens.
 
+New-Surface graph preparation is currently internal and unregistered; it is not
+Mesh Import into an existing target. Its explicitly different action semantics
+are recorded in [private Surface preparation](surface-creation-preparation.md).
+This does not advertise a public creation workflow.
+
 ## Revision 1 representation
 
 A `.vmesh` is one self-contained, uncompressed file:

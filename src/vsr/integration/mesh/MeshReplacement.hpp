@@ -47,16 +47,23 @@ inline bool equivalent(
       == 0;
 }
 
+// New-graph planning may start only from an empty detached triangle, never
+// bypass an existing target's dependency inventory.
 inline const char *prepareMesh(const scene::Geometry &geometry,
     const Bundle &bundle,
-    MeshReplacement &result)
+    MeshReplacement &result,
+    bool newGeometry = false)
 {
   MeshReplacement staged;
   if (!scene::detail::PreparedMeshBinding::available(geometry))
     return "parameter_batch_active";
   if (!boundedParameters(geometry))
     return "mesh_parameter_limit";
-  if (const auto *reason = plan(geometry, staged.dependencies, false))
+  if (newGeometry) {
+    if (geometry.scene() || geometry.numParameters()
+        || geometry.subtype() != scene::tokens::geometry::triangle)
+      return "invalid_new_geometry";
+  } else if (const auto *reason = plan(geometry, staged.dependencies, false))
     return reason;
   for (std::size_t i = 0; i < staged.dependencies.fieldCount; ++i) {
     const auto *field = staged.dependencies.fields[i];
