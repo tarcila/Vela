@@ -89,6 +89,26 @@ local hit = renderer:pick(960, 540) -- nil on a miss; (0, 0) is top-left
 if hit then print(hit.objectType, hit.objectIndex, hit.position) end
 ```
 
+### Typed bounds and RGB NanoVDB fields
+
+Use an explicit box value for BOX3 parameters; six-number tables are not
+converted to boxes:
+
+```lua
+local volume = scene:createVolume("principledVolume")
+volume:setParameter("bounds", vsr.box3.new(
+    vsr.float3(-1, -1, 0), vsr.float3(1, 1, 2)))
+local bounds = volume:getParameter("bounds")
+print(bounds.lower.x, bounds.upper.z)
+```
+
+The box preserves its endpoints exactly, including reversed or degenerate
+corners. Parameter-specific validity is not enforced by the binding.
+
+`vsr.io.importNVDB` preserves Vec3f grids and checks their active voxel count,
+not whether their RGB values are nonzero. RGB fields have no scalar `range`
+parameter: no luminance or magnitude reduction is implied.
+
 ### Example Scripts
 
 See [scripts/examples/](../../../scripts/examples/) for worked examples:
