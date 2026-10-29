@@ -79,6 +79,13 @@ void registerMathBindings(sol::state &lua)
       });
   registerVecArithmetic(float3Type);
 
+  vsr.new_usertype<math::box3>("box3",
+      sol::constructors<math::box3(math::float3, math::float3)>(),
+      "lower",
+      sol::readonly(&math::box3::lower),
+      "upper",
+      sol::readonly(&math::box3::upper));
+
   auto float4Type = vsr.new_usertype<math::float4>("float4",
       sol::constructors<math::float4(),
           math::float4(float, float, float, float)>(),
