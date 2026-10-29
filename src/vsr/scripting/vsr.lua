@@ -49,6 +49,16 @@ local float3 = {}
 ---@operator unm: vsr.float4
 local float4 = {}
 
+---@class vsr.box3
+---@field lower vsr.float3 # Lower corner; endpoints are preserved without validation.
+---@field upper vsr.float3 # Upper corner.
+local box3 = {}
+
+---@param lower vsr.float3
+---@param upper vsr.float3
+---@return vsr.box3
+function box3.new(lower, upper) end
+
 ---@class vsr.mat3
 ---@field identity vsr.mat3
 ---@operator index(integer): vsr.float3
@@ -65,7 +75,7 @@ local mat4 = {}
 -- Parameter value types accepted by setParameter / returned by getParameter
 ------------------------------------------------------------------------
 
----@alias vsr.ParameterValue boolean|number|string|vsr.float2|vsr.float3|vsr.float4|vsr.mat4|vsr.Array|vsr.Sampler|vsr.Geometry|vsr.Material|vsr.SpatialField|vsr.Volume|vsr.Light|vsr.Camera|vsr.Surface|number[]
+---@alias vsr.ParameterValue boolean|number|string|vsr.float2|vsr.float3|vsr.float4|vsr.box3|vsr.mat4|vsr.Array|vsr.Sampler|vsr.Geometry|vsr.Material|vsr.SpatialField|vsr.Volume|vsr.Light|vsr.Camera|vsr.Surface|number[]
 
 ------------------------------------------------------------------------
 -- Token (ContextBindings.cpp)
@@ -798,6 +808,8 @@ vsr.ARRAY = 0
 vsr.SPATIAL_FIELD = 0
 
 -- Math utility functions (MathBindings.cpp) ------------------------------
+
+vsr.box3 = box3
 
 --- Construct a float2.
 ---@overload fun(): vsr.float2

@@ -34,6 +34,8 @@ void setParameterFromLua(
     obj->setParameter(token, value.as<math::float3>());
   } else if (value.is<math::float4>()) {
     obj->setParameter(token, value.as<math::float4>());
+  } else if (value.is<math::box3>()) {
+    obj->setParameter(token, value.as<math::box3>());
   } else if (value.is<math::mat4>()) {
     obj->setParameter(token, value.as<math::mat4>());
   } else if (value.is<scene::ArrayRef>()) {
@@ -108,7 +110,7 @@ void setParameterFromLua(
     std::string typeName = sol::type_name(value.lua_state(), value.get_type());
     throw std::runtime_error(fmt::format(
         "Unsupported type '{}' for parameter '{}'"
-        ": expected bool, number, string, float2/3/4, mat4, ArrayRef, "
+        ": expected bool, number, string, float2/3/4, box3, mat4, ArrayRef, "
         "SamplerRef, GeometryRef, MaterialRef, SpatialFieldRef, "
         "VolumeRef, LightRef, CameraRef, SurfaceRef, "
         "or table of 2-4 numbers",
@@ -151,6 +153,8 @@ sol::object getParameterAsLua(
     return sol::make_object(lua, val.get<math::float3>());
   if (val.is<math::float4>())
     return sol::make_object(lua, val.get<math::float4>());
+  if (val.is<math::box3>())
+    return sol::make_object(lua, val.get<math::box3>());
   if (val.is<math::mat4>())
     return sol::make_object(lua, val.get<math::mat4>());
 

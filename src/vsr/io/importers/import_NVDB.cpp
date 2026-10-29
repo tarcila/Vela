@@ -111,6 +111,9 @@ SpatialFieldRef import_NVDB(Scene &scene, const char *filepath)
     case nanovdb::GridType::Float:
       hasActiveVoxels = grid.grid<float>()->activeVoxelCount() > 0;
       break;
+    case nanovdb::GridType::Vec3f:
+      hasActiveVoxels = grid.grid<nanovdb::Vec3f>()->activeVoxelCount() > 0;
+      break;
     default:
       break;
     }
