@@ -77,6 +77,12 @@ endif()
 if (TARGET vsr_network)
   target_sources(${PROJECT_NAME} PRIVATE test_NetworkChannel.cpp)
 endif()
+if (TARGET vsr_ui_imgui)
+  target_sources(${PROJECT_NAME} PRIVATE test_TransferFunctionEditor.cpp)
+  target_link_libraries(${PROJECT_NAME} PRIVATE vsr_ui_imgui)
+  add_test(NAME vsr::TransferFunctionEditor
+    COMMAND ${PROJECT_NAME} "[TransferFunctionEditor]")
+endif()
 if (TARGET vsr_lua)
   target_sources(${PROJECT_NAME} PRIVATE
     test_LuaRenderer.cpp test_LuaVolume.cpp)
