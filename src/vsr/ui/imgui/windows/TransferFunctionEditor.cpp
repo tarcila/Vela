@@ -80,7 +80,7 @@ void TransferFunctionEditor::buildUI()
   }
 
   if (!m_volume) {
-    ImGui::Text("{no volume selected}");
+    ImGui::Text("{no transferFunction1D volume selected}");
     return;
   }
 
@@ -240,6 +240,8 @@ void TransferFunctionEditor::buildUI_drawEditor()
 void TransferFunctionEditor::buildUI_opacityScale()
 {
   auto *param = m_volume->parameter("opacity");
+  if (!param)
+    return;
   if (!vsr::ui::buildUI_parameter(*m_volume,
           *param,
           appContext()->vsr.scene,
@@ -257,6 +259,8 @@ void TransferFunctionEditor::buildUI_opacityScale()
 void TransferFunctionEditor::buildUI_unitDistance()
 {
   auto *param = m_volume->parameter("unitDistance");
+  if (!param)
+    return;
   if (!vsr::ui::buildUI_parameter(*m_volume,
           *param,
           appContext()->vsr.scene,
@@ -275,8 +279,10 @@ void TransferFunctionEditor::buildUI_valueRange()
 {
   ImGui::BeginDisabled(!m_volume);
 
-  if (vsr::ui::buildUI_parameter(*m_volume,
-          *m_volume->parameter("valueRange"),
+  auto *param = m_volume->parameter("valueRange");
+  if (param
+      && vsr::ui::buildUI_parameter(*m_volume,
+          *param,
           appContext()->vsr.scene,
           false,
           objectEditPolicy())) {
@@ -414,13 +420,14 @@ void TransferFunctionEditor::setObjectPtrsFromSelectedObject()
 {
   const auto &selectedNodes = appContext()->getSelectedNodes();
 
-  // Collect all volume pointers from selection
+  // Other volume subtypes do not have transfer-function parameters.
   std::vector<vsr::scene::Volume *> allVolumes;
   for (const auto &node : selectedNodes) {
     if (!node.valid())
       continue;
     auto *obj = (*node)->getObject();
-    if (obj && obj->type() == ANARI_VOLUME) {
+    if (obj && obj->type() == ANARI_VOLUME
+        && obj->subtype() == vsr::scene::tokens::volume::transferFunction1D) {
       allVolumes.push_back((vsr::scene::Volume *)obj);
     }
   }
@@ -430,6 +437,8 @@ void TransferFunctionEditor::setObjectPtrsFromSelectedObject()
     m_volume = nullptr;
     m_otherVolumes.clear();
     m_colorMapArray = nullptr;
+    m_lastColorVolume = nullptr;
+    m_awaitingSamples = false;
     return;
   }
 
