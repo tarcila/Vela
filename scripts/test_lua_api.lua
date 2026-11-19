@@ -1485,6 +1485,54 @@ test("Layer:foreach early termination", function()
   assert(count == 1, "foreach should stop after returning false")
 end)
 
+test("Layer:foreach preserves callback return semantics", function()
+  local s = vsr.createScene()
+  local layer = s:defaultLayer()
+  s:insertChildNode(layer:root(), "first")
+  s:insertChildNode(layer:root(), "second")
+  local cases = {
+    {fn = function() end, count = 3},
+    {fn = function() return nil end, count = 3},
+    {fn = function() return true end, count = 3},
+    {fn = function() return false end, count = 1},
+  }
+  for _, case in ipairs(cases) do
+    local count = 0
+    layer:foreach(function(node, level)
+      count = count + 1
+      return case.fn()
+    end)
+    assert(count == case.count, "unexpected traversal count: " .. count)
+  end
+end)
+
+test("Layer:foreach propagates callback errors with both Lua frames", function()
+  local s = vsr.createScene()
+  local layer = s:defaultLayer()
+  s:insertChildNode(layer:root(), "child")
+  for _, statement in ipairs({
+    'error("FOREACH_SENTINEL")',
+    'assert(false, "FOREACH_SENTINEL")',
+  }) do
+    local callback = assert(load(
+      "return function(node, level)\n" .. statement .. "\nend",
+      "@foreach-callback.lua"))()
+    local caller = assert(load(
+      "local layer, callback = ...\nlayer:foreach(callback)\nreturn true",
+      "@foreach-caller.lua"))
+    local ok, err = pcall(caller, layer, callback)
+    assert(not ok, "callback failure must propagate")
+    assert(err:find("FOREACH_SENTINEL", 1, true), err)
+    assert(err:find("stack traceback:", 1, true), err)
+    assert(err:find("foreach-callback.lua:2", 1, true), err)
+    assert(err:find("foreach-caller.lua:2", 1, true), err)
+    assert(not err:find("protected_function_result", 1, true), err)
+    local count = 0
+    layer:foreach(function() count = count + 1 end)
+    assert(count == 2, "traversal must recover after callback failure")
+  end
+end)
+
 -- LayerNode properties
 section("LayerNode Properties")
 
