@@ -10,6 +10,19 @@
 
 namespace vsr::scripting {
 
+namespace {
+
+int callbackTraceback(lua_State *lua)
+{
+  const char *message = lua_tostring(lua, 1);
+  if (!message)
+    message = "Lua callback raised a non-string error";
+  luaL_traceback(lua, lua, message, 1);
+  return 1;
+}
+
+} // namespace
+
 void registerLayerBindings(sol::state &lua)
 {
   sol::table vsr = lua["vsr"];
@@ -142,12 +155,22 @@ void registerLayerBindings(sol::state &lua)
       "at",
       &Layer::at,
       "foreach",
-      [](Layer &l, sol::function fn) {
+      [](Layer &l, sol::protected_function fn) {
+        auto *lua = fn.lua_state();
+        // Capture callback frames before the protected call unwinds them.
+        lua_pushcfunction(lua, callbackTraceback);
+        fn.set_error_handler(sol::reference(lua, -1));
+        lua_pop(lua, 1);
         l.traverse(l.root(), [&fn, &l](scene::LayerNode &node, int level) {
-          sol::object result = fn(l.at(node.index()), level);
-          if (result.is<bool>() && !result.as<bool>())
-            return false;
-          return true;
+          auto result = fn(l.at(node.index()), level);
+          if (!result.valid()) {
+            sol::error error = result;
+            throw error;
+          }
+          if (result.return_count() == 0)
+            return true;
+          sol::object value = result.get<sol::object>();
+          return !value.is<bool>() || value.as<bool>();
         });
       });
 }
