@@ -87,6 +87,50 @@ TEST_CASE(
   REQUIRE(c.vsr.scene.numberOfObjects(ANARI_VOLUME) == 0);
 }
 
+TEST_CASE("Principled and legacy imports retain command-line insertion order",
+    "[App]")
+{
+  auto file = std::filesystem::temp_directory_path()
+      / "vsr-cli-order_2x2x2_float32.raw";
+  const float samples[8] = {1, 1, 1, 1, 1, 1, 1, 1};
+  std::ofstream(file, std::ios::binary)
+      .write(reinterpret_cast<const char *>(samples), sizeof(samples));
+  vsr::app::Context c;
+  std::vector<std::string> args{"app",
+      "-principled_volume",
+      "name=first",
+      "bounds=0,0,0,1,1,1",
+      "-volume",
+      file.string(),
+      "-principled_volume",
+      "name=last",
+      "bounds=0,0,0,1,1,1"};
+  c.parseCommandLine(args);
+  REQUIRE(c.loadCommandLineSceneInputs());
+  std::filesystem::remove(file);
+  REQUIRE(c.vsr.scene.getObject<vsr::scene::Volume>(0)->name() == "first");
+  REQUIRE(c.vsr.scene.getObject<vsr::scene::Volume>(1)->subtype()
+      == "transferFunction1D");
+  REQUIRE(c.vsr.scene.getObject<vsr::scene::Volume>(2)->name() == "last");
+}
+
+TEST_CASE("Principled medium is assigned to one MPI rank as one input", "[App]")
+{
+  vsr::app::Context c;
+  c.vsr.scene.setMpiRankInfo(1, 2);
+  std::vector<std::string> args{"app",
+      "-principled_volume",
+      "name=rank0",
+      "bounds=0,0,0,1,1,1",
+      "-principled_volume",
+      "name=rank1",
+      "bounds=0,0,0,1,1,1"};
+  c.parseCommandLine(args);
+  REQUIRE(c.loadCommandLineSceneInputs());
+  REQUIRE(c.vsr.scene.numberOfObjects(ANARI_VOLUME) == 1);
+  REQUIRE(c.vsr.scene.getObject<vsr::scene::Volume>(0)->name() == "rank1");
+}
+
 TEST_CASE("Unsupported principled backend does not create a substitute volume",
     "[PrincipledVolumeImport]")
 {
