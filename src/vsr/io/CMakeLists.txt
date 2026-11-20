@@ -74,6 +74,7 @@ PRIVATE
   importers/import_SWC_SDF.cpp
   importers/import_TRK.cpp
   importers/import_volume.cpp
+  importers/import_principledVolume.cpp
   importers/import_VTI.cpp
   importers/import_VTP.cpp
   importers/import_VTU.cpp

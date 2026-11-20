@@ -50,6 +50,7 @@ project_add_executable(
   test_PickRequest.cpp
   test_PrincipledVolumeImport.cpp
   test_PrincipledVolumeFields.cpp
+  test_PrincipledVolumeAssembly.cpp
   test_Procedural.cpp
   test_RenderIndex.cpp
   test_Scene.cpp

@@ -11,7 +11,27 @@ Volume::Volume(Token stype) : Object(ANARI_VOLUME, stype)
 {
   addParameter("visible").setValue(true).setDescription(
       "whether the volume is visible in the scene");
-  if (stype == tokens::volume::transferFunction1D) {
+  if (stype == tokens::volume::principledVolume) {
+    addParameter("density").setValue(1.f).setMin(0.f);
+    addParameter("scatteringColor")
+        .setValue(float3(1.f))
+        .setUsage(ParameterUsageHint::COLOR);
+    addParameter("transmissionColor")
+        .setValue(float3(0.36787944f))
+        .setUsage(ParameterUsageHint::COLOR);
+    addParameter("transmissionDistance").setValue(1.f).setMin(0.f);
+    addParameter("anisotropy").setValue(0.f).setMin(-1.f).setMax(1.f);
+    addParameter("secondaryAnisotropy").setValue(0.f).setMin(-1.f).setMax(1.f);
+    addParameter("secondaryWeight").setValue(0.f).setMin(0.f).setMax(1.f);
+    addParameter("emission")
+        .setValue(float3(0.f))
+        .setUsage(ParameterUsageHint::COLOR);
+    addParameter("temperature").setValue(1.f);
+    addParameter("blackbodyIntensity").setValue(0.f).setMin(0.f);
+    addParameter("blackbodyTint")
+        .setValue(float3(1.f))
+        .setUsage(ParameterUsageHint::COLOR);
+  } else if (stype == tokens::volume::transferFunction1D) {
     addParameter("color")
         .setValue(float3{1.f})
         .setUsage(ParameterUsageHint::COLOR)
@@ -74,6 +94,7 @@ anari::Object Volume::makeANARIObject(anari::Device d) const
 
 namespace tokens::volume {
 
+const Token principledVolume = "principledVolume";
 const Token gaussianSplat = "gaussianSplat";
 const Token structuredRegular = "structuredRegular";
 const Token structuredRectilinear = "structuredRectilinear";
