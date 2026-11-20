@@ -48,6 +48,7 @@ project_add_executable(
   test_ObjectUsePtr.cpp
   test_Parameter.cpp
   test_PickRequest.cpp
+  test_PrincipledVolumeImport.cpp
   test_Procedural.cpp
   test_RenderIndex.cpp
   test_Scene.cpp
@@ -248,6 +249,7 @@ add_test(NAME vsr::Forest        COMMAND ${PROJECT_NAME} "[Forest]"       )
 add_test(NAME vsr::Geometry      COMMAND ${PROJECT_NAME} "[Geometry]"     )
 add_test(NAME vsr::ImageImport   COMMAND ${PROJECT_NAME} "[ImageImport]"  )
 add_test(NAME vsr::ImagePipeline COMMAND ${PROJECT_NAME} "[ImagePipeline]")
+add_test(NAME vsr::PrincipledVolumeImport COMMAND ${PROJECT_NAME} "[PrincipledVolumeImport]")
 add_test(NAME vsr::Importers     COMMAND ${PROJECT_NAME} "[Importers]"    )
 add_test(NAME vsr::LayerSubtreeArchive
   COMMAND ${PROJECT_NAME} "[LayerSubtreeArchive]")
