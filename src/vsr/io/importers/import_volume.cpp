@@ -80,7 +80,9 @@ SpatialFieldRef import_spatial_field(
   }
 
   auto ext = extensionOf(file.c_str());
-  if (ext == ".raw")
+  if (ext == ".vti")
+    return import_VTI(scene, file.c_str());
+  else if (ext == ".raw")
     return import_RAW(scene, file.c_str());
   else if (ext == ".flash" || ext == ".hdf5")
     return import_FLASH(scene, file.c_str());

@@ -72,6 +72,12 @@ SpatialFieldRef import_VTI(Scene &scene,
   auto storeExtra = [&](SpatialFieldRef &f) {
     if (extraFields)
       extraFields->push_back(f);
+    else {
+      auto *data = f->parameterValueAsObject<Array>("data");
+      scene.removeObject(f.data());
+      if (data)
+        scene.removeObject(data);
+    }
   };
 
   for (uint32_t i = 0; i < pointData->GetNumberOfArrays(); ++i) {
@@ -156,6 +162,8 @@ SpatialFieldRef import_VTI(Scene &scene,
           array->GetName(),
           numComponents);
     }
+    if (found && !extraFields)
+      return field;
   }
 
   if (!found) {
@@ -164,6 +172,7 @@ SpatialFieldRef import_VTI(Scene &scene,
         "(only 1- and 3-component arrays are supported; file has %d array(s))",
         filepath,
         pointData->GetNumberOfArrays());
+    scene.removeObject(field.data());
     return {};
   }
 
