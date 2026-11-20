@@ -15,6 +15,7 @@
 #include "vsr/rendering/view/CameraPath.h"
 #include "vsr/rendering/view/Manipulator.hpp"
 // vsr_io
+#include "vsr/io/PrincipledVolumeImport.hpp"
 #include "vsr/io/importers.hpp"
 
 #include "vsr/app/ANARIDeviceManager.h"
@@ -39,12 +40,18 @@ struct ForeignSceneImport
   vsr::io::ImportFile file;
 };
 
+struct PrincipledVolumeSceneImport
+{
+  vsr::io::PrincipledVolumeImportOptions options;
+  std::string layerName;
+};
+
 /*
  * Parsed scene input intent. A Scene Archive load replaces the current Scene;
  * a foreign import adds converted content to it.
  */
-using CommandLineSceneInput =
-    std::variant<SceneArchiveLoad, ForeignSceneImport>;
+using CommandLineSceneInput = std::
+    variant<SceneArchiveLoad, ForeignSceneImport, PrincipledVolumeSceneImport>;
 
 struct CommandLineOptions
 {

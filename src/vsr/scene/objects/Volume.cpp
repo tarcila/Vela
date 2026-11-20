@@ -3,6 +3,7 @@
 
 #include "vsr/scene/objects/Volume.hpp"
 #include "vsr/core/ColorMapUtil.hpp"
+#include "vsr/core/Logging.hpp"
 #include "vsr/scene/Scene.hpp"
 
 namespace vsr::scene {
@@ -113,6 +114,18 @@ ObjectPoolRef<Volume> Volume::self() const
 
 anari::Object Volume::makeANARIObject(anari::Device d) const
 {
+  if (subtype() == tokens::volume::principled) {
+    const auto *types = anariGetObjectSubtypes(d, ANARI_VOLUME);
+    bool supported = false;
+    if (types)
+      for (auto p = types; *p; ++p)
+        supported |= subtype() == *p;
+    if (!supported) {
+      vsr::core::logError(
+          "[Volume] device does not support principled; no fallback is available");
+      return nullptr;
+    }
+  }
   return anari::newObject<anari::Volume>(d, subtype().c_str());
 }
 

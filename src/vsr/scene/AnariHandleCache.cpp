@@ -66,6 +66,8 @@ anari::Object AnariHandleCache::getHandle(
 
     auto d = device;
     o = obj->makeANARIObject(d);
+    if (!o)
+      return nullptr;
     obj->updateAllANARIParameters(d, o, this);
     if (type == ANARI_SURFACE || type == ANARI_VOLUME)
       anari::setParameter(d, o, "id", encodeObjectId(type, idx));

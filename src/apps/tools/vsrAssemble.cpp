@@ -46,6 +46,10 @@ void printUsage(const char *programName)
   printf("  -ply <file...>             Import PLY files\n");
   printf(
       "  -volume <file...>          Import volume data (RAW, NVDB, VTI, etc.)\n");
+  printf(
+      "  -principled_volume <property[:field|value]=value...>\n"
+      "                            Import one principled medium\n"
+      "  -principled_volume_json <file>  Import a JSON medium description\n");
   printf("  -hdri <file>               Set HDRI environment map\n");
   printf("  -silo <file...>            Import Silo files\n");
   printf("  -usd <file...>             Import USD files\n");
@@ -130,11 +134,15 @@ bool allInputFilesExist(const vsr::app::CommandLineOptions &commandLine)
   for (const auto &input : commandLine.sceneInputs) {
     if (const auto *archive = std::get_if<vsr::app::SceneArchiveLoad>(&input))
       files.push_back(archive->filename);
-    else {
+    else if (const auto *foreign =
+                 std::get_if<vsr::app::ForeignSceneImport>(&input)) {
       // "<file>;<layer>[;<importer option>]"
-      const auto &importFile =
-          std::get<vsr::app::ForeignSceneImport>(input).file.second;
+      const auto &importFile = foreign->file.second;
       files.push_back(importFile.substr(0, importFile.find(';')));
+    } else if (const auto *medium =
+                   std::get_if<vsr::app::PrincipledVolumeSceneImport>(&input)) {
+      for (const auto &[property, source] : medium->options.fields)
+        files.push_back(source.file.string());
     }
   }
   for (const auto &sequence : commandLine.animationFilenames) {
