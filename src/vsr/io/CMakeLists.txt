@@ -7,6 +7,7 @@ project_add_library(STATIC)
 
 project_sources(
 PRIVATE
+  PrincipledVolumeImport.cpp
   AnariCaptureImport.cpp
   UsdImport.cpp
   archives/SceneArchive.cpp
@@ -96,6 +97,8 @@ PRIVATE
   serialization/Parameter.cpp
   serialization/serialization_datatree.cpp
 )
+
+project_include_directories(PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../../../external/vela_tinygltf/src)
 
 project_include_directories(
 PUBLIC
