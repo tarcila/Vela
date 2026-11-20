@@ -4,6 +4,9 @@
 #pragma once
 
 #include "Modal.h"
+#include "PrincipledVolumeImportEditor.h"
+#include <atomic>
+#include <memory>
 // vsr_io
 #include "vsr/io/UsdImport.hpp"
 // std
@@ -20,6 +23,16 @@ struct ImportFileDialog : public Modal
 
  private:
   void buildUsdVariantUI();
+  void buildPrincipledVolumeUI();
+
+  struct ImportResult
+  {
+    std::atomic<bool> done{false};
+    std::string error;
+  };
+  PrincipledVolumeImportEditor m_principledEditor;
+  std::shared_ptr<ImportResult> m_importResult;
+  std::string m_importError;
 
   std::string m_filename;
   int m_selectedFileType{0};

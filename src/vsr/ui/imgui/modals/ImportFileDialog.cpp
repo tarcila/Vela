@@ -59,6 +59,7 @@ constexpr ImporterChoice IMPORTERS[] = {
     {"VTP", vsr::io::ImporterType::VTP},
     {"VTU", vsr::io::ImporterType::VTU},
     {"XYZDP", vsr::io::ImporterType::XYZDP},
+    {"Principled Volume", vsr::io::ImporterType::NONE},
     {"VOLUME", vsr::io::ImporterType::VOLUME},
     {"VOLUME_ANIMATION", vsr::io::ImporterType::VOLUME_ANIMATION},
 };
@@ -82,10 +83,17 @@ void ImportFileDialog::buildUI()
   for (size_t i = 0; i < std::size(IMPORTERS); i++)
     importerNames[i] = IMPORTERS[i].name;
 
+  ImGui::BeginDisabled(bool(m_importResult));
   ImGui::Combo("importer type",
       &m_selectedFileType,
       importerNames,
       std::size(importerNames));
+  ImGui::EndDisabled();
+
+  if (IMPORTERS[m_selectedFileType].type == vsr::io::ImporterType::NONE) {
+    buildPrincipledVolumeUI();
+    return;
+  }
 
   static std::string outPath;
   if (ImGui::Button("...")) {
@@ -151,6 +159,52 @@ void ImportFileDialog::buildUI()
 
     m_app->showTaskModal(doLoad, "Please Wait: Importing Data...");
   }
+}
+
+void ImportFileDialog::buildPrincipledVolumeUI()
+{
+  if (m_importResult && m_importResult->done.load()) {
+    m_importError = m_importResult->error;
+    m_importResult.reset();
+    if (m_importError.empty()) {
+      hide();
+      return;
+    }
+  }
+  ImGui::BeginDisabled(bool(m_importResult));
+  m_principledEditor.buildUI(m_app);
+  const auto validation = m_principledEditor.validationError();
+  if (!validation.empty())
+    ImGui::TextWrapped("%s", validation.c_str());
+  if (!m_importError.empty())
+    ImGui::TextWrapped("%s", m_importError.c_str());
+  if (ImGui::Button("cancel"))
+    hide();
+  ImGui::SameLine();
+  ImGui::BeginDisabled(!validation.empty() || m_app->blockingTaskRunning());
+  if (ImGui::Button("import")) {
+    auto *ctx = appContext();
+    auto parent = ctx->getFirstSelected();
+    if (!parent)
+      parent = ctx->vsr.scene.defaultLayer()->root();
+    auto options = m_principledEditor.options();
+    auto result = std::make_shared<ImportResult>();
+    m_importResult = result;
+    m_importError.clear();
+    m_app->showTaskModal(
+        [ctx, parent, options = std::move(options), result]() {
+          try {
+            vsr::io::import_principledVolume(ctx->vsr.scene, options, parent);
+            ctx->vsr.scene.signalLayerStructureChanged(parent->value().layer());
+          } catch (const std::exception &e) {
+            result->error = e.what();
+          }
+          result->done.store(true);
+        },
+        "Please Wait: Importing Principled Volume...");
+  }
+  ImGui::EndDisabled();
+  ImGui::EndDisabled();
 }
 
 void ImportFileDialog::buildUsdVariantUI()
