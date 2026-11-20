@@ -32,6 +32,13 @@ void ensureDefaultTransferFunction(vsr::core::TransferFunction &tf)
 
 } // namespace
 
+vsr::core::TransferFunction defaultVolumeTransferFunction()
+{
+  vsr::core::TransferFunction tf;
+  ensureDefaultTransferFunction(tf);
+  return tf;
+}
+
 bool isUsdImporter(ImporterType type)
 {
   return type == ImporterType::USD || type == ImporterType::USD_MTLX

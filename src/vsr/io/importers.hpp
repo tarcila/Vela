@@ -204,6 +204,9 @@ std::vector<UserColorMap> loadUserColorMaps(
     const std::filesystem::path &directory);
 vsr::core::TransferFunction importTransferFunction(const std::string &filepath);
 
+// Initial transfer function for callers dispatching a mixed sequence of inputs.
+vsr::core::TransferFunction defaultVolumeTransferFunction();
+
 void import_file(Scene &scene,
     vsr::animation::AnimationManager &animMgr,
     const ImportFile &file,

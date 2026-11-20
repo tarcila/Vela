@@ -275,8 +275,6 @@ void Context::parseCommandLine(std::vector<std::string> &args)
 bool Context::loadCommandLineSceneInputs()
 {
   bool success = true;
-  std::vector<vsr::io::ImportFile> foreignImports;
-
   for (const auto &input : commandLine.sceneInputs) {
     if (const auto *archive = std::get_if<SceneArchiveLoad>(&input)) {
       if (!vsr::io::load_SceneArchive(vsr.scene, archive->filename.c_str())) {
@@ -284,14 +282,28 @@ bool Context::loadCommandLineSceneInputs()
             archive->filename.c_str());
         success = false;
       }
-    } else if (const auto *foreign = std::get_if<ForeignSceneImport>(&input)) {
-      foreignImports.push_back(foreign->file);
     }
   }
 
-  vsr::io::import_files(vsr.scene, vsr.animationMgr, foreignImports);
+  auto transferFunction = vsr::io::defaultVolumeTransferFunction();
+  size_t importIndex = 0;
+  const auto ranks = vsr.scene.mpiNumRanks();
+  const auto rank = vsr.scene.mpiRank();
   for (const auto &input : commandLine.sceneInputs) {
-    if (const auto *medium = std::get_if<PrincipledVolumeSceneImport>(&input)) {
+    if (std::holds_alternative<SceneArchiveLoad>(input))
+      continue; // Native base still precedes all additive imports.
+    const auto *foreign = std::get_if<ForeignSceneImport>(&input);
+    const bool everyRank =
+        foreign && foreign->file.first == vsr::io::ImporterType::XF;
+    const bool assigned = ranks <= 1 || importIndex % ranks == rank;
+    ++importIndex;
+    if (!everyRank && !assigned)
+      continue;
+    if (foreign) {
+      vsr::io::import_file(
+          vsr.scene, vsr.animationMgr, foreign->file, transferFunction);
+    } else if (const auto *medium =
+                   std::get_if<PrincipledVolumeSceneImport>(&input)) {
       try {
         auto *layer = vsr.scene.layer(medium->layerName);
         const bool createdLayer = !layer;
