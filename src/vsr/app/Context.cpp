@@ -54,11 +54,61 @@ void Context::parseCommandLine(int argc, const char **argv)
 void Context::parseCommandLine(std::vector<std::string> &args)
 {
   auto &importerType = this->commandLine.importerType;
+  std::optional<size_t> medium;
+  bool jsonMedium = false;
+  auto finishMedium = [&]() {
+    if (medium) {
+      const auto &o = std::get<PrincipledVolumeSceneImport>(
+          commandLine.sceneInputs[*medium])
+                          .options;
+      if (o.fields.empty() && o.parameters.empty() && !o.bounds)
+        throw std::runtime_error(
+            "-principled_volume requires property assignments");
+    }
+    medium.reset();
+  };
 
   for (int i = 1; i < args.size(); i++) {
     std::string &arg = args[i];
     if (arg.empty())
       continue;
+
+    if (arg == "-principled_volume" || arg == "-principled_volume_json") {
+      finishMedium();
+      importerType = vsr::io::ImporterType::NONE;
+      commandLine.currentAnimationSequence = nullptr;
+      PrincipledVolumeSceneImport input{{}, commandLine.currentLayerName};
+      jsonMedium = arg == "-principled_volume_json";
+      if (jsonMedium) {
+        if (i + 1 >= args.size() || args[i + 1].empty()
+            || args[i + 1][0] == '-')
+          throw std::runtime_error(
+              "-principled_volume_json requires a description filename");
+        input.options = vsr::io::readPrincipledVolumeDescription(args[++i]);
+      }
+      commandLine.sceneInputs.push_back(std::move(input));
+      if (!jsonMedium)
+        medium = commandLine.sceneInputs.size() - 1;
+      continue;
+    }
+    if ((medium || jsonMedium) && arg[0] != '-') {
+      if (jsonMedium)
+        throw std::runtime_error("JSON medium does not accept CLI overrides");
+      vsr::io::applyPrincipledVolumeAssignment(
+          std::get<PrincipledVolumeSceneImport>(
+              commandLine.sceneInputs[*medium])
+              .options,
+          arg);
+      continue;
+    }
+    const bool wasMedium = medium.has_value() || jsonMedium;
+    const bool globalOption = arg == "-v" || arg == "--verbose" || arg == "-e"
+        || arg == "--echoOutput" || arg == "--openUnloaded" || arg == "-l"
+        || arg == "--layer";
+    if (wasMedium && !globalOption) {
+      finishMedium();
+      jsonMedium = false;
+    }
 
     if (arg == "-v" || arg == "--verbose")
       setLogVerbose(true);
@@ -175,6 +225,9 @@ void Context::parseCommandLine(std::vector<std::string> &args)
     else if (arg == "-camera" || arg == "--camera")
       this->commandLine.cameraFile = args[++i];
     else {
+      if (wasMedium)
+        throw std::runtime_error(
+            "unexpected principled volume option '" + arg + "'");
       if (importerType != vsr::io::ImporterType::NONE) {
         if (importerType == vsr::io::ImporterType::POINTSBIN_MULTIFILE
             || importerType == vsr::io::ImporterType::VOLUME_ANIMATION) {
@@ -215,6 +268,7 @@ void Context::parseCommandLine(std::vector<std::string> &args)
     }
   }
 
+  finishMedium();
   this->commandLine.currentAnimationSequence = nullptr;
 }
 
@@ -230,12 +284,33 @@ bool Context::loadCommandLineSceneInputs()
             archive->filename.c_str());
         success = false;
       }
-    } else {
-      foreignImports.push_back(std::get<ForeignSceneImport>(input).file);
+    } else if (const auto *foreign = std::get_if<ForeignSceneImport>(&input)) {
+      foreignImports.push_back(foreign->file);
     }
   }
 
   vsr::io::import_files(vsr.scene, vsr.animationMgr, foreignImports);
+  for (const auto &input : commandLine.sceneInputs) {
+    if (const auto *medium = std::get_if<PrincipledVolumeSceneImport>(&input)) {
+      try {
+        auto *layer = vsr.scene.layer(medium->layerName);
+        const bool createdLayer = !layer;
+        if (!layer)
+          layer = vsr.scene.addLayer(medium->layerName);
+        try {
+          vsr::io::import_principledVolume(
+              vsr.scene, medium->options, layer->root());
+        } catch (...) {
+          if (createdLayer)
+            vsr.scene.removeLayer(layer);
+          throw;
+        }
+      } catch (const std::exception &e) {
+        vsr::core::logError("%s", e.what());
+        success = false;
+      }
+    }
+  }
   return success;
 }
 

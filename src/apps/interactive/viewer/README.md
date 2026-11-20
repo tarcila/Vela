@@ -128,6 +128,48 @@ Load a volume with a transfer function:
 ./vsrViewer -xf fire.xf -volume density.nvdb
 ```
 
+Import one principled participating medium (requires a device advertising
+`principledVolume`):
+
+```bash
+./vsrViewer -principled_volume name=smoke density=smoke.nvdb \
+  density:value=0.5 temperature=heat.nvdb blackbodyIntensity=1
+./vsrViewer -principled_volume_json medium.json
+```
+
+Each `-principled_volume` starts one medium. Assignments have the form
+`property[:field|value]=value`; a complete numeric scalar or comma-separated RGB
+vector infers `value`, otherwise a field-capable property infers `field`.
+Use `density:field=123` for a numeric filename. A field and its multiplier value
+can coexist; duplicate assignments to either semantic are errors. Existing
+importer flags end the block. JSON descriptions do not accept CLI overrides.
+
+Field slots are scalar `density`/`temperature` and linear RGB
+`scatteringColor`/`emission`. Only readers that produce RGB fields can fill RGB
+slots; VTI retains its scalar component splitting. No transfer function,
+normalization or resampling is applied. `.vdb` means NanoVDB, not OpenVDB.
+Use `bounds=xmin,ymin,zmin,xmax,ymax,zmax` to override automatic union bounds;
+uniform media and fields without derivable domains (currently FLASH AMR)
+require explicit finite, positive bounds. Values multiply bound fields.
+Emission defaults to `0,0,0` and blackbody intensity to `0`, even with fields
+attached; enable them explicitly when wanted.
+
+```json
+{
+  "name": "smoke",
+  "fields": {
+    "density": {"file": "smoke.nvdb"},
+    "temperature": {"file": "heat.nvdb"}
+  },
+  "parameters": {"density": 0.5, "blackbodyIntensity": 1}
+}
+```
+
+JSON paths resolve relative to the description file. Optional `bounds` is a
+six-number array; RGB parameters are three-number arrays. The importer UI can
+read JSON into editable mappings and export a description with absolute source
+paths. Animation sequences are not supported by these flags.
+
 Start secondary viewport on another ANARI library:
 
 ```bash
