@@ -3,10 +3,17 @@
 
 #include "catch.hpp"
 #include "vsr/io/PrincipledVolumeImport.hpp"
+#include "vsr/io/importers.hpp"
+#include "vsr/io/importers/detail/PrincipledVolumeField.hpp"
+#include <nanovdb/io/IO.h>
+#include <nanovdb/tools/CreateNanoGrid.h>
+#include <nanovdb/tools/GridBuilder.h>
 #include <filesystem>
 #include <fstream>
 
 using namespace vsr::io;
+using namespace vsr::scene;
+using namespace vsr::math;
 namespace {
 struct DescriptionFixture
 {

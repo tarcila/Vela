@@ -39,6 +39,7 @@ PRIVATE
   importers/detail/HDRImage.cpp
   importers/detail/AnariCaptureText.cpp
   importers/detail/importer_common.cpp
+  importers/detail/PrincipledVolumeField.cpp
   importers/detail/pbrt/PbrtLexer.cpp
   importers/detail/pbrt/PbrtParser.cpp
   importers/detail/pbrt/PbrtScene.cpp

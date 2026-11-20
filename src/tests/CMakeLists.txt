@@ -49,6 +49,7 @@ project_add_executable(
   test_Parameter.cpp
   test_PickRequest.cpp
   test_PrincipledVolumeImport.cpp
+  test_PrincipledVolumeFields.cpp
   test_Procedural.cpp
   test_RenderIndex.cpp
   test_Scene.cpp
@@ -141,6 +142,7 @@ PRIVATE
   vsr_rendering
   vsr_scene
   vela_ext_catch2
+  vela_ext_nanovdb
   vela_ext_stb_image
 )
 if (TARGET vsr_scivis_studio_model)

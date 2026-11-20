@@ -98,8 +98,8 @@ void import_XYZDP(Scene &scene, vsr::animation::AnimationManager &animMgr, const
 // Spatial field importers //
 
 // Dispatch to the appropriate spatial field importer based on file extension.
-// Supports: .raw, .flash/.hdf5, .nvdb/.vdb, .mhd, .vtu, .silo/.sil
-// Note: .vti is not supported here; use import_volume() for VTI files.
+// Supports: .raw, .flash/.hdf5, .nvdb/.vdb, .mhd, .vtu, .vti, .silo/.sil
+// VTI selects the first scalar field (vectors retain the legacy component split).
 SpatialFieldRef import_spatial_field(Scene &scene, const char *filename, std::optional<std::string> propertyName = std::nullopt);
 
 SpatialFieldRef import_RAW(Scene &scene, const char *filename);
