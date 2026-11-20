@@ -11,7 +11,51 @@ Volume::Volume(Token stype) : Object(ANARI_VOLUME, stype)
 {
   addParameter("visible").setValue(true).setDescription(
       "whether the volume is visible in the scene");
-  if (stype == tokens::volume::transferFunction1D) {
+  if (stype == tokens::volume::principled) {
+    addParameter("density").setValue(1.f).setMin(0.f).setDescription(
+        "total extinction scale; multiplies density.field, "
+        "zero outside its domain; zero disables extinction "
+        "and thermal emission");
+    addParameter("scattering")
+        .setValue(float3(1.f))
+        .setUsage(ParameterUsageHint::COLOR)
+        .setDescription(
+            "linear-RGB single-scattering albedo in [0, 1]; "
+            "multiplies a scalar or RGB scattering.field, "
+            "using the constant outside its domain");
+    addParameter("transmissionColor")
+        .setValue(float3(0.36787944f))
+        .setUsage(ParameterUsageHint::COLOR);
+    addParameter("transmissionDistance")
+        .setValue(1.f)
+        .setDescription(
+            "world-space distance for transmissionColor at density "
+            "one; must be positive when extinction is nonzero");
+    addParameter("anisotropy").setValue(0.f).setMin(-1.f).setMax(1.f);
+    addParameter("secondaryAnisotropy").setValue(0.f).setMin(-1.f).setMax(1.f);
+    addParameter("secondaryWeight").setValue(0.f).setMin(0.f).setMax(1.f);
+    addParameter("emission")
+        .setValue(float3(0.f))
+        .setUsage(ParameterUsageHint::COLOR)
+        .setDescription(
+            "linear-RGB radiance per world-space length, independent "
+            "of density; multiplies a scalar or RGB emission.field, "
+            "using the constant outside its domain");
+    addParameter("temperature")
+        .setValue(1.f)
+        .setDescription(
+            "kelvin; multiplies temperature.field, using the "
+            "constant outside its domain; nonpositive is cold");
+    addParameter("blackbodyIntensity")
+        .setValue(0.f)
+        .setMin(0.f)
+        .setDescription(
+            "thermal radiance scale; emission also requires nonzero "
+            "absorption (non-white effective scattering albedo)");
+    addParameter("blackbodyTint")
+        .setValue(float3(1.f))
+        .setUsage(ParameterUsageHint::COLOR);
+  } else if (stype == tokens::volume::transferFunction1D) {
     addParameter("color")
         .setValue(float3{1.f})
         .setUsage(ParameterUsageHint::COLOR)
@@ -74,6 +118,7 @@ anari::Object Volume::makeANARIObject(anari::Device d) const
 
 namespace tokens::volume {
 
+const Token principled = "principled";
 const Token gaussianSplat = "gaussianSplat";
 const Token structuredRegular = "structuredRegular";
 const Token structuredRectilinear = "structuredRectilinear";
