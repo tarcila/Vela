@@ -12,6 +12,7 @@ project_sources(PRIVATE
   modals/ObjectFileDialog.cpp
   modals/OfflineRenderModal.cpp
   modals/ImportFileDialog.cpp
+  modals/PrincipledVolumeImportEditor.cpp
   modals/Modal.cpp
   modals/CuttingPlaneDialog.cpp
   modals/VorticityDialog.cpp

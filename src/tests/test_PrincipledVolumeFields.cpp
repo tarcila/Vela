@@ -123,7 +123,7 @@ TEST_CASE(
 TEST_CASE("Principled VTI spatial import does not orphan extra fields",
     "[PrincipledVolumeImport]")
 {
-#if VSR_USE_VTK
+#if VSR_TEST_WITH_VTK
   auto path = std::filesystem::temp_directory_path() / "vsr-principled.vti";
   std::ofstream(path)
       << R"(<?xml version="1.0"?><VTKFile type="ImageData" version="0.1" byte_order="LittleEndian"><ImageData WholeExtent="0 1 0 1 0 1" Origin="0 0 0" Spacing="1 1 1"><Piece Extent="0 1 0 1 0 1"><PointData Scalars="density"><DataArray type="Float32" Name="density" format="ascii">1 2 3 4 5 6 7 8</DataArray><DataArray type="Float32" Name="heat" format="ascii">8 7 6 5 4 3 2 1</DataArray></PointData><CellData/></Piece></ImageData></VTKFile>)";

@@ -82,7 +82,8 @@ if (TARGET vsr_network)
   target_sources(${PROJECT_NAME} PRIVATE test_NetworkChannel.cpp)
 endif()
 if (TARGET vsr_ui_imgui)
-  target_sources(${PROJECT_NAME} PRIVATE test_TransferFunctionEditor.cpp)
+  target_sources(${PROJECT_NAME} PRIVATE test_TransferFunctionEditor.cpp test_PrincipledVolumeEditor.cpp)
+  add_test(NAME vsr::PrincipledVolumeEditor COMMAND ${PROJECT_NAME} "[PrincipledVolumeEditor]")
   target_link_libraries(${PROJECT_NAME} PRIVATE vsr_ui_imgui)
   add_test(NAME vsr::TransferFunctionEditor
     COMMAND ${PROJECT_NAME} "[TransferFunctionEditor]")
@@ -168,6 +169,8 @@ endif()
 if (TARGET vsr_scivis_studio_test_client_core)
   target_link_libraries(${PROJECT_NAME} PRIVATE vsr_scivis_studio_test_client_core)
 endif()
+
+target_compile_definitions(${PROJECT_NAME} PRIVATE VSR_TEST_WITH_VTK=$<BOOL:${VSR_USE_VTK}>)
 
 add_test(NAME vsr::AnimationManager COMMAND ${PROJECT_NAME} "[AnimationManager]")
 add_test(NAME vsr::AutoExposure   COMMAND ${PROJECT_NAME} "[AutoExposure]" )
